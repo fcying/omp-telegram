@@ -58,6 +58,8 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存的诊断只用于分类, 绝不出现在 Telegram 输出中.
 
+实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活动工具名. reasoning、raw frame、工具参数/结果、命令文本、stdout 和 stderr 绝不渲染. 首次 Send 失败会抑制当前 turn 的 progress, 避免重复消息; Edit 失败仍可重试. 进度具有 generation 与 turn fence, 不写 SQLite, 不能影响终态分类或 durable outbox completion.
+
 ## 身份与过期工作
 
 | 身份 | 表示 |

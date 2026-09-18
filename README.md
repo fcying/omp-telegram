@@ -63,11 +63,14 @@ data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 max_workers = 4
 queue_capacity = 16
+progress_mode = "summary"
 database_retention_days = 90
 ```
 
 If no configuration file is specified and the default file is absent, the service uses these embedded defaults without generating a file.
 `database_retention_days` enables the Database Message Retention janitor. It retains terminal inbox/outbox records for the configured number of days measured from their latest state transition. The default is `90`; set it to `0` to disable cleanup. Pending/submitted inbox and pending/sending outbox records remain durable. It never removes bindings, history, startup intents, workspaces, omp session files, or other omp data.
+
+`progress_mode` controls one best-effort, editable live task message: `off` disables it and typing actions, `summary` shows assistant output, active tool names, and task state, and `verbose` also shows the six most recent observable tool activities. Live progress never includes reasoning, tool arguments, command text, results, stdout, or stderr. It is not persisted and does not affect durable final replies.
 
 ### 3. Set the environment and start
 

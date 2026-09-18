@@ -18,3 +18,10 @@ max_workers = 4
 queue_capacity = 16
 # Remove terminal database messages older than this many days. Set 0 to disable cleanup.
 database_retention_days = 90
+# Telegram live task progress.
+#
+# off: Disable live progress and typing actions.
+# summary: Show assistant activity, active tools, and task state.
+# verbose: Also show recent observable tool activity.
+# Raw thinking/reasoning and unfiltered tool arguments are never sent.
+progress_mode = "summary"

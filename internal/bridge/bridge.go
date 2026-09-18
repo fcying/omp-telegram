@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,10 +80,10 @@ type worker struct {
 	turn                uint64
 	finishing           bool
 	compacting          bool
+	progress            progressState
 	operations          chan operationResult
 	background          sync.WaitGroup
 	busy                bool
-	toolName            string
 	lastTyping          time.Time
 	preview             string
 	lastAssistant       *terminalAssistant
@@ -90,6 +91,7 @@ type worker struct {
 	lastPreview         string
 	previewID           int64
 	previewBusy         bool
+	progressSuppressed  bool
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
 	mediaResults        chan mediaResult
@@ -111,7 +113,30 @@ type previewResult struct {
 	text       string
 	generation int64
 	turn       uint64
+	err        error
 }
+
+const (
+	maxRecentTools   = 6
+	maxActiveTools   = 6
+	maxToolNameUnits = 64
+	maxPreviewUnits  = 2200
+	maxProgressUnits = 3500
+)
+
+type progressState struct {
+	ActiveTools map[string]progressTool
+	RecentTools []progressTool
+	Retrying    bool
+}
+
+type progressTool struct {
+	ID      string
+	Name    string
+	Running bool
+	IsError bool
+}
+
 type operationResult struct {
 	generation int64
 	err        error
@@ -137,6 +162,8 @@ type rpcEvent struct {
 	Success               bool                         `json:"success"`
 	Command               string                       `json:"command"`
 	ToolName              string                       `json:"toolName"`
+	ToolCallID            string                       `json:"toolCallId"`
+	IsError               bool                         `json:"isError"`
 	AssistantMessageEvent struct{ Type, Delta string } `json:"assistantMessageEvent"`
 	Messages              []message                    `json:"messages"`
 }
@@ -554,14 +581,7 @@ func (w *worker) run() {
 		case <-done:
 			w.failed()
 		case result := <-w.previewResult:
-			w.previewBusy = false
-			if result.generation == w.binding.Generation && result.turn == w.turn {
-				w.previewID = result.id
-				w.lastPreview = result.text
-			}
-			if w.finishing {
-				w.finishPreview()
-			}
+			w.previewFinished(result)
 		case result := <-w.operations:
 			if result.generation == w.binding.Generation && w.client != nil {
 				w.compacting = false
@@ -603,7 +623,8 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 		cancel()
 		delete(w.hostRequests, id)
 	}
-	w.toolName = ""
+	w.progress = progressState{}
+	w.progressSuppressed = false
 	w.turn++
 	w.finishing = false
 	w.compacting = false
@@ -995,6 +1016,8 @@ func (w *worker) dispatch() {
 	w.owner = q.user
 	w.turn++
 	w.busy = true
+	w.progress = progressState{ActiveTools: make(map[string]progressTool)}
+	w.progressSuppressed = false
 	w.preview = ""
 	w.stream.Reset()
 	w.lastPreview = ""
@@ -1021,7 +1044,7 @@ func (w *worker) dispatch() {
 	}
 }
 func (w *worker) finish() {
-	w.toolName = ""
+	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		text := w.preview
 		if err := w.b.db.CompleteInboxWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
@@ -1173,9 +1196,10 @@ func (w *worker) finishTerminal(e rpcEvent) {
 }
 func (w *worker) finishPreview() {
 	w.finishing = false
+	w.progress = progressState{}
 	if w.previewID != 0 {
 		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
-		_ = w.b.tg.Edit(ctx, w.key.chat, w.previewID, "Preview ended. The complete result follows.", nil)
+		_ = w.b.tg.Edit(ctx, w.key.chat, w.previewID, "Task ended. The complete result follows.", nil)
 		cancel()
 	}
 }
@@ -1186,6 +1210,7 @@ func (w *worker) event(raw []byte) {
 	}
 	switch e.Type {
 	case "host_tool_call":
+		w.renameProgressTool(e.ToolCallID, e.ToolName)
 		w.hostSend(e)
 	case "host_tool_cancel":
 		if cancel, ok := w.hostRequests[e.TargetID]; ok {
@@ -1193,9 +1218,9 @@ func (w *worker) event(raw []byte) {
 			delete(w.hostRequests, e.TargetID)
 		}
 	case "tool_execution_start":
-		w.toolName = e.ToolName
+		w.startProgressTool(e.ToolCallID, e.ToolName)
 	case "tool_execution_end":
-		w.toolName = ""
+		w.finishProgressTool(e.ToolCallID, e.IsError)
 	case "message_update":
 		if e.AssistantMessageEvent.Type == "text_delta" {
 			w.stream.WriteString(e.AssistantMessageEvent.Delta)
@@ -1205,8 +1230,13 @@ func (w *worker) event(raw []byte) {
 		w.compacting = true
 	case "auto_compaction_end":
 		w.compacting = false
+	case "auto_retry_start":
+		w.progress.Retrying = true
+	case "auto_retry_end":
+		w.progress.Retrying = false
 	case "agent_start":
 		w.busy = true
+		w.progress.ActiveTools = make(map[string]progressTool)
 		w.lastAssistant = nil
 		w.finalAssistantTexts = nil
 	case "message_end":
@@ -1246,6 +1276,9 @@ func (w *worker) event(raw []byte) {
 	}
 }
 func (w *worker) typing() {
+	if w.b.cfg.ProgressMode == "off" {
+		return
+	}
 	preparing := len(w.queue) > 0 && w.queue[0].preparing
 	if (!w.busy && !preparing) || time.Since(w.lastTyping) < 5*time.Second {
 		return
@@ -1260,15 +1293,212 @@ func (w *worker) typing() {
 	}()
 }
 
-func (w *worker) flushPreview() {
-	snapshot := w.preview
-	if w.toolName != "" {
-		snapshot = "Running tool: " + w.toolName
+func clipUTF16(s string, limit int) string {
+	if parts := split(s, limit); len(parts) > 0 {
+		return parts[0]
 	}
-	if !w.busy || w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
+	return ""
+}
+
+func utf16Length(s string) int {
+	units := 0
+	for _, r := range s {
+		size := utf16.RuneLen(r)
+		if size < 0 {
+			size = 1
+		}
+		units += size
+	}
+	return units
+}
+
+func tailUTF16(s string, limit int) string {
+	if utf16Length(s) <= limit {
+		return s
+	}
+	runes := []rune(s)
+	units, start := 0, len(runes)
+	for start > 0 {
+		size := utf16.RuneLen(runes[start-1])
+		if size < 0 {
+			size = 1
+		}
+		if units+size > limit {
+			break
+		}
+		units += size
+		start--
+	}
+	return string(runes[start:])
+}
+
+func (w *worker) addRecentTool(tool progressTool) {
+	w.progress.RecentTools = append(w.progress.RecentTools, tool)
+	if len(w.progress.RecentTools) > maxRecentTools {
+		w.progress.RecentTools = w.progress.RecentTools[len(w.progress.RecentTools)-maxRecentTools:]
+	}
+}
+
+func (w *worker) startProgressTool(id, name string) {
+	if id == "" || name == "" {
 		return
 	}
-	text := split(snapshot, 3500)[0] + "\n[Generating]"
+	if w.progress.ActiveTools == nil {
+		w.progress.ActiveTools = make(map[string]progressTool)
+	}
+	tool := progressTool{ID: id, Name: clipUTF16(name, maxToolNameUnits), Running: true}
+	w.progress.ActiveTools[id] = tool
+	w.addRecentTool(tool)
+}
+
+func (w *worker) renameProgressTool(id, name string) {
+	if id == "" || name == "" {
+		return
+	}
+	tool, ok := w.progress.ActiveTools[id]
+	if !ok {
+		return
+	}
+	tool.Name = clipUTF16(name, maxToolNameUnits)
+	w.progress.ActiveTools[id] = tool
+	for i := len(w.progress.RecentTools) - 1; i >= 0; i-- {
+		if w.progress.RecentTools[i].ID == id && w.progress.RecentTools[i].Running {
+			w.progress.RecentTools[i] = tool
+			return
+		}
+	}
+}
+
+func (w *worker) finishProgressTool(id string, isError bool) {
+	tool, ok := w.progress.ActiveTools[id]
+	if !ok {
+		return
+	}
+	delete(w.progress.ActiveTools, id)
+	tool.Running, tool.IsError = false, isError
+	for i := len(w.progress.RecentTools) - 1; i >= 0; i-- {
+		if w.progress.RecentTools[i].ID == id {
+			w.progress.RecentTools[i] = tool
+			return
+		}
+	}
+	w.addRecentTool(tool)
+}
+
+func sortedProgressTools(tools map[string]progressTool) []progressTool {
+	out := make([]progressTool, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, tool)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name == out[j].Name {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func progressToolLine(tool progressTool) string {
+	state := "completed"
+	if tool.Running {
+		state = "running"
+	} else if tool.IsError {
+		state = "failed"
+	}
+	return "- " + tool.Name + ": " + state
+}
+
+func (w *worker) progressStatus() string {
+	switch {
+	case w.progress.Retrying:
+		return "Retrying automatically..."
+	case w.compacting:
+		return "Compacting context..."
+	case len(w.progress.ActiveTools) > 1:
+		return "Running tools..."
+	case len(w.progress.ActiveTools) == 1:
+		return "Running tool..."
+	case w.busy:
+		return "Running"
+	default:
+		return ""
+	}
+}
+
+func (w *worker) renderProgress() string {
+	if !w.busy || w.active == 0 {
+		return ""
+	}
+	sections := []string{"Processing..."}
+	if status := w.progressStatus(); status != "" {
+		sections = append(sections, "Status: "+status)
+	}
+	active := sortedProgressTools(w.progress.ActiveTools)
+	if len(active) > 0 {
+		lines := []string{"Tools:"}
+		for i, tool := range active {
+			if i == maxActiveTools {
+				lines = append(lines, fmt.Sprintf("- %d more", len(active)-i))
+				break
+			}
+			lines = append(lines, progressToolLine(tool))
+		}
+		sections = append(sections, strings.Join(lines, "\n"))
+	}
+	text := strings.Join(sections, "\n\n")
+	if w.preview != "" {
+		available := maxProgressUnits - utf16Length(text) - utf16Length("\n\nOutput:\n")
+		if available > 0 {
+			if available > maxPreviewUnits {
+				available = maxPreviewUnits
+			}
+			text += "\n\nOutput:\n" + tailUTF16(w.preview, available)
+		}
+	}
+	if w.b.cfg.ProgressMode != "verbose" || len(w.progress.RecentTools) == 0 {
+		return text
+	}
+	var recent []string
+	for i := len(w.progress.RecentTools) - 1; i >= 0; i-- {
+		candidate := append([]string{progressToolLine(w.progress.RecentTools[i])}, recent...)
+		section := "Recent tool activity:\n" + strings.Join(candidate, "\n")
+		if utf16Length(text)+utf16Length("\n\n")+utf16Length(section) > maxProgressUnits {
+			break
+		}
+		recent = candidate
+	}
+	if len(recent) > 0 {
+		text += "\n\nRecent tool activity:\n" + strings.Join(recent, "\n")
+	}
+	return text
+}
+
+func (w *worker) previewFinished(result previewResult) {
+	w.previewBusy = false
+	if result.generation != w.binding.Generation || result.turn != w.turn {
+		return
+	}
+	if result.err == nil {
+		w.previewID = result.id
+		w.lastPreview = result.text
+	} else if result.id == 0 {
+		w.progressSuppressed = true
+	}
+	if w.finishing {
+		w.finishPreview()
+	}
+}
+
+func (w *worker) flushPreview() {
+	if w.b.cfg.ProgressMode == "off" || w.progressSuppressed {
+		return
+	}
+	snapshot := w.renderProgress()
+	if w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
+		return
+	}
+	text := snapshot
 	id := w.previewID
 	gen := w.binding.Generation
 	turn := w.turn
@@ -1278,16 +1508,18 @@ func (w *worker) flushPreview() {
 		defer w.background.Done()
 		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 		defer cancel()
+		var err error
 		if id == 0 {
-			m, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, nil)
-			if e == nil {
-				id = m.MessageID
+			var message telegram.Message
+			message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, nil)
+			if err == nil {
+				id = message.MessageID
 			}
 		} else {
-			_ = w.b.tg.Edit(ctx, w.key.chat, id, text, nil)
+			err = w.b.tg.Edit(ctx, w.key.chat, id, text, nil)
 		}
 		select {
-		case w.previewResult <- previewResult{id, snapshot, gen, turn}:
+		case w.previewResult <- previewResult{id: id, text: snapshot, generation: gen, turn: turn, err: err}:
 		case <-w.ctx.Done():
 		}
 	}()

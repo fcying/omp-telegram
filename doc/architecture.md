@@ -58,6 +58,8 @@ The client waits for `ready`, negotiates protocol v2, serializes stdin writes, a
 
 RPC v2 may compact large terminal frames and omit messages already emitted by `message_end`. The worker caches the latest assistant message's `stopReason` and `errorMessage`, plus finalized text from every assistant `message_end`; terminal `agent_end` messages take precedence, and the cache is used only when they contain no assistant message. The cache resets at `agent_start`, terminal completion, and shutdown. Cached diagnostics classify the result but never appear in Telegram output.
 
+Live progress is an in-memory, best-effort view using the existing one-message preview transport. `progress_mode=off` suppresses Telegram Send/Edit and typing but continues text-delta processing for final-result fallback. `summary` shows assistant output, active tool names keyed by tool call ID, and state; `verbose` adds the bounded recent tool list. Retry, compaction, and concurrent tools are explicit events. `tool_execution_end` is the sole completion source, including host tools; host callbacks only correct a matching active tool name. Reasoning, raw frames, tool arguments/results, command text, stdout, and stderr are never rendered. An initial Send failure suppresses progress for that turn to avoid duplicate messages; an Edit failure remains retryable. Progress has generation and turn fences, does not write SQLite, and cannot affect terminal classification or durable outbox completion.
+
 ## Identity and stale work
 
 | Identity | Representation |

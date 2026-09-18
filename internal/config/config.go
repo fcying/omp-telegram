@@ -27,6 +27,7 @@ type Config struct {
 	MaxWorkers            int
 	QueueCapacity         int
 	DatabaseRetentionDays int
+	ProgressMode          string
 }
 
 // fileConfig accepts quoted environment references in otherwise numeric fields.
@@ -41,6 +42,7 @@ type fileConfig struct {
 	MaxWorkers            any    `toml:"max_workers"`
 	QueueCapacity         any    `toml:"queue_capacity"`
 	DatabaseRetentionDays any    `toml:"database_retention_days"`
+	ProgressMode          string `toml:"progress_mode"`
 }
 
 func Load(path string) (Config, error) {
@@ -61,7 +63,7 @@ func load(path, baseDir string) (Config, error) {
 		path = filepath.Join(baseDir, "config.toml")
 	}
 	var c Config
-	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16), DatabaseRetentionDays: int64(90)}
+	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16), DatabaseRetentionDays: int64(90), ProgressMode: "summary"}
 	f, err := os.Open(path)
 	var reader io.Reader
 	if err == nil {
@@ -137,6 +139,12 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("worker, queue, or retention limit exceeds platform integer range")
 	}
 	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
+	switch raw.ProgressMode {
+	case "off", "summary", "verbose":
+		c.ProgressMode = raw.ProgressMode
+	default:
+		return c, errors.New("progress_mode must be off, summary, or verbose")
+	}
 	if len(c.AllowedUsers) == 0 || len(c.AllowedChats) == 0 {
 		return c, errors.New("allowed_users and allowed_chats must be nonempty")
 	}

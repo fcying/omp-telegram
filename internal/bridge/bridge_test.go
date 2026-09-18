@@ -180,6 +180,8 @@ type fakeHTTP struct {
 	rejectCommands bool
 	rejectLanguage string
 	files          map[string][]byte
+	failProgress   bool
+	progressCalls  int
 	downloadGate   <-chan struct{}
 	fileRequests   int
 	uploads        []mediaUpload
@@ -192,6 +194,12 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 	var req map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return nil, err
+	}
+	if f.failProgress && (filepath.Base(r.URL.Path) == "sendMessage" || filepath.Base(r.URL.Path) == "editMessageText") {
+		f.mu.Lock()
+		f.progressCalls++
+		f.mu.Unlock()
+		return nil, errors.New("progress transport failed")
 	}
 	var result any = true
 	switch filepath.Base(r.URL.Path) {
@@ -390,6 +398,197 @@ func TestSplitPreservesUnicodeAndLength(t *testing.T) {
 		}
 	}
 }
+func TestTailUTF16(t *testing.T) {
+	if got := tailUTF16("discard😀keep", 6); got != "😀keep" {
+		t.Fatalf("UTF-16 tail = %q", got)
+	}
+}
+func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
+	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "off"}}, busy: true}
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`))
+	w.flushPreview()
+	w.typing()
+	if w.preview != "checking bridge" || len(w.progress.ActiveTools) != 1 {
+		t.Fatal("off mode stopped internal progress tracking")
+	}
+	if w.previewBusy || w.previewID != 0 || w.lastPreview != "" {
+		t.Fatal("off mode started live progress delivery")
+	}
+	if !w.lastTyping.IsZero() {
+		t.Fatal("off mode sent a typing action")
+	}
+}
+
+func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
+	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "summary"}}, active: 10, busy: true}
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"PRIVATE"}}`))
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read","arguments":{"path":"SECRET path"},"result":"SECRET result"}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"bash-1","toolName":"bash"}`))
+	if got := w.progressStatus(); got != "Running tools..." {
+		t.Fatalf("concurrent tool status = %q", got)
+	}
+	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"read-1"}`))
+	if len(w.progress.ActiveTools) != 1 || w.progress.ActiveTools["bash-1"].Name != "bash" {
+		t.Fatal("ending one tool removed a concurrent tool")
+	}
+	progress := w.renderProgress()
+	for _, want := range []string{"checking bridge", "bash: running", "Status: Running tool..."} {
+		if !strings.Contains(progress, want) {
+			t.Fatalf("summary progress missing %q: %q", want, progress)
+		}
+	}
+	for _, hidden := range []string{"PRIVATE", "SECRET path", "SECRET result", "read: completed", "toolCallId"} {
+		if strings.Contains(progress, hidden) {
+			t.Fatalf("summary progress leaked %q: %q", hidden, progress)
+		}
+	}
+	w.b.cfg.ProgressMode = "verbose"
+	progress = w.renderProgress()
+	if !strings.Contains(progress, "Recent tool activity:") || !strings.Contains(progress, "read: completed") {
+		t.Fatalf("verbose progress omitted recent completion: %q", progress)
+	}
+}
+
+func TestManualCompactionDoesNotReuseTaskProgress(t *testing.T) {
+	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "summary"}}, busy: true, compacting: true, previewID: 42}
+	if got := w.renderProgress(); got != "" {
+		t.Fatalf("manual compaction rendered task progress: %q", got)
+	}
+}
+
+func TestAgentStartPreservesRetryState(t *testing.T) {
+	w := &worker{active: 10, busy: true}
+	w.event([]byte(`{"type":"auto_retry_start"}`))
+	if !w.progress.Retrying {
+		t.Fatal("auto_retry_start did not enable retry state")
+	}
+	w.event([]byte(`{"type":"agent_start"}`))
+	if !w.progress.Retrying {
+		t.Fatal("agent_start cleared active retry state")
+	}
+	w.event([]byte(`{"type":"auto_retry_end"}`))
+	if w.progress.Retrying {
+		t.Fatal("auto_retry_end did not clear retry state")
+	}
+}
+
+func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
+	w := &worker{busy: true}
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"telegram_send"}`))
+	w.event([]byte(`{"type":"host_tool_call","id":"host-1","toolCallId":"tool-1","toolName":"telegram_send"}`))
+	w.event([]byte(`{"type":"host_tool_cancel","targetId":"host-1"}`))
+	if _, ok := w.progress.ActiveTools["tool-1"]; !ok {
+		t.Fatal("host tool event ended progress before tool_execution_end")
+	}
+	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"tool-1"}`))
+	if len(w.progress.ActiveTools) != 0 || len(w.progress.RecentTools) != 1 || w.progress.RecentTools[0].Running {
+		t.Fatal("tool_execution_end did not exclusively complete host tool progress")
+	}
+}
+
+func TestProgressStatusPriorityAndBounds(t *testing.T) {
+	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "verbose"}}, active: 10, busy: true, preview: strings.Repeat("😀", maxProgressUnits)}
+	w.startProgressTool("tool-1", "bash")
+	w.compacting = true
+	if !strings.Contains(w.renderProgress(), "Status: Compacting context...") {
+		t.Fatal("compaction status was not rendered")
+	}
+	w.progress.Retrying = true
+	progress := w.renderProgress()
+	if !strings.Contains(progress, "Status: Retrying automatically...") || len(utf16.Encode([]rune(progress))) > maxProgressUnits {
+		t.Fatalf("retry priority or progress bound failed: %d UTF-16 units", len(utf16.Encode([]rune(progress))))
+	}
+}
+
+func TestProgressCompletionFences(t *testing.T) {
+	for _, result := range []previewResult{
+		{generation: 6, turn: 8, id: 99, text: "stale generation"},
+		{generation: 7, turn: 9, id: 99, text: "stale turn"},
+	} {
+		w := &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current", finishing: true}
+		w.previewFinished(result)
+		if w.previewID != 42 || w.lastPreview != "current" || !w.finishing {
+			t.Fatalf("stale progress result changed current turn: %#v", w)
+		}
+	}
+	w := &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current"}
+	w.previewFinished(previewResult{generation: 7, turn: 8, id: 42, text: "failed", err: errors.New("edit failed")})
+	if w.progressSuppressed || w.lastPreview != "current" || w.previewID != 42 {
+		t.Fatal("edit failure was not retained for a later retry")
+	}
+}
+
+func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
+	for _, mode := range []string{"off", "summary", "verbose"} {
+		t.Run(mode, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Mark(10, "submitted"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, preview: "answer", confirms: map[string]confirmation{}}
+			w.finish()
+			output, err := db.NextOutput()
+			if err != nil || output.Text != "answer" {
+				t.Fatalf("durable output = %#v, err = %v", output, err)
+			}
+			var state string
+			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "done" {
+				t.Fatalf("inbox state = %q, err = %v", state, err)
+			}
+		})
+	}
+}
+
+func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
+	fake := &fakeHTTP{failProgress: true}
+	old := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = old }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{
+		b:             &Bridge{cfg: config.Config{ProgressMode: "summary"}, tg: telegram.New("fake"), fatal: make(chan error, 1)},
+		ctx:           ctx,
+		cancel:        cancel,
+		active:        10,
+		busy:          true,
+		preview:       "working",
+		previewResult: make(chan previewResult, 1),
+	}
+	w.flushPreview()
+	result := <-w.previewResult
+	if result.err == nil {
+		t.Fatal("failed Telegram progress delivery was reported as successful")
+	}
+	w.previewFinished(result)
+	w.flushPreview()
+	if !w.progressSuppressed || !w.busy || w.previewBusy || w.lastPreview != "" || w.previewID != 0 {
+		t.Fatal("initial progress failure changed worker task state incorrectly")
+	}
+	fake.mu.Lock()
+	calls := fake.progressCalls
+	fake.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("initial progress send retried %d times", calls)
+	}
+	select {
+	case err := <-w.b.fatal:
+		t.Fatalf("progress failure made daemon fatal: %v", err)
+	default:
+	}
+}
+
 func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	db, e := store.Open(t.TempDir())
 	if e != nil {

@@ -63,11 +63,14 @@ data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 max_workers = 4
 queue_capacity = 16
+progress_mode = "summary"
 database_retention_days = 90
 ```
 
 未指定配置文件, 且默认文件不存在时, 程序会使用同样的内置默认配置, 不生成文件.
 `database_retention_days` 启用 Database Message Retention janitor. 它按最后一次状态转换时间保留设定天数的终态 inbox/outbox 记录. 默认值是 `90`; 设置为 `0` 可关闭清理. pending/submitted inbox 及 pending/sending outbox 保持持久化. 它绝不删除 binding、history、startup intent、工作目录、omp session 文件或其他 omp 数据.
+
+`progress_mode` 控制一条尽力而为、可编辑的任务实时消息: `off` 关闭它和 typing action, `summary` 显示 assistant 输出、活动工具名和任务状态, `verbose` 额外显示最近 6 条可观察的工具活动. 实时进度绝不包含 reasoning、工具参数、命令文本、结果、stdout 或 stderr. 它不持久化, 不影响最终回复的可靠交付.
 
 ### 3. 设置环境变量并启动
 

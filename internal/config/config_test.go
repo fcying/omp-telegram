@@ -54,6 +54,23 @@ func TestTOMLAuthorization(t *testing.T) {
 	}
 }
 
+func TestProgressMode(t *testing.T) {
+	path, source := configFixture(t)
+	c, err := loadSource(t, path, source)
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("default progress mode = %q, err = %v", c.ProgressMode, err)
+	}
+	for _, mode := range []string{"off", "summary", "verbose"} {
+		c, err = loadSource(t, path, source+"\nprogress_mode = \""+mode+"\"\n")
+		if err != nil || c.ProgressMode != mode {
+			t.Fatalf("progress mode %q = %q, err = %v", mode, c.ProgressMode, err)
+		}
+	}
+	if _, err = loadSource(t, path, source+"\nprogress_mode = \"detailed\"\n"); err == nil || err.Error() != "progress_mode must be off, summary, or verbose" {
+		t.Fatalf("invalid progress mode error = %v", err)
+	}
+}
+
 func TestRelativeOMPPathIsMadeAbsoluteAfterValidation(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "bin"), 0700); err != nil {
