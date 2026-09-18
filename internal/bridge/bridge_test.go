@@ -709,12 +709,16 @@ func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
 	defer cancel()
 	w := &worker{
 		b:             &Bridge{cfg: config.Config{ProgressMode: "summary"}, tg: telegram.New("fake"), fatal: make(chan error, 1)},
+		binding:       store.Binding{Generation: 1},
 		ctx:           ctx,
 		cancel:        cancel,
 		active:        10,
+		owner:         7,
+		turn:          1,
 		busy:          true,
 		preview:       "working",
 		previewResult: make(chan previewResult, 1),
+		confirms:      make(map[string]confirmation),
 	}
 	w.flushPreview()
 	result := <-w.previewResult
@@ -723,7 +727,7 @@ func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
 	}
 	w.previewFinished(result)
 	w.flushPreview()
-	if !w.progressSuppressed || !w.busy || w.previewBusy || w.lastPreview != "" || w.previewID != 0 {
+	if !w.progressSuppressed || !w.busy || w.previewBusy || w.lastPreview != "" || w.previewID != 0 || len(w.confirms) != 0 || w.previewStopToken != "" {
 		t.Fatal("initial progress failure changed worker task state incorrectly")
 	}
 	fake.mu.Lock()

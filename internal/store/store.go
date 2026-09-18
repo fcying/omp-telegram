@@ -14,7 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 const messageCleanupBatchSize = 1000
 
 type Store struct{ DB *sql.DB }
@@ -36,9 +36,9 @@ type Input struct {
 	Raw json.RawMessage
 }
 type Output struct {
-	ID, Chat, Thread int64
-	Text             string
-	Kind, Path, Name string
+	ID, Chat, Thread, ReplyTo int64
+	Text                      string
+	Kind, Path, Name          string
 }
 
 type CleanupResult struct {
@@ -115,8 +115,8 @@ func initialize(db *sql.DB) error {
  CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
- CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX idx_inbox_state ON inbox(state,id);
  CREATE INDEX idx_outbox_state ON outbox(state,id);`)
 		if e != nil {
@@ -159,6 +159,17 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 4
+	}
+	if version == 4 {
+		for _, query := range []string{
+			"ALTER TABLE inbox ADD COLUMN reply_to INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE outbox ADD COLUMN reply_to INTEGER NOT NULL DEFAULT 0",
+		} {
+			if _, e = tx.Exec(query); e != nil {
+				return e
+			}
+		}
+		version = 5
 	}
 	if version != 0 {
 		if _, e = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); e != nil {
@@ -226,6 +237,15 @@ func (s *Store) Pending() ([]Input, error) {
 }
 func (s *Store) Mark(id int64, state string) error {
 	_, e := s.DB.Exec("UPDATE inbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
+	return e
+}
+
+// Submit records a root task's originating Telegram message before OMP accepts it.
+func (s *Store) Submit(id, replyTo int64) error {
+	if replyTo < 0 {
+		return errors.New("invalid reply target")
+	}
+	_, e := s.DB.Exec("UPDATE inbox SET state='submitted',reply_to=?,updated_at=? WHERE id=?", replyTo, time.Now().Unix(), id)
 	return e
 }
 func (s *Store) Binding(bot, chat, thread int64) (Binding, error) {
@@ -484,6 +504,13 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 	}
 	defer tx.Rollback()
 	now := time.Now().Unix()
+	var replyTo int64
+	if err := tx.QueryRowContext(ctx, "SELECT reply_to FROM inbox WHERE id=? AND state='submitted'", id).Scan(&replyTo); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("input is not submitted")
+		}
+		return err
+	}
 	result, err := tx.ExecContext(ctx, "UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state='submitted'", state, now, id)
 	if err != nil {
 		return err
@@ -496,7 +523,7 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 		return fmt.Errorf("input is not submitted")
 	}
 	for _, reply := range replies {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(chat,thread,text,state,created_at,updated_at) VALUES(?,?,?,'pending',?,?)", chat, thread, reply, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(chat,thread,text,state,reply_to,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?)", chat, thread, reply, replyTo, now, now); err != nil {
 			return err
 		}
 	}
@@ -514,7 +541,7 @@ func (s *Store) EnqueueAttachment(chat, thread int64, kind, path, name, caption 
 
 func (s *Store) NextOutput() (Output, error) {
 	var o Output
-	e := s.DB.QueryRow("SELECT id,chat,thread,text,kind,path,name FROM outbox WHERE state='pending' ORDER BY id LIMIT 1").Scan(&o.ID, &o.Chat, &o.Thread, &o.Text, &o.Kind, &o.Path, &o.Name)
+	e := s.DB.QueryRow("SELECT id,chat,thread,text,reply_to,kind,path,name FROM outbox WHERE state='pending' ORDER BY id LIMIT 1").Scan(&o.ID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name)
 	return o, e
 }
 func (s *Store) MarkOutput(id int64, state string) error {

@@ -73,6 +73,11 @@ type Keyboard struct {
 	InlineKeyboard [][]Button `json:"inline_keyboard"`
 }
 
+type SendOptions struct {
+	ReplyToMessageID int64
+	Keyboard         *Keyboard
+}
+
 type BotCommand struct {
 	Command     string `json:"command"`
 	Description string `json:"description"`
@@ -158,17 +163,36 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 	return updates, err
 }
 
-func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, keyboard *Keyboard) (Message, error) {
-	fields := map[string]any{"chat_id": chatID, "text": text}
-	if threadID != 0 {
-		fields["message_thread_id"] = threadID
+func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, options SendOptions) (Message, error) {
+	return sendWithReplyFallback(options, func(options SendOptions) (Message, error) {
+		fields := map[string]any{"chat_id": chatID, "text": text}
+		if threadID != 0 {
+			fields["message_thread_id"] = threadID
+		}
+		if options.ReplyToMessageID != 0 {
+			fields["reply_to_message_id"] = options.ReplyToMessageID
+		}
+		if options.Keyboard != nil {
+			fields["reply_markup"] = options.Keyboard
+		}
+		var message Message
+		err := c.call(ctx, "sendMessage", fields, &message, false)
+		return message, err
+	})
+}
+
+func sendWithReplyFallback(options SendOptions, send func(SendOptions) (Message, error)) (Message, error) {
+	message, err := send(options)
+	if err == nil || options.ReplyToMessageID == 0 || !replyRejected(err) {
+		return message, err
 	}
-	if keyboard != nil {
-		fields["reply_markup"] = keyboard
-	}
-	var message Message
-	err := c.call(ctx, "sendMessage", fields, &message, false)
-	return message, err
+	options.ReplyToMessageID = 0
+	return send(options)
+}
+
+func replyRejected(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(apiErr.Description), "reply")
 }
 
 func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string, keyboard *Keyboard) error {

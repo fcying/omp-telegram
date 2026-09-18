@@ -99,9 +99,40 @@ func TestSendFileMultipartRetriesExplicitRateLimit(t *testing.T) {
 	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	message, err := client.SendFile(context.Background(), -10, 8, "document", path, `quoted "file".txt`, "caption")
+	message, err := client.SendFile(context.Background(), -10, 8, "document", path, `quoted "file".txt`, "caption", SendOptions{})
 	if err != nil || message.MessageID != 42 || attempts.Load() != 2 {
 		t.Fatalf("send = %+v %v attempts=%d", message, err, attempts.Load())
+	}
+}
+
+func TestSendFileFallsBackWhenReplyTargetIsUnavailable(t *testing.T) {
+	var attempts atomic.Int32
+	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Error(err)
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+		if attempts.Add(1) == 1 {
+			if r.FormValue("reply_to_message_id") != "42" {
+				t.Errorf("initial reply target = %q", r.FormValue("reply_to_message_id"))
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}`)
+			return
+		}
+		if r.FormValue("reply_to_message_id") != "" {
+			t.Error("fallback retained rejected reply target")
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":43}}`)
+	})
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	message, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", "", SendOptions{ReplyToMessageID: 42})
+	if err != nil || message.MessageID != 43 || attempts.Load() != 2 {
+		t.Fatalf("reply fallback message=%+v attempts=%d error=%v", message, attempts.Load(), err)
 	}
 }
 
@@ -171,7 +202,7 @@ func TestConversationAttachments(t *testing.T) {
 				if err := os.WriteFile(path, attachment.payload, 0600); err != nil {
 					t.Fatal(err)
 				}
-				message, err := client.SendFile(context.Background(), conversation.chatID, conversation.threadID, attachment.kind, path, "attachment", "Result")
+				message, err := client.SendFile(context.Background(), conversation.chatID, conversation.threadID, attachment.kind, path, "attachment", "Result", SendOptions{})
 				if err != nil || message.MessageID != 42 {
 					t.Fatalf("send attachment = %+v, %v", message, err)
 				}
@@ -196,7 +227,7 @@ func TestSendFileUncertainDeliveryDoesNotRetry(t *testing.T) {
 	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", "")
+	_, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", "", SendOptions{})
 	if err == nil || !DeliveryUncertain(err) || strings.Contains(err.Error(), "secret-token") || attempts.Load() != 1 {
 		t.Fatalf("error=%v attempts=%d", err, attempts.Load())
 	}
@@ -213,16 +244,16 @@ func TestSendFileLimitsBeforeNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	file.Close()
-	if _, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", ""); err == nil || DeliveryUncertain(err) {
+	if _, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", "", SendOptions{}); err == nil || DeliveryUncertain(err) {
 		t.Fatal("oversize accepted")
 	}
 	if err := os.WriteFile(path, []byte("not an image"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.SendFile(context.Background(), 1, 0, "photo", path, "file", ""); err == nil || DeliveryUncertain(err) {
+	if _, err := client.SendFile(context.Background(), 1, 0, "photo", path, "file", "", SendOptions{}); err == nil || DeliveryUncertain(err) {
 		t.Fatal("invalid photo accepted")
 	}
-	if _, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", strings.Repeat("\U0001F600", 513)); err == nil || DeliveryUncertain(err) {
+	if _, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", strings.Repeat("\U0001F600", 513), SendOptions{}); err == nil || DeliveryUncertain(err) {
 		t.Fatal("oversize UTF-16 caption accepted")
 	}
 }
@@ -257,7 +288,7 @@ func TestSendFileDeliveryCertainty(t *testing.T) {
 					_, _ = io.Copy(io.Discard, r.Body)
 					fmt.Fprint(w, tc.body)
 				})
-				_, err := client.SendFile(context.Background(), 1, 0, kind, path, "image.png", "")
+				_, err := client.SendFile(context.Background(), 1, 0, kind, path, "image.png", "", SendOptions{})
 				if err == nil || DeliveryUncertain(err) != tc.uncertain || attempts.Load() != 1 {
 					t.Fatalf("error=%v uncertain=%v attempts=%d", err, DeliveryUncertain(err), attempts.Load())
 				}
@@ -267,11 +298,11 @@ func TestSendFileDeliveryCertainty(t *testing.T) {
 			client := localClient(t, func(w http.ResponseWriter, r *http.Request) { t.Error("preflight failure reached network") })
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			_, err := client.SendFile(ctx, 1, 0, kind, path, "image.png", "")
+			_, err := client.SendFile(ctx, 1, 0, kind, path, "image.png", "", SendOptions{})
 			if err == nil || DeliveryUncertain(err) {
 				t.Fatalf("canceled upload = %v", err)
 			}
-			_, err = client.SendFile(context.Background(), 1, 0, kind, path+".missing", "image.png", "")
+			_, err = client.SendFile(context.Background(), 1, 0, kind, path+".missing", "image.png", "", SendOptions{})
 			if err == nil || DeliveryUncertain(err) {
 				t.Fatalf("missing upload = %v", err)
 			}
@@ -294,7 +325,7 @@ func TestSendFileRateLimitThenMissingFileIsDefinite(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":0}}`)
 	})
-	_, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", "")
+	_, err := client.SendFile(context.Background(), 1, 0, "document", path, "file", "", SendOptions{})
 	if err == nil || DeliveryUncertain(err) || attempts.Load() != 1 {
 		t.Fatalf("error=%v uncertain=%v attempts=%d", err, DeliveryUncertain(err), attempts.Load())
 	}

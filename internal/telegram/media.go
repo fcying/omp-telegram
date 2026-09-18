@@ -103,7 +103,13 @@ func validFilePath(path string) bool {
 }
 
 // SendFile streams a private local snapshot. Only explicit rate limits may retry.
-func (c *Client) SendFile(ctx context.Context, chatID, threadID int64, kind, path, name, caption string) (Message, error) {
+func (c *Client) SendFile(ctx context.Context, chatID, threadID int64, kind, path, name, caption string, options SendOptions) (Message, error) {
+	return sendWithReplyFallback(options, func(options SendOptions) (Message, error) {
+		return c.sendFile(ctx, chatID, threadID, kind, path, name, caption, options.ReplyToMessageID)
+	})
+}
+
+func (c *Client) sendFile(ctx context.Context, chatID, threadID int64, kind, path, name, caption string, replyTo int64) (Message, error) {
 	var message Message
 	limit := int64(50_000_000)
 	method := "sendDocument"
@@ -130,7 +136,7 @@ func (c *Client) SendFile(ctx context.Context, chatID, threadID int64, kind, pat
 		if err != nil {
 			return message, deliveryFailure(err, uncertain)
 		}
-		retry, delay, err := c.upload(ctx, file, chatID, threadID, method, kind, name, caption, limit, &message)
+		retry, delay, err := c.upload(ctx, file, chatID, threadID, method, kind, name, caption, replyTo, limit, &message)
 		_ = file.Close()
 		uncertain = uncertain || DeliveryUncertain(err)
 		if err == nil || !retry || attempt == 2 {
@@ -176,7 +182,7 @@ func openUpload(path, kind string, limit int64) (*os.File, error) {
 	return file, nil
 }
 
-func (c *Client) upload(ctx context.Context, file *os.File, chatID, threadID int64, method, kind, name, caption string, limit int64, result *Message) (bool, time.Duration, error) {
+func (c *Client) upload(ctx context.Context, file *os.File, chatID, threadID int64, method, kind, name, caption string, replyTo, limit int64, result *Message) (bool, time.Duration, error) {
 	if ctx.Err() != nil {
 		return false, 0, deliveryFailure(ctx.Err(), false)
 	}
@@ -194,6 +200,9 @@ func (c *Client) upload(ctx context.Context, file *os.File, chatID, threadID int
 		writeErr := multipartWriter.WriteField("chat_id", strconv.FormatInt(chatID, 10))
 		if writeErr == nil && threadID != 0 {
 			writeErr = multipartWriter.WriteField("message_thread_id", strconv.FormatInt(threadID, 10))
+		}
+		if writeErr == nil && replyTo != 0 {
+			writeErr = multipartWriter.WriteField("reply_to_message_id", strconv.FormatInt(replyTo, 10))
 		}
 		if writeErr == nil && caption != "" {
 			writeErr = multipartWriter.WriteField("caption", caption)

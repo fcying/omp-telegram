@@ -62,7 +62,7 @@ bridge 使用公开 RPC v2, 不依赖协议扩展. 调用 `prompt` 前, 先将�
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存的诊断只用于分类, 绝不出现在 Telegram 输出中.
 
-实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活动工具名. reasoning、raw frame、工具参数/结果、命令文本、stdout 和 stderr 绝不渲染. 首次 Send 失败会抑制当前 turn 的 progress, 避免重复消息; Edit 失败仍可重试. 进度具有 generation 与 turn fence, 不写 SQLite, 不能影响终态分类或 durable outbox completion.
+实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 清空 bridge 延后 prompt, 发送与 `/stop` 相同的原生 `abort`; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
 
 ## 身份与过期工作
 
@@ -121,7 +121,7 @@ Telegram update
 
 `Accept` 为每个 update 执行一个原子事务. offset 不会先于输入持久化推进, 重复 update 不覆盖原记录.
 
-普通任务完成时输入必须处于 submitted, 全部最终文本分段和终态 inbox 状态在同一事务中提交. 正常终结输出为 `done`; provider/model error 为 `uncertain`; 明确的 OMP abort 为 `cancelled`. 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
+普通根任务在 OMP 接受 prompt 前, 持久化记录原始 Telegram message ID. 完成要求该输入处于 submitted, 并在同一事务中提交全部最终文本分段、其持久化 reply target 和终态 inbox 状态. 正常终结输出为 `done`; provider/model error 为 `uncertain`; 明确的 OMP abort 为 `cancelled`. 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
 
 完成事务失败时停止 worker, 不伪装成任务完成. 重启时 submitted 输入转为 `uncertain`, 旧的 pending 普通消息, 附件和 `/review` 取消, 不自动重放. 其他待处理控制命令仍正常鉴权; 依赖内存状态的旧 callback token 会随状态丢失而失效.
 
@@ -142,6 +142,8 @@ Telegram client 在传输边界区分错误:
 - 不能只看 HTTP 状态码分类. 之前发生的不确定性不能被后来的本地失败抹掉.
 
 不为这两种终态增加自动重发. 明确的 Telegram 限流保留有界重试. 数据库事务无法与 Telegram 网络副作用原子提交, 因此不承诺 exactly-once.
+
+outbox replay 为每个最终文本分段保留持久化的 reply target. Telegram 因原始消息不可用而拒绝该 target 时, client 对同一文本仅再发送一次普通消息; 该 UX fallback 不改变 inbox/outbox ownership 或任务结算.
 
 ## 会话生命周期
 

@@ -83,7 +83,7 @@ func TestConversationMessages(t *testing.T) {
 			})
 			ctx := context.Background()
 			keyboard := &Keyboard{InlineKeyboard: [][]Button{{{Text: "Stop", CallbackData: "stop"}}}}
-			message, err := client.Send(ctx, conversation.chatID, conversation.threadID, "Starting", keyboard)
+			message, err := client.Send(ctx, conversation.chatID, conversation.threadID, "Starting", SendOptions{Keyboard: keyboard})
 			if err != nil || message.MessageID != 42 {
 				t.Fatalf("send = %+v, %v", message, err)
 			}
@@ -164,6 +164,9 @@ func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
 		if text != "<b>literal</b> _literal_" {
 			t.Errorf("text changed: %q", text)
 		}
+		if string(fields["reply_to_message_id"]) != "42" {
+			t.Errorf("reply target = %s, want 42", fields["reply_to_message_id"])
+		}
 		if attempts.Add(1) == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":0}}`)
@@ -171,12 +174,39 @@ func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42,"chat":{"id":-10,"type":"supergroup"},"message_thread_id":8}}`)
 	})
-	message, err := client.Send(context.Background(), -10, 8, "<b>literal</b> _literal_", nil)
+	message, err := client.Send(context.Background(), -10, 8, "<b>literal</b> _literal_", SendOptions{ReplyToMessageID: 42})
 	if err != nil || message.MessageID != 42 {
 		t.Fatalf("send = %+v, %v", message, err)
 	}
 	if attempts.Load() != 2 {
 		t.Fatalf("attempts = %d", attempts.Load())
+	}
+}
+
+func TestSendFallsBackWhenReplyTargetIsUnavailable(t *testing.T) {
+	var attempts atomic.Int32
+	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var fields map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+			t.Error(err)
+			return
+		}
+		if attempts.Add(1) == 1 {
+			if string(fields["reply_to_message_id"]) != "42" {
+				t.Errorf("initial reply target = %s, want 42", fields["reply_to_message_id"])
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}`)
+			return
+		}
+		if _, exists := fields["reply_to_message_id"]; exists {
+			t.Error("fallback retained rejected reply target")
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":43}}`)
+	})
+	message, err := client.Send(context.Background(), 1, 0, "answer", SendOptions{ReplyToMessageID: 42})
+	if err != nil || message.MessageID != 43 || attempts.Load() != 2 {
+		t.Fatalf("reply fallback message=%+v attempts=%d error=%v", message, attempts.Load(), err)
 	}
 }
 
@@ -191,7 +221,7 @@ func TestRetryAfterCancellationAndBounds(t *testing.T) {
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			_, err := client.Send(ctx, 1, 0, "hello", nil)
+			_, err := client.Send(ctx, 1, 0, "hello", SendOptions{})
 			if seconds == 60 {
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("expected cancellation, got %v", err)
@@ -219,7 +249,7 @@ func TestRateLimitAttemptLimit(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":0}}`)
 	})
-	_, err := client.Send(context.Background(), 1, 0, "hello", nil)
+	_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != 429 || attempts.Load() != 3 || DeliveryUncertain(err) {
 		t.Fatalf("attempts=%d error=%v", attempts.Load(), err)
@@ -237,7 +267,7 @@ func TestAmbiguousSendNotRetriedAndURLNotExposed(t *testing.T) {
 		}
 		conn.Close()
 	})
-	_, err := client.Send(context.Background(), 1, 0, "hello", nil)
+	_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 	if err == nil || !DeliveryUncertain(err) {
 		t.Fatal("expected uncertain transport failure")
 	}
@@ -303,7 +333,7 @@ func TestRedirectDoesNotForwardCredentials(t *testing.T) {
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	})
-	_, err := client.Send(context.Background(), 1, 0, "private", nil)
+	_, err := client.Send(context.Background(), 1, 0, "private", SendOptions{})
 	if err == nil || forwarded.Load() != 0 {
 		t.Fatalf("redirect followed: requests=%d err=%v", forwarded.Load(), err)
 	}
@@ -333,7 +363,7 @@ func TestSendResponseDeliveryCertainty(t *testing.T) {
 				w.WriteHeader(tc.status)
 				fmt.Fprint(w, tc.body)
 			})
-			_, err := client.Send(context.Background(), 1, 0, "hello", nil)
+			_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 			if err == nil || DeliveryUncertain(err) != tc.uncertain || attempts.Load() != 1 {
 				t.Fatalf("error=%v uncertain=%v attempts=%d", err, DeliveryUncertain(err), attempts.Load())
 			}
@@ -345,7 +375,7 @@ func TestSendPreflightFailures(t *testing.T) {
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) { t.Error("preflight failure reached network") })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := client.Send(ctx, 1, 0, "hello", nil)
+	_, err := client.Send(ctx, 1, 0, "hello", SendOptions{})
 	if !errors.Is(err, context.Canceled) || DeliveryUncertain(err) {
 		t.Fatalf("canceled send = %v", err)
 	}
@@ -354,7 +384,7 @@ func TestSendPreflightFailures(t *testing.T) {
 		t.Fatalf("unencodable request = %v", err)
 	}
 	client.baseURL = ":invalid"
-	_, err = client.Send(context.Background(), 1, 0, "hello", nil)
+	_, err = client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 	if err == nil || DeliveryUncertain(err) {
 		t.Fatalf("invalid endpoint = %v", err)
 	}
@@ -385,7 +415,7 @@ func TestSendIncompleteResponseRemainsUncertain(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		fmt.Fprint(w, `{"ok":false,"error_code":403,"description":"Forbidden"}`)
 	})
-	_, err := client.Send(context.Background(), 1, 0, "hello", nil)
+	_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 	if err == nil || !DeliveryUncertain(err) || attempts.Load() != 1 {
 		t.Fatalf("error=%v uncertain=%v attempts=%d", err, DeliveryUncertain(err), attempts.Load())
 	}

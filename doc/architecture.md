@@ -62,7 +62,7 @@ The bridge uses public RPC v2 without protocol extensions. Before calling `promp
 
 RPC v2 may compact large terminal frames and omit messages already emitted by `message_end`. The worker caches the latest assistant message's `stopReason` and `errorMessage`, plus finalized text from every assistant `message_end`; terminal `agent_end` messages take precedence, and the cache is used only when they contain no assistant message. The cache resets at `agent_start`, terminal completion, and shutdown. Cached diagnostics classify the result but never appear in Telegram output.
 
-Live progress is an in-memory, best-effort view using the existing one-message preview transport. `progress_mode=off` suppresses Telegram Send/Edit and typing but continues text-delta processing for final-result fallback. `summary` shows assistant output, active tool names keyed by tool call ID, and state; `verbose` adds the bounded recent tool list. Retry, compaction, and concurrent tools are explicit events. `tool_execution_end` is the sole completion source, including host tools; host callbacks only correct a matching active tool name. Reasoning, raw frames, tool arguments/results, command text, stdout, and stderr are never rendered. An initial Send failure suppresses progress for that turn to avoid duplicate messages; an Edit failure remains retryable. Progress has generation and turn fences, does not write SQLite, and cannot affect terminal classification or durable outbox completion.
+Live progress is an in-memory, best-effort view using the existing one-message preview transport. `progress_mode=off` suppresses Telegram Send/Edit and typing but continues text-delta processing for final-result fallback. `summary` shows assistant output, active tool names keyed by tool call ID, and state; `verbose` adds the bounded recent tool list. Retry, compaction, and concurrent tools are explicit events. `tool_execution_end` is the sole completion source, including host tools; host callbacks only correct a matching active tool name. Reasoning, raw frames, tool arguments/results, command text, stdout, and stderr are never rendered. Each active root progress message has a Stop button fenced by owner, worker generation, active inbox ID, and turn. A valid click consumes and removes the button, clears bridge-deferred prompts, and sends the same native `abort` as `/stop`; stale buttons are removed without aborting. Programmatic task settlement, worker replacement, and shutdown invalidate the button through the bounded cleanup queue. An initial Send failure suppresses progress for that turn to avoid duplicate messages; an Edit failure remains retryable. Progress replies to the root input when possible, but reply rejection falls back to a plain message without changing task state.
 
 ## Identity and stale work
 
@@ -121,7 +121,7 @@ Telegram update
 
 `Accept` performs one atomic transaction per update. Offset advancement never precedes durable input, and duplicates do not overwrite the original stored update.
 
-For ordinary tasks, completion requires a submitted input and commits all final text parts with the terminal inbox state in one transaction. Normal terminal output is `done`; a provider/model error is `uncertain`; an explicit OMP abort is `cancelled`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
+For ordinary root tasks, submission durably records the originating Telegram message ID before OMP accepts the prompt. Completion requires that submitted input and commits all final text parts, their persisted reply target, and the terminal inbox state in one transaction. Normal terminal output is `done`; a provider/model error is `uncertain`; an explicit OMP abort is `cancelled`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
 
 A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages, attachments, and `/review` commands are canceled rather than replayed. Other pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
 
@@ -142,6 +142,8 @@ The Telegram client classifies failures at the transport boundary:
 - HTTP status alone is insufficient. Prior uncertainty must not be erased by a later local failure.
 
 There is no new automatic resend for either terminal error state. Explicit Telegram rate limits retain bounded retries. A database transaction cannot atomically commit a Telegram network side effect, so exactly-once delivery is not promised.
+
+Outbox replay preserves the stored reply target for every final text part. If Telegram rejects that target because the original message is unavailable, the client sends the same text once without reply binding; this UX fallback does not change inbox/outbox ownership or task settlement.
 
 ## Session lifecycle
 

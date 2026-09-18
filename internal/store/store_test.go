@@ -165,6 +165,24 @@ func TestCompletionSurvivesRestartWithOrderedReplies(t *testing.T) {
 	}
 }
 
+func TestRootReplyTargetSurvivesCompletionAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 1, 2, []string{"first", "second"}))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	for _, want := range []string{"first", "second"} {
+		out, err := s.NextOutput()
+		requireStoreOK(t, err)
+		if out.Text != want || out.ReplyTo != 42 {
+			t.Fatalf("durable reply target = %+v, want text %q replying to 42", out, want)
+		}
+		requireStoreOK(t, s.MarkOutput(out.ID, "done"))
+	}
+}
+
 func TestRestartRecovery(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
@@ -529,12 +547,14 @@ PRAGMA user_version=3;`)
 	requireStoreOK(t, db.Close())
 	s := openTestStore(t, dir)
 	var version int
-	var inboxCreated, inboxUpdated, outboxCreated, outboxUpdated int64
+	var inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo int64
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM inbox WHERE id=1").Scan(&inboxCreated, &inboxUpdated))
 	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM outbox WHERE id=1").Scan(&outboxCreated, &outboxUpdated))
-	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 {
-		t.Fatalf("version/message timestamps after migration = %d/%d/%d/%d/%d", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated)
+	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM inbox WHERE id=1").Scan(&inboxReplyTo))
+	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM outbox WHERE id=1").Scan(&outboxReplyTo))
+	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 || inboxReplyTo != 0 || outboxReplyTo != 0 {
+		t.Fatalf("version/message migration = version=%d times=%d/%d/%d/%d replies=%d/%d", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo)
 	}
 	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)

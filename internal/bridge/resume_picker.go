@@ -206,7 +206,7 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		err = w.b.tg.Edit(ctx, w.key.chat, messageID, text.String(), keyboard)
 	} else {
 		var message telegram.Message
-		message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text.String(), keyboard)
+		message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text.String(), telegram.SendOptions{Keyboard: keyboard})
 		messageID = message.MessageID
 	}
 	if err != nil {

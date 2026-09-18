@@ -55,7 +55,7 @@ func (w *worker) initMedia() {
 func (w *worker) queueMedia(in incoming) {
 	w.initMedia()
 	ctx, cancel := context.WithCancel(w.ctx)
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, preparing: true, cancel: cancel})
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, preparing: true, cancel: cancel})
 	workspace, generation := w.binding.Workspace, w.binding.Generation
 	message := *in.msg
 	w.background.Add(1)

@@ -123,7 +123,7 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 		d.fake.mu.Lock()
 		defer d.fake.mu.Unlock()
 		for _, m := range d.fake.messages {
-			if m["chat_id"] == float64(7) && m["reply_markup"] != nil {
+			if m["chat_id"] == float64(7) && strings.Contains(m["text"].(string), "Saved omp sessions") && m["reply_markup"] != nil {
 				return true
 			}
 		}

@@ -52,6 +52,7 @@ func supportedConversation(m *telegram.Message) bool {
 type queued struct {
 	id        int64
 	user      int64
+	replyTo   int64
 	text      string
 	images    []media.Image
 	preparing bool
@@ -64,7 +65,8 @@ type confirmation struct {
 	workspace            string
 	options              []string
 	expires              time.Time
-	generation           int64
+	generation, active   int64
+	turn                 uint64
 	user                 int64
 	messageID            int64
 	sessions             []omp.SessionSummary
@@ -72,45 +74,46 @@ type confirmation struct {
 	page                 int
 }
 type worker struct {
-	b                   *Bridge
-	key                 target
-	input               chan incoming
-	client              *omp.Client
-	binding             store.Binding
-	startIntent         *store.StartIntent
-	sessionID           string
-	claimedSession      string
-	restoring           bool
-	queue               []queued
-	stream              strings.Builder
-	active              int64
-	owner               int64
-	turn                uint64
-	finishing           bool
-	compacting          bool
-	progress            progressState
-	operations          chan operationResult
-	background          sync.WaitGroup
-	busy                bool
-	lastTyping          time.Time
-	preview             string
-	lastAssistant       *terminalAssistant
-	finalAssistantTexts []string
-	lastPreview         string
-	previewID           int64
-	previewBusy         bool
-	progressSuppressed  bool
-	previewResult       chan previewResult
-	confirms            map[string]confirmation
-	keyboardCleanup     chan int64
-	mediaResults        chan mediaResult
-	sendResults         chan sendResult
-	hostRequests        map[string]context.CancelFunc
-	resumeResults       chan resumeListResult
-	resumeCancel        context.CancelFunc
-	resumeRequest       uint64
-	ctx                 context.Context
-	cancel              context.CancelFunc
+	b                     *Bridge
+	key                   target
+	input                 chan incoming
+	client                *omp.Client
+	binding               store.Binding
+	startIntent           *store.StartIntent
+	sessionID             string
+	claimedSession        string
+	restoring             bool
+	queue                 []queued
+	stream                strings.Builder
+	active, activeReplyTo int64
+	owner                 int64
+	turn                  uint64
+	finishing             bool
+	compacting            bool
+	progress              progressState
+	operations            chan operationResult
+	background            sync.WaitGroup
+	busy                  bool
+	lastTyping            time.Time
+	preview               string
+	lastAssistant         *terminalAssistant
+	finalAssistantTexts   []string
+	lastPreview           string
+	previewID             int64
+	previewStopToken      string
+	previewBusy           bool
+	progressSuppressed    bool
+	previewResult         chan previewResult
+	confirms              map[string]confirmation
+	keyboardCleanup       chan int64
+	mediaResults          chan mediaResult
+	sendResults           chan sendResult
+	hostRequests          map[string]context.CancelFunc
+	resumeResults         chan resumeListResult
+	resumeCancel          context.CancelFunc
+	resumeRequest         uint64
+	ctx                   context.Context
+	cancel                context.CancelFunc
 }
 
 type terminalAssistant struct {
@@ -120,6 +123,7 @@ type terminalAssistant struct {
 type previewResult struct {
 	id         int64
 	text       string
+	stopToken  string
 	generation int64
 	turn       uint64
 	err        error
@@ -494,9 +498,9 @@ func (b *Bridge) deliver(ctx context.Context) error {
 		}
 		switch o.Kind {
 		case "text":
-			_, e = b.tg.Send(ctx, o.Chat, o.Thread, o.Text, nil)
+			_, e = b.tg.Send(ctx, o.Chat, o.Thread, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		case "photo", "document":
-			_, e = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text)
+			_, e = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		default:
 			return errors.New("unsupported outbox content kind")
 		}
@@ -545,6 +549,18 @@ func (w *worker) mark(id int64, state string) bool {
 	}
 	if e := w.b.db.Mark(id, state); e != nil {
 		w.b.fail(e)
+		w.cancel()
+		return false
+	}
+	return true
+}
+
+func (w *worker) submit(q queued) bool {
+	if q.id == 0 {
+		return true
+	}
+	if err := w.b.db.Submit(q.id, q.replyTo); err != nil {
+		w.b.fail(err)
 		w.cancel()
 		return false
 	}
@@ -653,6 +669,7 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 	w.finishing = false
 	w.compacting = false
 	w.preview = ""
+	w.activeReplyTo = 0
 	w.finalAssistantTexts = nil
 	w.lastAssistant = nil
 	w.stream.Reset()
@@ -681,6 +698,7 @@ func (w *worker) failed() {
 	w.shutdown()
 	w.busy = false
 	w.active = 0
+	w.activeReplyTo = 0
 	w.clearQueue()
 }
 func (w *worker) clearQueue() {
@@ -692,6 +710,17 @@ func (w *worker) clearQueue() {
 		w.mark(q.id, "cancelled")
 	}
 	w.queue = nil
+}
+
+func (w *worker) stop() {
+	w.clearQueue()
+	if w.client != nil {
+		if _, err := w.call("abort", nil); err != nil {
+			w.say("The abort request failed.")
+			return
+		}
+	}
+	w.say("Abort requested and queued prompts cleared.")
 }
 func (w *worker) call(kind string, fields map[string]any) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
@@ -964,17 +993,11 @@ func (w *worker) handle(in incoming) {
 		w.clearQueue()
 		w.shutdown()
 		w.active = 0
+		w.activeReplyTo = 0
 		w.busy = false
 		w.say("The instance is closed. The session has been preserved.")
 	case "/stop":
-		w.clearQueue()
-		if w.client != nil {
-			if _, e := w.call("abort", nil); e != nil {
-				w.say("The abort request failed.")
-				return
-			}
-		}
-		w.say("Abort requested and queued prompts cleared.")
+		w.stop()
 	case "/status":
 		w.status()
 	case "/name":
@@ -1092,10 +1115,11 @@ func (w *worker) dispatch() {
 	}
 	q := w.queue[0]
 	w.queue = w.queue[1:]
-	if !w.mark(q.id, "submitted") {
+	if !w.submit(q) {
 		return
 	}
 	w.active = q.id
+	w.activeReplyTo = q.replyTo
 	w.owner = q.user
 	w.turn++
 	w.busy = true
@@ -1105,6 +1129,7 @@ func (w *worker) dispatch() {
 	w.stream.Reset()
 	w.lastPreview = ""
 	w.previewID = 0
+	w.previewStopToken = ""
 	fields := map[string]any{"message": q.text}
 	if len(q.images) > 0 {
 		fields["images"] = q.images
@@ -1117,6 +1142,7 @@ func (w *worker) dispatch() {
 		w.clearQueue()
 		w.active = 0
 		w.busy = false
+		w.activeReplyTo = 0
 		return
 	}
 	var response struct {
@@ -1138,7 +1164,7 @@ func (w *worker) enqueuePrompt(in incoming, text string) {
 		w.mark(in.id, "cancelled")
 		return
 	}
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, text: text})
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text})
 }
 func (w *worker) finish() {
 	// Progress state is finalized only after the durable result transaction.
@@ -1153,6 +1179,7 @@ func (w *worker) finish() {
 			return
 		}
 		w.active = 0
+		w.activeReplyTo = 0
 		w.busy = false
 		w.preview = ""
 		w.stream.Reset()
@@ -1206,6 +1233,7 @@ func (w *worker) finishIncomplete(state, notice string) {
 		return
 	}
 	w.active = 0
+	w.activeReplyTo = 0
 	w.busy = false
 	w.preview = ""
 	w.lastAssistant = nil
@@ -1571,15 +1599,85 @@ func (w *worker) renderProgress() string {
 	return text
 }
 
+func (w *worker) newProgressStopToken() string {
+	if w.owner == 0 {
+		return ""
+	}
+	var data [12]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("stop-%d-%s", w.owner, hex.EncodeToString(data[:]))
+}
+
+func (w *worker) progressKeyboard(token string) *telegram.Keyboard {
+	if token != "" && token != w.previewStopToken {
+		return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: "Stop", CallbackData: token + ":0"}}}}
+	}
+	if token == "" {
+		token = w.previewStopToken
+	}
+	c, ok := w.confirms[token]
+	if !ok || c.action != "stop" || c.generation != w.binding.Generation || c.turn != w.turn || c.active != w.active {
+		return nil
+	}
+	return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: "Stop", CallbackData: token + ":0"}}}}
+}
+
+func progressStopTokenOwner(token string) (int64, bool) {
+	raw, ok := strings.CutPrefix(token, "stop-")
+	if !ok {
+		return 0, false
+	}
+	owner, nonce, ok := strings.Cut(raw, "-")
+	if !ok || len(nonce) != 24 {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(owner, 10, 64)
+	return id, err == nil && id > 0
+}
+
 func (w *worker) previewFinished(result previewResult) {
 	w.previewBusy = false
 	if result.generation != w.binding.Generation || result.turn != w.turn {
+		if result.stopToken != "" {
+			if c, ok := w.confirms[result.stopToken]; ok && c.action == "stop" && c.generation == result.generation && c.turn == result.turn {
+				delete(w.confirms, result.stopToken)
+				if w.previewStopToken == result.stopToken {
+					w.previewStopToken = ""
+				}
+			}
+			w.queueKeyboardCleanup(result.id)
+		}
 		return
 	}
 	if result.err == nil {
 		w.previewID = result.id
 		w.lastPreview = result.text
-	} else if result.id == 0 {
+	}
+	if result.stopToken != "" {
+		c, registered := w.confirms[result.stopToken]
+		switch {
+		case !registered || c.action != "stop" || c.generation != result.generation || c.turn != result.turn:
+			// The token was consumed while Telegram accepted the initial send.
+			w.queueKeyboardCleanup(result.id)
+		case result.err != nil:
+			delete(w.confirms, result.stopToken)
+			if w.previewStopToken == result.stopToken {
+				w.previewStopToken = ""
+			}
+		case w.active != 0 && w.busy && !w.finishing && c.active == w.active:
+			c.messageID = result.id
+			w.confirms[result.stopToken] = c
+		default:
+			delete(w.confirms, result.stopToken)
+			if w.previewStopToken == result.stopToken {
+				w.previewStopToken = ""
+			}
+			w.queueKeyboardCleanup(result.id)
+		}
+	}
+	if result.err != nil && result.id == 0 {
 		w.progressSuppressed = true
 	}
 	if w.finishing {
@@ -1599,6 +1697,16 @@ func (w *worker) flushPreview() {
 	id := w.previewID
 	gen := w.binding.Generation
 	turn := w.turn
+	replyTo := w.activeReplyTo
+	stopToken := ""
+	if id == 0 && w.active != 0 && w.busy && !w.finishing {
+		stopToken = w.newProgressStopToken()
+		if stopToken != "" {
+			w.confirms[stopToken] = confirmation{action: "stop", generation: gen, active: w.active, turn: turn, user: w.owner}
+			w.previewStopToken = stopToken
+		}
+	}
+	keyboard := w.progressKeyboard(stopToken)
 	w.previewBusy = true
 	w.background.Add(1)
 	go func() {
@@ -1608,19 +1716,20 @@ func (w *worker) flushPreview() {
 		var err error
 		if id == 0 {
 			var message telegram.Message
-			message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, nil)
+			message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, telegram.SendOptions{ReplyToMessageID: replyTo, Keyboard: keyboard})
 			if err == nil {
 				id = message.MessageID
 			}
 		} else {
-			err = w.b.tg.Edit(ctx, w.key.chat, id, text, nil)
+			err = w.b.tg.Edit(ctx, w.key.chat, id, text, keyboard)
 		}
 		select {
-		case w.previewResult <- previewResult{id: id, text: snapshot, generation: gen, turn: turn, err: err}:
+		case w.previewResult <- previewResult{id: id, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, err: err}:
 		case <-w.ctx.Done():
 		}
 	}()
 }
+
 func (w *worker) confirm(c confirmation, title string, options []string) {
 	parts := split(title, 3800)
 	if len(parts) == 0 {
@@ -1644,7 +1753,7 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
-	message, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, k)
+	message, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, telegram.SendOptions{Keyboard: k})
 	if e != nil {
 		w.cancelUI(c)
 		w.say("Failed to send the confirmation. The operation was canceled.")
@@ -1658,21 +1767,54 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	defer cancel()
 	token, index, ok := strings.Cut(q.Data, ":")
 	c, exists := w.confirms[token]
-	if !ok || !exists || c.user != q.From.ID {
+	if !ok || !exists {
+		if owner, isStop := progressStopTokenOwner(token); isStop && owner == q.From.ID && q.Message != nil {
+			w.clearKeyboard(q.Message.MessageID)
+		}
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
 	}
-	if time.Now().After(c.expires) || c.generation != w.binding.Generation {
-		delete(w.confirms, token)
+	if c.user != q.From.ID {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
-		w.clearKeyboard(c.messageID)
+		return callbackDone
+	}
+	messageID := c.messageID
+	if c.action == "stop" && messageID == 0 && q.Message != nil {
+		messageID = q.Message.MessageID
+	}
+	if (!c.expires.IsZero() && time.Now().After(c.expires)) || c.generation != w.binding.Generation {
+		delete(w.confirms, token)
+		if w.previewStopToken == token {
+			w.previewStopToken = ""
+		}
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		w.clearKeyboard(messageID)
 		if c.generation == w.binding.Generation {
 			w.cancelUI(c)
 		}
 		return callbackDone
 	}
 	n, err := strconv.Atoi(index)
-	if err != nil || n < 0 || (c.method != "select" && n > 1) || (c.method == "select" && n > len(c.options)) {
+	if err != nil || n < 0 || (c.action == "stop" && n != 0) || (c.method != "select" && c.action != "stop" && n > 1) || (c.method == "select" && n > len(c.options)) {
+		return callbackDone
+	}
+	if c.action == "stop" {
+		if c.active != w.active || c.turn != w.turn || w.active == 0 || !w.busy {
+			delete(w.confirms, token)
+			if w.previewStopToken == token {
+				w.previewStopToken = ""
+			}
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			w.clearKeyboard(messageID)
+			return callbackDone
+		}
+		delete(w.confirms, token)
+		if w.previewStopToken == token {
+			w.previewStopToken = ""
+		}
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Stopping")
+		w.clearKeyboard(messageID)
+		w.stop()
 		return callbackDone
 	}
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
@@ -1804,6 +1946,7 @@ func (w *worker) cancelStart() bool {
 	w.startIntent = nil
 	return true
 }
+
 func (w *worker) ui(e rpcEvent) {
 	switch e.Method {
 	case "confirm", "select":
@@ -1845,6 +1988,9 @@ func (w *worker) cancelUI(c confirmation) {
 // that decision, since native cancellation and old generations must not echo.
 func (w *worker) dropConfirmation(token string, c confirmation) {
 	delete(w.confirms, token)
+	if w.previewStopToken == token {
+		w.previewStopToken = ""
+	}
 	w.queueKeyboardCleanup(c.messageID)
 }
 
@@ -1856,7 +2002,7 @@ func (w *worker) clearConfirmations() {
 
 func (w *worker) expire() {
 	for token, c := range w.confirms {
-		if time.Now().After(c.expires) {
+		if !c.expires.IsZero() && time.Now().After(c.expires) {
 			w.dropConfirmation(token, c)
 			if c.generation == w.binding.Generation {
 				w.cancelUI(c)
