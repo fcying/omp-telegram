@@ -82,16 +82,20 @@ The database is `omp-telegram.db` under `data_dir`. It uses WAL, a busy timeout,
 | `bindings` | PK `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | Last validated session binding, restoration eligibility, and active-task interruption marker |
 | `startup_intents` | PK `(bot,chat,thread)`; `kind,workspace,session,generation` | Durable uncommitted `/new` or `/resume` transition |
 | `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots, not a session browser |
-| `inbox` | PK `id`; `raw,state` | Update deduplication and processing state |
-| `outbox` | Autoincrement `id`; `chat,thread,text,state,kind,path,name` | Ordered text/attachment delivery |
+| `inbox` | PK `id`; `raw,state,created_at,updated_at` | Update deduplication and processing state |
+| `outbox` | Autoincrement `id`; `chat,thread,text,state,kind,path,name,created_at,updated_at` | Ordered text/attachment delivery |
 
-The hot-path indexes are `inbox(state,id)` and `outbox(state,id)`. There is no automatic retention cleanup, retry scheduler, `source_update/seq` mapping, or multi-bot namespace for inbox/outbox.
+### Database Message Retention
+
+`database_retention_days` defaults to 90. `0` disables automatic cleanup; positive values retain terminal Telegram bridge message records for that many days, measured from `updated_at`, the latest state transition. The Bridge runs this best-effort janitor once at startup and every 24 hours thereafter. Failures are logged and retry on the next interval; they do not stop Telegram or omp processing.
+
+Only explicitly enumerated terminal states are eligible: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, legacy `sent`, `failed`, `uncertain`, `cancelled`. Inbox `pending`/`submitted` and outbox `pending`/`sending` remain durable. Deletion uses committed batches of 1000 rows; the service never automatically runs `VACUUM`.
+
+Retention never deletes bindings, history, startup intents, workspaces, omp session files, or other omp data. Terminal outbox attachment snapshots become unowned after their corresponding delete commits and are removed best-effort only when confined to `data_dir/attachments/outbox/`. Each janitor run also removes unreferenced `attachment-*` snapshots in that private spool once their file modification time exceeds the retention cutoff.
 
 ### Schema version
 
-`PRAGMA user_version` is the schema version, currently 3. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states.
-
-Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 and 2 migrate transactionally through `startup_intents` and the binding interruption marker before advancing `user_version`. An older binary rejects the newer schema. Application versions and database versions evolve independently.
+`PRAGMA user_version` is the schema version, currently 4. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 3 migrate transactionally through `startup_intents`, the binding interruption marker, and message timestamps before advancing `user_version`. Existing v3 messages receive migration-time timestamps, giving them a full retention period rather than guessing historical age. An older binary rejects the newer schema. Application versions and database versions evolve independently.
 
 ### Input and completion transactions
 
@@ -178,8 +182,8 @@ Keep regression tests for observable behavior: atomic rollback, restart identity
 
 Current evidence includes transactional failure injection, index query plans, real omp restart recovery, and real Telegram file transfers with injected input. A parent-SIGKILL probe observed a cooperating native omp/tool tree exit, while isolated fixtures demonstrated that non-cooperating descendants can survive. Actual user-client input/clicks, the full live fault matrix, and successful long-session compaction still need acceptance.
 
-Application version comes from `Version` in [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go), initially `v0.1.0`. `--version`/`-v` includes Git revision/dirty metadata when available; `-ldflags "-X main.Version=..."` can override the base version.
+Application version comes from `Version` in [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go). `--version`/`-v` includes Git revision/dirty metadata when available; `-ldflags "-X main.Version=..."` can override the base version.
 
-The [release workflow](../.github/workflows/release.yaml) runs on every branch push, pull request, and manual dispatch. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. Same-repository pull requests create a skipped workflow because their head commit's push run already provides validation; pull requests from another repository run the validation jobs in the base repository without publishing. A new source version on `main` creates a formal release without rewriting an existing version tag. Other publishable builds use a unique `v<version>-dev.g<commit>` version and GitHub prerelease; after the replacement succeeds, publishing a new temporary build removes older prereleases. Manual runs on branches other than `main`/`dev` never publish.
+The [release workflow](../.github/workflows/release.yaml) runs on `main` pushes, pull requests, and manual dispatch. All non-`main` branch changes must enter through a pull request. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. Every workflow from the repository publishes: a new source version on `main` creates a formal release without rewriting an existing version tag, while all other internal workflows publish a unique `v<version>-dev.g<commit>` GitHub prerelease. Internal PR prereleases are tagged at the real head commit. Pull requests from another repository use the same validation path but never publish. Manual runs outside `main` publish prereleases.
 
 Release archives contain the binary and LICENSE, with `SHA256SUMS` alongside them. Publishing uses `GITHUB_TOKEN` with write permission only in the release job. To release a new application version, update `Version` to `vMAJOR.MINOR.PATCH` and merge/push to `main`. This does not automatically change the database schema version.

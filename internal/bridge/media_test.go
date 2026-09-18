@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/png"
@@ -11,8 +12,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"omp-telegram/internal/config"
 	"omp-telegram/internal/media"
+	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
 
@@ -249,5 +253,94 @@ func TestObsoleteHostAttachmentCannotReachNewGeneration(t *testing.T) {
 	}
 	if cancelled {
 		t.Fatal("old result cancelled a new request with the same ID")
+	}
+}
+
+func TestDatabaseCleanupRemovesOnlyOwnedSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	spool := filepath.Join(dir, "attachments", "outbox")
+	if err = os.MkdirAll(spool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(spool, "attachment-retained")
+	missing := filepath.Join(spool, "attachment-missing")
+	outside := filepath.Join(t.TempDir(), "outside")
+	for _, path := range []string{snapshot, missing, outside} {
+		if path != missing {
+			if err = os.WriteFile(path, []byte("attachment"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err = db.EnqueueAttachment(1, 2, "document", path, "file", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []int64{1, 2, 3} {
+		if err = db.MarkOutput(id, "done"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	if _, err = db.DB.Exec("UPDATE outbox SET created_at=?,updated_at=?", old, old); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	if err != nil || result.Outbox != 3 {
+		t.Fatalf("cleanup result = %+v, error %v", result, err)
+	}
+	for _, path := range result.AttachmentPaths {
+		removeOutboxSnapshot(spool, path)
+	}
+	if _, err = os.Stat(snapshot); !os.IsNotExist(err) {
+		t.Fatalf("owned snapshot remained: %v", err)
+	}
+	if _, err = os.Stat(outside); err != nil {
+		t.Fatalf("outside path was removed: %v", err)
+	}
+}
+
+func TestDatabaseCleanupReconcilesOrphanedSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	spool := filepath.Join(dir, "attachments", "outbox")
+	if err = os.MkdirAll(spool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(spool, "attachment-orphan")
+	referenced := filepath.Join(spool, "attachment-referenced")
+	recent := filepath.Join(spool, "attachment-recent")
+	unrelated := filepath.Join(spool, "keep")
+	for _, path := range []string{orphan, referenced, recent, unrelated} {
+		if err = os.WriteFile(path, []byte("attachment"), 0400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().AddDate(0, 0, -91)
+	for _, path := range []string{orphan, referenced, unrelated} {
+		if err = os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = db.EnqueueAttachment(1, 2, "document", referenced, "file", ""); err != nil {
+		t.Fatal(err)
+	}
+	b := Bridge{cfg: config.Config{DataDir: dir}, db: db}
+	b.reconcileOutboxSnapshots(context.Background(), time.Now().AddDate(0, 0, -90))
+	if _, err = os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan snapshot remained: %v", err)
+	}
+	for _, path := range []string{referenced, recent, unrelated} {
+		if _, err = os.Stat(path); err != nil {
+			t.Fatalf("retained snapshot %q: %v", path, err)
+		}
 	}
 }

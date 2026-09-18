@@ -204,6 +204,31 @@ func TestNumericEnvironmentValues(t *testing.T) {
 	}
 }
 
+func TestDatabaseRetentionDays(t *testing.T) {
+	path, source := configFixture(t)
+	c, err := loadSource(t, path, source)
+	if err != nil || c.DatabaseRetentionDays != 90 {
+		t.Fatalf("default database retention = %d, error %v", c.DatabaseRetentionDays, err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{{"0", 0}, {"90", 90}, {`"${BRIDGE_TEST_RETENTION}"`, 180}} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("BRIDGE_TEST_RETENTION", "180")
+			c, err := loadSource(t, path, source+"\ndatabase_retention_days = "+tc.value)
+			if err != nil || c.DatabaseRetentionDays != tc.want {
+				t.Fatalf("database retention = %d, error %v", c.DatabaseRetentionDays, err)
+			}
+		})
+	}
+	for _, value := range []string{"-1", "1.5", "true"} {
+		if _, err := loadSource(t, path, source+"\ndatabase_retention_days = "+value); err == nil {
+			t.Fatalf("invalid retention accepted: %s", value)
+		}
+	}
+}
+
 func TestCommaSeparatedAllowlists(t *testing.T) {
 	path, source := configFixture(t)
 	t.Setenv("OMP_TELEGRAM_ALLOWED_USERS", " 8, 9 ")

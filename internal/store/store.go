@@ -9,11 +9,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
+const messageCleanupBatchSize = 1000
 
 type Store struct{ DB *sql.DB }
 type Binding struct {
@@ -37,6 +39,11 @@ type Output struct {
 	ID, Chat, Thread int64
 	Text             string
 	Kind, Path, Name string
+}
+
+type CleanupResult struct {
+	Inbox, Outbox   int64
+	AttachmentPaths []string
 }
 
 func Open(dir string) (*Store, error) {
@@ -108,8 +115,8 @@ func initialize(db *sql.DB) error {
  CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
- CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL);
- CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '');
+ CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX idx_inbox_state ON inbox(state,id);
  CREATE INDEX idx_outbox_state ON outbox(state,id);`)
 		if e != nil {
@@ -131,12 +138,36 @@ func initialize(db *sql.DB) error {
 		if e != nil {
 			return e
 		}
+		version = 3
+	}
+	if version == 3 {
+		for _, query := range []string{
+			"ALTER TABLE inbox ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE inbox ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE outbox ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE outbox ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+		} {
+			if _, e = tx.Exec(query); e != nil {
+				return e
+			}
+		}
+		now := time.Now().Unix()
+		if _, e = tx.Exec("UPDATE inbox SET created_at=?,updated_at=? WHERE created_at=0 OR updated_at=0", now, now); e != nil {
+			return e
+		}
+		if _, e = tx.Exec("UPDATE outbox SET created_at=?,updated_at=? WHERE created_at=0 OR updated_at=0", now, now); e != nil {
+			return e
+		}
+		version = 4
+	}
+	if version != 0 {
 		if _, e = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); e != nil {
 			return e
 		}
 	}
-	if _, e = tx.Exec(`UPDATE inbox SET state='uncertain' WHERE state='submitted';
- UPDATE outbox SET state='uncertain' WHERE state='sending';`); e != nil {
+	now := time.Now().Unix()
+	if _, e = tx.Exec(`UPDATE inbox SET state='uncertain',updated_at=? WHERE state='submitted';
+ UPDATE outbox SET state='uncertain',updated_at=? WHERE state='sending';`, now, now); e != nil {
 		return e
 	}
 	return tx.Commit()
@@ -168,7 +199,8 @@ func (s *Store) Accept(id int64, raw []byte) error {
 		return e
 	}
 	defer tx.Rollback()
-	if _, e = tx.Exec("INSERT INTO inbox VALUES(?,?,'pending') ON CONFLICT(id) DO NOTHING", id, raw); e != nil {
+	now := time.Now().Unix()
+	if _, e = tx.Exec("INSERT INTO inbox(id,raw,state,created_at,updated_at) VALUES(?,?, 'pending',?,?) ON CONFLICT(id) DO NOTHING", id, raw, now, now); e != nil {
 		return e
 	}
 	if _, e = tx.Exec("INSERT INTO meta VALUES('offset',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)", id+1); e != nil {
@@ -193,7 +225,7 @@ func (s *Store) Pending() ([]Input, error) {
 	return out, rows.Err()
 }
 func (s *Store) Mark(id int64, state string) error {
-	_, e := s.DB.Exec("UPDATE inbox SET state=? WHERE id=?", state, id)
+	_, e := s.DB.Exec("UPDATE inbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
 	return e
 }
 func (s *Store) Binding(bot, chat, thread int64) (Binding, error) {
@@ -245,6 +277,106 @@ func (s *Store) SetInterrupted(b Binding, interrupted bool) error {
 	return err
 }
 
+func (s *Store) CleanupMessages(ctx context.Context, cutoff int64) (CleanupResult, error) {
+	var result CleanupResult
+	for {
+		count, err := s.cleanupInboxBatch(ctx, cutoff)
+		if err != nil {
+			return result, err
+		}
+		result.Inbox += count
+		if count < messageCleanupBatchSize {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+	}
+	for {
+		count, paths, err := s.cleanupOutboxBatch(ctx, cutoff)
+		if err != nil {
+			return result, err
+		}
+		result.Outbox += count
+		result.AttachmentPaths = append(result.AttachmentPaths, paths...)
+		if count < messageCleanupBatchSize {
+			return result, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+	}
+}
+
+func (s *Store) OutboxAttachmentPaths(ctx context.Context) ([]string, error) {
+	rows, err := s.DB.QueryContext(ctx, "SELECT path FROM outbox WHERE kind IN ('photo','document') AND path != ''")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err = rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
+func (s *Store) cleanupInboxBatch(ctx context.Context, cutoff int64) (int64, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, "DELETE FROM inbox WHERE id IN (SELECT id FROM inbox WHERE state IN ('done','cancelled','ignored','failed','uncertain') AND updated_at<? ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return count, tx.Commit()
+}
+
+func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []string, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, "SELECT path FROM outbox WHERE id IN (SELECT id FROM outbox WHERE state IN ('done','sent','failed','uncertain','cancelled') AND updated_at<? ORDER BY id LIMIT ?) AND kind IN ('photo','document')", cutoff, messageCleanupBatchSize)
+	if err != nil {
+		return 0, nil, err
+	}
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err = rows.Scan(&path); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		paths = append(paths, path)
+	}
+	if err = rows.Close(); err != nil {
+		return 0, nil, err
+	}
+	result, err := tx.ExecContext(ctx, "DELETE FROM outbox WHERE id IN (SELECT id FROM outbox WHERE state IN ('done','sent','failed','uncertain','cancelled') AND updated_at<? ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
+	if err != nil {
+		return 0, nil, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, nil, err
+	}
+	return count, paths, nil
+}
 func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 	if (intent.Kind != "new" && intent.Kind != "resume") || intent.Generation != previous.Generation+1 {
 		return errors.New("invalid startup intent")
@@ -322,19 +454,31 @@ func (s *Store) PendingStarts(bot int64) ([]StartIntent, error) {
 }
 
 func (s *Store) Enqueue(chat, thread int64, text string) error {
-	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state) VALUES(?,?,?,'pending')", chat, thread, text)
+	now := time.Now().Unix()
+	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,created_at,updated_at) VALUES(?,?,?,'pending',?,?)", chat, thread, text, now, now)
 	return e
 }
 
 // CompleteInboxWithReplies commits the complete final result and input completion together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
+	return s.completeInboxWithReplies(ctx, id, chat, thread, "done", replies)
+}
+
+// CompleteInboxUncertainWithReplies commits a terminal result that cannot be confirmed.
+// A failed transaction leaves the submitted input and outbox unchanged.
+func (s *Store) CompleteInboxUncertainWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
+	return s.completeInboxWithReplies(ctx, id, chat, thread, "uncertain", replies)
+}
+
+func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state string, replies []string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, "UPDATE inbox SET state='done' WHERE id=? AND state='submitted'", id)
+	now := time.Now().Unix()
+	result, err := tx.ExecContext(ctx, "UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state='submitted'", state, now, id)
 	if err != nil {
 		return err
 	}
@@ -346,7 +490,7 @@ func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread i
 		return fmt.Errorf("input is not submitted")
 	}
 	for _, reply := range replies {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(chat,thread,text,state) VALUES(?,?,?,'pending')", chat, thread, reply); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(chat,thread,text,state,created_at,updated_at) VALUES(?,?,?,'pending',?,?)", chat, thread, reply, now, now); err != nil {
 			return err
 		}
 	}
@@ -357,7 +501,8 @@ func (s *Store) EnqueueAttachment(chat, thread int64, kind, path, name, caption 
 	if kind != "photo" && kind != "document" {
 		return fmt.Errorf("unsupported attachment kind %q", kind)
 	}
-	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,kind,path,name) VALUES(?,?,?,'pending',?,?,?)", chat, thread, caption, kind, path, name)
+	now := time.Now().Unix()
+	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,kind,path,name,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?,?,?)", chat, thread, caption, kind, path, name, now, now)
 	return e
 }
 
@@ -367,7 +512,7 @@ func (s *Store) NextOutput() (Output, error) {
 	return o, e
 }
 func (s *Store) MarkOutput(id int64, state string) error {
-	_, e := s.DB.Exec("UPDATE outbox SET state=? WHERE id=?", state, id)
+	_, e := s.DB.Exec("UPDATE outbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
 	return e
 }
 func (s *Store) Uncertain() (int, error) {

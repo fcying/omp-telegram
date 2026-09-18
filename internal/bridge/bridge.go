@@ -133,9 +133,12 @@ type rpcEvent struct {
 	AssistantMessageEvent struct{ Type, Delta string } `json:"assistantMessageEvent"`
 	Messages              []message                    `json:"messages"`
 }
+
 type message struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role         string          `json:"role"`
+	Content      json.RawMessage `json:"content"`
+	StopReason   string          `json:"stopReason"`
+	ErrorMessage string          `json:"errorMessage"`
 }
 
 var botCommands = []telegram.BotCommand{
@@ -183,11 +186,19 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2)}
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() { cancel(); b.wg.Wait() }()
+	b.cleanupDatabase(ctx)
 	workers := map[target]*worker{}
 	if err := b.restoreWorkers(ctx, workers); err != nil {
 		return err
 	}
 	b.wg.Add(2)
+	if cfg.DatabaseRetentionDays > 0 {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.runDatabaseJanitor(ctx)
+		}()
+	}
 	go func() {
 		defer b.wg.Done()
 		if err := b.deliver(ctx); err != nil {
@@ -308,6 +319,101 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 			return err
 		case <-wake:
 		case <-tick.C:
+		}
+	}
+}
+
+const databaseJanitorInterval = 24 * time.Hour
+
+func (b *Bridge) cleanupDatabase(ctx context.Context) {
+	if b.cfg.DatabaseRetentionDays == 0 {
+		return
+	}
+	result, err := b.db.CleanupMessages(ctx, time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays).Unix())
+	for _, path := range result.AttachmentPaths {
+		removeOutboxSnapshot(filepath.Join(b.cfg.DataDir, "attachments", "outbox"), path)
+	}
+	if err != nil {
+		log.Printf("database cleanup failed: %v", err)
+		return
+	}
+	b.reconcileOutboxSnapshots(ctx, time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays))
+	if result.Inbox != 0 || result.Outbox != 0 {
+		log.Printf("database cleanup completed: inbox=%d outbox=%d", result.Inbox, result.Outbox)
+	}
+}
+
+func (b *Bridge) runDatabaseJanitor(ctx context.Context) {
+	ticker := time.NewTicker(databaseJanitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.cleanupDatabase(ctx)
+		}
+	}
+}
+
+func removeOutboxSnapshot(spoolRoot, path string) {
+	rel, err := filepath.Rel(spoolRoot, path)
+	if err != nil || !filepath.IsLocal(rel) {
+		return
+	}
+	root, err := os.OpenRoot(spoolRoot)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	if err = root.Remove(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Print("database cleanup snapshot removal failed")
+	}
+}
+
+func (b *Bridge) reconcileOutboxSnapshots(ctx context.Context, cutoff time.Time) {
+	paths, err := b.db.OutboxAttachmentPaths(ctx)
+	if err != nil {
+		log.Print("database cleanup snapshot reconciliation failed")
+		return
+	}
+	referenced := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		referenced[path] = struct{}{}
+	}
+	spoolRoot := filepath.Join(b.cfg.DataDir, "attachments", "outbox")
+	root, err := os.OpenRoot(spoolRoot)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Print("database cleanup snapshot reconciliation failed")
+		}
+		return
+	}
+	defer root.Close()
+	dir, err := root.Open(".")
+	if err != nil {
+		log.Print("database cleanup snapshot reconciliation failed")
+		return
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		log.Print("database cleanup snapshot reconciliation failed")
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "attachment-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if _, exists := referenced[filepath.Join(spoolRoot, entry.Name())]; exists {
+			continue
+		}
+		if err = root.Remove(entry.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Print("database cleanup snapshot removal failed")
 		}
 	}
 }
@@ -894,16 +1000,13 @@ func (w *worker) dispatch() {
 		AgentInvoked *bool `json:"agentInvoked"`
 	}
 	if json.Unmarshal(raw, &r) == nil && r.AgentInvoked != nil && !*r.AgentInvoked {
-		w.finish()
+		w.finishTerminal(rpcEvent{})
 	}
 }
 func (w *worker) finish() {
 	w.toolName = ""
 	if w.active != 0 {
 		text := w.preview
-		if text == "" {
-			text = "The task has ended without text output."
-		}
 		if err := w.b.db.CompleteInboxWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
 			if w.ctx.Err() == nil {
 				log.Print("final result commit failed; stopping worker")
@@ -925,6 +1028,56 @@ func (w *worker) finish() {
 		return
 	}
 	w.finishPreview()
+}
+
+func (w *worker) finishUncertain(notice string) {
+	if w.active == 0 {
+		return
+	}
+	text := w.preview
+	if text != "" {
+		text += "\n\n"
+	}
+	text += notice
+	if err := w.b.db.CompleteInboxUncertainWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
+		if w.ctx.Err() == nil {
+			log.Print("uncertain result commit failed; stopping worker")
+			w.b.fail(err)
+			w.cancel()
+		}
+		return
+	}
+	w.active = 0
+	w.busy = false
+	w.preview = ""
+	w.stream.Reset()
+	w.confirms = map[string]confirmation{}
+	if w.previewBusy {
+		w.finishing = true
+		return
+	}
+	w.finishPreview()
+}
+
+func terminalFailed(e rpcEvent) bool {
+	for _, m := range e.Messages {
+		if m.Role == "assistant" && (m.StopReason == "error" || m.ErrorMessage != "") {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *worker) finishTerminal(e rpcEvent) {
+	if terminalFailed(e) {
+		w.finishUncertain("omp reported that the task failed before producing a confirmed text result. The task outcome is uncertain and will not be replayed automatically. Use /resume to inspect the session.")
+		return
+	}
+	if w.preview == "" {
+		w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically. Use /resume to inspect the session.")
+		return
+	}
+	w.finish()
 }
 func (w *worker) finishPreview() {
 	w.finishing = false
@@ -982,10 +1135,10 @@ func (w *worker) event(raw []byte) {
 		if len(texts) > 0 {
 			w.preview = strings.Join(texts, "\n\n")
 		}
-		w.finish()
+		w.finishTerminal(e)
 	case "prompt_result":
 		if e.AgentInvoked != nil && !*e.AgentInvoked {
-			w.finish()
+			w.finishTerminal(e)
 		}
 	case "response":
 		if !e.Success {

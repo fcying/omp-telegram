@@ -63,9 +63,11 @@ data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 max_workers = 4
 queue_capacity = 16
+database_retention_days = 90
 ```
 
 未指定配置文件, 且默认文件不存在时, 程序会使用同样的内置默认配置, 不生成文件.
+`database_retention_days` 启用 Database Message Retention janitor. 它按最后一次状态转换时间保留设定天数的终态 inbox/outbox 记录. 默认值是 `90`; 设置为 `0` 可关闭清理. pending/submitted inbox 及 pending/sending outbox 保持持久化. 它绝不删除 binding、history、startup intent、工作目录、omp session 文件或其他 omp 数据.
 
 ### 3. 设置环境变量并启动
 

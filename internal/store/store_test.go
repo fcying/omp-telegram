@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func openTestStore(t *testing.T, dir string) *Store {
@@ -507,4 +508,117 @@ func TestSetRunningCannotDisableReplacementGeneration(t *testing.T) {
 	if len(got) != 1 || got[0] != next {
 		t.Fatalf("current generation could not resume: %+v", got)
 	}
+}
+
+func TestVersionThreeMigratesMessageTimestamps(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+	requireStoreOK(t, err)
+	_, err = db.Exec(`CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
+CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL);
+CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '');
+CREATE INDEX idx_inbox_state ON inbox(state,id);
+CREATE INDEX idx_outbox_state ON outbox(state,id);
+INSERT INTO inbox VALUES(1,'input','done');
+INSERT INTO outbox(chat,thread,text,state) VALUES(2,3,'output','sent');
+PRAGMA user_version=3;`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, db.Close())
+	s := openTestStore(t, dir)
+	var version int
+	var inboxCreated, inboxUpdated, outboxCreated, outboxUpdated int64
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM inbox WHERE id=1").Scan(&inboxCreated, &inboxUpdated))
+	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM outbox WHERE id=1").Scan(&outboxCreated, &outboxUpdated))
+	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 {
+		t.Fatalf("version/message timestamps after migration = %d/%d/%d/%d/%d", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated)
+	}
+	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 0 || result.Outbox != 0 {
+		t.Fatalf("migration-time records were immediately pruned: %+v", result)
+	}
+}
+
+func TestCleanupMessagesProtectsNonterminalAndRecentRows(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	binding := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}
+	requireStoreOK(t, s.Save(binding))
+	for _, id := range []int64{1, 2, 3, 4, 5, 6, 7, 8} {
+		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
+	}
+	for id, state := range map[int64]string{1: "done", 2: "failed", 3: "uncertain", 4: "ignored", 5: "cancelled", 6: "pending", 7: "submitted", 8: "done"} {
+		requireStoreOK(t, s.Mark(id, state))
+	}
+	for range 7 {
+		requireStoreOK(t, s.Enqueue(2, 3, "message"))
+	}
+	for id, state := range map[int64]string{1: "done", 2: "failed", 3: "uncertain", 4: "cancelled", 5: "pending", 6: "sending", 7: "done"} {
+		requireStoreOK(t, s.MarkOutput(id, state))
+	}
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	requireStoreOK(t, setMessageTimes(s, old, old, []int64{1, 2, 3, 4, 5, 6, 7}, []int64{1, 2, 3, 4, 5, 6}))
+	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 5 || result.Outbox != 4 {
+		t.Fatalf("cleanup counts = %+v, want inbox=5 outbox=4", result)
+	}
+	for _, id := range []int64{6, 7, 8} {
+		var state string
+		requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&state))
+	}
+	for _, id := range []int64{5, 6, 7} {
+		var state string
+		requireStoreOK(t, s.DB.QueryRow("SELECT state FROM outbox WHERE id=?", id).Scan(&state))
+	}
+	if _, err = s.Binding(binding.Bot, binding.Chat, binding.Thread); err != nil {
+		t.Fatalf("message cleanup removed binding: %v", err)
+	}
+}
+
+func TestCleanupMessagesUsesLatestStateTransitionAndBatches(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	for id := int64(1); id <= 2_502; id++ {
+		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
+		requireStoreOK(t, s.Mark(id, "done"))
+	}
+	old := time.Now().AddDate(0, 0, -120).Unix()
+	requireStoreOK(t, setMessageTimes(s, old, old, nil, nil))
+	updated := time.Now().Unix()
+	_, err := s.DB.Exec("UPDATE inbox SET updated_at=? WHERE id=2502", updated)
+	requireStoreOK(t, err)
+	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 2_501 || result.Outbox != 0 {
+		t.Fatalf("batched cleanup result = %+v", result)
+	}
+	var state string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=2502").Scan(&state))
+}
+
+func setMessageTimes(s *Store, created, updated int64, inbox, outbox []int64) error {
+	if inbox == nil {
+		_, err := s.DB.Exec("UPDATE inbox SET created_at=?,updated_at=?", created, updated)
+		if err != nil {
+			return err
+		}
+	} else {
+		for _, id := range inbox {
+			if _, err := s.DB.Exec("UPDATE inbox SET created_at=?,updated_at=? WHERE id=?", created, updated, id); err != nil {
+				return err
+			}
+		}
+	}
+	if outbox == nil {
+		return nil
+	}
+	for _, id := range outbox {
+		if _, err := s.DB.Exec("UPDATE outbox SET created_at=?,updated_at=? WHERE id=?", created, updated, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }

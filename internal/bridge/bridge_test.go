@@ -415,6 +415,58 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	}
 }
 
+func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Mark(10, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"partial answer"}}`))
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"error","errorMessage":"SECRET upstream diagnostics"}]}`))
+	var state string
+	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "uncertain" {
+		t.Fatalf("terminal failure state = %q, error %v", state, err)
+	}
+	o, err := db.NextOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(o.Text, "omp reported that the task failed") || !strings.Contains(o.Text, "partial answer") || strings.Contains(o.Text, "SECRET") {
+		t.Fatalf("terminal failure output = %q", o.Text)
+	}
+}
+
+func TestTerminalWithoutTextIsUncertain(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Mark(10, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w.event([]byte(`{"type":"agent_end"}`))
+	var state string
+	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "uncertain" {
+		t.Fatalf("empty terminal state = %q, error %v", state, err)
+	}
+}
+
 func TestDispatchWaitsForPreviewCleanup(t *testing.T) {
 	w := &worker{client: &omp.Client{}, finishing: true, queue: []queued{{id: 1}}}
 	w.dispatch()

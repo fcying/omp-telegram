@@ -17,28 +17,30 @@ import (
 )
 
 type Config struct {
-	Token         string
-	AllowedUsers  []int64
-	AllowedChats  []int64
-	WorkspaceRoot string
-	OMP           string
-	OMPArgs       []string
-	DataDir       string
-	MaxWorkers    int
-	QueueCapacity int
+	Token                 string
+	AllowedUsers          []int64
+	AllowedChats          []int64
+	WorkspaceRoot         string
+	OMP                   string
+	OMPArgs               []string
+	DataDir               string
+	MaxWorkers            int
+	QueueCapacity         int
+	DatabaseRetentionDays int
 }
 
 // fileConfig accepts quoted environment references in otherwise numeric fields.
 type fileConfig struct {
-	Token         string `toml:"token"`
-	AllowedUsers  []any  `toml:"allowed_users"`
-	AllowedChats  []any  `toml:"allowed_chats"`
-	WorkspaceRoot string `toml:"workspace_root"`
-	OMP           string `toml:"omp"`
-	OMPArgs       string `toml:"omp_args"`
-	DataDir       string `toml:"data_dir"`
-	MaxWorkers    any    `toml:"max_workers"`
-	QueueCapacity any    `toml:"queue_capacity"`
+	Token                 string `toml:"token"`
+	AllowedUsers          []any  `toml:"allowed_users"`
+	AllowedChats          []any  `toml:"allowed_chats"`
+	WorkspaceRoot         string `toml:"workspace_root"`
+	OMP                   string `toml:"omp"`
+	OMPArgs               string `toml:"omp_args"`
+	DataDir               string `toml:"data_dir"`
+	MaxWorkers            any    `toml:"max_workers"`
+	QueueCapacity         any    `toml:"queue_capacity"`
+	DatabaseRetentionDays any    `toml:"database_retention_days"`
 }
 
 func Load(path string) (Config, error) {
@@ -59,7 +61,7 @@ func load(path, baseDir string) (Config, error) {
 		path = filepath.Join(baseDir, "config.toml")
 	}
 	var c Config
-	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16)}
+	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16), DatabaseRetentionDays: int64(90)}
 	f, err := os.Open(path)
 	var reader io.Reader
 	if err == nil {
@@ -127,10 +129,14 @@ func load(path, baseDir string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
-	if int64(int(workers)) != workers || int64(int(capacity)) != capacity {
-		return c, errors.New("worker or queue limit exceeds platform integer range")
+	retentionDays, err := integer(raw.DatabaseRetentionDays, "database_retention_days")
+	if err != nil {
+		return c, err
 	}
-	c.MaxWorkers, c.QueueCapacity = int(workers), int(capacity)
+	if int64(int(workers)) != workers || int64(int(capacity)) != capacity || int64(int(retentionDays)) != retentionDays {
+		return c, errors.New("worker, queue, or retention limit exceeds platform integer range")
+	}
+	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
 	if len(c.AllowedUsers) == 0 || len(c.AllowedChats) == 0 {
 		return c, errors.New("allowed_users and allowed_chats must be nonempty")
 	}
@@ -146,6 +152,9 @@ func load(path, baseDir string) (Config, error) {
 	}
 	if c.MaxWorkers < 1 || c.QueueCapacity < 1 {
 		return c, errors.New("worker and queue limits must be positive")
+	}
+	if c.DatabaseRetentionDays < 0 {
+		return c, errors.New("database_retention_days must be zero or positive")
 	}
 	workspace := raw.WorkspaceRoot
 	if workspace == "${OMP_TELEGRAM_WORKSPACE_ROOT}" || workspace == "$OMP_TELEGRAM_WORKSPACE_ROOT" {

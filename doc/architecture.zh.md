@@ -82,16 +82,20 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 | `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | 最后一次已验证的会话绑定, 恢复资格和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
 | `history` | `bot,chat,thread,workspace,session,generation` | 旧绑定快照, 不是会话浏览器 |
-| `inbox` | 主键 `id`; `raw,state` | update 去重和处理状态 |
-| `outbox` | 自增 `id`; `chat,thread,text,state,kind,path,name` | 按顺序交付文字和附件 |
+| `inbox` | 主键 `id`; `raw,state,created_at,updated_at` | update 去重和处理状态 |
+| `outbox` | 自增 `id`; `chat,thread,text,state,kind,path,name,created_at,updated_at` | 按顺序交付文字和附件 |
 
-热路径索引为 `inbox(state,id)` 和 `outbox(state,id)`. 当前没有自动清理保留期, 重试调度器, `source_update/seq` 映射或 inbox/outbox 的多 Bot namespace.
+### Database Message Retention
+
+`database_retention_days` 默认值是 90. `0` 关闭自动清理; 正数按 `updated_at` 即最后一次状态转换时间保留相应天数的终态 Telegram bridge 消息记录. Bridge 会在启动时执行一次, 并在之后每 24 小时执行一次这个 best-effort janitor. 失败只记录日志, 在下一个周期重试, 不会停止 Telegram 或 omp 处理.
+
+只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
+
+保留策略绝不删除 binding, history, startup intent, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 3. 空库在同一事务中创建表, 索引和版本号. 重新打开时整理上次运行留下的状态.
-
-已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 和 2 通过 `startup_intents` 及 binding 中断标记的事务迁移后才推进 `user_version`. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 4. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 3 会依次通过 `startup_intents`、binding 中断标记及消息时间戳的事务迁移后才推进 `user_version`. 已有 v3 消息在迁移时获得当前时间戳，从而获得完整保留期而不是猜测历史年龄. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -178,8 +182,8 @@ just service
 
 已有证据包括事务失败注入, 索引查询计划, 真实 omp 重启恢复, 以及注入输入配合真实 Telegram 文件传输. 父进程 SIGKILL 实验观察到配合清理的原生 omp/工具树退出, 独立夹具同时证明不配合的后代可以存活. 真实用户客户端输入/点击, 完整线上故障矩阵和长会话成功压缩仍待验收.
 
-应用版本来自 [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go) 的 `Version`, 初始为 `v0.1.0`. `--version`/`-v` 在构建元数据可用时显示 Git revision/dirty 标记, 可通过 `-ldflags "-X main.Version=..."` 覆盖基础版本.
+应用版本由 [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go) 中的 `Version` 定义. `--version`/`-v` 在构建元数据可用时显示 Git revision/dirty 标记, 可通过 `-ldflags "-X main.Version=..."` 覆盖基础版本.
 
-[发布工作流](../.github/workflows/release.yaml) 在所有分支 push, PR 及手动触发时运行. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 同仓 PR 会创建 skipped workflow, 因其 head commit 的 push run 已提供验证; 来自其他仓库的 PR 会在本仓运行验证 jobs, 但不会发布. `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag. 其他可发布构建使用唯一的 `v<版本>-dev.g<commit>` 版本和 GitHub prerelease; 替代版本发布成功后会移除旧的 prerelease. 在 `main`/`dev` 之外手动运行不会发布.
+[发布工作流](../.github/workflows/release.yaml) 在 `main` push, PR 及手动触发时运行. 所有非 `main` 分支变更必须通过 PR 进入 workflow. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 本仓库的每个 workflow 都会发布: `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag; 其他本仓 workflow 均发布唯一的 `v<版本>-dev.g<commit>` GitHub prerelease. 内部 PR 的 prerelease 指向真实 head commit. 来自其他仓库的 PR 使用同一验证路径, 但绝不发布. `main` 之外的手动运行发布 prerelease.
 
 发布包包含二进制和 LICENSE, 并提供 `SHA256SUMS`. 只有发布 job 为 `GITHUB_TOKEN` 申请写权限. 发布新应用版本时, 将 `Version` 改为 `vMAJOR.MINOR.PATCH` 并合并/push 到 `main`, 不会自动改变数据库 schema 版本.

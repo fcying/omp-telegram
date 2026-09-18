@@ -16,3 +16,5 @@ data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 max_workers = 4
 queue_capacity = 16
+# Remove terminal database messages older than this many days. Set 0 to disable cleanup.
+database_retention_days = 90

@@ -63,9 +63,11 @@ data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 max_workers = 4
 queue_capacity = 16
+database_retention_days = 90
 ```
 
 If no configuration file is specified and the default file is absent, the service uses these embedded defaults without generating a file.
+`database_retention_days` enables the Database Message Retention janitor. It retains terminal inbox/outbox records for the configured number of days measured from their latest state transition. The default is `90`; set it to `0` to disable cleanup. Pending/submitted inbox and pending/sending outbox records remain durable. It never removes bindings, history, startup intents, workspaces, omp session files, or other omp data.
 
 ### 3. Set the environment and start
 

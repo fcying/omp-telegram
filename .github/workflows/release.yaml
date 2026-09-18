@@ -3,6 +3,7 @@ name: release
 on:
   pull_request:
   push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -18,11 +19,11 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
       prerelease: ${{ steps.release.outputs.prerelease }}
+      target: ${{ steps.release.outputs.target }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -37,14 +38,19 @@ jobs:
             echo "Expected one Version value in vMAJOR.MINOR.PATCH form" >&2
             exit 1
           fi
+          target="$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            target="${{ github.event.pull_request.head.sha }}"
+          fi
           prerelease=true
-          version="${source_version}-dev.g${GITHUB_SHA:0:12}"
+          version="${source_version}-dev.g${target:0:12}"
           if [[ "$GITHUB_REF" == "refs/heads/main" ]] && ! git show-ref --verify --quiet "refs/tags/${source_version}"; then
             version="$source_version"
             prerelease=false
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -62,6 +68,8 @@ jobs:
       TARGET_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.target }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -109,8 +117,8 @@ jobs:
 
   release:
     needs: [prepare, build]
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
     concurrency:
       group: release-publish
       cancel-in-progress: false
@@ -136,13 +144,18 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          TARGET: ${{ needs.prepare.outputs.target }}
         run: |
           set -euo pipefail
-          args=(release create "$VERSION" build/* --target "$GITHUB_SHA" --generate-notes --title "$VERSION")
+          args=(release create "$VERSION" build/* --target "$TARGET" --generate-notes --title "$VERSION")
           if [[ "$PRERELEASE" == true ]]; then
             args+=(--prerelease)
           fi
-          gh "${args[@]}"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" build/* --clobber
+          else
+            gh "${args[@]}"
+          fi
           if [[ "$PRERELEASE" == true ]]; then
             while IFS= read -r tag; do
               if [[ "$tag" != "$VERSION" ]]; then
