@@ -445,6 +445,189 @@ func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
 	}
 }
 
+func TestNormalTerminalCompletionIsDone(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Mark(10, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"final answer"}],"stopReason":"stop"}]}`))
+	var state string
+	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "done" {
+		t.Fatalf("normal terminal state = %q, error %v", state, err)
+	}
+	o, err := db.NextOutput()
+	if err != nil || o.Text != "final answer" {
+		t.Fatalf("normal terminal output = %q, error %v", o.Text, err)
+	}
+}
+
+func TestCompactedTerminalEventsUseMessageEndMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, preview, message, state, want, hidden string
+	}{
+		{
+			name:    "aborted",
+			preview: "partial answer",
+			message: `{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"aborted","errorMessage":"Request was aborted"}`,
+			state:   "cancelled",
+			want:    "Task was cancelled before completion.",
+			hidden:  "Request was aborted",
+		},
+		{
+			name:    "error",
+			preview: "partial answer",
+			message: `{"role":"assistant","stopReason":"error","errorMessage":"SECRET diagnostic"}`,
+			state:   "uncertain",
+			want:    "omp reported that the task failed",
+			hidden:  "SECRET diagnostic",
+		},
+		{
+			name:    "rewritten normal",
+			preview: "old streamed answer",
+			message: `{"role":"assistant","content":[{"type":"text","text":"rewritten final answer"}],"stopReason":"stop"}`,
+			state:   "done",
+			want:    "rewritten final answer",
+			hidden:  "old streamed answer",
+		},
+		{
+			name:    "normal without delta",
+			message: `{"role":"assistant","content":[{"type":"text","text":"final answer"}],"stopReason":"stop"}`,
+			state:   "done",
+			want:    "final answer",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Mark(10, "submitted"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+			w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"` + tc.preview + `"}}`))
+			w.event([]byte(`{"type":"message_end","message":` + tc.message + `}`))
+			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[],"messageCount":1}`))
+			var state string
+			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != tc.state {
+				t.Fatalf("compacted terminal state = %q, error %v; want %q", state, err, tc.state)
+			}
+			o, err := db.NextOutput()
+			if err != nil || !strings.Contains(o.Text, tc.want) || tc.hidden != "" && strings.Contains(o.Text, tc.hidden) {
+				t.Fatalf("compacted terminal output = %q, error %v", o.Text, err)
+			}
+		})
+	}
+}
+
+func TestAgentStartClearsTerminalMetadata(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Mark(10, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"aborted","errorMessage":"Request was aborted"}}`))
+	w.event([]byte(`{"type":"agent_start"}`))
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"final answer"}}`))
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[]}`))
+	var state string
+	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "done" {
+		t.Fatalf("post-agent-start state = %q, error %v", state, err)
+	}
+}
+
+func TestTerminalAbortIsCancelled(t *testing.T) {
+	for _, tc := range []struct {
+		name, event, want, hidden string
+	}{
+		{
+			name:   "partial output",
+			event:  `{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"aborted","errorMessage":"Request was aborted"}]}`,
+			want:   "partial answer",
+			hidden: "Request was aborted",
+		},
+		{
+			name:   "empty output",
+			event:  `{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","stopReason":"aborted","errorMessage":"Stopped by user"}]}`,
+			want:   "Task was cancelled before completion.",
+			hidden: "Stopped by user",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Mark(10, "submitted"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+			w.event([]byte(tc.event))
+			var state string
+			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "cancelled" {
+				t.Fatalf("terminal abort state = %q, error %v", state, err)
+			}
+			o, err := db.NextOutput()
+			if err != nil || !strings.Contains(o.Text, tc.want) || !strings.Contains(o.Text, "Task was cancelled before completion.") || strings.Contains(o.Text, tc.hidden) {
+				t.Fatalf("terminal abort output = %q, error %v", o.Text, err)
+			}
+		})
+	}
+}
+
+func TestNonterminalAgentEndDoesNotCompleteInput(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Mark(10, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":[{"role":"assistant","stopReason":"error"}]}`))
+	var state string
+	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "submitted" || w.active != 10 {
+		t.Fatalf("nonterminal agent end state = %q, active %d, error %v", state, w.active, err)
+	}
+}
+
 func TestTerminalWithoutTextIsUncertain(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	if err != nil {

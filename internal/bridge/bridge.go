@@ -63,41 +63,48 @@ type confirmation struct {
 	page                 int
 }
 type worker struct {
-	b              *Bridge
-	key            target
-	input          chan incoming
-	client         *omp.Client
-	binding        store.Binding
-	startIntent    *store.StartIntent
-	sessionID      string
-	claimedSession string
-	restoring      bool
-	queue          []queued
-	stream         strings.Builder
-	active         int64
-	owner          int64
-	turn           uint64
-	finishing      bool
-	compacting     bool
-	operations     chan operationResult
-	background     sync.WaitGroup
-	busy           bool
-	toolName       string
-	lastTyping     time.Time
-	preview        string
-	lastPreview    string
-	previewID      int64
-	previewBusy    bool
-	previewResult  chan previewResult
-	confirms       map[string]confirmation
-	mediaResults   chan mediaResult
-	sendResults    chan sendResult
-	hostRequests   map[string]context.CancelFunc
-	resumeResults  chan resumeListResult
-	resumeCancel   context.CancelFunc
-	resumeRequest  uint64
-	ctx            context.Context
-	cancel         context.CancelFunc
+	b                   *Bridge
+	key                 target
+	input               chan incoming
+	client              *omp.Client
+	binding             store.Binding
+	startIntent         *store.StartIntent
+	sessionID           string
+	claimedSession      string
+	restoring           bool
+	queue               []queued
+	stream              strings.Builder
+	active              int64
+	owner               int64
+	turn                uint64
+	finishing           bool
+	compacting          bool
+	operations          chan operationResult
+	background          sync.WaitGroup
+	busy                bool
+	toolName            string
+	lastTyping          time.Time
+	preview             string
+	lastAssistant       *terminalAssistant
+	finalAssistantTexts []string
+	lastPreview         string
+	previewID           int64
+	previewBusy         bool
+	previewResult       chan previewResult
+	confirms            map[string]confirmation
+	mediaResults        chan mediaResult
+	sendResults         chan sendResult
+	hostRequests        map[string]context.CancelFunc
+	resumeResults       chan resumeListResult
+	resumeCancel        context.CancelFunc
+	resumeRequest       uint64
+	ctx                 context.Context
+	cancel              context.CancelFunc
+}
+
+type terminalAssistant struct {
+	StopReason   string
+	ErrorMessage string
 }
 type previewResult struct {
 	id         int64
@@ -140,6 +147,14 @@ type message struct {
 	StopReason   string          `json:"stopReason"`
 	ErrorMessage string          `json:"errorMessage"`
 }
+
+type terminalResult int
+
+const (
+	terminalDone terminalResult = iota
+	terminalUncertain
+	terminalCancelled
+)
 
 var botCommands = []telegram.BotCommand{
 	{Command: "new", Description: "New session: /new <name or project path>"},
@@ -593,6 +608,8 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 	w.finishing = false
 	w.compacting = false
 	w.preview = ""
+	w.finalAssistantTexts = nil
+	w.lastAssistant = nil
 	w.stream.Reset()
 	w.confirms = map[string]confirmation{}
 	if w.client != nil {
@@ -1023,6 +1040,8 @@ func (w *worker) finish() {
 	} else if w.preview != "" {
 		w.say(w.preview)
 	}
+	w.lastAssistant = nil
+	w.finalAssistantTexts = nil
 	if w.previewBusy {
 		w.finishing = true
 		return
@@ -1031,7 +1050,17 @@ func (w *worker) finish() {
 }
 
 func (w *worker) finishUncertain(notice string) {
+	w.finishIncomplete("uncertain", notice)
+}
+
+func (w *worker) finishCancelled(notice string) {
+	w.finishIncomplete("cancelled", notice)
+}
+
+func (w *worker) finishIncomplete(state, notice string) {
 	if w.active == 0 {
+		w.lastAssistant = nil
+		w.finalAssistantTexts = nil
 		return
 	}
 	text := w.preview
@@ -1039,9 +1068,18 @@ func (w *worker) finishUncertain(notice string) {
 		text += "\n\n"
 	}
 	text += notice
-	if err := w.b.db.CompleteInboxUncertainWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
+	var err error
+	switch state {
+	case "uncertain":
+		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800))
+	case "cancelled":
+		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800))
+	default:
+		panic("invalid terminal state")
+	}
+	if err != nil {
 		if w.ctx.Err() == nil {
-			log.Print("uncertain result commit failed; stopping worker")
+			log.Print("incomplete result commit failed; stopping worker")
 			w.b.fail(err)
 			w.cancel()
 		}
@@ -1050,6 +1088,8 @@ func (w *worker) finishUncertain(notice string) {
 	w.active = 0
 	w.busy = false
 	w.preview = ""
+	w.lastAssistant = nil
+	w.finalAssistantTexts = nil
 	w.stream.Reset()
 	w.confirms = map[string]confirmation{}
 	if w.previewBusy {
@@ -1059,25 +1099,77 @@ func (w *worker) finishUncertain(notice string) {
 	w.finishPreview()
 }
 
-func terminalFailed(e rpcEvent) bool {
-	for _, m := range e.Messages {
-		if m.Role == "assistant" && (m.StopReason == "error" || m.ErrorMessage != "") {
-			return true
+func lastAssistant(messages []message) (message, bool) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			return messages[i], true
 		}
 	}
-	return false
+	return message{}, false
+}
+
+func assistantText(m message) string {
+	var blocks []struct{ Type, Text string }
+	if json.Unmarshal(m.Content, &blocks) != nil {
+		return ""
+	}
+	var texts []string
+	for _, block := range blocks {
+		if block.Type == "text" && block.Text != "" {
+			texts = append(texts, block.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+func assistantTexts(messages []message) []string {
+	var texts []string
+	for _, m := range messages {
+		if m.Role == "assistant" {
+			if text := assistantText(m); text != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	return texts
+}
+
+func assistantTerminalState(m message) terminalResult {
+	switch m.StopReason {
+	case "aborted":
+		return terminalCancelled
+	case "error":
+		return terminalUncertain
+	}
+	if m.ErrorMessage != "" {
+		return terminalUncertain
+	}
+	return terminalDone
+}
+
+func (w *worker) terminalState(e rpcEvent) terminalResult {
+	if m, ok := lastAssistant(e.Messages); ok {
+		return assistantTerminalState(m)
+	}
+	if w.lastAssistant != nil {
+		return assistantTerminalState(message{Role: "assistant", StopReason: w.lastAssistant.StopReason, ErrorMessage: w.lastAssistant.ErrorMessage})
+	}
+	return terminalDone
 }
 
 func (w *worker) finishTerminal(e rpcEvent) {
-	if terminalFailed(e) {
-		w.finishUncertain("omp reported that the task failed before producing a confirmed text result. The task outcome is uncertain and will not be replayed automatically. Use /resume to inspect the session.")
-		return
+	switch w.terminalState(e) {
+	case terminalUncertain:
+		w.finishUncertain("omp reported that the task failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically.")
+	case terminalCancelled:
+		w.finishCancelled("Task was cancelled before completion.")
+	case terminalDone:
+		if w.preview == "" {
+			w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically.")
+			return
+		}
+		w.finish()
 	}
-	if w.preview == "" {
-		w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically. Use /resume to inspect the session.")
-		return
-	}
-	w.finish()
 }
 func (w *worker) finishPreview() {
 	w.finishing = false
@@ -1115,25 +1207,25 @@ func (w *worker) event(raw []byte) {
 		w.compacting = false
 	case "agent_start":
 		w.busy = true
+		w.lastAssistant = nil
+		w.finalAssistantTexts = nil
+	case "message_end":
+		var m message
+		if json.Unmarshal(e.Message, &m) == nil && m.Role == "assistant" {
+			w.lastAssistant = &terminalAssistant{StopReason: m.StopReason, ErrorMessage: m.ErrorMessage}
+			if text := assistantText(m); text != "" {
+				w.finalAssistantTexts = append(w.finalAssistantTexts, text)
+			}
+		}
 	case "agent_end":
 		if e.IsTerminal != nil && !*e.IsTerminal {
 			return
 		}
-		var texts []string
-		for _, m := range e.Messages {
-			if m.Role == "assistant" {
-				var blocks []struct{ Type, Text string }
-				if json.Unmarshal(m.Content, &blocks) == nil {
-					for _, c := range blocks {
-						if c.Type == "text" && c.Text != "" {
-							texts = append(texts, c.Text)
-						}
-					}
-				}
-			}
-		}
+		texts := assistantTexts(e.Messages)
 		if len(texts) > 0 {
 			w.preview = strings.Join(texts, "\n\n")
+		} else if len(w.finalAssistantTexts) > 0 {
+			w.preview = strings.Join(w.finalAssistantTexts, "\n\n")
 		}
 		w.finishTerminal(e)
 	case "prompt_result":

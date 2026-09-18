@@ -54,7 +54,9 @@ flowchart LR
 - RPC stdout reader 不执行 Telegram HTTP 交付. 事件缓冲有界, 协议错误或持续积压会使 client 失败, 不允许内存无限增长.
 - 全局 slot 限制活动 topic 实例数量, 原生会话列表查询另有并发上限.
 
-Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关联响应. `Call("prompt")` 成功只代表请求被接受, 不代表任务完成. 只有终结 agent 事件或本地命令完成信号才能结束任务, 非终结事件不能开始下一条排队 prompt. 分帧和重组都有明确边界, 不回退到 PTY/ANSI 解析.
+Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关联响应. `Call("prompt")` 成功只代表请求被接受, 不代表任务完成. 只有 `isTerminal` 不为 `false` 的 `agent_end` 事件或本地命令完成信号才能结束任务, 非终结事件不能开始下一条排队 prompt. 终结 assistant message 的 `stopReason=error` 或非空 `errorMessage` 使输入以 `uncertain` 提交; `stopReason=aborted` 以 `cancelled` 提交; 其他有确认文本的情况以 `done` 提交. `uncertain` 和 `cancelled` 的终态结果仍可交付 partial text, 但绝不转发 provider diagnostics. 分帧和重组都有明确边界, 不回退到 PTY/ANSI 解析.
+
+RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存的诊断只用于分类, 绝不出现在 Telegram 输出中.
 
 ## 身份与过期工作
 
@@ -106,12 +108,12 @@ Telegram update
   -> 持久化 submitted
   -> 向 omp stdin 写入 prompt
   -> 收到终结事件
-  -> 事务: 写入全部最终文本分段 + 标记 inbox done
+  -> 事务: 写入最终文本分段 + 标记 inbox 为 done, uncertain 或 cancelled
 ```
 
 `Accept` 为每个 update 执行一个原子事务. offset 不会先于输入持久化推进, 重复 update 不覆盖原记录.
 
-普通任务通过 `CompleteInboxWithReplies` 完成: 输入必须处于 submitted, 全部最终文本分段和 `done` 一起提交, 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
+普通任务完成时输入必须处于 submitted, 全部最终文本分段和终态 inbox 状态在同一事务中提交. 正常终结输出为 `done`; provider/model error 为 `uncertain`; 明确的 OMP abort 为 `cancelled`. 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
 
 完成事务失败时停止 worker, 不伪装成任务完成. 重启时 submitted 输入转为 `uncertain`, 旧的 pending 普通消息取消. 待处理控制命令仍正常鉴权; 依赖内存状态的旧 callback token 会随状态丢失而失效.
 

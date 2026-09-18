@@ -54,7 +54,9 @@ Incoming updates are persisted before routing authorization. Unauthorized inputs
 - The RPC stdout reader never performs Telegram HTTP delivery. Its event buffers are bounded; protocol violations or overload fail the client rather than allowing unbounded growth.
 - A global slot limit bounds active topic instances. Native session-list queries have a separate concurrency limit.
 
-The client waits for `ready`, negotiates protocol v2, serializes stdin writes, and correlates responses by request ID. A successful `Call("prompt")` means acceptance, not task completion. Terminal agent events or a local-command completion signal finish the task; nonterminal events must not dispatch the next queued prompt. Framing and reassembly have explicit bounds, with no PTY/ANSI parsing fallback.
+The client waits for `ready`, negotiates protocol v2, serializes stdin writes, and correlates responses by request ID. A successful `Call("prompt")` means acceptance, not task completion. Only `agent_end` events whose `isTerminal` is not `false`, or a local-command completion signal, finish the task; nonterminal events must not dispatch the next queued prompt. On a terminal assistant message, `stopReason=error` or a nonempty `errorMessage` commits the input as `uncertain`; `stopReason=aborted` commits it as `cancelled`; otherwise confirmed text commits it as `done`. Partial text remains deliverable for `uncertain` and `cancelled` terminal results, while provider diagnostics are never forwarded. Framing and reassembly have explicit bounds, with no PTY/ANSI parsing fallback.
+
+RPC v2 may compact large terminal frames and omit messages already emitted by `message_end`. The worker caches the latest assistant message's `stopReason` and `errorMessage`, plus finalized text from every assistant `message_end`; terminal `agent_end` messages take precedence, and the cache is used only when they contain no assistant message. The cache resets at `agent_start`, terminal completion, and shutdown. Cached diagnostics classify the result but never appear in Telegram output.
 
 ## Identity and stale work
 
@@ -106,12 +108,12 @@ Telegram update
   -> persist submitted
   -> write prompt to omp stdin
   -> receive terminal completion
-  -> transaction: persist every final text part + set inbox done
+  -> transaction: persist final text parts + set inbox done, uncertain, or cancelled
 ```
 
 `Accept` performs one atomic transaction per update. Offset advancement never precedes durable input, and duplicates do not overwrite the original stored update.
 
-For ordinary tasks, `CompleteInboxWithReplies` requires a submitted input and commits all final text parts with `done`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
+For ordinary tasks, completion requires a submitted input and commits all final text parts with the terminal inbox state in one transaction. Normal terminal output is `done`; a provider/model error is `uncertain`; an explicit OMP abort is `cancelled`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
 
 A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages are canceled. Pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
 

@@ -471,6 +471,12 @@ func (s *Store) CompleteInboxUncertainWithReplies(ctx context.Context, id, chat,
 	return s.completeInboxWithReplies(ctx, id, chat, thread, "uncertain", replies)
 }
 
+// CompleteInboxCancelledWithReplies commits an aborted terminal result and its replies together.
+// A failed transaction leaves the submitted input and outbox unchanged.
+func (s *Store) CompleteInboxCancelledWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
+	return s.completeInboxWithReplies(ctx, id, chat, thread, "cancelled", replies)
+}
+
 func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state string, replies []string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
