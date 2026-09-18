@@ -97,6 +97,56 @@ func TestConversationMessages(t *testing.T) {
 	}
 }
 
+func TestClearKeyboardPreservesText(t *testing.T) {
+	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/editMessageReplyMarkup" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+			t.Error(err)
+			return
+		}
+		if string(fields["chat_id"]) != "-10" || string(fields["message_id"]) != "42" {
+			t.Errorf("wrong destination: %s", fields)
+		}
+		if _, exists := fields["text"]; exists {
+			t.Error("keyboard cleanup must not change message text")
+		}
+		var keyboard Keyboard
+		if err := json.Unmarshal(fields["reply_markup"], &keyboard); err != nil {
+			t.Error(err)
+		} else if keyboard.InlineKeyboard == nil || len(keyboard.InlineKeyboard) != 0 {
+			t.Errorf("expected nonnull empty inline keyboard, got %+v", keyboard)
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42,"text":"Keep this text"}}`)
+	})
+	if err := client.ClearKeyboard(context.Background(), -10, 42); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClearKeyboardSurfacesFailureWithoutRetry(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var attempts atomic.Int32
+			client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.WriteHeader(status)
+				fmt.Fprintf(w, `{"ok":false,"error_code":%d,"description":"cannot edit keyboard"}`, status)
+			})
+			err := client.ClearKeyboard(context.Background(), 10, 42)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Code != status {
+				t.Fatalf("expected API error %d, got %v", status, err)
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("keyboard cleanup attempted %d times", got)
+			}
+		})
+	}
+}
+
 func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
 	var attempts atomic.Int32
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {

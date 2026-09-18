@@ -184,6 +184,16 @@ func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string,
 	return err
 }
 
+// ClearKeyboard removes an inline keyboard without changing the message text.
+func (c *Client) ClearKeyboard(ctx context.Context, chatID, messageID int64) error {
+	fields := map[string]any{
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"reply_markup": Keyboard{InlineKeyboard: [][]Button{}},
+	}
+	return c.call(ctx, "editMessageReplyMarkup", fields, nil, false)
+}
+
 func (c *Client) AnswerCallback(ctx context.Context, id, text string) error {
 	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": text}, nil, false)
 }

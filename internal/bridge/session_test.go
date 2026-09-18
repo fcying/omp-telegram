@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 )
@@ -68,5 +69,61 @@ func TestNativeIDResumeDoesNotRecreateMissingDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(cwd); !os.IsNotExist(err) {
 		t.Fatal("resume recreated a missing directory")
+	}
+}
+
+func TestNameChangesTitleWithoutInterruptingTasks(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 2
+	command("/new " + t.TempDir())
+	before := w.binding
+	command("wait")
+	w.dispatch()
+	active := w.active
+	command("queued task")
+	command("/name Bugfix HAL")
+	command("/status")
+	var text string
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if statusFields(text)["Session"] != "Bugfix HAL" {
+		t.Fatalf("status did not expose native session title: %q", text)
+	}
+	if w.binding != before || !w.busy || w.active != active || len(w.queue) != 1 {
+		t.Fatal("renaming changed session identity or active/queued work")
+	}
+	raw, err := w.call("get_state", nil)
+	var state struct {
+		RootPrompts int `json:"fixtureRootPrompts"`
+	}
+	if err != nil || json.Unmarshal(raw, &state) != nil || state.RootPrompts != 1 {
+		t.Fatalf("naming incorrectly started an agent turn: %+v, %v", state, err)
+	}
+	command("/name")
+	command("/status")
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil || statusFields(text)["Session"] != "Bugfix HAL" {
+		t.Fatal("empty name cleared the existing title")
+	}
+}
+
+func TestRejectedNamePreservesTitleAndSession(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/name No session")
+	if w.client != nil {
+		t.Fatal("name command created a session")
+	}
+	command("/new " + t.TempDir())
+	command("/name Existing title")
+	command("/model fixture/reject-name")
+	before := w.binding
+	command("/name Rejected title")
+	command("/status")
+	var text string
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil || statusFields(text)["Session"] != "Existing title" {
+		t.Fatal("rejected name changed the displayed native title")
+	}
+	if w.client == nil || w.binding != before {
+		t.Fatal("rejected metadata update closed or replaced the session")
 	}
 }

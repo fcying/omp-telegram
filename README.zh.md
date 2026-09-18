@@ -107,26 +107,38 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 
 等收到就绪消息后, 直接发送普通文字即可. 已有文件不会被复制或清空.
 
+首次直接发送 `/new` 会使用 `workspace_root` 本身, 默认是可执行文件旁的 `workspace/`. 后续沿用当前对话上次选择的目录. 不同对话使用默认目录时会话独立, 但文件共享; 需要独立项目目录时使用 `/new <项目名>`.
+
 ## 对话命令
 
 | 命令 | 用途 |
 | --- | --- |
 | `/new <名称或路径>` | 在指定目录开启新会话, 替换已有实例前需要确认 |
-| `/new` | 沿用当前对话上次选择的目录, 开启新会话 |
+| `/new` | 沿用历史目录开启新会话; 没有历史目录时使用 `workspace_root` |
 | `/stop` | 中止当前任务并清空排队消息, 保留会话 |
 | `/close` | 关闭 omp 实例, 保留文件和会话历史 |
 | `/resume` | 用分页按钮选择当前目录中的 omp 历史会话 |
 | `/resume <session ID>` | 按 omp 原生 ID 恢复会话及原目录, 使用前先关闭已有实例 |
-| `/status` | 查看工作目录, session ID, 模型, 运行状态和队列 |
-| `/model` | 查看当前状态和模型 |
+| `/status` | 查看目录, 会话标题/ID, 模型, 思考等级, Fast, 上下文用量, 活动状态, 队列和速度 |
+| `/name <名称>` | 命名当前 omp session, 例如 `/name Bugfix HAL`; 不修改 Telegram topic 名称 |
+| `/model` | 用按钮选择 OMP 配置的 cycle 角色, 同时显示当前模型 |
 | `/model provider/model` | 空闲时切换模型 |
+| `/thinking` | 空闲时用按钮选择思考等级, 显示当前等级 |
+| `/fast [on\|off\|status]` | 用按钮选择 Fast, 显式开关, 或查看设置与实际生效状态 |
 | `/compact` | 空闲时经确认压缩上下文 |
+| `/handoff [补充要求]` | 空闲且队列为空时执行 OMP 原生 handoff, 可附带交接要求 |
 | `/review [arguments]` | 作为独立任务运行 omp 原生 `/review` 命令 |
 | `/help` | 查看帮助 |
 
 以上所有命令, 包括 `/new <名称或路径>` 和 `/resume`, 都可用于普通私聊和 topic. 普通私聊使用 `(chat, 0)`, 沿用 topic 的 worker 和会话生命周期, 不需要单独的私聊 worker 或数据库迁移. `/followup` 仍不支持.
 
 普通文字, 附件和 `/review` 都是由 bridge 排队的独立任务, 在每个对话内串行执行. 任务运行期间发送的消息会等待当前任务结束. `/stop` 先清空 bridge 队列, 再发送普通 `abort` 请求中止当前任务.
+
+模型菜单按 OMP 的 `cycleOrder` 列出角色, 例如 `smol`, `default`, `slow`, 不罗列全部可用模型. 所选角色及其 thinking 设置由 OMP 自己解析. 打开菜单不会切换模型; 点击选择时实例必须空闲且队列为空. 选择后清除按钮, 回复实际选中的模型. 仍可手动使用 `/model provider/model`.
+
+角色菜单支持 `omp_args` 中的 `--config 路径` 和 `--config=路径`, 多个文件按原顺序应用. 原生查询先加载继承的 `PI_CONFIG_FILES`, 再加载这些覆盖文件; 相对路径以 worker 工作目录为基准. 不改写配置文件. `--profile`, `--smol`, `--slow`, `--plan` 等运行时覆盖项仍需使用明确的 `/model provider/model` 切换.
+
+`/thinking` 提供固定等级 `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. 菜单标记当前实际生效等级; OMP 可能按模型能力调整请求等级. bridge 不通过 `set_thinking_level` 发送类型契约未声明的 `auto`. OMP 已有配置和模型角色的 thinking 设置保持不变.
 
 bot 菜单, 按钮和服务提示使用英语. 你可以用任意语言提问, 程序不会翻译模型回复.
 

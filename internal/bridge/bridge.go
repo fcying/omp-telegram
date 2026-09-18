@@ -66,7 +66,9 @@ type confirmation struct {
 	expires              time.Time
 	generation           int64
 	user                 int64
+	messageID            int64
 	sessions             []omp.SessionSummary
+	models               []omp.ModelRole
 	page                 int
 }
 type worker struct {
@@ -100,6 +102,7 @@ type worker struct {
 	progressSuppressed  bool
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
+	keyboardCleanup     chan int64
 	mediaResults        chan mediaResult
 	sendResults         chan sendResult
 	hostRequests        map[string]context.CancelFunc
@@ -145,6 +148,8 @@ type progressTool struct {
 
 type operationResult struct {
 	generation int64
+	kind       string
+	cancelled  bool
 	err        error
 }
 type callbackResult bool
@@ -195,9 +200,13 @@ var botCommands = []telegram.BotCommand{
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
 	{Command: "resume", Description: "Choose an omp session in this working directory"},
-	{Command: "status", Description: "Show workspace, model and queue"},
-	{Command: "model", Description: "Show or switch model: /model provider/model"},
+	{Command: "status", Description: "Show session, model, context, speed and queue"},
+	{Command: "name", Description: "Name the omp session: /name <title>"},
+	{Command: "model", Description: "Choose a cycle role or /model provider/model"},
+	{Command: "thinking", Description: "Choose the thinking level for this session"},
+	{Command: "fast", Description: "Choose fast mode: /fast [on|off|status]"},
 	{Command: "compact", Description: "Compact context after confirmation"},
+	{Command: "handoff", Description: "Run native handoff: /handoff [instructions]"},
 	{Command: "help", Description: "Show usage help"},
 }
 
@@ -592,7 +601,16 @@ func (w *worker) run() {
 			if result.generation == w.binding.Generation && w.client != nil {
 				w.compacting = false
 				w.busy = false
-				if result.err != nil {
+				if result.kind == "handoff" {
+					switch {
+					case result.err != nil:
+						w.say("Handoff failed or its outcome is uncertain. It will not be replayed automatically.")
+					case result.cancelled:
+						w.say("Handoff canceled without a result.")
+					default:
+						w.say("Handoff completed.")
+					}
+				} else if result.err != nil {
 					w.say("Compaction failed.")
 				} else {
 					w.say("Compaction completed.")
@@ -638,7 +656,7 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 	w.finalAssistantTexts = nil
 	w.lastAssistant = nil
 	w.stream.Reset()
-	w.confirms = map[string]confirmation{}
+	w.clearConfirmations()
 	if w.client != nil {
 		w.client.Close()
 		w.client = nil
@@ -687,7 +705,7 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 	}
 	old, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && old.Workspace == "" {
-		return "", errors.New("First use requires /new <name or project path>.")
+		return resolveWorkspace(w.b.cfg.WorkspaceRoot, w.b.cfg.WorkspaceRoot)
 	}
 	if err != nil {
 		return "", errors.New("Failed to read the session binding.")
@@ -784,7 +802,6 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			}
 			w.active = 0
 			w.busy = false
-			w.confirms = map[string]confirmation{}
 		}
 	}
 	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs})
@@ -948,7 +965,6 @@ func (w *worker) handle(in incoming) {
 		w.shutdown()
 		w.active = 0
 		w.busy = false
-		w.confirms = map[string]confirmation{}
 		w.say("The instance is closed. The session has been preserved.")
 	case "/stop":
 		w.clearQueue()
@@ -961,29 +977,50 @@ func (w *worker) handle(in incoming) {
 		w.say("Abort requested and queued prompts cleared.")
 	case "/status":
 		w.status()
-	case "/model":
+	case "/name":
+		if arg == "" {
+			w.say("Usage: /name <session title>")
+			return
+		}
 		if w.client == nil {
 			w.say("No instance is running.")
 			return
 		}
-		if arg == "" {
-			w.status()
+		if _, err := w.call("set_session_name", map[string]any{"name": arg}); err != nil {
+			w.say("The session name change could not be confirmed. Use /status to check before retrying.")
 			return
 		}
-		if w.busy {
-			w.say("Wait for the current task to finish before switching models.")
+		w.say("Session named: " + menuText(arg, 160))
+	case "/model":
+		if arg == "" {
+			w.showModelPicker(in.msg.From.ID)
 			return
 		}
 		provider, model, ok := strings.Cut(arg, "/")
 		if !ok || provider == "" || model == "" {
-			w.say("Usage: /model provider/model")
+			w.say("Usage: /model or /model provider/model")
 			return
 		}
-		if _, e := w.call("set_model", map[string]any{"provider": provider, "modelId": model}); e != nil {
-			w.say("Failed to switch models.")
-		} else {
-			w.say("Model switched.")
+		w.switchModel(provider, model)
+	case "/thinking":
+		if arg != "" {
+			w.say("Usage: /thinking")
+			return
 		}
+		w.showThinkingPicker(in.msg.From.ID)
+	case "/fast":
+		switch arg {
+		case "":
+			w.showFastPicker(in.msg.From.ID)
+		case "on", "off":
+			w.switchFast(arg == "on")
+		case "status":
+			w.showFastStatus()
+		default:
+			w.say("Usage: /fast [on|off|status]")
+		}
+	case "/handoff":
+		w.handoff(arg)
 	case "/compact":
 		if w.client == nil || w.busy {
 			w.say("An idle instance is required.")
@@ -994,6 +1031,39 @@ func (w *worker) handle(in incoming) {
 		w.say("Unsupported command. Use /help.")
 	}
 }
+func (w *worker) handoff(instructions string) {
+	if w.client == nil {
+		w.say("No instance is running.")
+		return
+	}
+	if w.busy || w.compacting || w.finishing || len(w.queue) != 0 {
+		w.say("Wait for the current task and queue to finish before handoff.")
+		return
+	}
+	var fields map[string]any
+	if instructions != "" {
+		fields = map[string]any{"customInstructions": instructions}
+	}
+	w.busy, w.compacting = true, true
+	client, generation := w.client, w.binding.Generation
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		raw, err := client.Call(w.ctx, "handoff", fields)
+		var result *struct {
+			SavedPath string `json:"savedPath"`
+		}
+		if err == nil {
+			err = json.Unmarshal(raw, &result)
+		}
+		select {
+		case w.operations <- operationResult{generation: generation, kind: "handoff", cancelled: result == nil, err: err}:
+		case <-w.ctx.Done():
+		}
+	}()
+	w.say("Handoff requested.")
+}
+
 func (w *worker) status() {
 	if w.client == nil {
 		n, _ := w.b.db.Uncertain()
@@ -1005,15 +1075,13 @@ func (w *worker) status() {
 		w.say("Failed to read the session state.")
 		return
 	}
-	var s struct {
-		Model        struct{ Provider, ID string }
-		IsStreaming  bool `json:"isStreaming"`
-		IsCompacting bool `json:"isCompacting"`
-	}
+	var s statusState
 	if json.Unmarshal(raw, &s) != nil {
+		w.say("Failed to read the session state.")
 		return
 	}
-	w.say(fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s/%s\nRunning: %t\nCompacting: %t\nQueued: %d", w.binding.Workspace, w.sessionID, s.Model.Provider, s.Model.ID, s.IsStreaming, s.IsCompacting, len(w.queue)))
+	home, _ := os.UserHomeDir()
+	w.say(formatStatus(s, w.binding.Workspace, w.sessionID, home, len(w.queue)))
 }
 func (w *worker) dispatch() {
 	if w.client == nil || w.busy || w.compacting || w.finishing || len(w.queue) == 0 {
@@ -1088,7 +1156,7 @@ func (w *worker) finish() {
 		w.busy = false
 		w.preview = ""
 		w.stream.Reset()
-		w.confirms = map[string]confirmation{}
+		w.clearConfirmations()
 	} else if w.preview != "" {
 		w.say(w.preview)
 	}
@@ -1143,7 +1211,7 @@ func (w *worker) finishIncomplete(state, notice string) {
 	w.lastAssistant = nil
 	w.finalAssistantTexts = nil
 	w.stream.Reset()
-	w.confirms = map[string]confirmation{}
+	w.clearConfirmations()
 	if w.previewBusy {
 		w.finishing = true
 		return
@@ -1570,26 +1638,37 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	if c.user == 0 {
 		c.user = w.owner
 	}
-	w.confirms[token] = c
 	k := &telegram.Keyboard{}
 	for i, label := range options {
 		k.InlineKeyboard = append(k.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}})
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
-	if _, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, k); e != nil {
-		delete(w.confirms, token)
+	message, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, k)
+	if e != nil {
 		w.cancelUI(c)
 		w.say("Failed to send the confirmation. The operation was canceled.")
+		return
 	}
+	c.messageID = message.MessageID
+	w.confirms[token] = c
 }
 func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 	token, index, ok := strings.Cut(q.Data, ":")
 	c, exists := w.confirms[token]
-	if !ok || !exists || time.Now().After(c.expires) || c.generation != w.binding.Generation || c.user != q.From.ID {
+	if !ok || !exists || c.user != q.From.ID {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return callbackDone
+	}
+	if time.Now().After(c.expires) || c.generation != w.binding.Generation {
+		delete(w.confirms, token)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		w.clearKeyboard(c.messageID)
+		if c.generation == w.binding.Generation {
+			w.cancelUI(c)
+		}
 		return callbackDone
 	}
 	n, err := strconv.Atoi(index)
@@ -1599,13 +1678,15 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
 	if c.action == "resume" {
 		delete(w.confirms, token)
-		var messageID int64
-		if q.Message != nil {
+		messageID := c.messageID
+		if messageID == 0 && q.Message != nil {
 			messageID = q.Message.MessageID
 		}
 		w.selectResume(c, n, messageID)
 		return callbackDone
 	}
+	delete(w.confirms, token)
+	w.clearKeyboard(c.messageID)
 	if c.action == "ui" {
 		frame := map[string]any{"type": "extension_ui_response", "id": c.uiID}
 		if c.method == "confirm" {
@@ -1615,6 +1696,8 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		} else {
 			frame["cancelled"] = true
 		}
+		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+		defer cancel()
 		if w.client == nil || w.client.Send(ctx, frame) != nil {
 			w.say("The confirmation could not be delivered to omp. Its state is uncertain and the instance has been closed.")
 			w.shutdown()
@@ -1623,10 +1706,22 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			w.busy = false
 			return callbackUncertain
 		}
-		delete(w.confirms, token)
 		return callbackDone
 	}
-	delete(w.confirms, token)
+	if c.action == "model" {
+		w.selectModel(c, n)
+		return callbackDone
+	}
+	if c.action == "thinking" {
+		w.selectThinking(c, n)
+		return callbackDone
+	}
+	if c.action == "fast" {
+		if n < len(c.options) {
+			w.switchFast(c.options[n] == "on")
+		}
+		return callbackDone
+	}
 	if n != 0 {
 		return callbackDone
 	}
@@ -1655,12 +1750,47 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			defer w.background.Done()
 			_, err := client.Call(w.ctx, "compact", nil)
 			select {
-			case w.operations <- operationResult{generation, err}:
+			case w.operations <- operationResult{generation: generation, err: err}:
 			case <-w.ctx.Done():
 			}
 		}()
 	}
 	return callbackDone
+}
+
+func (w *worker) clearKeyboard(messageID int64) {
+	if messageID == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	_ = w.b.tg.ClearKeyboard(ctx, w.key.chat, messageID)
+}
+
+func (w *worker) queueKeyboardCleanup(messageID int64) {
+	if messageID == 0 || w.ctx.Err() != nil {
+		return
+	}
+	if w.keyboardCleanup == nil {
+		w.keyboardCleanup = make(chan int64, 32)
+		w.background.Add(1)
+		go func() {
+			defer w.background.Done()
+			for {
+				select {
+				case <-w.ctx.Done():
+					return
+				case id := <-w.keyboardCleanup:
+					w.clearKeyboard(id)
+				}
+			}
+		}()
+	}
+	// Tokens are already invalidated; UI cleanup is expendable under backpressure.
+	select {
+	case w.keyboardCleanup <- messageID:
+	default:
+	}
 }
 
 func (w *worker) cancelStart() bool {
@@ -1697,8 +1827,8 @@ func (w *worker) ui(e rpcEvent) {
 		w.say("Input dialogs are not supported and have been canceled. Provide the information in a normal message.")
 	case "cancel":
 		for token, c := range w.confirms {
-			if c.uiID == e.TargetID {
-				delete(w.confirms, token)
+			if c.action == "ui" && c.uiID != "" && c.uiID == e.TargetID {
+				w.dropConfirmation(token, c)
 			}
 		}
 	}
@@ -1710,11 +1840,27 @@ func (w *worker) cancelUI(c confirmation) {
 		_ = w.client.Send(ctx, map[string]any{"type": "extension_ui_response", "id": c.uiID, "cancelled": true})
 	}
 }
+
+// Programmatic invalidation does not send native UI replies. The caller owns
+// that decision, since native cancellation and old generations must not echo.
+func (w *worker) dropConfirmation(token string, c confirmation) {
+	delete(w.confirms, token)
+	w.queueKeyboardCleanup(c.messageID)
+}
+
+func (w *worker) clearConfirmations() {
+	for token, c := range w.confirms {
+		w.dropConfirmation(token, c)
+	}
+}
+
 func (w *worker) expire() {
 	for token, c := range w.confirms {
 		if time.Now().After(c.expires) {
-			delete(w.confirms, token)
-			w.cancelUI(c)
+			w.dropConfirmation(token, c)
+			if c.generation == w.binding.Generation {
+				w.cancelUI(c)
+			}
 		}
 	}
 }

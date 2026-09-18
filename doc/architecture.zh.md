@@ -147,6 +147,26 @@ Telegram client 在传输边界区分错误:
 
 `/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
 
+无参数 `/new` 优先沿用对话保存的工作目录. 没有历史目录时解析并使用 `workspace_root` 本身, 不另建按对话划分的子目录. 数据库读取失败仍报错, 不回退默认目录. 选择同一目录的对话共享文件, 不共享原生 session 身份.
+
+合法的最终选择或取消会先消费 confirmation token, 再尽力通过 `editMessageReplyMarkup` 移除 inline keyboard, 不修改消息正文. 清理失败不阻止实际操作. 翻页直接更新原菜单. 已知的过期菜单也会清理; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启持久化.
+
+定时过期处理在 worker 内使 token 失效, 随后非阻塞提交键盘清理, 不等待 Telegram. 每个 worker 只有一个清理消费者, 最多缓存 32 个 message ID; 队列满时放弃尽力而为的按钮移除, 但 token 仍然失效. 每个请求超时五秒, worker 取消时停止消费者, 因此 UI 清理阻塞不会拖住控制命令或终结事件. 用户主动选择仍保持先清按钮再执行操作的原顺序.
+
+程序主动失效也统一使用该有界清理队列: 取消 resume 列表, 原生 UI cancel, 关闭/替换实例和任务终结都会删除 token, 并把已知菜单 message ID 加入清理队列. 失效 helper 不发送原生 UI 回复; 只有明确的本地取消路径才发送, 且只作用于当前 generation. 不向 OMP 回送原生 cancel 事件. 清理仍是尽力而为, worker context 已取消或队列溢出时不保证移除按钮.
+
+`/model` 在 worker 工作目录通过只读 `omp config get ... --json` 子进程读取 `cycleOrder` 和 `modelRoles`. 按参数顺序把 `--config` 文件追加到查询子进程继承的 `PI_CONFIG_FILES`, 由 OMP 自己合并覆盖配置. 支持两种参数写法, 工作目录相对路径和 `~/` 展开. 包含环境列表分隔符的路径通过继承的只读文件描述符传递, 避免被拆成不同文件. 不修改配置文件或父进程环境. 不通过切换模型枚举角色, 不重复实现 selector 解析. 选择角色时发送原生本地命令 `/model @role`, 并用 `get_state` 验证成功后的模型标识; 不转发原始命令输出. 切换要求原生与 bridge 都空闲且 bridge 队列为空. 尚不支持的 `--profile`, `--smol`, `--slow`, `--plan` 覆盖项仍会禁用角色菜单, 但可手动指定模型. 原生角色命令结果不确定时使 client 失效.
+
+`/thinking` 复用模型选择的 owner/generation/过期与空闲检查. 只有合法按钮被消费后才发送 `set_thinking_level`, 随后读取 `get_state.thinkingLevel`, 报告原生调整后的实际等级而不是回显请求值. 通过 OMP 现有 RPC 修改会话状态, 不编辑 OMP 配置文件, 不启动 agent turn.
+
+`/fast` 打开绑定 owner 的开关菜单; `/fast on` 和 `/fast off` 仅在空闲且队列为空时调用原生 `set_fast_mode`. 回复分别使用原生返回的 `enabled` 和 `active`, 不把请求设置等同于实际生效状态. 模型不支持或请求失败时不提示成功. `/fast status` 只读取原生状态, 任务运行中也可使用. Provider 支持与服务等级行为仍由 OMP 负责.
+
+`/status` 只解码 `get_state` 的安全白名单字段. 当前用户 home 下的目录缩写为 `~`, 会话标题同时保留短原生 ID. Thinking 表示实际生效等级, 不代表是否配置 auto. Fast 显示实际启用状态, 与设置不同时单独注明设置值. Context 按 OMP 返回的 `contextUsage.percent` 百分数直接显示, 仅在未返回该值时用 token 用量/窗口推算; 速度使用原生 `tokensPerSecond`. 缺失指标显示 `n/a`, 与零值区分. `Queued` 仅统计 bridge 延后 prompt. 不渲染原始模型配置, header, system prompt 或原生队列数量.
+
+`/name <名称>` 对运行中的实例调用原生 `set_session_name`. 它走控制命令路径, 不排在 prompt 后面, 不打断当前任务. 不改变 session 身份或工作目录, 不重命名 Telegram topic. 名称持久化由 OMP 管理, 包括尚未写入历史的新会话处理; bridge 不在 SQLite 另存标题副本. `/status` 从原生状态读取名称.
+
+`/handoff [补充要求]` 直接调用原生 `handoff`, 可携带 `customInstructions`; 摘要生成和上下文维护仍由 OMP 负责. 要求实例空闲且 bridge 队列为空, 复用现有异步维护结果通道, 按 generation 隔离旧结果. bridge 不创建替代 session, 不自行生成交接文档, 不重放失败或结果不确定的操作. 等待结果时仍可处理本地 `/help` 和 `/close`. 其他 RPC 命令遵循 OMP 自身串行规则, 不承诺 `/stop` 能立即中断 handoff.
+
 每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的自动恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. `/close` 会先删除待完成意图, 再关闭当前绑定.
 
 `running` 表示恢复资格, 不是实时 PID 状态:

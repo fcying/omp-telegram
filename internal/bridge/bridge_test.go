@@ -27,6 +27,21 @@ import (
 
 // This subprocess speaks RPC to exercise the real pipe and actor boundaries.
 func TestMain(m *testing.M) {
+	if len(os.Args) == 5 && os.Args[1] == "config" && os.Args[2] == "get" && os.Args[4] == "--json" {
+		var value any
+		switch os.Args[3] {
+		case "cycleOrder":
+			value = []string{"smol", "default", "slow", "free"}
+		case "modelRoles":
+			value = map[string]string{"smol": "fixture/quick:low", "default": "fixture/safe:medium", "slow": "fixture/deep:high", "free": "fixture/free:off"}
+		default:
+			os.Exit(2)
+		}
+		if json.NewEncoder(os.Stdout).Encode(map[string]any{"key": os.Args[3], "value": value}) != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "acp" {
 		runResumeListFixture()
 		os.Exit(0)
@@ -88,6 +103,12 @@ func TestMain(m *testing.M) {
 		sessionID := strings.TrimSuffix(filepath.Base(session), ".jsonl")
 		emit(map[string]any{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": []int{1, 2}, "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
 		streaming := false
+		modelProvider, modelID := "fixture", "safe"
+		thinkingLevel := "medium"
+		fastEnabled, fastActive := false, false
+		sessionName := ""
+		rootPrompts := 0
+		uiReplies := 0
 		scan := bufio.NewScanner(os.Stdin)
 		for scan.Scan() {
 			var cmd map[string]any
@@ -98,6 +119,7 @@ func TestMain(m *testing.M) {
 			resp := map[string]any{"type": "response", "id": cmd["id"], "command": typ, "success": true}
 			switch typ {
 			case "extension_ui_response":
+				uiReplies++
 				continue
 			case "host_tool_result":
 				text := "attachment accepted"
@@ -108,9 +130,63 @@ func TestMain(m *testing.M) {
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				continue
 			case "get_state":
-				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "model": map[string]any{"provider": "fixture", "id": "safe", "headers": map[string]string{"Authorization": "SECRET"}}, "systemPrompt": "PRIVATE"}
+				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies}
+			case "set_session_name":
+				name, _ := cmd["name"].(string)
+				if strings.TrimSpace(name) == "" || modelID == "reject-name" {
+					resp["success"] = false
+				} else {
+					sessionName = strings.TrimSpace(name)
+				}
+			case "handoff":
+				if streaming {
+					resp["success"] = false
+				} else if cmd["customInstructions"] == "hold" {
+					continue
+				} else if cmd["customInstructions"] == "cancel" {
+					resp["data"] = nil
+				} else if cmd["customInstructions"] == "fail" {
+					resp["success"] = false
+				} else {
+					resp["data"] = map[string]any{}
+				}
+			case "set_fast_mode":
+				enabled, ok := cmd["enabled"].(bool)
+				if !ok || (enabled && modelID == "no-fast") {
+					resp["success"] = false
+				} else {
+					fastEnabled = enabled
+					fastActive = enabled && modelID != "fast-fallback"
+					resp["data"] = map[string]bool{"enabled": fastEnabled, "active": fastActive}
+				}
+			case "set_model":
+				modelProvider, _ = cmd["provider"].(string)
+				modelID, _ = cmd["modelId"].(string)
+				resp["data"] = map[string]string{"provider": modelProvider, "id": modelID}
+			case "set_thinking_level":
+				level, _ := cmd["level"].(string)
+				if modelID == "reject-thinking" {
+					resp["success"] = false
+				} else if level == "max" {
+					thinkingLevel = "high"
+				} else {
+					thinkingLevel = level
+				}
+			case "cycle_model":
+				os.Exit(2)
 			case "prompt":
 				text, _ := cmd["message"].(string)
+				if strings.HasPrefix(text, "/model @") {
+					id, ok := map[string]string{"smol": "quick", "default": "safe", "slow": "deep", "free": "free"}[strings.TrimPrefix(text, "/model @")]
+					if !ok {
+						os.Exit(2)
+					}
+					modelProvider, modelID = "fixture", id
+					emit(map[string]any{"type": "command_output", "text": "Model set to " + modelProvider + "/" + modelID + "."})
+					resp["data"] = map[string]any{"agentInvoked": false}
+					emit(resp)
+					continue
+				}
 				if text == "/session info" {
 					cwd, err := os.Getwd()
 					if err != nil {
@@ -121,6 +197,7 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
+				rootPrompts++
 				if text == "failed-prompt-ack" {
 					emit(map[string]any{"type": "agent_start"})
 					resp["success"] = false
@@ -190,18 +267,21 @@ func TestMain(m *testing.M) {
 }
 
 type fakeHTTP struct {
-	mu             sync.Mutex
-	messages       []map[string]any
-	callbacks      []string
-	updates        chan telegram.Update
-	rejectCommands bool
-	rejectLanguage string
-	files          map[string][]byte
-	failProgress   bool
-	progressCalls  int
-	downloadGate   <-chan struct{}
-	fileRequests   int
-	uploads        []mediaUpload
+	mu                sync.Mutex
+	messages          []map[string]any
+	callbacks         []string
+	updates           chan telegram.Update
+	rejectCommands    bool
+	rejectLanguage    string
+	files             map[string][]byte
+	failProgress      bool
+	progressCalls     int
+	downloadGate      <-chan struct{}
+	fileRequests      int
+	uploads           []mediaUpload
+	keyboardClears    []map[string]any
+	failKeyboardClear bool
+	keyboardClearGate <-chan struct{}
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -241,6 +321,22 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		id := len(f.messages)
 		f.mu.Unlock()
 		result = map[string]any{"message_id": id}
+	case "editMessageReplyMarkup":
+		f.mu.Lock()
+		f.keyboardClears = append(f.keyboardClears, req)
+		fail := f.failKeyboardClear
+		gate := f.keyboardClearGate
+		f.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}
+		if fail {
+			return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"ok":false,"error_code":400,"description":"keyboard cleanup failed"}`)), Header: make(http.Header), Request: r}, nil
+		}
 	case "answerCallbackQuery":
 		f.mu.Lock()
 		f.callbacks = append(f.callbacks, req["text"].(string))
@@ -1274,18 +1370,21 @@ func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 	}
 }
 
-func TestUnboundNewDoesNotAllocate(t *testing.T) {
+func TestUnboundNewUsesWorkspaceRoot(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
+	root := filepath.Join(w.b.cfg.WorkspaceRoot, "default-workspace")
+	w.b.cfg.WorkspaceRoot = root
 	command("/new")
-	if w.client != nil || len(w.b.slots) != 0 {
-		t.Fatal("unbound new allocated a worker")
+	if w.client == nil {
+		t.Fatal("unbound new did not start a native session")
 	}
-	if _, err := w.b.db.Binding(99, -10, 11); err == nil {
-		t.Fatal("unbound new persisted a binding")
+	binding, err := w.b.db.Binding(99, -10, 11)
+	if err != nil || binding.Workspace != root || !binding.Running {
+		t.Fatalf("default workspace binding = %+v, err=%v", binding, err)
 	}
-	entries, err := os.ReadDir(w.b.cfg.WorkspaceRoot)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("unbound new changed workspace root: %v, %v", entries, err)
+	info, err := w.client.SessionInfo(w.ctx)
+	if err != nil || info.CWD != root {
+		t.Fatalf("native default directory = %q, err=%v", info.CWD, err)
 	}
 }
 

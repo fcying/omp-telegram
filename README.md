@@ -107,26 +107,38 @@ With the default workspace root, this creates or opens `workspace/demo` beside t
 
 Wait for the ready message, then send ordinary text. Missing directories are created; existing files are not copied or cleared.
 
+For a first session, plain `/new` uses `workspace_root` itself (by default, `workspace/` beside the executable). Later uses keep this conversation's last selected directory. Different conversations using the default have independent sessions but share files; use `/new <project-name>` for separate project directories.
+
 ## Conversation commands
 
 | Command | What it does |
 | --- | --- |
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running instance requires confirmation |
-| `/new` | Start a fresh session in this conversation's previously selected directory |
+| `/new` | Start a fresh session in the previous directory, or `workspace_root` if none was selected |
 | `/stop` | Stop the current task and clear queued prompts, keeping the session open |
 | `/close` | Close the omp instance, preserving files and session history |
 | `/resume` | Choose a saved omp session in the current directory using paginated buttons |
 | `/resume <session ID>` | Restore a native omp session and its original directory; close any running instance first |
-| `/status` | Show the directory, session ID, model, activity, and queue |
-| `/model` | Show the current status and model |
+| `/status` | Show workspace, session title/ID, model, thinking, fast mode, context usage, activity, queue, and speed |
+| `/name <title>` | Name the current omp session, e.g. `/name Bugfix HAL`; does not rename the Telegram topic |
+| `/model` | Choose a configured OMP cycle role with buttons; shows the current model |
 | `/model provider/model` | Switch models while idle |
+| `/thinking` | Choose the thinking level while idle; shows the current level |
+| `/fast [on\|off\|status]` | Choose fast mode with buttons, explicitly enable/disable it, or show setting and actual activity |
 | `/compact` | Compact context while idle, after confirmation |
+| `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue; optional instructions guide the handoff |
 | `/review [arguments]` | Run omp's native `/review` command as an independent task |
 | `/help` | Show help |
 
 All commands above, including `/new <name or path>` and `/resume`, work in ordinary private chats as well as topics. An ordinary private chat uses `(chat, 0)` with the same worker and session lifecycle as a topic; no separate private-chat worker or database migration is needed. `/followup` remains unsupported.
 
 Ordinary text, attachments, and `/review` are independent tasks queued by the bridge and run sequentially within each conversation. Messages sent while a task is running wait for it to finish. `/stop` clears the bridge queue, then sends a plain `abort` request to stop the current task.
+
+The model picker follows OMP's `cycleOrder` roles, such as `smol`, `default`, and `slow`, rather than listing every available model. OMP resolves the selected role and its thinking setting. Opening the menu does not switch models; selecting requires an idle instance with an empty queue. Buttons disappear after selection, and the reply reports the actual selected model. Manual `/model provider/model` remains available.
+
+The role picker supports `omp_args` with `--config path` or `--config=path`, including multiple files in their original order. The native query loads inherited `PI_CONFIG_FILES` first, followed by these overlays; relative paths are resolved from the worker workspace. It does not rewrite configuration files. Runtime `--profile`, `--smol`, `--slow`, and `--plan` overrides still require explicit `/model provider/model` selection.
+
+`/thinking` offers the fixed levels `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. The menu marks the current effective level; OMP may adjust the requested level for the current model. The bridge does not send the undocumented `auto` value through `set_thinking_level`. Existing OMP configuration and model-role thinking settings remain unchanged.
 
 Bot menus, buttons, and service messages are in English. You can write prompts in any language; model replies are not translated by the service.
 

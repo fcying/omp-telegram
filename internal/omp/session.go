@@ -15,8 +15,9 @@ type SessionInfo struct {
 }
 
 type metadataQuery struct {
-	id     string
-	output chan string
+	id        string
+	modelRole bool
+	output    chan string
 }
 
 // SessionInfo queries the local /session command without starting an agent turn.
@@ -109,7 +110,14 @@ func (c *Client) captureMetadata(frame json.RawMessage) bool {
 	var event struct {
 		Text string `json:"text"`
 	}
-	if json.Unmarshal(frame, &event) != nil || !strings.HasPrefix(event.Text, "Session: "+query.id+"\n") {
+	if json.Unmarshal(frame, &event) != nil {
+		return false
+	}
+	if query.modelRole {
+		if _, ok := parseModelOutput(event.Text); !ok {
+			return false
+		}
+	} else if !strings.HasPrefix(event.Text, "Session: "+query.id+"\n") {
 		return false
 	}
 	select {

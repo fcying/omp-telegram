@@ -52,7 +52,7 @@ func (w *worker) cancelResumeList() {
 	}
 	for token, c := range w.confirms {
 		if c.action == "resume" {
-			delete(w.confirms, token)
+			w.dropConfirmation(token, c)
 		}
 	}
 }
@@ -199,32 +199,38 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		add("Next")
 	}
 	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: "Cancel", CallbackData: fmt.Sprintf("%s:%d", token, len(c.options))}})
-	w.confirms[token] = c
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
 	var err error
 	if messageID != 0 {
 		err = w.b.tg.Edit(ctx, w.key.chat, messageID, text.String(), keyboard)
 	} else {
-		_, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text.String(), keyboard)
+		var message telegram.Message
+		message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text.String(), keyboard)
+		messageID = message.MessageID
 	}
 	if err != nil {
-		delete(w.confirms, token)
 		w.say("Failed to display the session selection menu. Use /resume to try again.")
+		return
 	}
+	c.messageID = messageID
+	w.confirms[token] = c
 }
 
 func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 	if w.resumeBusy() {
+		w.clearKeyboard(messageID)
 		w.say("The conversation is busy. Use /resume again after the task and queue finish.")
 		return
 	}
 	start, end := c.page*resumePageSize, min((c.page+1)*resumePageSize, len(c.sessions))
 	if start < 0 || start >= len(c.sessions) || index < 0 {
+		w.clearKeyboard(messageID)
 		return
 	}
 	rows := end - start
 	if index < rows {
+		w.clearKeyboard(messageID)
 		selected := c.sessions[start+index]
 		if !sameWorkspace(selected.CWD, c.workspace) {
 			w.say("The selected session is not in this working directory.")
@@ -260,10 +266,6 @@ func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 		rows++
 	}
 	if index == rows {
-		if messageID != 0 {
-			ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
-			defer cancel()
-			_ = w.b.tg.Edit(ctx, w.key.chat, messageID, "Session selection canceled.", &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}})
-		}
+		w.clearKeyboard(messageID)
 	}
 }

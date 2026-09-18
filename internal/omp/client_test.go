@@ -14,6 +14,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		fixtureModelConfig()
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "acp" {
 		fixtureACP()
 		os.Exit(0)
@@ -31,6 +35,9 @@ func TestMain(m *testing.M) {
 				os.Exit(1)
 			}
 			if fixtureSessionCommand(command) {
+				continue
+			}
+			if fixtureModelCommand(command) {
 				continue
 			}
 			switch command["type"] {
