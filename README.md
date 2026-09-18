@@ -2,16 +2,16 @@
 
 [中文版](README.zh.md)
 
-Use [Oh My Pi](https://github.com/can1357/oh-my-pi) from Telegram topics. Each topic runs a separate omp session in a working directory you choose. Messages queue within a topic; different topics can work concurrently.
+Use [Oh My Pi](https://github.com/can1357/oh-my-pi) from Telegram private chats and topics. Each ordinary private chat or topic runs a separate omp session in a working directory you choose. Messages queue within a conversation; different conversations can work concurrently.
 
 Supports text conversations, images and files, session selection, and restoring active sessions after a service restart. Your existing omp model, credentials, tools, and session history remain managed by omp.
 
 ## Requirements
 
 - Linux, on amd64 or arm64.
-- A working omp installation and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
+- An omp installation supporting RPC protocol v2 and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
 - Access to Telegram and your model provider.
-- A Telegram bot and a chat with topics enabled. Group topics and topic-enabled private bot chats are supported; ordinary unthreaded chats are not.
+- A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -45,9 +45,11 @@ This installs the binary to `~/tool/omp-telegram/omp-telegram`. Use `just instal
 ### 1. Prepare Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and keep its token private.
-2. Enable topics and create a topic to use. In a group, add the bot and allow it to send messages. For private chats, enable the bot's topic/threaded mode. This service does not create topics.
+2. For an ordinary private chat, open the bot and press Start; no topic mode is required. To use topics instead, enable the bot's topic/threaded mode for private chats, or add the bot to a topic-enabled group and allow it to send messages. Create a topic yourself; this service does not create topics.
 3. For groups, ensure the bot receives ordinary messages, not just commands. Disable privacy mode with BotFather's `/setprivacy`, following any instructions to re-add the bot, or grant the necessary administrator permissions.
 4. Obtain your numeric user ID and chat ID. Before starting this service, use a Bot API client you control to inspect `message.from.id` and `message.chat.id` in [getUpdates](https://core.telegram.org/bots/api#getupdates). Never give your bot token to an ID lookup website. Send as your personal account, not an anonymous administrator or channel.
+
+For the simplest setup, use an ordinary private chat with the bot. Topics are optional for private use and let you run multiple independent OMP sessions or projects in one Telegram chat. In groups, topics are required.
 
 ### 2. Prepare the configuration
 
@@ -91,7 +93,7 @@ Keep the token private. Typing it directly into a shell may leave it in command 
 
 `--check` validates local configuration, finds the omp executable, and creates the configured data/workspace directories; it does not test Telegram or model authentication. The second command runs in the foreground; Ctrl-C stops the service.
 
-### 4. Start a conversation in a topic
+### 4. Start a conversation in a private chat or topic
 
 ```text
 /new demo
@@ -105,12 +107,12 @@ With the default workspace root, this creates or opens `workspace/demo` beside t
 
 Wait for the ready message, then send ordinary text. Missing directories are created; existing files are not copied or cleared.
 
-## Topic commands
+## Conversation commands
 
 | Command | What it does |
 | --- | --- |
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running instance requires confirmation |
-| `/new` | Start a fresh session in this topic's previously selected directory |
+| `/new` | Start a fresh session in this conversation's previously selected directory |
 | `/stop` | Stop the current task and clear queued prompts, keeping the session open |
 | `/close` | Close the omp instance, preserving files and session history |
 | `/resume` | Choose a saved omp session in the current directory using paginated buttons |
@@ -119,16 +121,19 @@ Wait for the ready message, then send ordinary text. Missing directories are cre
 | `/model` | Show the current status and model |
 | `/model provider/model` | Switch models while idle |
 | `/compact` | Compact context while idle, after confirmation |
-| `/help`, `/start` | Show help |
+| `/review [arguments]` | Run omp's native `/review` command as an independent task |
+| `/help` | Show help |
 
-Use `/status` or the ready message to find the native omp session ID. Prefer the full ID when restoring. The `/resume` picker requires an idle topic with no queued prompts. Ordinary messages never start a new instance by themselves, and unsupported slash commands are not forwarded to omp.
+All commands above, including `/new <name or path>` and `/resume`, work in ordinary private chats as well as topics. An ordinary private chat uses `(chat, 0)` with the same worker and session lifecycle as a topic; no separate private-chat worker or database migration is needed. `/followup` remains unsupported.
+
+Ordinary text, attachments, and `/review` are independent tasks queued by the bridge and run sequentially within each conversation. Messages sent while a task is running wait for it to finish. `/stop` clears the bridge queue, then sends a plain `abort` request to stop the current task.
 
 Bot menus, buttons, and service messages are in English. You can write prompts in any language; model replies are not translated by the service.
 
 ### Restart and recovery
 
-- Restarting the service restores sessions that were still open. Topics closed with `/close` stay closed; `/stop` does not disable restoration.
-- Interrupted tasks are not rerun, and previously queued ordinary prompts are canceled. Check the conversation and files before deciding to resend a request.
+- Restarting the service restores sessions that were still open. Conversations closed with `/close` stay closed; `/stop` does not disable restoration.
+- Interrupted tasks are not rerun, and pending tasks, including `/review`, are canceled rather than replayed automatically. Check the conversation and files before deciding to resend a request.
 - A missing session file or working directory causes recovery to fail, not to create a replacement session. Startup or session-switch interruptions may require manual `/resume`.
 - **Send `/close` before deleting a topic.** Deleting a Telegram topic does not automatically stop its omp instance.
 
@@ -164,8 +169,8 @@ An explicitly selected missing file, an unreadable file, or invalid TOML causes 
 | `omp_args` | Extra omp arguments; defaults to optional `OMP_TELEGRAM_ARGS`. An explicit empty string disables them |
 | `data_dir` | Database, lock, and outgoing attachment storage; defaults to the executable directory |
 | `workspace_root` | Base directory for `/new <name>`; defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then executable-directory `workspace/` |
-| `max_workers` | Maximum active topic instances, default 4 |
-| `queue_capacity` | Waiting prompts per topic, default 16 |
+| `max_workers` | Maximum active conversation instances, default 4 |
+| `queue_capacity` | Waiting prompts per conversation, default 16 |
 
 Strings support `$VAR` and `${VAR}`; use `$$` for a literal dollar sign. The default references to `OMP_TELEGRAM_ARGS` and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset; other missing references fail. `.env` files and shell startup files are not loaded automatically.
 
@@ -206,7 +211,7 @@ Before upgrading, stop the service and back up its data directory, working direc
 
 Check the installed application version with `~/tool/omp-telegram/omp-telegram --version` or `-v`.
 
-- Authorize trusted users only. omp runs with the service user's filesystem permissions and environment. Separate topic sessions are not a filesystem or credential sandbox.
+- Authorize trusted users only. omp runs with the service user's filesystem permissions and environment. Separate conversation sessions are not a filesystem or credential sandbox.
 - Group members may see prompts and replies even when they cannot control the bot. The database stores message content and currently has no automatic retention cleanup.
 - A send timeout may still mean a message arrived. Do not assume a missing reply means the task did not run.
 - Prefer normal shutdown over `kill -9`; forced termination does not guarantee that every tool subprocess exits.
@@ -215,7 +220,7 @@ Check the installed application version with `~/tool/omp-telegram/omp-telegram -
 
 | Symptom | Check |
 | --- | --- |
-| Bot does not respond | Both allowlists, topic mode, group privacy settings, and whether another poller or webhook is using the bot |
+| Bot does not respond | Both allowlists, a topic when using a group, group privacy settings, and whether another poller or webhook is using the bot |
 | `omp executable not found` | The service process's `PATH`, including omp and its runtime; your interactive shell may have a different environment |
 | `/resume` shows no sessions | The selected directory and whether omp has saved history yet. A new empty session may not have a resumable file |
 | `/compact` fails | Short sessions may have nothing to compact. Check omp's model configuration if compaction also fails locally |

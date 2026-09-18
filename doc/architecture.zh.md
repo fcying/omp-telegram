@@ -6,9 +6,9 @@
 
 ## 范围与职责
 
-桥接负责 Telegram polling, 鉴权, topic 路由, 子进程启动/关闭以及可靠消息交付. 模型执行, 工具, 配置, 凭据和原生会话历史由 omp 管理.
+桥接负责 Telegram polling, 鉴权, 对话路由, 子进程启动/关闭以及可靠消息交付. 模型执行, 工具, 配置, 凭据和原生会话历史由 omp 管理.
 
-部署模型是一库一 Bot, 每个 topic 一个 worker. 不实现终端模拟, 第二份模型上下文, 多 Bot 分发器, 通用后端抽象或不确定任务的自动重放. 独立会话不等于文件系统或凭据隔离.
+部署模型是一库一 Bot, 每个对话一个 worker: 普通私聊, 私聊 topic 或群组 topic. 不支持没有 topic 的群组消息. 不实现终端模拟, 第二份模型上下文, 多 Bot 分发器, 通用后端抽象或不确定任务的自动重放. 独立会话不等于文件系统或凭据隔离.
 
 ## 模块
 
@@ -30,8 +30,8 @@
 ```mermaid
 flowchart LR
     TG[Telegram getUpdates] --> IN[inbox 与 offset 原子提交]
-    IN --> AUTH[鉴权和 topic 路由]
-    AUTH --> W[每 topic 一个 worker]
+    IN --> AUTH[鉴权和对话路由]
+    AUTH --> W[每个对话一个 worker]
     W --> Q[串行 prompt 队列]
     Q --> RPC[omp RPC client]
     RPC --> OMP[独立 omp 进程]
@@ -44,17 +44,21 @@ flowchart LR
 
 启动顺序为: 加载配置, 锁定数据目录, 初始化数据库并整理遗留状态, `getMe`, 校验数据库 Bot 归属, 注册命令, 恢复实例, 再启动 polling 和交付. `--version` 在加载配置前返回. `--check` 检查本地配置并创建配置中的目录, 不打开数据库或验证 Telegram 认证.
 
-收到的 update 先持久化, 再进行路由鉴权. 未授权输入标记为 ignored, 不能启动进程, 下载文件或执行命令. 用户和 chat 必须同时在白名单中; 没有 topic 的消息只获得操作指引, 不推断目标话题.
+收到的 update 先持久化, 再进行路由鉴权. 未授权输入标记为 ignored, 不能启动进程, 下载文件或执行命令. 用户和 chat 必须同时在白名单中, 普通私聊也必须同时允许 user ID 和相同的私聊 chat ID. 鉴权通过后, 接受非零 thread ID 或 private 类型 chat 的消息; 没有 topic 的群组消息只获得操作指引, 不推断目标话题.
 
 ### 并发模型
 
-- 每个 topic 使用 actor 风格的 worker. 普通 prompt 串行执行, 不同 worker 可并行.
+- 每个对话使用 actor 风格的 worker. 普通文字, 附件和 `/review` 都作为独立 prompt 进入 bridge 延后队列, 串行执行. bridge 只在当前任务结束后提交下一条 prompt. `/followup` 仍不支持.
 - 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
 - 附件准备和上传异步且有并发上限. 尚在准备的附件保留其队列位置.
 - RPC stdout reader 不执行 Telegram HTTP 交付. 事件缓冲有界, 协议错误或持续积压会使 client 失败, 不允许内存无限增长.
-- 全局 slot 限制活动 topic 实例数量, 原生会话列表查询另有并发上限.
+- 全局 slot 限制活动对话实例数量, 原生会话列表查询另有并发上限.
 
 Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关联响应. `Call("prompt")` 成功只代表请求被接受, 不代表任务完成. 只有 `isTerminal` 不为 `false` 的 `agent_end` 事件或本地命令完成信号才能结束任务, 非终结事件不能开始下一条排队 prompt. 终结 assistant message 的 `stopReason=error` 或非空 `errorMessage` 使输入以 `uncertain` 提交; `stopReason=aborted` 以 `cancelled` 提交; 其他有确认文本的情况以 `done` 提交. `uncertain` 和 `cancelled` 的终态结果仍可交付 partial text, 但绝不转发 provider diagnostics. 分帧和重组都有明确边界, 不回退到 PTY/ANSI 解析.
+
+### Prompt 和 interrupt 语义
+
+bridge 使用公开 RPC v2, 不依赖协议扩展. 调用 `prompt` 前, 先将该输入设为 active terminal-result owner. 成功的 acknowledgement 不需要路由分类; `agentInvoked=false` 通过正常完成流程结束本地命令, 其他已接受的 prompt 则等待终结事件. prompt 请求失败或无法确认时, 该输入以 uncertain 结束, 同时关闭该 OMP client 并取消 bridge 队列, 不重试. 不能将该 client 当作 idle 后继续复用, 否则未确认的工作可能接管后续输入的结果归属. `/stop` 先清 bridge 延后 prompt, 再发送不带清队列选项的普通 `abort` 请求. 重启或执行结果不确定后, 包括 `/review` 在内的待执行任务都不会自动重放.
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存的诊断只用于分类, 绝不出现在 Telegram 输出中.
 
@@ -65,10 +69,12 @@ RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出�
 | 身份 | 表示 |
 | --- | --- |
 | Bot | `getMe` 返回的数字 ID, 不是 token 或 username |
-| Topic | `(bot, chat, thread)` |
-| 运行实例 | Topic 加 `generation` 及当前 client |
+| 对话 | `(bot, chat, thread)`; 普通私聊使用 `thread=0` |
+| 运行实例 | 对话加 `generation` 及当前 client |
 | 已保存会话 | omp 原生 session 文件路径 |
 | 输入 update | 当前 Bot 所属数据库内唯一的 Telegram update ID |
+
+普通私聊使用现有的 `(chat, 0)` 目标及 worker/会话生命周期; topic 目标保留其 thread ID. 无需新增 worker 类型或数据库迁移. 已存储的 binding 不包含 Telegram chat 类型, 因此恢复时零 thread 目标只接受正数的私聊 chat ID, 并继续检查 chat 白名单; topic 目标沿用原有恢复行为.
 
 `CheckBot` 拒绝其他 Bot 复用数据库. `daemon.lock` 防止两个桥接进程同时使用同一数据目录. 操作者仍需避免用不同数据目录或其他 polling 客户端重复运行同一个 Bot.
 
@@ -117,7 +123,7 @@ Telegram update
 
 普通任务完成时输入必须处于 submitted, 全部最终文本分段和终态 inbox 状态在同一事务中提交. 正常终结输出为 `done`; provider/model error 为 `uncertain`; 明确的 OMP abort 为 `cancelled`. 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
 
-完成事务失败时停止 worker, 不伪装成任务完成. 重启时 submitted 输入转为 `uncertain`, 旧的 pending 普通消息取消. 待处理控制命令仍正常鉴权; 依赖内存状态的旧 callback token 会随状态丢失而失效.
+完成事务失败时停止 worker, 不伪装成任务完成. 重启时 submitted 输入转为 `uncertain`, 旧的 pending 普通消息, 附件和 `/review` 取消, 不自动重放. 其他待处理控制命令仍正常鉴权; 依赖内存状态的旧 callback token 会随状态丢失而失效.
 
 ### 输出交付
 
@@ -139,7 +145,7 @@ Telegram client 在传输边界区分错误:
 
 ## 会话生命周期
 
-`/new` 解析工作目录, 替换已有运行实例时要求确认. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, topic, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
+`/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
 
 每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的自动恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. `/close` 会先删除待完成意图, 再关闭当前绑定.
 
@@ -163,7 +169,7 @@ Telegram client 在传输边界区分错误:
 - Linux RPC/ACP 启动使用父死亡 SIGTERM. Linux 将此信号关联到创建子进程的 OS 线程, 因此线程锁定到 `Wait` 完成, 每个存活原生子进程占一个锁定线程.
 - 父死亡信号不是整个进程树 containment. 忽略信号, 后代残留, 脱离进程组或清除父死亡设置的程序, 仍需要部署层边界. 项目不强制 systemd/supervisor 配置.
 - 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `data_dir/attachments/outbox/` 私有快照后入队, 交付确认后删除快照, 失败则保留.
-- Host tool 受当前 topic/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
+- Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
 
 ## 配置与路径契约
 

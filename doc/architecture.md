@@ -6,9 +6,9 @@ This document describes the current implementation and its recovery semantics.
 
 ## Scope and ownership
 
-The bridge owns Telegram polling, authorization, topic routing, subprocess startup/shutdown, and reliable message delivery. omp owns model execution, tools, configuration, credentials, and native session history.
+The bridge owns Telegram polling, authorization, conversation routing, subprocess startup/shutdown, and reliable message delivery. omp owns model execution, tools, configuration, credentials, and native session history.
 
-The deployment model is one bot per database and one worker per topic. There is no terminal emulation, second model transcript, multi-bot dispatcher, generic backend abstraction, or automatic replay of uncertain tasks. Different sessions do not isolate filesystems or credentials.
+The deployment model is one bot per database and one worker per conversation: an ordinary private chat, private-chat topic, or group topic. Non-topic group messages are unsupported. There is no terminal emulation, second model transcript, multi-bot dispatcher, generic backend abstraction, or automatic replay of uncertain tasks. Different sessions do not isolate filesystems or credentials.
 
 ## Modules
 
@@ -30,8 +30,8 @@ The deployment model is one bot per database and one worker per topic. There is 
 ```mermaid
 flowchart LR
     TG[Telegram getUpdates] --> IN[Atomic inbox and offset commit]
-    IN --> AUTH[Authorization and topic routing]
-    AUTH --> W[Per-topic worker]
+    IN --> AUTH[Authorization and conversation routing]
+    AUTH --> W[Per-conversation worker]
     W --> Q[Sequential prompt queue]
     Q --> RPC[omp RPC client]
     RPC --> OMP[Independent omp process]
@@ -44,17 +44,21 @@ flowchart LR
 
 Startup proceeds through configuration loading, the data-directory lock, database initialization/reconciliation, `getMe`, database bot-ownership checking, command registration, restoration, then polling and delivery. `--version` returns before configuration loading. `--check` validates local configuration and creates the configured directories; it does not open the database or authenticate with Telegram.
 
-Incoming updates are persisted before routing authorization. Unauthorized inputs are marked ignored and cannot start a process, download a file, or execute a command. Users and chats must both be allowed; messages without a topic receive guidance rather than an inferred destination.
+Incoming updates are persisted before routing authorization. Unauthorized inputs are marked ignored and cannot start a process, download a file, or execute a command. Users and chats must both be allowed, including both the user ID and matching private chat ID for ordinary private chats. After authorization, messages with a nonzero thread ID or private chat type are accepted; non-topic group messages receive guidance rather than an inferred destination.
 
 ### Concurrency
 
-- Each topic has an actor-like worker. Ordinary prompts run sequentially; different workers may run concurrently.
+- Each conversation has an actor-like worker. Ordinary text, attachments, and `/review` enter the bridge's deferred queue as independent prompts and run sequentially. The bridge submits the next prompt only after the current task finishes. `/followup` remains unsupported.
 - Commands and callbacks use the worker's control path rather than waiting behind queued prompts. This does not promise that every operation is nonblocking: startup and some control RPC round trips still take time.
 - Attachment preparation and uploads are asynchronous and bounded. Pending preparation retains its queue position.
 - The RPC stdout reader never performs Telegram HTTP delivery. Its event buffers are bounded; protocol violations or overload fail the client rather than allowing unbounded growth.
-- A global slot limit bounds active topic instances. Native session-list queries have a separate concurrency limit.
+- A global slot limit bounds active conversation instances. Native session-list queries have a separate concurrency limit.
 
 The client waits for `ready`, negotiates protocol v2, serializes stdin writes, and correlates responses by request ID. A successful `Call("prompt")` means acceptance, not task completion. Only `agent_end` events whose `isTerminal` is not `false`, or a local-command completion signal, finish the task; nonterminal events must not dispatch the next queued prompt. On a terminal assistant message, `stopReason=error` or a nonempty `errorMessage` commits the input as `uncertain`; `stopReason=aborted` commits it as `cancelled`; otherwise confirmed text commits it as `done`. Partial text remains deliverable for `uncertain` and `cancelled` terminal results, while provider diagnostics are never forwarded. Framing and reassembly have explicit bounds, with no PTY/ANSI parsing fallback.
+
+### Prompt and interrupt semantics
+
+The bridge uses public RPC v2 without protocol extensions. Before calling `prompt`, it marks the input as the active terminal-result owner. A successful acknowledgement needs no routing classification; `agentInvoked=false` completes a local command through the normal completion path, while other accepted prompts await terminal events. A failed or unconfirmed prompt request settles the input as uncertain, closes that OMP client, and cancels the bridge queue without retrying. The client must not be reused as idle: unconfirmed work could otherwise take ownership of a later input's result. `/stop` clears bridge-deferred prompts, then sends a plain `abort` request without queue-clearing options. Pending tasks, including `/review`, are never replayed automatically after restart or uncertain execution.
 
 RPC v2 may compact large terminal frames and omit messages already emitted by `message_end`. The worker caches the latest assistant message's `stopReason` and `errorMessage`, plus finalized text from every assistant `message_end`; terminal `agent_end` messages take precedence, and the cache is used only when they contain no assistant message. The cache resets at `agent_start`, terminal completion, and shutdown. Cached diagnostics classify the result but never appear in Telegram output.
 
@@ -65,10 +69,12 @@ Live progress is an in-memory, best-effort view using the existing one-message p
 | Identity | Representation |
 | --- | --- |
 | Bot | Numeric ID returned by `getMe`, not its token or username |
-| Topic | `(bot, chat, thread)` |
-| Live worker incarnation | Topic plus `generation` and its current client |
+| Conversation | `(bot, chat, thread)`; ordinary private chats use `thread=0` |
+| Live worker incarnation | Conversation plus `generation` and its current client |
 | Saved conversation | Native omp session-file path |
 | Inbound update | Telegram update ID, unique within this bot-owned database |
+
+Ordinary private chats use the existing `(chat, 0)` target and worker/session lifecycle; topic targets retain their thread IDs. No new worker type or schema migration is required. Stored bindings do not contain Telegram chat type, so recovery accepts zero-thread targets only for positive private chat IDs, still enforcing the chat allowlist; topic targets keep their existing recovery behavior.
 
 `CheckBot` rejects another bot using the same database. `daemon.lock` prevents two bridge processes from opening the same data directory concurrently. Operators must still avoid running the same bot with another data directory or polling client.
 
@@ -117,7 +123,7 @@ Telegram update
 
 For ordinary tasks, completion requires a submitted input and commits all final text parts with the terminal inbox state in one transaction. Normal terminal output is `done`; a provider/model error is `uncertain`; an explicit OMP abort is `cancelled`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
 
-A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages are canceled. Pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
+A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages, attachments, and `/review` commands are canceled rather than replayed. Other pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
 
 ### Output delivery
 
@@ -139,7 +145,7 @@ There is no new automatic resend for either terminal error state. Explicit Teleg
 
 ## Session lifecycle
 
-`/new` resolves a working directory and, when replacing a live instance, requires confirmation. `/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, topic, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory.
+`/new` resolves a working directory and, when replacing a live instance, requires confirmation. `/new <name or path>`, `/resume`, and the other existing commands work in ordinary private chats and topics alike. `/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, conversation, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory.
 
 Every user-requested start first commits a `startup_intents` record with the frozen operation, target, and next generation. In the same transaction, any prior running binding becomes ineligible for automatic restoration. Only after native identity validation and host-tool registration does a second transaction publish the binding and delete the intent. `/close` deletes a pending intent before closing the current binding.
 
@@ -163,7 +169,7 @@ After restart, a committed running binding restores the exact saved session file
 - Linux RPC and ACP launches use parent-death SIGTERM. Because Linux ties this signal to the creating OS thread, that thread stays locked until `Wait` completes, costing one locked thread per live native child.
 - Parent-death signaling is not process-tree containment. Ignored signals, surviving descendants, escaped groups, or cleared parent-death settings require a deployment-level containment boundary. No systemd/supervisor configuration is imposed by the project.
 - Incoming attachments are confined to the selected workspace and retained under `.telegram/incoming/`. Outgoing files are copied to private snapshots under `data_dir/attachments/outbox/` before enqueueing. Confirmed deliveries remove snapshots; failures retain them.
-- Host tool calls are scoped to the active topic/request and cannot select another Telegram destination. Raw RPC state, provider headers, credentials, and system prompts must not be logged or sent as status output.
+- Host tool calls are scoped to the active conversation/request and cannot select another Telegram destination. Raw RPC state, provider headers, credentials, and system prompts must not be logged or sent as status output.
 
 ## Configuration and path contracts
 

@@ -124,7 +124,7 @@ func (w *worker) resumeListed(result resumeListResult) {
 		return
 	}
 	if w.resumeBusy() {
-		w.say("The topic became busy. Use /resume again when it is idle.")
+		w.say("The conversation became busy. Use /resume again when it is idle.")
 		return
 	}
 	if len(result.sessions) == 0 {
@@ -216,7 +216,7 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 
 func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 	if w.resumeBusy() {
-		w.say("The topic is busy. Use /resume again after the task and queue finish.")
+		w.say("The conversation is busy. Use /resume again after the task and queue finish.")
 		return
 	}
 	start, end := c.page*resumePageSize, min((c.page+1)*resumePageSize, len(c.sessions))
@@ -231,11 +231,11 @@ func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 			return
 		}
 		if w.client != nil && strings.EqualFold(selected.ID, w.sessionID) {
-			w.say("This omp session is already active in this topic.")
+			w.say("This omp session is already active in this conversation.")
 			return
 		}
 		if w.b.sessionInUse(selected.ID) {
-			w.say("This session is active in another topic. Close that instance first.")
+			w.say("This session is active in another conversation. Close that instance first.")
 			return
 		}
 		if !validSessionID(selected.ID) {

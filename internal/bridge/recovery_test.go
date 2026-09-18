@@ -24,18 +24,24 @@ type recoveryDaemon struct {
 	cancel context.CancelFunc
 	done   chan error
 	nextID int64
+	chat   int64
 }
 
 func newRecoveryDaemon(t *testing.T, maxWorkers int) *recoveryDaemon {
+	t.Helper()
+	return newRecoveryDaemonForChat(t, maxWorkers, -10)
+}
+
+func newRecoveryDaemonForChat(t *testing.T, maxWorkers int, chat int64) *recoveryDaemon {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	d := &recoveryDaemon{
-		t: t, root: t.TempDir(),
+		t: t, root: t.TempDir(), chat: chat,
 		fake: &fakeHTTP{updates: make(chan telegram.Update, 32)},
-		cfg:  config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: maxWorkers, QueueCapacity: 4},
+		cfg:  config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{chat}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: maxWorkers, QueueCapacity: 4},
 	}
 	old := http.DefaultTransport
 	http.DefaultTransport = d.fake
@@ -84,7 +90,12 @@ func (d *recoveryDaemon) stop() {
 func (d *recoveryDaemon) send(thread int64, text string) int64 {
 	d.t.Helper()
 	d.nextID++
-	d.fake.updates <- update(d.nextID, thread, text)
+	u := update(d.nextID, thread, text)
+	u.Message.Chat.ID = d.chat
+	if d.chat > 0 {
+		u.Message.Chat.Type = "private"
+	}
+	d.fake.updates <- u
 	return d.nextID
 }
 
@@ -95,7 +106,7 @@ func (d *recoveryDaemon) command(thread int64, text string) {
 
 func (d *recoveryDaemon) binding(thread int64) store.Binding {
 	d.t.Helper()
-	b, err := d.db.Binding(99, -10, thread)
+	b, err := d.db.Binding(99, d.chat, thread)
 	if err != nil {
 		d.t.Fatal(err)
 	}
@@ -122,6 +133,37 @@ func (d *recoveryDaemon) restored(before store.Binding) store.Binding {
 		d.t.Fatalf("restore changed session identity or lost running intent: before=%+v after=%+v", before, after)
 	}
 	return after
+}
+
+func TestForeignBotCommandsRemainIgnoredAfterRestart(t *testing.T) {
+	d := newRecoveryDaemonForChat(t, 1, 7)
+	ids := []int64{
+		d.send(0, "/status@OtherBot"),
+		d.send(0, "/review@OtherBot foo"),
+	}
+	for _, id := range ids {
+		waitFor(t, func() bool {
+			var state string
+			return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&state) == nil && state == "ignored"
+		})
+	}
+	d.stop()
+	d.start()
+	// A command to this bot is a polling barrier and must still be accepted.
+	d.command(0, "/help@FIXTURE_BOT")
+	for _, id := range ids {
+		if got := d.state(id); got != "ignored" {
+			t.Fatalf("foreign command %d changed after restart: %s", id, got)
+		}
+	}
+	pending, err := d.db.Pending()
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("foreign commands remain eligible for replay: %v, %v", pending, err)
+	}
+	var replies int
+	if err := d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&replies); err != nil || replies != 1 {
+		t.Fatalf("foreign commands generated replies: count=%d, err=%v", replies, err)
+	}
 }
 
 func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) {
@@ -153,7 +195,7 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", uncertain).Scan(&state) == nil && state == "submitted"
 	})
-	queued := d.send(11, "queued-before-restart")
+	queued := d.send(11, "/review queued-before-restart")
 	waitFor(t, func() bool {
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
@@ -194,35 +236,115 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 }
 
 func TestDaemonRecoveryRetainsUncommittedStartupIntent(t *testing.T) {
-	d := newRecoveryDaemon(t, 1)
-	d.command(11, "/help")
+	t.Run("group-topic", func(t *testing.T) { testRecoveryStartupIntent(t, -10, 11) })
+	t.Run("private-chat", func(t *testing.T) { testRecoveryStartupIntent(t, 7, 0) })
+}
+
+func testRecoveryStartupIntent(t *testing.T, chat, thread int64) {
+	t.Helper()
+	d := newRecoveryDaemonForChat(t, 1, chat)
+	d.command(thread, "/help")
 	d.stop()
 	db, err := store.Open(d.root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := store.StartIntent{Bot: 99, Chat: -10, Thread: 11, Kind: "new", Workspace: t.TempDir(), Generation: 1}
-	if err = db.PrepareStart(store.Binding{Bot: 99, Chat: -10, Thread: 11}, intent); err != nil {
+	intent := store.StartIntent{Bot: 99, Chat: chat, Thread: thread, Kind: "new", Workspace: t.TempDir(), Generation: 1}
+	if err = db.PrepareStart(store.Binding{Bot: 99, Chat: chat, Thread: thread}, intent); err != nil {
 		t.Fatal(err)
 	}
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	d.start()
-	waitFor(t, func() bool { return d.fake.has(11, "start was interrupted") })
+	waitFor(t, func() bool { return d.fake.has(thread, "start was interrupted") })
 	intents, err := d.db.PendingStarts(99)
 	if err != nil || len(intents) != 1 || intents[0] != intent {
 		t.Fatalf("recovered startup intents = %+v, error %v", intents, err)
 	}
-	d.command(11, "/new "+t.TempDir())
+	d.command(thread, "/new "+t.TempDir())
 	intents, err = d.db.PendingStarts(99)
 	if err != nil || len(intents) != 1 || intents[0] != intent {
 		t.Fatalf("new command replaced pending startup intent: %+v, error %v", intents, err)
 	}
-	d.command(11, "/close")
+	d.command(thread, "/close")
 	intents, err = d.db.PendingStarts(99)
 	if err != nil || len(intents) != 0 {
 		t.Fatalf("close did not cancel startup intent: %+v, error %v", intents, err)
+	}
+}
+
+func TestDaemonRecoveryPreservesPrivateChatWithoutReplayingTasks(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+	d := newRecoveryDaemonForChat(t, 1, 7)
+	d.command(0, "/new "+t.TempDir())
+	before := d.binding(0)
+	if !filepath.IsAbs(before.Session) || !before.Running {
+		t.Fatal("private session did not persist absolute identity and running intent")
+	}
+	uncertain := d.send(0, "wait")
+	waitFor(t, func() bool {
+		var state string
+		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", uncertain).Scan(&state) == nil && state == "submitted"
+	})
+	queued := d.send(0, "/review queued-before-restart")
+	waitFor(t, func() bool {
+		var state string
+		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
+	})
+	d.stop()
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+	d.start()
+	d.restored(before)
+	waitFor(t, func() bool { return d.fake.has(0, "Gateway restarted while the previous task was active") })
+	if state := d.state(uncertain); state != "uncertain" {
+		t.Fatalf("interrupted private submission became %q", state)
+	}
+	if state := d.state(queued); state != "cancelled" {
+		t.Fatalf("queued private prompt became %q", state)
+	}
+	id := d.send(0, "cwd")
+	waitFor(t, func() bool { return d.fake.has(0, "answer: "+before.Workspace) })
+	waitInputDone(t, d.db, id)
+}
+
+func TestRecoverySkipsNonTopicGroupsAndUnauthorizedPrivateChats(t *testing.T) {
+	for _, chat := range []int64{-10, 0, 7} {
+		for _, startup := range []bool{false, true} {
+			db, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding := store.Binding{Bot: 99, Chat: chat, Workspace: t.TempDir(), Session: "/missing/session.jsonl", Generation: 1, Running: true}
+			if startup {
+				intent := store.StartIntent{Bot: 99, Chat: chat, Kind: "new", Workspace: binding.Workspace, Generation: 1}
+				err = db.PrepareStart(store.Binding{Bot: 99, Chat: chat}, intent)
+			} else {
+				err = db.Save(binding)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := &Bridge{
+				cfg: config.Config{AllowedChats: []int64{-10, 0}, QueueCapacity: 4},
+				db:  db, bot: telegram.User{ID: 99}, tg: telegram.New("fake"),
+				slots: make(chan struct{}, 1), fatal: make(chan error, 1),
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			workers := make(map[target]*worker)
+			err = b.restoreWorkers(ctx, workers)
+			cancel()
+			b.wg.Wait()
+			if closeErr := db.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(workers) != 0 {
+				t.Fatalf("recovered unsupported or unauthorized chat %d (startup=%v)", chat, startup)
+			}
+		}
 	}
 }
 

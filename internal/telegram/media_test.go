@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -101,6 +102,81 @@ func TestSendFileMultipartRetriesExplicitRateLimit(t *testing.T) {
 	message, err := client.SendFile(context.Background(), -10, 8, "document", path, `quoted "file".txt`, "caption")
 	if err != nil || message.MessageID != 42 || attempts.Load() != 2 {
 		t.Fatalf("send = %+v %v attempts=%d", message, err, attempts.Load())
+	}
+}
+
+func TestConversationAttachments(t *testing.T) {
+	var photo bytes.Buffer
+	if err := png.Encode(&photo, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	for _, conversation := range []struct {
+		name     string
+		chatID   int64
+		threadID int64
+	}{
+		{"private", 10, 0},
+		{"private topic", 10, 8},
+		{"group topic", -10, 8},
+	} {
+		for _, attachment := range []struct {
+			kind    string
+			method  string
+			payload []byte
+		}{
+			{"photo", "sendPhoto", photo.Bytes()},
+			{"document", "sendDocument", []byte("document contents")},
+		} {
+			t.Run(conversation.name+"/"+attachment.kind, func(t *testing.T) {
+				client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+					reject := func(reason string) {
+						t.Error(reason)
+						w.WriteHeader(http.StatusBadRequest)
+						fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"invalid attachment request"}`)
+					}
+					if err := r.ParseMultipartForm(1024); err != nil {
+						reject(err.Error())
+						return
+					}
+					defer r.MultipartForm.RemoveAll()
+					if r.URL.Path != "/bot123:secret-token/"+attachment.method || r.FormValue("chat_id") != fmt.Sprint(conversation.chatID) {
+						reject("wrong attachment destination")
+						return
+					}
+					_, hasThread := r.MultipartForm.Value["message_thread_id"]
+					_, hasThreadFile := r.MultipartForm.File["message_thread_id"]
+					if conversation.threadID == 0 {
+						if hasThread || hasThreadFile {
+							reject("thread field is not accepted for private messages")
+							return
+						}
+					} else if r.FormValue("message_thread_id") != fmt.Sprint(conversation.threadID) {
+						reject("wrong attachment topic")
+						return
+					}
+					file, header, err := r.FormFile(attachment.kind)
+					if err != nil {
+						reject(err.Error())
+						return
+					}
+					defer file.Close()
+					payload, err := io.ReadAll(file)
+					if err != nil || !bytes.Equal(payload, attachment.payload) || header.Filename != "attachment" || r.FormValue("caption") != "Result" {
+						reject("attachment contents were not preserved")
+						return
+					}
+					fmt.Fprint(w, `{"ok":true,"result":{"message_id":42}}`)
+				})
+				path := filepath.Join(t.TempDir(), "attachment")
+				if err := os.WriteFile(path, attachment.payload, 0600); err != nil {
+					t.Fatal(err)
+				}
+				message, err := client.SendFile(context.Background(), conversation.chatID, conversation.threadID, attachment.kind, path, "attachment", "Result")
+				if err != nil || message.MessageID != 42 {
+					t.Fatalf("send attachment = %+v, %v", message, err)
+				}
+			})
+		}
 	}
 }
 

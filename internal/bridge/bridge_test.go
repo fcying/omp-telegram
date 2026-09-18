@@ -87,6 +87,7 @@ func TestMain(m *testing.M) {
 		}
 		sessionID := strings.TrimSuffix(filepath.Base(session), ".jsonl")
 		emit(map[string]any{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": []int{1, 2}, "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
+		streaming := false
 		scan := bufio.NewScanner(os.Stdin)
 		for scan.Scan() {
 			var cmd map[string]any
@@ -103,6 +104,7 @@ func TestMain(m *testing.M) {
 				if failed, _ := cmd["isError"].(bool); failed {
 					text = "attachment rejected"
 				}
+				streaming = false
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				continue
 			case "get_state":
@@ -119,7 +121,17 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
+				if text == "failed-prompt-ack" {
+					emit(map[string]any{"type": "agent_start"})
+					resp["success"] = false
+					emit(resp)
+					continue
+				}
+				if _, ok := cmd["streamingBehavior"]; ok || streaming {
+					os.Exit(2)
+				}
 				emit(resp)
+				streaming = true
 				emit(map[string]any{"type": "agent_start"})
 				if text == "wait" {
 					continue
@@ -149,9 +161,14 @@ func TestMain(m *testing.M) {
 				}
 				emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text}})
 				emit(map[string]any{"type": "agent_end", "isTerminal": false})
+				streaming = false
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}}})
 				continue
 			case "abort":
+				if _, ok := cmd["clearQueuedMessages"]; ok {
+					os.Exit(2)
+				}
+				streaming = false
 				emit(resp)
 				emit(map[string]any{"type": "agent_end", "messages": []any{}})
 				continue
@@ -236,7 +253,8 @@ func (f *fakeHTTP) has(thread int64, text string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, m := range f.messages {
-		if m["message_thread_id"] == float64(thread) && strings.Contains(m["text"].(string), text) {
+		gotThread, _ := m["message_thread_id"].(float64)
+		if gotThread == float64(thread) && strings.Contains(m["text"].(string), text) {
 			return true
 		}
 	}
@@ -304,6 +322,33 @@ func TestCommandRegistrationFailureStopsStartup(t *testing.T) {
 		})
 	}
 }
+
+func TestStartIsHiddenHelpAlias(t *testing.T) {
+	for _, command := range botCommands {
+		if command.Command == "start" {
+			t.Fatal("start is registered in the visible command menu")
+		}
+	}
+	if strings.Contains(commandHelp(), "/start") {
+		t.Fatal("start is included in visible help")
+	}
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(1, []byte(`{"update_id":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &worker{b: &Bridge{db: db, fatal: make(chan error, 1)}, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel}
+	w.handle(incoming{id: 1, msg: &telegram.Message{Text: "/start"}})
+	output, err := db.NextOutput()
+	if err != nil || output.Text != commandHelp() {
+		t.Fatalf("hidden start reply = %#v, err = %v", output, err)
+	}
+}
 func update(id, thread int64, text string) telegram.Update {
 	return telegram.Update{UpdateID: id, Message: &telegram.Message{MessageID: id, MessageThreadID: thread, From: &telegram.User{ID: 7}, Chat: telegram.Chat{ID: -10}, Text: text}}
 }
@@ -342,11 +387,20 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 	if f.has(11, "independent") {
 		t.Fatal("cross-topic output")
 	}
+	send(update(13, 11, "/review"))
+	waitFor(t, func() bool {
+		var state string
+		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=13").Scan(&state) == nil && state == "pending"
+	})
 	send(update(6, 11, "/stop"))
 	waitFor(t, func() bool {
 		var state string
 		_ = db.DB.QueryRow("SELECT state FROM inbox WHERE id=4").Scan(&state)
 		return state == "cancelled"
+	})
+	waitFor(t, func() bool {
+		var state string
+		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=13").Scan(&state) == nil && state == "cancelled"
 	})
 	send(update(7, 11, "after stop"))
 	waitFor(t, func() bool { return f.has(11, "answer: after stop") })
@@ -1160,6 +1214,63 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 			t.Fatal(err)
 		}
 		w.handle(incoming{id: id, msg: u.Message})
+	}
+}
+
+func TestIdleReviewWithArgumentsCompletes(t *testing.T) {
+	f, db, send := setupBridge(t)
+	send(update(1, 11, "/new "+t.TempDir()))
+	waitBinding(t, db, 11)
+	send(update(2, 11, "/review staged changes"))
+	waitFor(t, func() bool { return f.has(11, "answer: /review staged changes") })
+	waitInputDone(t, db, 2)
+	send(update(3, 11, "after review"))
+	waitFor(t, func() bool { return f.has(11, "answer: after review") })
+	waitInputDone(t, db, 3)
+}
+
+func TestUnsupportedFollowupDoesNotStartTask(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	command("/followup must not run")
+	w.dispatch()
+	if w.busy || w.active != 0 || len(w.queue) != 0 {
+		t.Fatal("unsupported followup started or queued a task")
+	}
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "done" {
+		t.Fatalf("unsupported command state=%q, err=%v", state, err)
+	}
+}
+
+func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 4
+	command("/new " + t.TempDir())
+	if w.client == nil {
+		t.Fatal("fixture did not start")
+	}
+	client := w.client
+	command("failed-prompt-ack")
+	command("/review must not run")
+	w.dispatch()
+	for id, want := range map[int64]string{2: "uncertain", 3: "cancelled"} {
+		var state string
+		if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&state); err != nil || state != want {
+			t.Fatalf("input %d: state=%q, want=%q, err=%v", id, state, want, err)
+		}
+	}
+	if w.client != nil || len(w.queue) != 0 {
+		t.Fatal("failed prompt retained a client or queued work")
+	}
+	select {
+	case <-client.Done():
+	default:
+		t.Fatal("uncertain process still running")
+	}
+	binding, err := w.b.db.Binding(99, -10, 11)
+	if err != nil || binding.Running {
+		t.Fatalf("uncertain process remains recoverable: %+v, %v", binding, err)
 	}
 }
 

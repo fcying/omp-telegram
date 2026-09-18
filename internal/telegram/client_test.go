@@ -22,6 +22,81 @@ func localClient(t *testing.T, handler http.HandlerFunc) *Client {
 	return client
 }
 
+func TestConversationMessages(t *testing.T) {
+	for _, conversation := range []struct {
+		name     string
+		chatID   int64
+		threadID int64
+	}{
+		{"private", 10, 0},
+		{"private topic", 10, 8},
+		{"group topic", -10, 8},
+	} {
+		t.Run(conversation.name, func(t *testing.T) {
+			client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var fields map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+					t.Error(err)
+					return
+				}
+				reject := func(reason string) {
+					t.Error(reason)
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"invalid conversation request"}`)
+				}
+				if string(fields["chat_id"]) != fmt.Sprint(conversation.chatID) {
+					reject("wrong destination chat")
+					return
+				}
+				thread, hasThread := fields["message_thread_id"]
+				editing := strings.HasSuffix(r.URL.Path, "/editMessageText")
+				if conversation.threadID == 0 || editing {
+					if hasThread {
+						reject("thread field is not accepted for private messages or edits")
+						return
+					}
+				} else if string(thread) != fmt.Sprint(conversation.threadID) {
+					reject("wrong destination topic")
+					return
+				}
+				switch r.URL.Path {
+				case "/bot123:secret-token/sendMessage", "/bot123:secret-token/editMessageText":
+					var keyboard Keyboard
+					if err := json.Unmarshal(fields["reply_markup"], &keyboard); err != nil || len(keyboard.InlineKeyboard) != 1 || len(keyboard.InlineKeyboard[0]) != 1 || keyboard.InlineKeyboard[0][0].CallbackData != "stop" {
+						reject("missing stop button")
+						return
+					}
+					if editing && (string(fields["message_id"]) != "42" || string(fields["text"]) != `"Working"`) {
+						reject("invalid progress edit")
+						return
+					}
+				case "/bot123:secret-token/sendChatAction":
+					if string(fields["action"]) != `"typing"` {
+						reject("invalid chat action")
+						return
+					}
+				default:
+					reject("unexpected endpoint")
+					return
+				}
+				fmt.Fprint(w, `{"ok":true,"result":{"message_id":42}}`)
+			})
+			ctx := context.Background()
+			keyboard := &Keyboard{InlineKeyboard: [][]Button{{{Text: "Stop", CallbackData: "stop"}}}}
+			message, err := client.Send(ctx, conversation.chatID, conversation.threadID, "Starting", keyboard)
+			if err != nil || message.MessageID != 42 {
+				t.Fatalf("send = %+v, %v", message, err)
+			}
+			if err := client.Edit(ctx, conversation.chatID, message.MessageID, "Working", keyboard); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Typing(ctx, conversation.chatID, conversation.threadID); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
 	var attempts atomic.Int32
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {

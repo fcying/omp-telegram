@@ -49,7 +49,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			continue
 		}
 		message := update.Message
-		if len(message.Photo) != 0 || message.Document != nil || !strings.HasPrefix(strings.TrimSpace(message.Text), "/") {
+		if deferredPrompt(message) {
 			if err := b.db.Mark(in.ID, "cancelled"); err != nil {
 				return err
 			}
@@ -59,7 +59,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		if ctx.Err() != nil {
 			break
 		}
-		if binding.Thread == 0 || !slices.Contains(b.cfg.AllowedChats, binding.Chat) {
+		if (binding.Thread == 0 && binding.Chat <= 0) || !slices.Contains(b.cfg.AllowedChats, binding.Chat) {
 			continue
 		}
 		key := target{binding.Chat, binding.Thread}
@@ -70,7 +70,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		if ctx.Err() != nil {
 			break
 		}
-		if intent.Thread == 0 || !slices.Contains(b.cfg.AllowedChats, intent.Chat) {
+		if (intent.Thread == 0 && intent.Chat <= 0) || !slices.Contains(b.cfg.AllowedChats, intent.Chat) {
 			continue
 		}
 		key := target{intent.Chat, intent.Thread}
@@ -86,6 +86,21 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		workers[key] = b.launchWorker(ctx, key, binding, false, intent)
 	}
 	return nil
+}
+
+func deferredPrompt(message *telegram.Message) bool {
+	if len(message.Photo) != 0 || message.Document != nil {
+		return true
+	}
+	text := strings.TrimSpace(message.Text)
+	if !strings.HasPrefix(text, "/") {
+		return true
+	}
+	command := strings.Fields(text)[0]
+	if name, _, ok := strings.Cut(command, "@"); ok {
+		command = name
+	}
+	return command == "/review"
 }
 
 func sameSessionFile(left, right string) bool {

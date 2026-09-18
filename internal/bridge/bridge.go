@@ -44,6 +44,11 @@ type incoming struct {
 	callback *telegram.CallbackQuery
 }
 type target struct{ chat, thread int64 }
+
+func supportedConversation(m *telegram.Message) bool {
+	return m != nil && (m.MessageThreadID != 0 || m.Chat.Type == "private")
+}
+
 type queued struct {
 	id        int64
 	user      int64
@@ -53,6 +58,7 @@ type queued struct {
 	cancel    context.CancelFunc
 	directory string
 }
+
 type confirmation struct {
 	action, uiID, method string
 	workspace            string
@@ -186,13 +192,13 @@ const (
 var botCommands = []telegram.BotCommand{
 	{Command: "new", Description: "New session: /new <name or project path>"},
 	{Command: "stop", Description: "Stop task and clear queue"},
+	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
 	{Command: "resume", Description: "Choose an omp session in this working directory"},
 	{Command: "status", Description: "Show workspace, model and queue"},
 	{Command: "model", Description: "Show or switch model: /model provider/model"},
 	{Command: "compact", Description: "Compact context after confirmation"},
 	{Command: "help", Description: "Show usage help"},
-	{Command: "start", Description: "Get started and show help"},
 }
 
 func commandHelp() string {
@@ -329,8 +335,8 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 				}
 				continue
 			}
-			if m.MessageThreadID == 0 {
-				if err = db.Enqueue(m.Chat.ID, 0, "Use /new <name or project path> inside an existing topic."); err != nil {
+			if !supportedConversation(m) {
+				if err = db.Enqueue(m.Chat.ID, 0, "This bot supports private chats and Telegram topics. In groups, use it inside a topic."); err != nil {
 					return err
 				}
 				if err = db.Mark(in.ID, "done"); err != nil {
@@ -720,7 +726,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			return
 		}
 		if w.b.sessionInUse(target) {
-			w.say("This session is already running in another topic. Close that instance first, or use a full session ID.")
+			w.say("This session is already running in another conversation. Close that instance first, or use a full session ID.")
 			return
 		}
 		session = target
@@ -823,7 +829,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	}
 	if !w.claimSession(info.File, info.ID) {
 		w.shutdown()
-		w.say("This omp session is already active in another topic.")
+		w.say("This omp session is already active in another conversation.")
 		return
 	}
 	if _, e = w.call("set_host_tools", map[string]any{"tools": telegramSendTools}); e != nil {
@@ -874,9 +880,9 @@ func (w *worker) handle(in incoming) {
 		w.mark(in.id, "ignored")
 		return
 	}
-	if hasAttachment || !strings.HasPrefix(text, "/") {
+	if hasAttachment {
 		if w.client == nil {
-			w.say("No instance is running in this topic. Start with /new <name or project path>, or use /resume for a saved session.")
+			w.say("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
 			w.mark(in.id, "done")
 			return
 		}
@@ -885,26 +891,35 @@ func (w *worker) handle(in incoming) {
 			w.mark(in.id, "cancelled")
 			return
 		}
-		if hasAttachment {
-			w.queueMedia(in)
-		} else {
-			w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, text: text})
+		w.queueMedia(in)
+		return
+	}
+	if !strings.HasPrefix(text, "/") {
+		w.enqueuePrompt(in, text)
+		return
+	}
+	fields := strings.Fields(text)
+	cmd := fields[0]
+	if name, bot, ok := strings.Cut(cmd, "@"); ok {
+		if !strings.EqualFold(bot, w.b.bot.Username) {
+			w.mark(in.id, "ignored")
+			return
 		}
+		cmd = name
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+	if cmd == "/review" {
+		prompt := "/review"
+		if arg != "" {
+			prompt += " " + arg
+		}
+		w.enqueuePrompt(in, prompt)
 		return
 	}
 	if !w.mark(in.id, "submitted") {
 		return
 	}
 	defer w.mark(in.id, "done")
-	fields := strings.Fields(text)
-	cmd := fields[0]
-	if name, bot, ok := strings.Cut(cmd, "@"); ok {
-		if !strings.EqualFold(bot, w.b.bot.Username) {
-			return
-		}
-		cmd = name
-	}
-	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 	switch cmd {
 	case "/help", "/start":
 		w.say(commandHelp())
@@ -1026,8 +1041,8 @@ func (w *worker) dispatch() {
 	if len(q.images) > 0 {
 		fields["images"] = q.images
 	}
-	raw, e := w.call("prompt", fields)
-	if e != nil {
+	raw, err := w.call("prompt", fields)
+	if err != nil {
 		w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
 		w.mark(q.id, "uncertain")
 		w.shutdown()
@@ -1036,12 +1051,26 @@ func (w *worker) dispatch() {
 		w.busy = false
 		return
 	}
-	var r struct {
+	var response struct {
 		AgentInvoked *bool `json:"agentInvoked"`
 	}
-	if json.Unmarshal(raw, &r) == nil && r.AgentInvoked != nil && !*r.AgentInvoked {
+	if json.Unmarshal(raw, &response) == nil && response.AgentInvoked != nil && !*response.AgentInvoked {
 		w.finishTerminal(rpcEvent{})
 	}
+}
+
+func (w *worker) enqueuePrompt(in incoming, text string) {
+	if w.client == nil {
+		w.say("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
+		w.mark(in.id, "done")
+		return
+	}
+	if len(w.queue) >= w.b.cfg.QueueCapacity {
+		w.say("The queue is full. This message was not submitted.")
+		w.mark(in.id, "cancelled")
+		return
+	}
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, text: text})
 }
 func (w *worker) finish() {
 	// Progress state is finalized only after the durable result transaction.
