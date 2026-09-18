@@ -165,6 +165,13 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 	d.start()
 	d.restored(live)
 	d.restored(stopped)
+	waitFor(t, func() bool { return d.fake.has(11, "Gateway restarted while the previous task was active") })
+	if d.fake.has(22, "Gateway restarted while the previous task was active") {
+		t.Fatal("idle session restoration published an interruption warning")
+	}
+	if d.binding(11).Interrupted {
+		t.Fatal("restored binding retained its interruption marker")
+	}
 	if state := d.state(uncertain); state != "uncertain" {
 		t.Fatalf("interrupted submission became %q", state)
 	}
@@ -206,6 +213,11 @@ func TestDaemonRecoveryRetainsUncommittedStartupIntent(t *testing.T) {
 	intents, err := d.db.PendingStarts(99)
 	if err != nil || len(intents) != 1 || intents[0] != intent {
 		t.Fatalf("recovered startup intents = %+v, error %v", intents, err)
+	}
+	d.command(11, "/new "+t.TempDir())
+	intents, err = d.db.PendingStarts(99)
+	if err != nil || len(intents) != 1 || intents[0] != intent {
+		t.Fatalf("new command replaced pending startup intent: %+v, error %v", intents, err)
 	}
 	d.command(11, "/close")
 	intents, err = d.db.PendingStarts(99)

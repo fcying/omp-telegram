@@ -20,6 +20,7 @@ import (
 	"unicode/utf16"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
@@ -411,6 +412,40 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	}
 	if !w.finishing {
 		t.Fatal("preview finalization was not deferred")
+	}
+}
+
+func TestDispatchWaitsForPreviewCleanup(t *testing.T) {
+	w := &worker{client: &omp.Client{}, finishing: true, queue: []queued{{id: 1}}}
+	w.dispatch()
+	if len(w.queue) != 1 {
+		t.Fatal("next prompt dispatched before prior preview cleanup")
+	}
+}
+
+func TestReplacementShutdownRetainsCapacitySlot(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	if len(w.b.slots) != 1 {
+		t.Fatal("running worker did not hold capacity slot")
+	}
+	w.shutdownWithSlot(false)
+	if len(w.b.slots) != 1 {
+		t.Fatal("replacement shutdown released its capacity slot")
+	}
+	<-w.b.slots
+}
+
+func TestStartFailureRetainsStartupIntent(t *testing.T) {
+	w, _, _ := setupWorkspaceWorker(t)
+	w.b.cfg.OMP = filepath.Join(t.TempDir(), "missing-omp")
+	w.start(false, t.TempDir(), "", false)
+	if w.startIntent == nil {
+		t.Fatal("failed start discarded startup intent")
+	}
+	intents, err := w.b.db.PendingStarts(w.b.bot.ID)
+	if err != nil || len(intents) != 1 || intents[0] != *w.startIntent {
+		t.Fatalf("failed start durable intent = %+v, error %v", intents, err)
 	}
 }
 

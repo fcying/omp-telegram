@@ -409,6 +409,16 @@ func TestStartupIntentCommitsReplacementAtomically(t *testing.T) {
 	if len(intents) != 1 || intents[0] != intent {
 		t.Fatalf("prepared intents = %+v, want %+v", intents, []StartIntent{intent})
 	}
+	conflict := intent
+	conflict.Workspace = "/workspaces/other"
+	if err = s.PrepareStart(stored, conflict); err == nil {
+		t.Fatal("prepared startup intent was overwritten")
+	}
+	intents, err = s.PendingStarts(old.Bot)
+	requireStoreOK(t, err)
+	if len(intents) != 1 || intents[0] != intent {
+		t.Fatalf("conflicting startup intent changed durable state: %+v", intents)
+	}
 	next := Binding{Bot: old.Bot, Chat: old.Chat, Thread: old.Thread, Workspace: intent.Workspace, Session: "/sessions/new.jsonl", Generation: intent.Generation, Running: true}
 	requireStoreOK(t, s.CommitStart(next))
 	stored, err = s.Binding(old.Bot, old.Chat, old.Thread)

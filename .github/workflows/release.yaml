@@ -3,7 +3,6 @@ name: release
 on:
   pull_request:
   push:
-    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -15,14 +14,15 @@ defaults:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
-      release: ${{ steps.release.outputs.release }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -37,14 +37,14 @@ jobs:
             echo "Expected one Version value in vMAJOR.MINOR.PATCH form" >&2
             exit 1
           fi
-          release=false
-          version="dev-${source_version}"
+          prerelease=true
+          version="${source_version}-dev.g${GITHUB_SHA:0:12}"
           if [[ "$GITHUB_REF" == "refs/heads/main" ]] && ! git show-ref --verify --quiet "refs/tags/${source_version}"; then
             version="$source_version"
-            release=true
+            prerelease=false
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -53,7 +53,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -132,33 +132,21 @@ jobs:
         working-directory: build
         run: sha256sum ./*.txz > SHA256SUMS
 
-      - name: Publish versioned release
-        if: needs.prepare.outputs.release == 'true'
-        uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ needs.prepare.outputs.version }}
-          commit: ${{ github.sha }}
-          immutableCreate: true
-          artifactErrorsFailBuild: true
-          generateReleaseNotes: true
-          artifacts: build/*
-
-      - name: Move development tag
+      - name: Publish release
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
-          git tag --force dev "$GITHUB_SHA"
-          git push --force origin refs/tags/dev
-
-      - name: Update development draft
-        uses: ncipollo/release-action@v1
-        with:
-          tag: dev
-          commit: ${{ github.sha }}
-          name: ${{ needs.prepare.outputs.version }}
-          allowUpdates: true
-          removeArtifacts: true
-          artifactErrorsFailBuild: true
-          generateReleaseNotes: true
-          prerelease: true
-          draft: true
-          makeLatest: false
-          artifacts: build/*
+          set -euo pipefail
+          args=(release create "$VERSION" build/* --target "$GITHUB_SHA" --generate-notes --title "$VERSION")
+          if [[ "$PRERELEASE" == true ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
+          if [[ "$PRERELEASE" == true ]]; then
+            while IFS= read -r tag; do
+              if [[ "$tag" != "$VERSION" ]]; then
+                gh release delete "$tag" --yes --cleanup-tag
+              fi
+            done < <(gh api --paginate --jq '.[] | select(.prerelease) | .tag_name' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          fi

@@ -465,7 +465,9 @@ func (w *worker) run() {
 		w.dispatch()
 	}
 }
-func (w *worker) shutdown() {
+func (w *worker) shutdown() { w.shutdownWithSlot(true) }
+
+func (w *worker) shutdownWithSlot(releaseSlot bool) {
 	if !w.restoring && w.ctx.Err() == nil {
 		w.persistClosed()
 	}
@@ -490,11 +492,20 @@ func (w *worker) shutdown() {
 	if w.client != nil {
 		w.client.Close()
 		w.client = nil
-		<-w.b.slots
+		if releaseSlot {
+			<-w.b.slots
+		}
 	}
 	w.releaseSession()
 	if w.active != 0 {
 		w.mark(w.active, "uncertain")
+		if w.binding.Running && w.ctx.Err() != nil {
+			if err := w.b.db.SetInterrupted(w.binding, true); err != nil {
+				w.b.fail(err)
+			} else {
+				w.binding.Interrupted = true
+			}
+		}
 	}
 }
 func (w *worker) failed() {
@@ -540,6 +551,10 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	if w.client != nil && !replace {
 		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
+		return
+	}
+	if w.startIntent != nil && !w.restoring {
+		w.say("A previous session start is still uncertain. Use /close before starting another session.")
 		return
 	}
 	old, e := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
@@ -592,7 +607,6 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			return
 		}
 	}
-	prepared := false
 	if !w.restoring {
 		intentWorkspace := cwd
 		if intentWorkspace == "" {
@@ -609,15 +623,13 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			w.say("Failed to save the startup intent.")
 			return
 		}
-		prepared = true
 		w.startIntent = &intent
 		w.binding = old
 		w.binding.Running = false
 		if replace {
 			w.clearQueue()
-			w.shutdown()
+			w.shutdownWithSlot(false)
 			if reuseSlot {
-				w.b.slots <- struct{}{}
 				reserved = true
 			}
 			w.active = 0
@@ -630,13 +642,10 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		if reserved {
 			<-w.b.slots
 		}
-		if prepared && !w.cancelStart() {
-			return
-		}
 		if resume {
-			w.say("Failed to resume omp. Check the session ID, original directory, and omp configuration.")
+			w.say("Failed to resume omp. The startup outcome is uncertain; use /close before retrying.")
 		} else {
-			w.say("Failed to start omp. Check the executable and local configuration.")
+			w.say("Failed to start omp. The startup outcome is uncertain; use /close before retrying.")
 		}
 		return
 	}
@@ -678,6 +687,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		w.say("Cannot register Telegram attachment delivery. The instance has been closed.")
 		return
 	}
+	interrupted := w.restoring && old.Interrupted
 	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, Generation: old.Generation + 1, Running: true}
 	if w.restoring {
 		e = w.b.db.Save(binding)
@@ -693,7 +703,11 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	w.startIntent = nil
 	w.preview, w.lastPreview = "", ""
 	w.previewID = 0
-	w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
+	ready := "omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID
+	if interrupted {
+		ready += "\n\n⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted."
+	}
+	w.say(ready)
 }
 func (w *worker) handle(in incoming) {
 	if in.callback != nil {
@@ -843,7 +857,7 @@ func (w *worker) status() {
 	w.say(fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s/%s\nRunning: %t\nCompacting: %t\nQueued: %d", w.binding.Workspace, w.sessionID, s.Model.Provider, s.Model.ID, s.IsStreaming, s.IsCompacting, len(w.queue)))
 }
 func (w *worker) dispatch() {
-	if w.client == nil || w.busy || w.compacting || len(w.queue) == 0 {
+	if w.client == nil || w.busy || w.compacting || w.finishing || len(w.queue) == 0 {
 		return
 	}
 	if w.queue[0].preparing {

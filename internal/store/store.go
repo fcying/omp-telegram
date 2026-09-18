@@ -13,7 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Store struct{ DB *sql.DB }
 type Binding struct {
@@ -21,6 +21,7 @@ type Binding struct {
 	Workspace, Session string
 	Generation         int64
 	Running            bool
+	Interrupted        bool
 }
 type StartIntent struct {
 	Bot, Chat, Thread  int64
@@ -104,7 +105,7 @@ func initialize(db *sql.DB) error {
 	if version == 0 {
 		_, e = tx.Exec(`
  CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
- CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+ CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL);
@@ -120,6 +121,13 @@ func initialize(db *sql.DB) error {
 	}
 	if version == 1 {
 		_, e = tx.Exec("CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread))")
+		if e != nil {
+			return e
+		}
+		version = 2
+	}
+	if version == 2 {
+		_, e = tx.Exec("ALTER TABLE bindings ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0")
 		if e != nil {
 			return e
 		}
@@ -190,7 +198,7 @@ func (s *Store) Mark(id int64, state string) error {
 }
 func (s *Store) Binding(bot, chat, thread int64) (Binding, error) {
 	b := Binding{Bot: bot, Chat: chat, Thread: thread}
-	e := s.DB.QueryRow("SELECT workspace,session,generation,running FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&b.Workspace, &b.Session, &b.Generation, &b.Running)
+	e := s.DB.QueryRow("SELECT workspace,session,generation,running,interrupted FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&b.Workspace, &b.Session, &b.Generation, &b.Running, &b.Interrupted)
 	return b, e
 }
 func (s *Store) Save(b Binding) error {
@@ -203,7 +211,7 @@ func (s *Store) Save(b Binding) error {
 	if e != nil {
 		return e
 	}
-	_, e = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running) VALUES(?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running)
+	_, e = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running,interrupted) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running, b.Interrupted)
 	if e != nil {
 		return e
 	}
@@ -211,7 +219,7 @@ func (s *Store) Save(b Binding) error {
 }
 
 func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
-	rows, e := s.DB.Query("SELECT bot,chat,thread,workspace,session,generation,running FROM bindings WHERE bot=? AND running=1 ORDER BY chat,thread", bot)
+	rows, e := s.DB.Query("SELECT bot,chat,thread,workspace,session,generation,running,interrupted FROM bindings WHERE bot=? AND running=1 ORDER BY chat,thread", bot)
 	if e != nil {
 		return nil, e
 	}
@@ -219,7 +227,7 @@ func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
 	var bindings []Binding
 	for rows.Next() {
 		var b Binding
-		if e = rows.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.Generation, &b.Running); e != nil {
+		if e = rows.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.Generation, &b.Running, &b.Interrupted); e != nil {
 			return nil, e
 		}
 		bindings = append(bindings, b)
@@ -230,6 +238,11 @@ func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
 func (s *Store) SetRunning(b Binding, running bool) error {
 	_, e := s.DB.Exec("UPDATE bindings SET running=? WHERE bot=? AND chat=? AND thread=? AND generation=?", running, b.Bot, b.Chat, b.Thread, b.Generation)
 	return e
+}
+
+func (s *Store) SetInterrupted(b Binding, interrupted bool) error {
+	_, err := s.DB.Exec("UPDATE bindings SET interrupted=? WHERE bot=? AND chat=? AND thread=? AND generation=?", interrupted, b.Bot, b.Chat, b.Thread, b.Generation)
+	return err
 }
 
 func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
@@ -254,7 +267,7 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 			return errors.New("startup binding changed")
 		}
 	}
-	_, err = tx.Exec("INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation) VALUES(?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET kind=excluded.kind,workspace=excluded.workspace,session=excluded.session,generation=excluded.generation", intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation)
+	_, err = tx.Exec("INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation) VALUES(?,?,?,?,?,?,?)", intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation)
 	if err != nil {
 		return err
 	}
@@ -277,7 +290,7 @@ func (s *Store) CommitStart(b Binding) error {
 	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running) VALUES(?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running); err != nil {
+	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running,interrupted) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running, b.Interrupted); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", b.Bot, b.Chat, b.Thread, b.Generation); err != nil {

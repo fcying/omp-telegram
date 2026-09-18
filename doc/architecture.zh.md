@@ -79,7 +79,7 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 | 表 | 键 / 字段 | 用途 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
-| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running` | 最后一次已验证的会话绑定和恢复资格 |
+| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | 最后一次已验证的会话绑定, 恢复资格和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
 | `history` | `bot,chat,thread,workspace,session,generation` | 旧绑定快照, 不是会话浏览器 |
 | `inbox` | 主键 `id`; `raw,state` | update 去重和处理状态 |
@@ -89,9 +89,9 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 2. 空库在同一事务中创建表, 索引和版本号. 重新打开时整理上次运行留下的状态.
+`PRAGMA user_version` 是数据库版本, 当前为 3. 空库在同一事务中创建表, 索引和版本号. 重新打开时整理上次运行留下的状态.
 
-已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 通过增加 `startup_intents` 的事务迁移后才推进 `user_version`. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
+已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 和 2 通过 `startup_intents` 及 binding 中断标记的事务迁移后才推进 `user_version`. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -140,13 +140,13 @@ Telegram client 在传输边界区分错误:
 | 事件 | 持久化行为 |
 | --- | --- |
 | 成功启动/恢复 | 发布原生身份, 删除意图并设置 `running=1` |
-| daemon 正常退出 | 保留已提交的恢复资格 |
+| daemon 正常退出 | 保留已提交的恢复资格; 活动任务标记为已中断 |
 | `/stop` | 保留实例和恢复资格, 清空等待 prompt |
 | `/close` | 删除待完成意图, 保存 `running=0`, 再关闭实例 |
 | worker 回收运行期故障实例 | 清除恢复资格, 活动任务转为不确定 |
 | 自动恢复失败 | 保留身份和恢复资格, 供手动恢复或下次服务重启使用 |
 
-重启后, 已提交且 `running=1` 的绑定会恢复准确的 session 文件和目录. 未提交的 new/resume 意图不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
+重启后, 已提交且 `running=1` 的绑定会恢复准确的 session 文件和目录. 被标记为中断的 binding 会在 `omp is ready` 消息中追加 warning, 并在新 generation 中清除标记; 空闲会话恢复保持静默. 未提交的 new/resume 意图不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
 
 ## 进程与文件安全
 
@@ -180,6 +180,6 @@ just service
 
 应用版本来自 [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go) 的 `Version`, 初始为 `v0.1.0`. `--version`/`-v` 在构建元数据可用时显示 Git revision/dirty 标记, 可通过 `-ldflags "-X main.Version=..."` 覆盖基础版本.
 
-[发布工作流](../.github/workflows/release.yaml) 在 PR, `main`/`dev` push 及手动触发时运行. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag. 其他构建使用 `dev-<版本>`; 成功的 `main`/`dev` 运行还会更新 `dev` tag 和开发草稿. PR 及其他分支手动运行不发布.
+[发布工作流](../.github/workflows/release.yaml) 在所有分支 push, PR 及手动触发时运行. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 同仓 PR 会创建 skipped workflow, 因其 head commit 的 push run 已提供验证; 来自其他仓库的 PR 会在本仓运行验证 jobs, 但不会发布. `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag. 其他可发布构建使用唯一的 `v<版本>-dev.g<commit>` 版本和 GitHub prerelease; 替代版本发布成功后会移除旧的 prerelease. 在 `main`/`dev` 之外手动运行不会发布.
 
 发布包包含二进制和 LICENSE, 并提供 `SHA256SUMS`. 只有发布 job 为 `GITHUB_TOKEN` 申请写权限. 发布新应用版本时, 将 `Version` 改为 `vMAJOR.MINOR.PATCH` 并合并/push 到 `main`, 不会自动改变数据库 schema 版本.

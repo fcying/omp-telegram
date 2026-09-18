@@ -79,7 +79,7 @@ The database is `omp-telegram.db` under `data_dir`. It uses WAL, a busy timeout,
 | Table | Key / fields | Role |
 | --- | --- | --- |
 | `meta` | `key`, integer `value` | Owning bot ID and polling offset |
-| `bindings` | PK `(bot,chat,thread)`; `workspace,session,generation,running` | Last validated session binding and restoration eligibility |
+| `bindings` | PK `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | Last validated session binding, restoration eligibility, and active-task interruption marker |
 | `startup_intents` | PK `(bot,chat,thread)`; `kind,workspace,session,generation` | Durable uncommitted `/new` or `/resume` transition |
 | `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots, not a session browser |
 | `inbox` | PK `id`; `raw,state` | Update deduplication and processing state |
@@ -89,9 +89,9 @@ The hot-path indexes are `inbox(state,id)` and `outbox(state,id)`. There is no a
 
 ### Schema version
 
-`PRAGMA user_version` is the schema version, currently 2. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states.
+`PRAGMA user_version` is the schema version, currently 3. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states.
 
-Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Version 1 migrates transactionally by adding `startup_intents` and then advancing `user_version`. An older binary rejects the newer schema. Application versions and database versions evolve independently.
+Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 and 2 migrate transactionally through `startup_intents` and the binding interruption marker before advancing `user_version`. An older binary rejects the newer schema. Application versions and database versions evolve independently.
 
 ### Input and completion transactions
 
@@ -140,13 +140,13 @@ Every user-requested start first commits a `startup_intents` record with the fro
 | Event | Persisted behavior |
 | --- | --- |
 | Successful start/resume | Publish native identity, delete intent, and set `running=1` |
-| Normal daemon shutdown | Preserve committed restoration eligibility |
+| Normal daemon shutdown | Preserve committed restoration eligibility; mark an active task as interrupted |
 | `/stop` | Keep the instance and eligibility; clear waiting prompts |
 | `/close` | Delete a pending intent, persist `running=0`, then close the instance |
 | Runtime failure closed by the worker | Clear eligibility; active task becomes uncertain |
 | Automatic restoration failure | Preserve saved identity and eligibility for manual recovery or a later service restart |
 
-After restart, a committed running binding restores the exact saved session file and directory. An uncommitted new/resume intent does not launch another omp process: the prior start may already have created process state whose identity was never committed. The bridge creates an inactive worker, reports the uncertainty, and requires explicit `/close` followed by `/new` or `/resume`. This preserves the requested transition without replaying an uncertain operation. Missing files/directories do not trigger a replacement conversation. A fresh omp session may report an identity before its history file exists.
+After restart, a committed running binding restores the exact saved session file and directory. A binding marked interrupted appends a warning to its `omp is ready` message, then clears the marker in the new generation; idle restorations stay silent. An uncommitted new/resume intent does not launch another omp process: the prior start may already have created process state whose identity was never committed. The bridge creates an inactive worker, reports the uncertainty, and requires explicit `/close` followed by `/new` or `/resume`. This preserves the requested transition without replaying an uncertain operation. Missing files/directories do not trigger a replacement conversation. A fresh omp session may report an identity before its history file exists.
 
 ## Process and file safety
 
@@ -180,6 +180,6 @@ Current evidence includes transactional failure injection, index query plans, re
 
 Application version comes from `Version` in [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go), initially `v0.1.0`. `--version`/`-v` includes Git revision/dirty metadata when available; `-ldflags "-X main.Version=..."` can override the base version.
 
-The [release workflow](../.github/workflows/release.yaml) runs on PRs, `main`/`dev` pushes, and manual dispatch. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. A new source version on `main` creates a formal release without rewriting an existing version tag. Other builds use `dev-<version>`; successful `main`/`dev` runs also update the `dev` tag and development draft. PRs and manual runs on other branches never publish.
+The [release workflow](../.github/workflows/release.yaml) runs on every branch push, pull request, and manual dispatch. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. Same-repository pull requests create a skipped workflow because their head commit's push run already provides validation; pull requests from another repository run the validation jobs in the base repository without publishing. A new source version on `main` creates a formal release without rewriting an existing version tag. Other publishable builds use a unique `v<version>-dev.g<commit>` version and GitHub prerelease; after the replacement succeeds, publishing a new temporary build removes older prereleases. Manual runs on branches other than `main`/`dev` never publish.
 
 Release archives contain the binary and LICENSE, with `SHA256SUMS` alongside them. Publishing uses `GITHUB_TOKEN` with write permission only in the release job. To release a new application version, update `Version` to `vMAJOR.MINOR.PATCH` and merge/push to `main`. This does not automatically change the database schema version.
