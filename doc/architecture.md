@@ -1,6 +1,6 @@
 # Architecture and development
 
-[中文版](architecture.zh.md) | [User guide](../README.md)
+English | [中文](architecture.zh.md) | [User guide](../README.md)
 
 This document describes the current implementation and its recovery semantics.
 
@@ -48,7 +48,7 @@ Incoming updates are persisted before routing authorization. Unauthorized inputs
 
 ### Concurrency
 
-- Each conversation has an actor-like worker. Ordinary text, attachments, and `/review` enter the bridge's deferred queue as independent prompts and run sequentially. The bridge submits the next prompt only after the current task finishes. `/followup` remains unsupported.
+- Each conversation has an actor-like worker. Ordinary text, attachments, and `/review` enter the bridge's deferred queue as independent prompts and run sequentially. The bridge submits the next prompt only after the current task finishes.
 - Commands and callbacks use the worker's control path rather than waiting behind queued prompts. This does not promise that every operation is nonblocking: startup and some control RPC round trips still take time.
 - Attachment preparation and uploads are asynchronous and bounded. Pending preparation retains its queue position.
 - The RPC stdout reader never performs Telegram HTTP delivery. Its event buffers are bounded; protocol violations or overload fail the client rather than allowing unbounded growth.
@@ -61,6 +61,8 @@ The client waits for `ready`, negotiates protocol v2, serializes stdin writes, a
 The bridge uses public RPC v2 without protocol extensions. Before calling `prompt`, it marks the input as the active terminal-result owner. A successful acknowledgement needs no routing classification; `agentInvoked=false` completes a local command through the normal completion path, while other accepted prompts await terminal events. A failed or unconfirmed prompt request settles the input as uncertain, closes that OMP client, and cancels the bridge queue without retrying. The client must not be reused as idle: unconfirmed work could otherwise take ownership of a later input's result. `/stop` clears bridge-deferred prompts, then sends a plain `abort` request without queue-clearing options. Pending tasks, including `/review`, are never replayed automatically after restart or uncertain execution.
 
 RPC v2 may compact large terminal frames and omit messages already emitted by `message_end`. The worker caches the latest assistant message's `stopReason` and `errorMessage`, plus finalized text from every assistant `message_end`; terminal `agent_end` messages take precedence, and the cache is used only when they contain no assistant message. The cache resets at `agent_start`, terminal completion, and shutdown. Cached diagnostics classify the result but never appear in Telegram output.
+
+### Missing terminal completion and watchdog
 
 Missing terminal completion has a separate conservative recovery path, never a success path. An active busy root task must have no activity for 30 seconds and no compaction/handoff, retry, running tool, host request, or native UI wait. A background `get_state` call has a five-second timeout and never blocks actor control handling. Both `isStreaming` and `isCompacting` must explicitly be `false`; absent/null/malformed fields and errors discard confirmation. Two confirmations must be separated by at least 30 seconds. Every event, including unknown or malformed events, and ordinary RPC activity invalidates probes. Results are fenced by client identity, generation, turn, active input, and activity revision; queued events take precedence over probe results. Confirmed missing completion uses the existing atomic uncertain-result transaction and progress cleanup, then retires the old client before queue dispatch, preserving the logical session claim and queued inputs for lazy resume without replay. Pending typing requests are canceled on terminal completion, turn changes, runtime release, and shutdown; their timeout remains four seconds.
 
@@ -164,7 +166,7 @@ For ordinary root tasks, submission durably records the originating Telegram mes
 
 A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages, attachments, and `/review` commands are canceled rather than replayed. Other pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
 
-### Output delivery
+### Output delivery and progress cleanup
 
 ```text
 pending -> sending -> done
@@ -182,9 +184,16 @@ The Telegram client classifies failures at the transport boundary:
 
 There is no new automatic resend for either terminal error state. Explicit Telegram rate limits retain bounded retries. A database transaction cannot atomically commit a Telegram network side effect, so exactly-once delivery is not promised.
 
+For progress deletion, a confirmed non-retryable Telegram 4xx other than 429 clears only the local progress association. A 429, 5xx, transport failure, or uncertain response retains that association for a later cleanup attempt. Cleanup state never changes the task or outbox result.
+
 Outbox replay preserves the stored reply target for every final text part. If Telegram rejects that target because the original message is unavailable, the client sends the same text once without reply binding; this UX fallback does not change inbox/outbox ownership or task settlement.
 
 Each progress preview is associated with its root inbox, and every final outbox part carries that inbox ID. For a normal `done` task, progress is deleted only after all associated outbox parts are marked `done` following confirmed Telegram delivery. `cancelled` and `uncertain` progress is retained. Startup retries completed associations left by a previous run. A confirmed non-retryable Telegram deletion rejection clears the best-effort progress association; once terminal data reaches the retention cutoff without pending or sending outbox work, retention clears the local association without deleting the Telegram message. Transport failures, 429, 5xx, and uncertain responses retain it for retry without changing task delivery state.
+
+### Attachment lifecycle
+
+Incoming Telegram attachments are downloaded only after authorization and remain under the selected workspace's `.telegram/incoming/` directory. They are workspace files and are not removed by bridge message retention. Outgoing `telegram_send` files must be regular files inside the active workspace. The bridge copies each file into a private `storage.data_dir/attachments/outbox/` snapshot before enqueueing it, so delivery is independent of later changes to the source file. A confirmed delivery removes the snapshot; failed or uncertain delivery leaves it owned by the outbox until terminal retention cleanup. Retention removes snapshots only after the corresponding outbox row is deleted, and the janitor removes old unreferenced `attachment-*` files only inside that private spool. Source workspace files are never removed by this cleanup.
+Snapshot removal after confirmed delivery is best-effort; retention and the spool janitor handle snapshots that cannot be removed immediately.
 
 ## Session lifecycle
 
@@ -210,7 +219,11 @@ Programmatic invalidation uses the same bounded cleanup queue: canceling a resum
 
 `/handoff [instructions]` directly calls native `handoff` with optional `customInstructions`; summary generation and context maintenance remain OMP-owned. It requires an idle instance and empty bridge queue, uses the existing asynchronous maintenance-result channel, and fences results by generation. The bridge does not create a replacement session or synthesize a handoff document, and does not replay failed or uncertain operations. Local `/help` and `/close` remain processable while awaiting the result. Other RPC commands follow OMP's own serialization; immediate `/stop` interruption of a handoff is not promised.
 
-Every user-requested start first commits a `startup_intents` record with the frozen operation, target, and next generation. In the same transaction, any prior running binding becomes ineligible for automatic restoration. Only after native identity validation and host-tool registration does a second transaction publish the binding and delete the intent. `/close` deletes a pending intent before closing the current binding.
+### Startup recovery and crash semantics
+
+An uncommitted startup intent records an unfinished transition, not permission to start another omp process. Recovery preserves the saved binding for explicit operator recovery and requires `/close` followed by `/new` or `/resume` before a new transition is attempted.
+
+Every user-requested start first commits a `startup_intents` record with the frozen operation, target, and next generation. In the same transaction, any prior running binding becomes ineligible for automatic restoration. Only after native identity validation and host-tool registration does a second transaction publish the binding and delete the intent. This is a bridge-level two-phase commit: durable intent first, live binding publication second; it does not make process startup exactly once. `/close` deletes a pending intent before closing the current binding.
 
 `running` is restoration eligibility, not a live PID indicator:
 
@@ -232,6 +245,8 @@ The next ordinary prompt, attachment, `/review`, or native control that requires
 Successful RPC calls refresh the idle clock and invalidate watchdog evidence. Failed RPC calls invalidate watchdog evidence, including in-flight probes, but do not refresh the idle clock.
 
 After restart, a committed running binding restores the exact saved session file and directory. Before any OMP process is restored, the daemon rebuilds every eligible binding's logical session claim from its persisted native session ID; bindings blocked by `worker.max_workers` retain that claim until explicitly closed, so another conversation cannot resume the same session. A binding marked interrupted appends a warning to its `omp is ready` message, then clears the marker in the new generation; idle restorations stay silent. An uncommitted new/resume intent does not launch another omp process: the prior start may already have created process state whose identity was never committed. The bridge creates an inactive worker, reports the uncertainty, and requires explicit `/close` followed by `/new` or `/resume`. This preserves the requested transition without replaying an uncertain operation. Missing files/directories do not trigger a replacement conversation. A fresh omp session may report an identity before its history file exists.
+
+The persisted logical session claim is the restore claim: it is rebuilt from the saved native session identity before process launch and retained while worker capacity delays reconnection.
 
 ## Process and file safety
 

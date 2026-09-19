@@ -1,8 +1,8 @@
 # 架构与开发说明
 
-[English](architecture.md) | [用户指南](../README.zh.md)
+[English](architecture.md) | 中文 | [用户指南](../README.zh.md)
 
-本文描述当前实现. 尚未落地的启动意图设计单独标注, 不与现有行为混用.
+本文描述当前实现及其恢复语义.
 
 ## 范围与职责
 
@@ -48,7 +48,7 @@ flowchart LR
 
 ### 并发模型
 
-- 每个对话使用 actor 风格的 worker. 普通文字, 附件和 `/review` 都作为独立 prompt 进入 bridge 延后队列, 串行执行. bridge 只在当前任务结束后提交下一条 prompt. `/followup` 仍不支持.
+- 每个对话使用 actor 风格的 worker. 普通文字, 附件和 `/review` 都作为独立 prompt 进入 bridge 延后队列, 串行执行. bridge 只在当前任务结束后提交下一条 prompt.
 - 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
 - 附件准备和上传异步且有并发上限. 尚在准备的附件保留其队列位置.
 - RPC stdout reader 不执行 Telegram HTTP 交付. 事件缓冲有界, 协议错误或持续积压会使 client 失败, 不允许内存无限增长.
@@ -61,6 +61,8 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 bridge 使用公开 RPC v2, 不依赖协议扩展. 调用 `prompt` 前, 先将该输入设为 active terminal-result owner. 成功的 acknowledgement 不需要路由分类; `agentInvoked=false` 通过正常完成流程结束本地命令, 其他已接受的 prompt 则等待终结事件. prompt 请求失败或无法确认时, 该输入以 uncertain 结束, 同时关闭该 OMP client 并取消 bridge 队列, 不重试. 不能将该 client 当作 idle 后继续复用, 否则未确认的工作可能接管后续输入的结果归属. `/stop` 先清 bridge 延后 prompt, 再发送不带清队列选项的普通 `abort` 请求. 重启或执行结果不确定后, 包括 `/review` 在内的待执行任务都不会自动重放.
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存的诊断只用于分类, 绝不出现在 Telegram 输出中.
+
+### 缺失终结信号与 watchdog
 
 缺失终结信号走独立的保守恢复路径, 绝不当作成功. 活跃 busy 根任务必须至少 30 秒无活动, 且没有 compact/handoff、retry、运行中工具、host request 或原生 UI 等待. 后台 `get_state` 请求超时为 5 秒, 不阻塞 actor 处理控制命令. `isStreaming` 和 `isCompacting` 都必须明确为 `false`; 缺失/null/格式错误字段及请求错误会丢弃确认. 两次确认至少相隔 30 秒. 所有事件 (包括未知或格式错误事件) 和普通 RPC 活动都会使探测失效. 结果按 client 身份、generation、turn、active input 和活动 revision 隔离, 已排队事件优先于探测结果. 确认缺失完成后, 复用原有 uncertain 结果原子事务和进度清理, 再先关闭旧 client, 后派发队列; 保留逻辑 session claim 和排队输入, 按需 resume, 不重放旧任务. 终态、turn 变化、runtime 释放和 shutdown 都会取消待处理 typing 请求, 请求仍有 4 秒超时.
 
@@ -164,7 +166,7 @@ Telegram update
 
 完成事务失败时停止 worker, 不伪装成任务完成. 重启时 submitted 输入转为 `uncertain`, 旧的 pending 普通消息, 附件和 `/review` 取消, 不自动重放. 其他待处理控制命令仍正常鉴权; 依赖内存状态的旧 callback token 会随状态丢失而失效.
 
-### 输出交付
+### 输出交付与 progress 清理
 
 ```text
 pending -> sending -> done
@@ -182,9 +184,16 @@ Telegram client 在传输边界区分错误:
 
 不为这两种终态增加自动重发. 明确的 Telegram 限流保留有界重试. 数据库事务无法与 Telegram 网络副作用原子提交, 因此不承诺 exactly-once.
 
+对于 progress 删除, 已确认且不可重试的 Telegram 4xx (429 除外) 只清除本地 progress 关联. 429, 5xx, 传输失败或不确定响应会保留该关联, 等待之后的清理尝试. 清理状态不会改变任务或 outbox 结果.
+
 outbox replay 为每个最终文本分段保留持久化的 reply target. Telegram 因原始消息不可用而拒绝该 target 时, client 对同一文本仅再发送一次普通消息; 该 UX fallback 不改变 inbox/outbox ownership 或任务结算.
 
 每条 progress preview 都关联其根 inbox, 每个最终 outbox 分段都携带该 inbox ID. 对于正常 `done` 任务, 只有全部关联 outbox 分段在 Telegram 确认送达并标记为 `done` 后才删除 progress. `cancelled` 和 `uncertain` 的 progress 保留. 启动时会重试上次运行留下的已完成关联. 已确认的不可重试 Telegram 删除拒绝会清除尽力而为的 progress 关联; 当终态数据达到 retention cutoff 且没有 pending 或 sending outbox 工作时, retention 会清除本地关联但不删除 Telegram 消息. 传输失败、429、5xx 和不确定响应会保留关联以便重试, 不改变任务交付状态.
+
+### 附件生命周期
+
+Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 workspace 的 `.telegram/incoming/` 下. 它们属于 workspace 文件, 不会被 bridge 消息 retention 删除. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. 确认送达后删除 snapshot; 失败或不确定交付会在 outbox 持有该文件, 直到终态 retention 清理. retention 只会在对应 outbox 行删除后删除 snapshot, janitor 也只会在这个私有 spool 内删除过期且无引用的 `attachment-*` 文件. 该清理不会删除 workspace 源文件.
+确认送达后的 snapshot 删除是 best-effort; 暂时无法删除的 snapshot 由 retention 和 spool janitor 后续处理.
 
 ## 会话生命周期
 
@@ -210,7 +219,11 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 
 `/handoff [补充要求]` 直接调用原生 `handoff`, 可携带 `customInstructions`; 摘要生成和上下文维护仍由 OMP 负责. 要求实例空闲且 bridge 队列为空, 复用现有异步维护结果通道, 按 generation 隔离旧结果. bridge 不创建替代 session, 不自行生成交接文档, 不重放失败或结果不确定的操作. 等待结果时仍可处理本地 `/help` 和 `/close`. 其他 RPC 命令遵循 OMP 自身串行规则, 不承诺 `/stop` 能立即中断 handoff.
 
-每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的自动恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. `/close` 会先删除待完成意图, 再关闭当前绑定.
+### 启动恢复与崩溃语义
+
+未提交的启动意图表示转换尚未完成, 不表示可以再次启动一个 omp 进程. 恢复会保留已保存 binding 供显式处理, 再次尝试新转换前需要执行 `/close`, 然后执行 `/new` 或 `/resume`.
+
+每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的自动恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. 这是 bridge 级 two-phase commit: 先持久化意图, 再发布运行绑定; 不保证进程启动 exactly once. `/close` 会先删除待完成意图, 再关闭当前绑定.
 
 `running` 表示恢复资格, 不是实时 PID 状态:
 
@@ -232,6 +245,8 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 成功 RPC 会刷新空闲计时并使 watchdog 证据失效. 失败 RPC 只使 watchdog 证据及正在进行的探测失效, 不刷新空闲计时.
 
 重启后, 已提交且 `running=1` 的 binding 会恢复准确的 session 文件和目录. 在恢复任何 OMP 进程前, daemon 根据每个符合条件 binding 已持久化的原生 session ID 重建逻辑 session claim; 被 `worker.max_workers` 阻塞的 binding 会持续持有该 claim, 直到显式 `/close`, 因而其他对话不能恢复同一 session. 被标记为中断的 binding 会在 `omp is ready` 消息中追加 warning, 并在新 generation 中清除标记; 空闲会话恢复保持静默. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
+
+持久化的逻辑 session claim 就是 restore claim: 它在进程启动前依据保存的原生 session 身份重建, 并在 worker 容量延迟重连期间保持.
 
 ## 进程与文件安全
 
