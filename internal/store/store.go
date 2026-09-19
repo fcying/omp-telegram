@@ -15,7 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 const messageCleanupBatchSize = 1000
 
 type Store struct{ DB *sql.DB }
@@ -37,9 +37,13 @@ type Input struct {
 	Raw json.RawMessage
 }
 type Output struct {
-	ID, Chat, Thread, ReplyTo int64
-	Text                      string
-	Kind, Path, Name          string
+	ID, InboxID, Chat, Thread, ReplyTo int64
+	Text                               string
+	Kind, Path, Name                   string
+}
+
+type ProgressMessage struct {
+	InboxID, Chat, MessageID int64
 }
 
 type CleanupResult struct {
@@ -116,10 +120,11 @@ func initialize(db *sql.DB) error {
  CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
- CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX idx_inbox_state ON inbox(state,id);
- CREATE INDEX idx_outbox_state ON outbox(state,id);`)
+ CREATE INDEX idx_outbox_state ON outbox(state,id);
+ CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state);`)
 		if e != nil {
 			return e
 		}
@@ -177,6 +182,18 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 6
+	}
+	if version == 6 {
+		for _, query := range []string{
+			"ALTER TABLE inbox ADD COLUMN progress_message_id INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE outbox ADD COLUMN inbox_id INTEGER NOT NULL DEFAULT 0",
+			"CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state)",
+		} {
+			if _, e = tx.Exec(query); e != nil {
+				return e
+			}
+		}
+		version = 7
 	}
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
@@ -417,7 +434,20 @@ func (s *Store) cleanupInboxBatch(ctx context.Context, cutoff int64) (int64, err
 		return 0, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, "DELETE FROM inbox WHERE id IN (SELECT id FROM inbox WHERE state IN ('done','cancelled','ignored','failed','uncertain') AND updated_at<? ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
+	if _, err = tx.ExecContext(ctx, `UPDATE inbox AS candidate
+SET progress_message_id=0
+WHERE candidate.state IN ('done','cancelled','ignored','failed','uncertain')
+  AND candidate.progress_message_id>0
+  AND candidate.updated_at<?
+  AND NOT EXISTS (
+		SELECT 1
+		FROM outbox AS active
+		WHERE active.inbox_id=candidate.id
+		  AND active.state IN ('pending','sending')
+	)`, cutoff); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, "DELETE FROM inbox WHERE id IN (SELECT id FROM inbox WHERE state IN ('done','cancelled','ignored','failed','uncertain') AND progress_message_id=0 AND updated_at<? ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -434,7 +464,7 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 		return 0, nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, "SELECT path FROM outbox WHERE id IN (SELECT id FROM outbox WHERE state IN ('done','sent','failed','uncertain','cancelled') AND updated_at<? ORDER BY id LIMIT ?) AND kind IN ('photo','document')", cutoff, messageCleanupBatchSize)
+	rows, err := tx.QueryContext(ctx, "SELECT path FROM outbox WHERE id IN (SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM inbox AS progress WHERE progress.id=candidate.inbox_id AND progress.progress_message_id>0) ORDER BY candidate.id LIMIT ?) AND kind IN ('photo','document')", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -450,7 +480,7 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 	if err = rows.Close(); err != nil {
 		return 0, nil, err
 	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM outbox WHERE id IN (SELECT id FROM outbox WHERE state IN ('done','sent','failed','uncertain','cancelled') AND updated_at<? ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
+	result, err := tx.ExecContext(ctx, "DELETE FROM outbox WHERE id IN (SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM inbox AS progress WHERE progress.id=candidate.inbox_id AND progress.progress_message_id>0) ORDER BY candidate.id LIMIT ?)", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -589,7 +619,7 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 		return fmt.Errorf("input is not submitted")
 	}
 	for _, reply := range replies {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(chat,thread,text,state,reply_to,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?)", chat, thread, reply, replyTo, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,state,reply_to,created_at,updated_at) VALUES(?,?,?,?,'pending',?,?,?)", id, chat, thread, reply, replyTo, now, now); err != nil {
 			return err
 		}
 	}
@@ -607,15 +637,78 @@ func (s *Store) EnqueueAttachment(chat, thread int64, kind, path, name, caption 
 
 func (s *Store) NextOutput() (Output, error) {
 	var o Output
-	e := s.DB.QueryRow("SELECT id,chat,thread,text,reply_to,kind,path,name FROM outbox WHERE state='pending' ORDER BY id LIMIT 1").Scan(&o.ID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name)
-	return o, e
+	err := s.DB.QueryRow("SELECT id,inbox_id,chat,thread,text,reply_to,kind,path,name FROM outbox WHERE state='pending' ORDER BY id LIMIT 1").Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name)
+	return o, err
 }
+
 func (s *Store) MarkOutput(id int64, state string) error {
-	_, e := s.DB.Exec("UPDATE outbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
-	return e
+	_, err := s.DB.Exec("UPDATE outbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
+	return err
 }
+
+func (s *Store) SetProgressMessage(inboxID, messageID int64) error {
+	if inboxID <= 0 || messageID <= 0 {
+		return errors.New("invalid progress message identity")
+	}
+	result, err := s.DB.Exec("UPDATE inbox SET progress_message_id=? WHERE id=?", messageID, inboxID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) CompletedProgressMessage(inboxID int64) (ProgressMessage, bool, error) {
+	var message ProgressMessage
+	err := s.DB.QueryRow(`
+SELECT i.id,MIN(o.chat),i.progress_message_id
+FROM inbox i
+JOIN outbox o ON o.inbox_id=i.id
+WHERE i.id=? AND i.state='done' AND i.progress_message_id>0
+  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state<>'done')
+GROUP BY i.id,i.progress_message_id`, inboxID).Scan(&message.InboxID, &message.Chat, &message.MessageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ProgressMessage{}, false, nil
+	}
+	return message, err == nil, err
+}
+
+func (s *Store) CompletedProgressMessages() ([]ProgressMessage, error) {
+	rows, err := s.DB.Query(`
+SELECT i.id,MIN(o.chat),i.progress_message_id
+FROM inbox i
+JOIN outbox o ON o.inbox_id=i.id
+WHERE i.state='done' AND i.progress_message_id>0
+  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state<>'done')
+GROUP BY i.id,i.progress_message_id ORDER BY i.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var messages []ProgressMessage
+	for rows.Next() {
+		var message ProgressMessage
+		if err := rows.Scan(&message.InboxID, &message.Chat, &message.MessageID); err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
+func (s *Store) ClearProgressMessage(inboxID, messageID int64) error {
+	_, err := s.DB.Exec("UPDATE inbox SET progress_message_id=0 WHERE id=? AND progress_message_id=?", inboxID, messageID)
+	return err
+}
+
 func (s *Store) Uncertain() (int, error) {
 	var n int
-	e := s.DB.QueryRow("SELECT (SELECT COUNT(*) FROM inbox WHERE state='uncertain')+(SELECT COUNT(*) FROM outbox WHERE state='uncertain')").Scan(&n)
-	return n, e
+	err := s.DB.QueryRow("SELECT (SELECT COUNT(*) FROM inbox WHERE state='uncertain')+(SELECT COUNT(*) FROM outbox WHERE state='uncertain')").Scan(&n)
+	return n, err
 }

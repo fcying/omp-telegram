@@ -105,6 +105,26 @@ func TestConversationMessages(t *testing.T) {
 	}
 }
 
+func TestDeleteMessage(t *testing.T) {
+	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/deleteMessage" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+			t.Error(err)
+			return
+		}
+		if string(fields["chat_id"]) != "-10" || string(fields["message_id"]) != "42" {
+			t.Errorf("wrong destination: %s", fields)
+		}
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	})
+	if err := client.Delete(context.Background(), -10, 42); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClearKeyboardPreservesText(t *testing.T) {
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/editMessageReplyMarkup" {

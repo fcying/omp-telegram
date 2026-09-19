@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -8,39 +9,94 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-func TestInitialProgressDelaySkipsShortTask(t *testing.T) {
+func allowInitialProgress(w *worker) {
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+}
+
+func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
 	w.b.cfg.QueueCapacity = 1
+	w.previewResult = make(chan previewResult, 1)
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.b.db.MarkOutput(ready.ID, "done"); err != nil {
+	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
 	command("missing-terminal")
 	w.dispatch()
 	drainWatchdogEvents(t, w)
 	w.flushPreview()
-	if w.previewBusy {
-		t.Fatal("short task started a progress send")
+	select {
+	case <-w.previewResult:
+		t.Fatal("initial progress was sent before the delay")
+	default:
 	}
-	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"short answer"}]}]}`))
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 	w.flushPreview()
+	var result previewResult
+	select {
+	case result = <-w.previewResult:
+		if result.err != nil || result.id == 0 {
+			t.Fatalf("progress send failed: %+v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial progress remained delayed")
+	}
+	w.previewFinished(result)
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"short answer"}]}]}`))
 	output, err := w.b.db.NextOutput()
 	if err != nil || output.Text != "short answer" {
 		t.Fatalf("final reply = %+v, err=%v", output, err)
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.messages) != 0 || len(f.keyboardClears) != 0 {
-		t.Fatal("short task created temporary progress or terminal UI traffic")
+	if got := f.deletedMessageIDs(); len(got) != 0 {
+		t.Fatalf("progress was deleted before final delivery: %v", got)
+	}
+	if err := w.b.db.MarkOutput(output.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	w.b.cleanupDeliveredProgress(context.Background(), output.InboxID)
+	waitFor(t, func() bool { return len(f.deletedMessageIDs()) == 1 })
+	if got := f.deletedMessageIDs(); len(got) != 1 || got[0] != result.id {
+		t.Fatalf("deleted progress messages = %v, want [%d]", got, result.id)
 	}
 }
 
-func TestInitialProgressDelaySurvivesNativeActivity(t *testing.T) {
+func TestShortTaskCompletesWithoutProgressMessage(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.ProgressMode = "summary"
+	w.previewResult = make(chan previewResult, 1)
+	command("/new " + t.TempDir())
+	ready, err := w.b.db.NextOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	command("short task")
+	w.dispatch()
+	w.progress.StartedAt = time.Now()
+	w.flushPreview()
+	select {
+	case result := <-w.previewResult:
+		t.Fatalf("short task sent progress: %+v", result)
+	default:
+	}
+	w.preview = "short answer"
+	w.finish()
+	f.mu.Lock()
+	messages := len(f.messages)
+	f.mu.Unlock()
+	if messages != 0 {
+		t.Fatalf("short task sent %d Telegram messages before final delivery", messages)
+	}
+}
+
+func TestInitialProgressSurvivesNativeActivity(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
 	w.b.cfg.QueueCapacity = 1
@@ -49,9 +105,9 @@ func TestInitialProgressDelaySurvivesNativeActivity(t *testing.T) {
 	command("missing-terminal")
 	w.dispatch()
 	drainWatchdogEvents(t, w)
-	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 	w.event([]byte(`{"type":"agent_start"}`))
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"working"}}`))
+	allowInitialProgress(w)
 	w.flushPreview()
 	select {
 	case result := <-w.previewResult:
@@ -89,7 +145,7 @@ func TestProgressStopButtonAbortsOnlyItsActiveRootTask(t *testing.T) {
 	if len(w.queue) != 1 {
 		t.Fatal("queued root task missing before stop")
 	}
-	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+	allowInitialProgress(w)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil || result.id == 0 {
@@ -119,12 +175,15 @@ func TestProgressStopButtonAbortsOnlyItsActiveRootTask(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "cancelled" {
 		t.Fatalf("queued root state = %q, error %v", state, err)
 	}
+	if got := f.deletedMessageIDs(); len(got) != 0 {
+		t.Fatalf("cancelled task deleted progress: %v", got)
+	}
 	if len(w.queue) != 0 || len(w.confirms) != 0 {
 		t.Fatal("valid progress stop did not consume its UI state")
 	}
 }
 
-func TestTerminalCompletionClearsProgressStopButton(t *testing.T) {
+func TestTerminalCompletionDeletesProgressMessage(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
 	w.b.cfg.QueueCapacity = 4
@@ -139,7 +198,7 @@ func TestTerminalCompletionClearsProgressStopButton(t *testing.T) {
 	}
 	command("question")
 	w.dispatch()
-	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+	allowInitialProgress(w)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil {
@@ -148,9 +207,31 @@ func TestTerminalCompletionClearsProgressStopButton(t *testing.T) {
 	w.previewFinished(result)
 	w.preview = "final"
 	w.finish()
+	out, err := w.b.db.NextOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.deletedMessageIDs(); len(got) != 0 {
+		t.Fatalf("progress was deleted before final delivery: %v", got)
+	}
+	if err := w.b.db.MarkOutput(out.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	w.b.cleanupDeliveredProgress(context.Background(), out.InboxID)
 	waitKeyboardClears(t, f, int(result.id))
 	if len(w.confirms) != 0 || w.previewStopToken != "" {
 		t.Fatal("terminal completion retained progress stop state")
+	}
+	waitFor(t, func() bool { return len(f.deletedMessageIDs()) == 1 })
+	if got := f.deletedMessageIDs(); len(got) != 1 || got[0] != result.id {
+		t.Fatalf("deleted progress messages = %v, want [%d]", got, result.id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, message := range f.messages {
+		if message["text"] == "Task ended. The complete result follows." {
+			t.Fatal("terminal progress placeholder was sent")
+		}
 	}
 }
 
@@ -260,7 +341,7 @@ func activeProgressStop(t *testing.T) (*worker, *fakeHTTP, string, int) {
 	}
 	command("wait")
 	w.dispatch()
-	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+	allowInitialProgress(w)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil || result.id == 0 {
@@ -445,7 +526,7 @@ func TestProgressStopAcceptsCallbackBeforeInitialResult(t *testing.T) {
 	}
 	command("wait")
 	w.dispatch()
-	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+	allowInitialProgress(w)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil || result.id == 0 {

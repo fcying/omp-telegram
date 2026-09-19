@@ -89,8 +89,8 @@ Both formats write to stderr. File storage and rotation belong to supervisor/jou
 | `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
 | `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
 | `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
-| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_failed`, `delivery_uncertain`, `reply_fallback` |
-| `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed` |
+| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
+| `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed`, `progress_message_write_failed`, `progress_cleanup_state_failed` |
 | `media` | `prepare_failed`, `snapshot_failed`, `attachment_persist_failed`, `cleanup_failed` |
 
 Root task correlation uses `chat_id`, `thread_id`, `generation`, `turn`, `inbox_id`, and `client_id` where applicable. `thread_id=0` is meaningful for private chats. Native `session_id` is recorded in full only after validation; file paths are never session log identities. `client_id` is process-local and monotonic, not persisted. `task_complete` reports `result=done|cancelled|uncertain` after the durable transaction succeeds, with `duration_ms` when the root start time is available. Delivery metadata uses `outbox_id`, `kind`, `api_code`, `retry_after_s`, `uncertain`, and `replay=false`; descriptions and response bodies are never logged. To trace receipt through actor handling, set `logging.component_levels.rpc = "debug"` and `logging.component_levels.bridge = "debug"`.
@@ -99,7 +99,7 @@ Bot IDs remain part of internal session identity and database checks, but are om
 
 Live progress is an in-memory, best-effort view using the existing one-message preview transport. `telegram.progress_mode=off` suppresses Telegram Send/Edit and typing but continues text-delta processing for final-result fallback. `summary` shows assistant output, active tool names keyed by tool call ID, and state; `verbose` adds the bounded recent tool list. Retry, compaction, and concurrent tools are explicit events. `tool_execution_end` is the sole completion source, including host tools; host callbacks only correct a matching active tool name. Reasoning, raw frames, tool arguments/results, command text, stdout, and stderr are never rendered. Each active root progress message has a Stop button fenced by owner, worker generation, active inbox ID, and turn. A valid click consumes and removes the button, clears bridge-deferred prompts, and sends the same native `abort` as `/stop`; stale buttons are removed without aborting. Programmatic task settlement, worker replacement, and shutdown invalidate the button through the bounded cleanup queue. An initial Send failure suppresses progress for that turn to avoid duplicate messages; an Edit failure remains retryable. Progress replies to the root input when possible, but reply rejection falls back to a plain message without changing task state.
 
-Initial progress has a 3-second delay measured from root dispatch using `progressState.StartedAt`, independent of idle activity. Events and repeated `agent_start` do not restart this delay. The existing 1.5-second tick checks eligibility, so initial progress normally starts around 3–4.5 seconds, subject to actor and network delays. Only initial creation is delayed; existing-message updates, typing, durable final replies, and in-flight terminal cleanup retain their existing behavior.
+Progress creation is evaluated on the regular 1.5-second worker tick after a three-second initial delay for a new task. Existing-message updates, typing, and durable final replies retain their independent behavior. Each progress preview is associated with its root inbox. For a normal `done` task, the bridge deletes that progress message only after every associated outbox part is marked `done` following confirmed Telegram delivery. `cancelled` and `uncertain` progress messages are retained. The association is a local cleanup aid, not a permanent retention pin: when terminal data reaches the retention cutoff with no associated `pending` or `sending` outbox work, cleanup clears only the local association and leaves the Telegram message in place. A confirmed non-retryable Telegram deletion rejection also releases the durable association. Transport failures, 429, 5xx, and uncertain responses leave it for a later retry. Startup retries completed associations left by a previous run.
 
 ## Identity and stale work
 
@@ -129,8 +129,8 @@ The database is `omp-telegram.db` under `storage.data_dir`. It uses WAL, a busy 
 | `bindings` | PK `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | Last validated session binding, restoration eligibility, and active-task interruption marker |
 | `startup_intents` | PK `(bot,chat,thread)`; `kind,workspace,session,generation` | Durable uncommitted `/new` or `/resume` transition |
 | `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots, not a session browser |
-| `inbox` | PK `id`; `raw,state,created_at,updated_at` | Update deduplication and processing state |
-| `outbox` | Autoincrement `id`; `chat,thread,text,state,kind,path,name,created_at,updated_at` | Ordered text/attachment delivery |
+| `inbox` | PK `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | Update deduplication, processing state, and optional live-progress identity |
+| `outbox` | Autoincrement `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,created_at,updated_at` | Ordered text/attachment delivery associated with its root input |
 
 ### Database Message Retention
 
@@ -138,11 +138,13 @@ The database is `omp-telegram.db` under `storage.data_dir`. It uses WAL, a busy 
 
 Only explicitly enumerated terminal states are eligible: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, legacy `sent`, `failed`, `uncertain`, `cancelled`. Inbox `pending`/`submitted` and outbox `pending`/`sending` remain durable. Deletion uses committed batches of 1000 rows; the service never automatically runs `VACUUM`.
 
+Terminal inbox rows with a nonzero `progress_message_id`, and their associated outbox rows, remain outside retention cleanup until the Telegram progress deletion succeeds, a confirmed non-retryable rejection clears the association, or the retention cutoff is reached with no associated `pending` or `sending` outbox work. The last case clears only the local association and does not call Telegram Delete.
+
 Retention never deletes bindings, history, startup intents, workspaces, omp session files, or other omp data. Terminal outbox attachment snapshots become unowned after their corresponding delete commits and are removed best-effort only when confined to `storage.data_dir/attachments/outbox/`. Each janitor run also removes unreferenced `attachment-*` snapshots in that private spool once their file modification time exceeds the retention cutoff.
 
 ### Schema version
 
-`PRAGMA user_version` is the schema version, currently 4. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 3 migrate transactionally through `startup_intents`, the binding interruption marker, and message timestamps before advancing `user_version`. Existing v3 messages receive migration-time timestamps, giving them a full retention period rather than guessing historical age. An older binary rejects the newer schema. Application versions and database versions evolve independently.
+`PRAGMA user_version` is the schema version, currently 7. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 6 migrate transactionally through `startup_intents`, the binding interruption marker, message timestamps, reply targets, native session IDs, and inbox/outbox progress associations before advancing `user_version`. Existing v3 messages receive migration-time timestamps, giving them a full retention period rather than guessing historical age. An older binary rejects the newer schema. Application versions and database versions evolve independently.
 
 ### Input and completion transactions
 
@@ -181,6 +183,8 @@ The Telegram client classifies failures at the transport boundary:
 There is no new automatic resend for either terminal error state. Explicit Telegram rate limits retain bounded retries. A database transaction cannot atomically commit a Telegram network side effect, so exactly-once delivery is not promised.
 
 Outbox replay preserves the stored reply target for every final text part. If Telegram rejects that target because the original message is unavailable, the client sends the same text once without reply binding; this UX fallback does not change inbox/outbox ownership or task settlement.
+
+Each progress preview is associated with its root inbox, and every final outbox part carries that inbox ID. For a normal `done` task, progress is deleted only after all associated outbox parts are marked `done` following confirmed Telegram delivery. `cancelled` and `uncertain` progress is retained. Startup retries completed associations left by a previous run. A confirmed non-retryable Telegram deletion rejection clears the best-effort progress association; once terminal data reaches the retention cutoff without pending or sending outbox work, retention clears the local association without deleting the Telegram message. Transport failures, 429, 5xx, and uncertain responses retain it for retry without changing task delivery state.
 
 ## Session lifecycle
 

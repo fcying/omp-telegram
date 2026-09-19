@@ -35,6 +35,11 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	if version != schemaVersion {
 		t.Fatalf("new database version = %d, want %d", version, schemaVersion)
 	}
+	var indexCount int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_outbox_inbox_state'").Scan(&indexCount))
+	if indexCount != 1 {
+		t.Fatalf("new database progress association index count = %d, want 1", indexCount)
+	}
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -180,6 +185,72 @@ func TestRootReplyTargetSurvivesCompletionAndRestart(t *testing.T) {
 			t.Fatalf("durable reply target = %+v, want text %q replying to 42", out, want)
 		}
 		requireStoreOK(t, s.MarkOutput(out.ID, "done"))
+	}
+}
+
+func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"first", "second"}))
+	requireStoreOK(t, s.SetProgressMessage(10, 99))
+	if target, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
+		t.Fatalf("pending progress cleanup = %+v, ready=%t, err=%v", target, ready, err)
+	}
+	first, err := s.NextOutput()
+	requireStoreOK(t, err)
+	if first.InboxID != 10 {
+		t.Fatalf("first output inbox = %d, want 10", first.InboxID)
+	}
+	requireStoreOK(t, s.MarkOutput(first.ID, "done"))
+	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
+		t.Fatalf("partial progress cleanup became ready=%t, err=%v", ready, err)
+	}
+	second, err := s.NextOutput()
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.MarkOutput(second.ID, "done"))
+	target, ready, err := s.CompletedProgressMessage(10)
+	requireStoreOK(t, err)
+	if !ready || target.InboxID != 10 || target.Chat != 7 || target.MessageID != 99 {
+		t.Fatalf("completed progress target = %+v, ready=%t", target, ready)
+	}
+	targets, err := s.CompletedProgressMessages()
+	requireStoreOK(t, err)
+	if len(targets) != 1 || targets[0] != target {
+		t.Fatalf("startup progress targets = %+v, want [%+v]", targets, target)
+	}
+	requireStoreOK(t, s.ClearProgressMessage(target.InboxID, target.MessageID))
+	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
+		t.Fatalf("cleared progress cleanup remained ready=%t, err=%v", ready, err)
+	}
+}
+func TestTerminalNonDoneProgressIsNotCleanupEligible(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	for _, tc := range []struct {
+		id    int64
+		state string
+	}{
+		{id: 20, state: "cancelled"},
+		{id: 21, state: "uncertain"},
+	} {
+		requireStoreOK(t, s.Accept(tc.id, []byte(`{}`)))
+		requireStoreOK(t, s.Mark(tc.id, "submitted"))
+		var err error
+		if tc.state == "cancelled" {
+			err = s.CompleteInboxCancelledWithReplies(context.Background(), tc.id, 7, 8, []string{"terminal"})
+		} else {
+			err = s.CompleteInboxUncertainWithReplies(context.Background(), tc.id, 7, 8, []string{"terminal"})
+		}
+		requireStoreOK(t, err)
+		requireStoreOK(t, s.SetProgressMessage(tc.id, tc.id+100))
+		if _, ready, err := s.CompletedProgressMessage(tc.id); err != nil || ready {
+			t.Fatalf("%s progress became cleanup eligible: ready=%t, err=%v", tc.state, ready, err)
+		}
+		var messageID int64
+		requireStoreOK(t, s.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=?", tc.id).Scan(&messageID))
+		if messageID != tc.id+100 {
+			t.Fatalf("%s progress association = %d", tc.state, messageID)
+		}
 	}
 }
 
@@ -551,14 +622,22 @@ PRAGMA user_version=3;`)
 	var version int
 	var inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo int64
 	var sessionID string
+	var progressMessageID, outboxInboxID int64
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM inbox WHERE id=1").Scan(&inboxCreated, &inboxUpdated))
 	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM outbox WHERE id=1").Scan(&outboxCreated, &outboxUpdated))
 	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM inbox WHERE id=1").Scan(&inboxReplyTo))
 	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM outbox WHERE id=1").Scan(&outboxReplyTo))
 	requireStoreOK(t, s.DB.QueryRow("SELECT session_id FROM bindings WHERE bot=1 AND chat=2 AND thread=3").Scan(&sessionID))
-	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 || inboxReplyTo != 0 || outboxReplyTo != 0 || sessionID != "01a0afcf-303b-775f-adda-fe30af90a116" {
-		t.Fatalf("version/message migration = version=%d times=%d/%d/%d/%d replies=%d/%d session=%q", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo, sessionID)
+	requireStoreOK(t, s.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=1").Scan(&progressMessageID))
+	requireStoreOK(t, s.DB.QueryRow("SELECT inbox_id FROM outbox WHERE id=1").Scan(&outboxInboxID))
+	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 || inboxReplyTo != 0 || outboxReplyTo != 0 || progressMessageID != 0 || outboxInboxID != 0 || sessionID != "01a0afcf-303b-775f-adda-fe30af90a116" {
+		t.Fatalf("version/message migration = version=%d times=%d/%d/%d/%d replies=%d/%d progress=%d/%d session=%q", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo, progressMessageID, outboxInboxID, sessionID)
+	}
+	var indexCount int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_outbox_inbox_state'").Scan(&indexCount))
+	if indexCount != 1 {
+		t.Fatalf("migrated progress association index count = %d, want 1", indexCount)
 	}
 	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)
@@ -614,6 +693,74 @@ func TestCleanupMessagesProtectsNonterminalAndRecentRows(t *testing.T) {
 	}
 	if _, err = s.Binding(binding.Bot, binding.Chat, binding.Thread); err != nil {
 		t.Fatalf("message cleanup removed binding: %v", err)
+	}
+}
+
+func TestCleanupMessagesRetainsProgressAssociationWithActiveOutbox(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Accept(1, []byte(`{}`)))
+	requireStoreOK(t, s.Mark(1, "submitted"))
+	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 1, 2, 3, []string{"reply"}))
+	requireStoreOK(t, s.SetProgressMessage(1, 77))
+	out, err := s.NextOutput()
+	requireStoreOK(t, err)
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	requireStoreOK(t, setMessageTimes(s, old, old, []int64{1}, []int64{out.ID}))
+	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 0 || result.Outbox != 0 {
+		t.Fatalf("cleanup removed active progress association: %+v", result)
+	}
+	requireStoreOK(t, s.MarkOutput(out.ID, "uncertain"))
+	requireStoreOK(t, setMessageTimes(s, old, old, nil, []int64{out.ID}))
+	result, err = s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 1 || result.Outbox != 1 {
+		t.Fatalf("cleanup after outbox became terminal = %+v, want inbox=1 outbox=1", result)
+	}
+}
+
+func TestCleanupMessagesReleasesExpiredTerminalProgressAssociations(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	cases := []struct {
+		id          int64
+		state       string
+		outboxState string
+	}{
+		{id: 1, state: "cancelled", outboxState: "cancelled"},
+		{id: 2, state: "uncertain", outboxState: "uncertain"},
+		{id: 3, state: "done", outboxState: "failed"},
+		{id: 4, state: "done", outboxState: "uncertain"},
+	}
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	for _, tc := range cases {
+		requireStoreOK(t, s.Accept(tc.id, []byte(`{}`)))
+		requireStoreOK(t, s.Mark(tc.id, "submitted"))
+		var err error
+		switch tc.state {
+		case "cancelled":
+			err = s.CompleteInboxCancelledWithReplies(context.Background(), tc.id, 7, 8, []string{"terminal"})
+		case "uncertain":
+			err = s.CompleteInboxUncertainWithReplies(context.Background(), tc.id, 7, 8, []string{"terminal"})
+		default:
+			err = s.CompleteInboxWithReplies(context.Background(), tc.id, 7, 8, []string{"terminal"})
+		}
+		requireStoreOK(t, err)
+		out, err := s.NextOutput()
+		requireStoreOK(t, err)
+		requireStoreOK(t, s.MarkOutput(out.ID, tc.outboxState))
+		requireStoreOK(t, s.SetProgressMessage(tc.id, tc.id+100))
+		requireStoreOK(t, setMessageTimes(s, old, old, []int64{tc.id}, []int64{out.ID}))
+	}
+	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != int64(len(cases)) || result.Outbox != int64(len(cases)) {
+		t.Fatalf("expired terminal progress cleanup = %+v, want inbox=%d outbox=%d", result, len(cases), len(cases))
+	}
+	var remaining int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM inbox WHERE progress_message_id>0").Scan(&remaining))
+	if remaining != 0 {
+		t.Fatalf("expired progress associations remained: %d", remaining)
 	}
 }
 

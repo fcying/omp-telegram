@@ -26,6 +26,13 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
+func requireStoreOK(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func testLogs(t *testing.T) *logging.Registry {
 	t.Helper()
 	logs, err := logging.New(io.Discard, logging.Options{Level: "info", Format: "text"})
@@ -314,22 +321,24 @@ func TestMain(m *testing.M) {
 }
 
 type fakeHTTP struct {
-	mu                sync.Mutex
-	messages          []map[string]any
-	callbacks         []string
-	updates           chan telegram.Update
-	rejectCommands    bool
-	rejectLanguage    string
-	files             map[string][]byte
-	failProgress      bool
-	progressCalls     int
-	downloadGate      <-chan struct{}
-	fileRequests      int
-	uploads           []mediaUpload
-	keyboardClears    []map[string]any
-	failKeyboardClear bool
-	keyboardClearGate <-chan struct{}
-	typingRequests    chan context.Context
+	mu                   sync.Mutex
+	messages             []map[string]any
+	callbacks            []string
+	updates              chan telegram.Update
+	rejectCommands       bool
+	rejectLanguage       string
+	files                map[string][]byte
+	failProgress         bool
+	progressCalls        int
+	downloadGate         <-chan struct{}
+	fileRequests         int
+	uploads              []mediaUpload
+	keyboardClears       []map[string]any
+	deletedMessages      []map[string]any
+	progressDeleteStatus int
+	failKeyboardClear    bool
+	keyboardClearGate    <-chan struct{}
+	typingRequests       chan context.Context
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -379,6 +388,14 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		id := len(f.messages)
 		f.mu.Unlock()
 		result = map[string]any{"message_id": id}
+	case "deleteMessage":
+		f.mu.Lock()
+		f.deletedMessages = append(f.deletedMessages, req)
+		status := f.progressDeleteStatus
+		f.mu.Unlock()
+		if status != 0 {
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"ok":false,"error_code":%d,"description":"progress deletion rejected"}`, status))), Header: make(http.Header), Request: r}, nil
+		}
 	case "editMessageReplyMarkup":
 		f.mu.Lock()
 		f.keyboardClears = append(f.keyboardClears, req)
@@ -729,6 +746,104 @@ func TestProgressCompletionFences(t *testing.T) {
 	}
 }
 
+func TestProgressEditCannotRestoreClearedAssociation(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
+	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	requireStoreOK(t, db.ClearProgressMessage(10, 77))
+	fake := &fakeHTTP{}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := testWorker(t, &worker{
+		b:             testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, db: db, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
+		binding:       store.Binding{Generation: 7},
+		turn:          8,
+		ctx:           ctx,
+		cancel:        cancel,
+		active:        10,
+		busy:          true,
+		preview:       "late edit",
+		previewID:     77,
+		lastPreview:   "current",
+		previewResult: make(chan previewResult, 1),
+		confirms:      make(map[string]confirmation),
+	})
+	w.flushPreview()
+	result := <-w.previewResult
+	if result.created {
+		t.Fatal("Edit response was marked as a newly created progress message")
+	}
+	w.previewFinished(result)
+	var progressID int64
+	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	if progressID != 0 {
+		t.Fatalf("late edit restored progress association: %d", progressID)
+	}
+	select {
+	case err := <-w.b.fatal:
+		t.Fatalf("late edit made bridge fatal: %v", err)
+	default:
+	}
+}
+
+func TestProgressAssociationFailureDeletesSentMessage(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	_, err = db.DB.Exec(`CREATE TRIGGER reject_progress_association BEFORE UPDATE OF progress_message_id ON inbox BEGIN SELECT RAISE(FAIL,'injected progress association failure'); END`)
+	requireStoreOK(t, err)
+	fake := &fakeHTTP{}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := testWorker(t, &worker{
+		b:             testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, db: db, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
+		binding:       store.Binding{Generation: 1},
+		ctx:           ctx,
+		cancel:        cancel,
+		active:        10,
+		owner:         7,
+		turn:          1,
+		busy:          true,
+		preview:       "working",
+		previewResult: make(chan previewResult, 1),
+		confirms:      make(map[string]confirmation),
+	})
+	w.flushPreview()
+	result := <-w.previewResult
+	if result.err != nil || result.id == 0 {
+		t.Fatalf("initial progress send failed: %+v", result)
+	}
+	w.previewFinished(result)
+	waitFor(t, func() bool { return len(fake.deletedMessageIDs()) == 1 })
+	if got := fake.deletedMessageIDs(); len(got) != 1 || got[0] != result.id {
+		t.Fatalf("orphan progress deletion = %v, want [%d]", got, result.id)
+	}
+	select {
+	case err := <-w.b.fatal:
+		if err == nil {
+			t.Fatal("association failure reported a nil fatal error")
+		}
+	default:
+		t.Fatal("association failure did not remain fatal")
+	}
+}
+
 func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 	for _, mode := range []string{"off", "summary", "verbose"} {
 		t.Run(mode, func(t *testing.T) {
@@ -756,6 +871,102 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 				t.Fatalf("inbox state = %q, err = %v", state, err)
 			}
 		})
+	}
+}
+
+func TestDeliveryCleansDoneProgressAfterAllReplies(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"first", "second"}))
+	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	fake := &fakeHTTP{}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	waitFor(t, func() bool {
+		ids := fake.deletedMessageIDs()
+		return len(ids) == 1 && ids[0] == 77
+	})
+	var state string
+	requireStoreOK(t, db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "done" {
+		t.Fatalf("inbox state = %q, want done", state)
+	}
+	var progressID int64
+	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	if progressID != 0 {
+		t.Fatalf("progress association remained after delivery: %d", progressID)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("delivery loop returned error: %v", err)
+	}
+}
+func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
+	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	out, err := db.NextOutput()
+	requireStoreOK(t, err)
+	requireStoreOK(t, db.MarkOutput(out.ID, "done"))
+	fake := &fakeHTTP{progressDeleteStatus: http.StatusInternalServerError}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
+	b.cleanupDeliveredProgress(context.Background(), 10)
+	var progressID int64
+	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	if progressID != 77 {
+		t.Fatalf("failed deletion cleared progress association: %d", progressID)
+	}
+	fake.progressDeleteStatus = 0
+	b.reconcileProgressCleanup(context.Background())
+	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	if progressID != 0 {
+		t.Fatalf("successful retry left progress association: %d", progressID)
+	}
+}
+
+func TestProgressDeletionPermanentFailureClearsAssociation(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
+	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	out, err := db.NextOutput()
+	requireStoreOK(t, err)
+	requireStoreOK(t, db.MarkOutput(out.ID, "done"))
+	fake := &fakeHTTP{progressDeleteStatus: http.StatusBadRequest}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
+	b.cleanupDeliveredProgress(context.Background(), 10)
+	var progressID int64
+	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	if progressID != 0 {
+		t.Fatalf("permanent deletion failure retained progress association: %d", progressID)
 	}
 }
 
@@ -1162,6 +1373,18 @@ func (f *fakeHTTP) messageCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.messages)
+}
+
+func (f *fakeHTTP) deletedMessageIDs() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]int64, 0, len(f.deletedMessages))
+	for _, message := range f.deletedMessages {
+		if id, ok := message["message_id"].(float64); ok {
+			ids = append(ids, int64(id))
+		}
+	}
+	return ids
 }
 
 func waitBinding(t *testing.T, db *store.Store, thread int64) {

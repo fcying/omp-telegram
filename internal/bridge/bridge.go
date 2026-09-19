@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -144,6 +145,8 @@ type terminalAssistant struct {
 }
 type previewResult struct {
 	id         int64
+	taskID     int64
+	created    bool
 	text       string
 	stopToken  string
 	generation int64
@@ -152,14 +155,13 @@ type previewResult struct {
 }
 
 const (
-	maxRecentTools   = 6
-	maxActiveTools   = 6
-	maxToolNameUnits = 64
-	maxPreviewUnits  = 2200
-	maxProgressUnits = 3500
+	maxRecentTools       = 6
+	maxActiveTools       = 6
+	maxToolNameUnits     = 64
+	maxPreviewUnits      = 2200
+	maxProgressUnits     = 3500
+	progressInitialDelay = 3 * time.Second
 )
-
-const progressInitialDelay = 3 * time.Second
 
 type progressState struct {
 	StartedAt   time.Time
@@ -303,6 +305,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2)}
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() { cancel(); b.wg.Wait() }()
+	b.reconcileProgressCleanup(ctx)
 	b.cleanupDatabase(ctx)
 	workers := map[target]*worker{}
 	if err := b.restoreWorkers(ctx, workers); err != nil {
@@ -593,6 +596,9 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", state)
 			return e
 		}
+		if state == "done" && o.InboxID != 0 {
+			b.cleanupDeliveredProgress(ctx, o.InboxID)
+		}
 		if o.Kind != "text" {
 			if state == "done" {
 				if removeErr := os.Remove(o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -608,6 +614,58 @@ func (b *Bridge) deliver(ctx context.Context) error {
 	}
 	return nil
 }
+func (b *Bridge) reconcileProgressCleanup(ctx context.Context) {
+	messages, err := b.db.CompletedProgressMessages()
+	if err != nil {
+		b.storeLog.Warn("completed progress lookup failed", "event", "progress_cleanup_state_failed")
+		return
+	}
+	for _, message := range messages {
+		b.deleteProgressMessage(ctx, message)
+	}
+}
+
+func (b *Bridge) cleanupDeliveredProgress(ctx context.Context, inboxID int64) {
+	message, ready, err := b.db.CompletedProgressMessage(inboxID)
+	if err != nil {
+		b.storeLog.Warn("completed progress lookup failed", "event", "progress_cleanup_state_failed")
+		return
+	}
+	if ready {
+		b.deleteProgressMessage(ctx, message)
+	}
+}
+
+func (b *Bridge) deleteProgressMessage(ctx context.Context, message store.ProgressMessage) {
+	if message.MessageID == 0 || ctx.Err() != nil {
+		return
+	}
+	deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := b.tg.Delete(deleteCtx, message.Chat, message.MessageID)
+	cancel()
+	if err != nil {
+		if ctx.Err() == nil {
+			info := telegram.ClassifyError(err)
+			permanent := !info.Uncertain && info.Code >= http.StatusBadRequest && info.Code < http.StatusInternalServerError && info.Code != http.StatusTooManyRequests
+			event := "progress_cleanup_failed"
+			if permanent {
+				event = "progress_cleanup_abandoned"
+			}
+			logTelegramFailure(b.telegramLog, slog.LevelWarn, event, "progress message cleanup failed", err,
+				slog.Int64("inbox_id", message.InboxID), slog.Int64("chat_id", message.Chat), slog.Int64("message_id", message.MessageID))
+			if permanent {
+				if err := b.db.ClearProgressMessage(message.InboxID, message.MessageID); err != nil {
+					b.storeLog.Warn("progress cleanup state persistence failed", "event", "progress_cleanup_state_failed", "inbox_id", message.InboxID)
+				}
+			}
+		}
+		return
+	}
+	if err := b.db.ClearProgressMessage(message.InboxID, message.MessageID); err != nil {
+		b.storeLog.Warn("progress cleanup state persistence failed", "event", "progress_cleanup_state_failed", "inbox_id", message.InboxID)
+	}
+}
+
 func (b *Bridge) fail(err error) {
 	select {
 	case b.fatal <- err:
@@ -1723,11 +1781,10 @@ func (w *worker) finishTerminal(e rpcEvent) {
 func (w *worker) finishPreview() {
 	w.finishing = false
 	w.progress = progressState{}
-	if w.previewID != 0 {
-		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
-		_ = w.b.tg.Edit(ctx, w.key.chat, w.previewID, "Task ended. The complete result follows.", nil)
-		cancel()
-	}
+	w.previewID = 0
+	w.lastPreview = ""
+	w.previewStopToken = ""
+	// Delivery reconciliation clears any persisted inbox association after success.
 }
 func (w *worker) event(raw []byte) {
 	w.touchActivity()
@@ -2042,7 +2099,35 @@ func progressStopTokenOwner(token string) (int64, bool) {
 	return id, err == nil && id > 0
 }
 
+func (w *worker) deleteOrphanProgressMessage(messageID int64) {
+	if messageID == 0 || w.b.tg == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.b.tg.Delete(ctx, w.key.chat, messageID); err != nil {
+		logTelegramFailure(w.b.telegramLog, slog.LevelWarn, "progress_cleanup_failed", "orphan progress message cleanup failed", err,
+			slog.Int64("chat_id", w.key.chat), slog.Int64("message_id", messageID))
+	}
+}
+
+func (w *worker) recordProgressMessage(result previewResult) {
+	if !result.created || result.err != nil || result.id == 0 || result.taskID == 0 || w.b.db == nil {
+		return
+	}
+	if err := w.b.db.SetProgressMessage(result.taskID, result.id); err != nil {
+		w.b.storeLog.Error("progress message association failed", "event", "progress_message_write_failed", "inbox_id", result.taskID, "message_id", result.id)
+		w.deleteOrphanProgressMessage(result.id)
+		w.b.fail(err)
+		return
+	}
+	if w.ctx != nil && (result.generation != w.binding.Generation || result.turn != w.turn || w.active == 0) {
+		w.b.cleanupDeliveredProgress(w.ctx, result.taskID)
+	}
+}
+
 func (w *worker) previewFinished(result previewResult) {
+	w.recordProgressMessage(result)
 	w.previewBusy = false
 	if result.generation != w.binding.Generation || result.turn != w.turn {
 		if result.stopToken != "" {
@@ -2094,8 +2179,7 @@ func (w *worker) flushPreview() {
 	if w.b.cfg.ProgressMode == "off" || w.progressSuppressed {
 		return
 	}
-	// Avoid creating a transient progress message for short tasks.
-	if w.previewID == 0 && !w.progress.StartedAt.IsZero() && time.Since(w.progress.StartedAt) < progressInitialDelay {
+	if w.previewID == 0 && time.Since(w.progress.StartedAt) < progressInitialDelay {
 		return
 	}
 	snapshot := w.renderProgress()
@@ -2104,9 +2188,11 @@ func (w *worker) flushPreview() {
 	}
 	text := snapshot
 	id := w.previewID
+	creating := id == 0
 	gen := w.binding.Generation
 	turn := w.turn
 	replyTo := w.activeReplyTo
+	taskID := w.active
 	stopToken := ""
 	if id == 0 && w.active != 0 && w.busy && !w.finishing {
 		stopToken = w.newProgressStopToken()
@@ -2133,7 +2219,7 @@ func (w *worker) flushPreview() {
 			err = w.b.tg.Edit(ctx, w.key.chat, id, text, keyboard)
 		}
 		select {
-		case w.previewResult <- previewResult{id: id, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, err: err}:
+		case w.previewResult <- previewResult{id: id, taskID: taskID, created: creating, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, err: err}:
 		case <-w.ctx.Done():
 		}
 	}()

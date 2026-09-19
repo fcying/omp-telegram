@@ -89,8 +89,8 @@ RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单�
 | `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
 | `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
 | `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
-| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_failed`, `delivery_uncertain`, `reply_fallback` |
-| `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed` |
+| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
+| `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed`, `progress_message_write_failed`, `progress_cleanup_state_failed` |
 | `media` | `prepare_failed`, `snapshot_failed`, `attachment_persist_failed`, `cleanup_failed` |
 
 根任务按场景使用 `chat_id`, `thread_id`, `generation`, `turn`, `inbox_id` 和 `client_id` 关联. 私聊的 `thread_id=0` 是有效身份. 原生 `session_id` 仅在验证后完整记录; 文件路径不作为日志会话身份. `client_id` 在进程内递增, 不持久化. `task_complete` 在持久化事务成功后记录 `result=done|cancelled|uncertain`, 根任务开始时间已知时附带 `duration_ms`. 交付 metadata 使用 `outbox_id`, `kind`, `api_code`, `retry_after_s`, `uncertain` 和 `replay=false`; 不记录 Description 或响应正文. 跟踪从接收到 actor 处理的完整链路时, 设置 `logging.component_levels.rpc = "debug"` 和 `logging.component_levels.bridge = "debug"`.
@@ -99,7 +99,7 @@ Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务
 
 实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 清空 bridge 延后 prompt, 发送与 `/stop` 相同的原生 `abort`; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
 
-首条进度通过 `progressState.StartedAt` 从根任务派发时计时, 延迟 3 秒, 与空闲活动计时独立. 事件及重复 `agent_start` 不重置此延迟. 沿用 1.5 秒 tick 检查, 因此通常在约 3–4.5 秒开始显示, 还受 actor 和网络延迟影响. 仅延迟首次创建; 已有消息更新、typing、持久化最终回复和在途进度终结清理保持原行为.
+Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.5 秒 worker tick 中检查. 已有消息更新、typing 和持久化最终回复保持独立行为. 每条 progress preview 都关联其根 inbox. 对于正常 `done` 任务, 只有全部关联 outbox 分段在 Telegram 确认送达并标记为 `done` 后, bridge 才删除该 progress. `cancelled` 和 `uncertain` 任务的 progress 保留. 这个关联只是本地清理辅助信息, 不是永久 retention pin: 当终态数据达到 retention cutoff 且没有关联的 `pending` 或 `sending` outbox 工作时, cleanup 只清除本地关联, 保留 Telegram 消息. 已确认的不可重试 Telegram 删除拒绝也会释放持久化关联. 传输失败、429、5xx 和不确定响应会保留关联以便后续重试. 启动时会重试上次运行留下的已完成关联.
 
 ## 身份与过期工作
 
@@ -129,8 +129,8 @@ Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务
 | `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | 最后一次已验证的会话绑定, 恢复资格和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
 | `history` | `bot,chat,thread,workspace,session,generation` | 旧绑定快照, 不是会话浏览器 |
-| `inbox` | 主键 `id`; `raw,state,created_at,updated_at` | update 去重和处理状态 |
-| `outbox` | 自增 `id`; `chat,thread,text,state,kind,path,name,created_at,updated_at` | 按顺序交付文字和附件 |
+| `inbox` | 主键 `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | update 去重、处理状态和可选的实时进度身份 |
+| `outbox` | 自增 `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,created_at,updated_at` | 与根输入关联的文字/附件顺序交付 |
 
 ### Database Message Retention
 
@@ -138,11 +138,13 @@ Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务
 
 只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
 
+带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
+
 保留策略绝不删除 binding, history, startup intent, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `storage.data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 4. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 3 会依次通过 `startup_intents`、binding 中断标记及消息时间戳的事务迁移后才推进 `user_version`. 已有 v3 消息在迁移时获得当前时间戳，从而获得完整保留期而不是猜测历史年龄. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 7. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 6 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID 以及 inbox/outbox progress 关联的事务迁移后才推进 `user_version`. 已有 v3 消息在迁移时获得当前时间戳, 从而获得完整保留期而不是猜测历史年龄. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -181,6 +183,8 @@ Telegram client 在传输边界区分错误:
 不为这两种终态增加自动重发. 明确的 Telegram 限流保留有界重试. 数据库事务无法与 Telegram 网络副作用原子提交, 因此不承诺 exactly-once.
 
 outbox replay 为每个最终文本分段保留持久化的 reply target. Telegram 因原始消息不可用而拒绝该 target 时, client 对同一文本仅再发送一次普通消息; 该 UX fallback 不改变 inbox/outbox ownership 或任务结算.
+
+每条 progress preview 都关联其根 inbox, 每个最终 outbox 分段都携带该 inbox ID. 对于正常 `done` 任务, 只有全部关联 outbox 分段在 Telegram 确认送达并标记为 `done` 后才删除 progress. `cancelled` 和 `uncertain` 的 progress 保留. 启动时会重试上次运行留下的已完成关联. 已确认的不可重试 Telegram 删除拒绝会清除尽力而为的 progress 关联; 当终态数据达到 retention cutoff 且没有 pending 或 sending outbox 工作时, retention 会清除本地关联但不删除 Telegram 消息. 传输失败、429、5xx 和不确定响应会保留关联以便重试, 不改变任务交付状态.
 
 ## 会话生命周期
 

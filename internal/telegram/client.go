@@ -334,6 +334,11 @@ func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string,
 	return err
 }
 
+// Delete removes a Telegram message without changing durable task state.
+func (c *Client) Delete(ctx context.Context, chatID, messageID int64) error {
+	return c.call(ctx, "deleteMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil, false)
+}
+
 // ClearKeyboard removes an inline keyboard without changing the message text.
 func (c *Client) ClearKeyboard(ctx context.Context, chatID, messageID int64) error {
 	fields := map[string]any{
