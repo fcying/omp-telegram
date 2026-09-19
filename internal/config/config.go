@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/shlex"
 	"github.com/pelletier/go-toml/v2"
@@ -28,6 +29,7 @@ type Config struct {
 	QueueCapacity         int
 	DatabaseRetentionDays int
 	ProgressMode          string
+	IdleTimeout           time.Duration
 }
 
 // fileConfig accepts quoted environment references in otherwise numeric fields.
@@ -43,6 +45,7 @@ type fileConfig struct {
 	QueueCapacity         any    `toml:"queue_capacity"`
 	DatabaseRetentionDays any    `toml:"database_retention_days"`
 	ProgressMode          string `toml:"progress_mode"`
+	IdleTimeout           string `toml:"idle_timeout"`
 }
 
 func Load(path string) (Config, error) {
@@ -63,7 +66,7 @@ func load(path, baseDir string) (Config, error) {
 		path = filepath.Join(baseDir, "config.toml")
 	}
 	var c Config
-	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16), DatabaseRetentionDays: int64(90), ProgressMode: "summary"}
+	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16), DatabaseRetentionDays: int64(90), ProgressMode: "summary", IdleTimeout: "30m"}
 	f, err := os.Open(path)
 	var reader io.Reader
 	if err == nil {
@@ -145,6 +148,11 @@ func load(path, baseDir string) (Config, error) {
 	default:
 		return c, errors.New("progress_mode must be off, summary, or verbose")
 	}
+	idleTimeout, err := parseIdleTimeout(raw.IdleTimeout)
+	if err != nil {
+		return c, err
+	}
+	c.IdleTimeout = idleTimeout
 	if len(c.AllowedUsers) == 0 || len(c.AllowedChats) == 0 {
 		return c, errors.New("allowed_users and allowed_chats must be nonempty")
 	}
@@ -245,6 +253,22 @@ func integer(value any, field string) (int64, error) {
 		}
 	}
 	return 0, fmt.Errorf("%s must contain an integer or a decimal integer string", field)
+}
+
+func parseIdleTimeout(value string) (time.Duration, error) {
+	value, err := expand(value)
+	if err != nil {
+		return 0, fmt.Errorf("idle_timeout: %w", err)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" || strings.EqualFold(value, "disabled") {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, errors.New("idle_timeout must be 0, disabled, or a positive Go duration")
+	}
+	return duration, nil
 }
 
 // Expand only parsed values, once, so environment contents cannot inject TOML.

@@ -1,3 +1,4 @@
+set export
 set default-script
 set script-interpreter := ["bash", "-euo", "pipefail"]
 
@@ -14,7 +15,7 @@ install bin_dir=(env_var("HOME") / "tool/omp-telegram"): build
     echo "Installed omp-telegram to {{bin_dir / "omp-telegram"}}."
 
 # Install the binary and restart the existing supervised daemon.
-service: install
+deploy: install
     supervisord ctl restart omp-telegram
 
 # Run unit tests without touching the supervised daemon.

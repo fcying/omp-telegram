@@ -9,21 +9,22 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 const messageCleanupBatchSize = 1000
 
 type Store struct{ DB *sql.DB }
 type Binding struct {
-	Bot, Chat, Thread  int64
-	Workspace, Session string
-	Generation         int64
-	Running            bool
-	Interrupted        bool
+	Bot, Chat, Thread             int64
+	Workspace, Session, SessionID string
+	Generation                    int64
+	Running                       bool
+	Interrupted                   bool
 }
 type StartIntent struct {
 	Bot, Chat, Thread  int64
@@ -112,7 +113,7 @@ func initialize(db *sql.DB) error {
 	if version == 0 {
 		_, e = tx.Exec(`
  CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
- CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+ CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
@@ -170,6 +171,15 @@ func initialize(db *sql.DB) error {
 			}
 		}
 		version = 5
+	}
+	if version == 5 {
+		if _, e = tx.Exec("ALTER TABLE bindings ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"); e != nil {
+			return e
+		}
+		version = 6
+	}
+	if e = backfillSessionIDs(tx); e != nil {
+		return e
 	}
 	if version != 0 {
 		if _, e = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); e != nil {
@@ -250,7 +260,7 @@ func (s *Store) Submit(id, replyTo int64) error {
 }
 func (s *Store) Binding(bot, chat, thread int64) (Binding, error) {
 	b := Binding{Bot: bot, Chat: chat, Thread: thread}
-	e := s.DB.QueryRow("SELECT workspace,session,generation,running,interrupted FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&b.Workspace, &b.Session, &b.Generation, &b.Running, &b.Interrupted)
+	e := s.DB.QueryRow("SELECT workspace,session,session_id,generation,running,interrupted FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.Running, &b.Interrupted)
 	return b, e
 }
 func (s *Store) Save(b Binding) error {
@@ -263,7 +273,7 @@ func (s *Store) Save(b Binding) error {
 	if e != nil {
 		return e
 	}
-	_, e = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running,interrupted) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running, b.Interrupted)
+	_, e = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,running,interrupted) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,session_id=excluded.session_id,generation=excluded.generation,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.SessionID, b.Generation, b.Running, b.Interrupted)
 	if e != nil {
 		return e
 	}
@@ -271,7 +281,7 @@ func (s *Store) Save(b Binding) error {
 }
 
 func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
-	rows, e := s.DB.Query("SELECT bot,chat,thread,workspace,session,generation,running,interrupted FROM bindings WHERE bot=? AND running=1 ORDER BY chat,thread", bot)
+	rows, e := s.DB.Query("SELECT bot,chat,thread,workspace,session,session_id,generation,running,interrupted FROM bindings WHERE bot=? AND running=1 ORDER BY chat,thread", bot)
 	if e != nil {
 		return nil, e
 	}
@@ -279,12 +289,68 @@ func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
 	var bindings []Binding
 	for rows.Next() {
 		var b Binding
-		if e = rows.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.Generation, &b.Running, &b.Interrupted); e != nil {
+		if e = rows.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.Running, &b.Interrupted); e != nil {
 			return nil, e
 		}
 		bindings = append(bindings, b)
 	}
 	return bindings, rows.Err()
+}
+
+func backfillSessionIDs(tx *sql.Tx) error {
+	rows, err := tx.Query("SELECT bot,chat,thread,session FROM bindings WHERE session_id='' ")
+	if err != nil {
+		return err
+	}
+	type bindingKey struct{ bot, chat, thread int64 }
+	ids := make(map[bindingKey]string)
+	for rows.Next() {
+		var key bindingKey
+		var session string
+		if err = rows.Scan(&key.bot, &key.chat, &key.thread, &session); err != nil {
+			rows.Close()
+			return err
+		}
+		if id := sessionIDFromPath(session); id != "" {
+			ids[key] = id
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for key, id := range ids {
+		if _, err = tx.Exec("UPDATE bindings SET session_id=? WHERE bot=? AND chat=? AND thread=?", id, key.bot, key.chat, key.thread); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sessionIDFromPath(session string) string {
+	base := strings.TrimSuffix(filepath.Base(session), ".jsonl")
+	if id := validSessionID(base); id != "" {
+		return id
+	}
+	if separator := strings.LastIndexByte(base, '_'); separator >= 0 {
+		return validSessionID(base[separator+1:])
+	}
+	return ""
+}
+
+func validSessionID(id string) string {
+	if len(id) < 8 || len(id) > 64 || strings.HasPrefix(id, "-") || strings.HasSuffix(id, "-") {
+		return ""
+	}
+	for _, r := range id {
+		if r != '-' && !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') && !(r >= 'A' && r <= 'F') {
+			return ""
+		}
+	}
+	return id
 }
 
 func (s *Store) SetRunning(b Binding, running bool) error {
@@ -442,7 +508,7 @@ func (s *Store) CommitStart(b Binding) error {
 	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running,interrupted) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running, b.Interrupted); err != nil {
+	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,running,interrupted) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,session_id=excluded.session_id,generation=excluded.generation,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.SessionID, b.Generation, b.Running, b.Interrupted); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", b.Bot, b.Chat, b.Thread, b.Generation); err != nil {

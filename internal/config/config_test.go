@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func configFixture(t *testing.T) (string, string) {
@@ -68,6 +69,36 @@ func TestProgressMode(t *testing.T) {
 	}
 	if _, err = loadSource(t, path, source+"\nprogress_mode = \"detailed\"\n"); err == nil || err.Error() != "progress_mode must be off, summary, or verbose" {
 		t.Fatalf("invalid progress mode error = %v", err)
+	}
+}
+
+func TestIdleTimeout(t *testing.T) {
+	path, source := configFixture(t)
+	c, err := loadSource(t, path, source)
+	if err != nil || c.IdleTimeout != 30*time.Minute {
+		t.Fatalf("default idle timeout = %v, error %v", c.IdleTimeout, err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  time.Duration
+	}{
+		{"\"0\"", 0},
+		{"\"disabled\"", 0},
+		{"\"30m\"", 30 * time.Minute},
+		{"\"${BRIDGE_TEST_IDLE_TIMEOUT}\"", 45 * time.Second},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("BRIDGE_TEST_IDLE_TIMEOUT", "45s")
+			c, err := loadSource(t, path, source+"\nidle_timeout = "+tc.value+"\n")
+			if err != nil || c.IdleTimeout != tc.want {
+				t.Fatalf("idle timeout = %v, want %v, error %v", c.IdleTimeout, tc.want, err)
+			}
+		})
+	}
+	for _, value := range []string{"\"-1s\"", "\"bad\"", "\"1\""} {
+		if _, err := loadSource(t, path, source+"\nidle_timeout = "+value+"\n"); err == nil {
+			t.Fatalf("invalid idle timeout accepted: %s", value)
+		}
 	}
 }
 

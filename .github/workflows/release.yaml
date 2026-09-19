@@ -43,7 +43,7 @@ jobs:
             target="${{ github.event.pull_request.head.sha }}"
           fi
           prerelease=true
-          version="${source_version}-dev.g${target:0:12}"
+          version="nightly"
           if [[ "$GITHUB_REF" == "refs/heads/main" ]] && ! git show-ref --verify --quiet "refs/tags/${source_version}"; then
             version="$source_version"
             prerelease=false
@@ -147,19 +147,16 @@ jobs:
           TARGET: ${{ needs.prepare.outputs.target }}
         run: |
           set -euo pipefail
-          args=(release create "$VERSION" build/* --target "$TARGET" --generate-notes --title "$VERSION")
           if [[ "$PRERELEASE" == true ]]; then
-            args+=(--prerelease)
-          fi
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" build/* --clobber
+            while IFS= read -r release_id; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"
+            done < <(gh api --paginate --jq '.[] | select(.draft and .name == "nightly") | .id' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            if gh release view "$VERSION" >/dev/null 2>&1; then
+              gh release delete "$VERSION" --yes
+            fi
+            git tag --force "$VERSION" "$TARGET"
+            git push origin "refs/tags/$VERSION" --force
+            gh release create "$VERSION" build/* --target "$TARGET" --generate-notes --title "$VERSION" --prerelease
           else
-            gh "${args[@]}"
-          fi
-          if [[ "$PRERELEASE" == true ]]; then
-            while IFS= read -r tag; do
-              if [[ "$tag" != "$VERSION" ]]; then
-                gh release delete "$tag" --yes --cleanup-tag
-              fi
-            done < <(gh api --paginate --jq '.[] | select(.prerelease) | .tag_name' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            gh release create "$VERSION" build/* --target "$TARGET" --generate-notes --title "$VERSION"
           fi

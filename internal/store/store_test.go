@@ -319,12 +319,12 @@ func TestBotIdentitySurvivesRestart(t *testing.T) {
 func TestLatestBindingAndHistorySurviveRestart(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
-	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/first", Session: "/sessions/first.jsonl", Generation: 1}
+	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/first", Session: "/sessions/first.jsonl", SessionID: "11111111", Generation: 1}
 	second := first
-	second.Workspace, second.Session, second.Generation = "/workspaces/second", "/sessions/second.jsonl", 2
+	second.Workspace, second.Session, second.SessionID, second.Generation = "/workspaces/second", "/sessions/second.jsonl", "22222222", 2
 	third := second
-	third.Session, third.Generation = "/sessions/third.jsonl", 3
-	other := Binding{Bot: 1, Chat: 2, Thread: 4, Workspace: "/workspaces/other", Session: "/sessions/other.jsonl", Generation: 1}
+	third.Session, third.SessionID, third.Generation = "/sessions/third.jsonl", "33333333", 3
+	other := Binding{Bot: 1, Chat: 2, Thread: 4, Workspace: "/workspaces/other", Session: "/sessions/other.jsonl", SessionID: "44444444", Generation: 1}
 	for _, b := range []Binding{first, other, second, third} {
 		requireStoreOK(t, s.Save(b))
 	}
@@ -340,14 +340,15 @@ func TestLatestBindingAndHistorySurviveRestart(t *testing.T) {
 	rows, err := s.DB.Query("SELECT bot,chat,thread,workspace,session,generation FROM history ORDER BY generation")
 	requireStoreOK(t, err)
 	defer rows.Close()
-	for _, want := range []Binding{first, second} {
+	for _, persisted := range []Binding{first, second} {
 		if !rows.Next() {
-			t.Fatalf("lost historical binding %+v: %v", want, rows.Err())
+			t.Fatalf("lost historical binding %+v: %v", persisted, rows.Err())
 		}
 		var got Binding
 		requireStoreOK(t, rows.Scan(&got.Bot, &got.Chat, &got.Thread, &got.Workspace, &got.Session, &got.Generation))
-		if got != want {
-			t.Fatalf("history = %+v, want %+v", got, want)
+		persisted.SessionID = ""
+		if got != persisted {
+			t.Fatalf("history = %+v, want %+v", got, persisted)
 		}
 	}
 	if rows.Next() {
@@ -540,6 +541,7 @@ CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL)
 CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '');
 CREATE INDEX idx_inbox_state ON inbox(state,id);
 CREATE INDEX idx_outbox_state ON outbox(state,id);
+INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running) VALUES(1,2,3,'/workspace','/sessions/2026-09-17T14-39-46-235Z_01a0afcf-303b-775f-adda-fe30af90a116.jsonl',1,1);
 INSERT INTO inbox VALUES(1,'input','done');
 INSERT INTO outbox(chat,thread,text,state) VALUES(2,3,'output','sent');
 PRAGMA user_version=3;`)
@@ -548,18 +550,34 @@ PRAGMA user_version=3;`)
 	s := openTestStore(t, dir)
 	var version int
 	var inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo int64
+	var sessionID string
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM inbox WHERE id=1").Scan(&inboxCreated, &inboxUpdated))
 	requireStoreOK(t, s.DB.QueryRow("SELECT created_at,updated_at FROM outbox WHERE id=1").Scan(&outboxCreated, &outboxUpdated))
 	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM inbox WHERE id=1").Scan(&inboxReplyTo))
 	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM outbox WHERE id=1").Scan(&outboxReplyTo))
-	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 || inboxReplyTo != 0 || outboxReplyTo != 0 {
-		t.Fatalf("version/message migration = version=%d times=%d/%d/%d/%d replies=%d/%d", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo)
+	requireStoreOK(t, s.DB.QueryRow("SELECT session_id FROM bindings WHERE bot=1 AND chat=2 AND thread=3").Scan(&sessionID))
+	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 || inboxReplyTo != 0 || outboxReplyTo != 0 || sessionID != "01a0afcf-303b-775f-adda-fe30af90a116" {
+		t.Fatalf("version/message migration = version=%d times=%d/%d/%d/%d replies=%d/%d session=%q", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo, sessionID)
 	}
 	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)
 	if result.Inbox != 0 || result.Outbox != 0 {
 		t.Fatalf("migration-time records were immediately pruned: %+v", result)
+	}
+}
+
+func TestAlreadyMigratedBindingBackfillsSessionID(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	path := "/sessions/2026-09-17T14-39-46-235Z_01a0afcf-303b-775f-adda-fe30af90a116.jsonl"
+	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Session: path, Generation: 1, Running: true}))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	got, err := s.Binding(1, 2, 3)
+	requireStoreOK(t, err)
+	if got.SessionID != "01a0afcf-303b-775f-adda-fe30af90a116" {
+		t.Fatalf("backfilled session ID = %q", got.SessionID)
 	}
 }
 

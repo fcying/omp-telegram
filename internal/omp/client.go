@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strconv"
@@ -309,11 +310,59 @@ func (c *Client) Call(ctx context.Context, typeName string, fields map[string]an
 }
 
 type envelope struct {
-	Type    string          `json:"type"`
-	ID      string          `json:"id"`
-	Command string          `json:"command"`
-	Success *bool           `json:"success"`
-	Data    json.RawMessage `json:"data"`
+	Type     string           `json:"type"`
+	ID       string           `json:"id"`
+	Command  string           `json:"command"`
+	Success  *bool            `json:"success"`
+	Data     json.RawMessage  `json:"data"`
+	Terminal terminalMetadata `json:"isTerminal"`
+}
+
+// Invalid optional metadata must not change protocol acceptance.
+type terminalMetadata uint8
+
+func (t *terminalMetadata) UnmarshalJSON(data []byte) error {
+	switch string(data) {
+	case "true":
+		*t = 1
+	case "false":
+		*t = 2
+	case "null":
+		*t = 0
+	default:
+		*t = 3
+	}
+	return nil
+}
+
+func (c *Client) logLifecycle(env envelope, phase string) {
+	switch env.Type {
+	case "agent_start", "agent_end", "prompt_result", "auto_compaction_start", "auto_compaction_end":
+	case "response":
+		if env.Success == nil || *env.Success {
+			return
+		}
+	default:
+		return
+	}
+	terminal := "absent"
+	switch env.Terminal {
+	case 1:
+		terminal = "true"
+	case 2:
+		terminal = "false"
+	case 3:
+		terminal = "invalid"
+	}
+	// Request IDs are local decimal counters; never log arbitrary peer strings.
+	var requestID uint64
+	requestIDValid := false
+	if env.ID != "" {
+		var err error
+		requestID, err = strconv.ParseUint(env.ID, 10, 64)
+		requestIDValid = err == nil
+	}
+	log.Printf("omp RPC lifecycle client=%p event=%s phase=%s terminal=%s request_id=%d request_id_valid=%t", c, env.Type, phase, terminal, requestID, requestIDValid)
 }
 
 func decodeObject(data []byte) (envelope, error) {
@@ -388,8 +437,10 @@ func (c *Client) readLoop() {
 			c.fail(errProtocol)
 			return
 		}
+		c.logLifecycle(env, "received")
 		if env.Type == "response" {
 			if env.Success == nil || env.Command == "" {
+				c.logLifecycle(env, "rejected")
 				c.fail(errors.New("omp: malformed RPC response"))
 				return
 			}
@@ -401,6 +452,7 @@ func (c *Client) readLoop() {
 			c.mu.Unlock()
 			if found {
 				if r.command != env.Command {
+					c.logLifecycle(env, "rejected")
 					c.fail(errors.New("omp: RPC response command mismatch"))
 					return
 				}
@@ -409,9 +461,11 @@ func (c *Client) readLoop() {
 					response.err = errors.New("omp: RPC command rejected")
 				}
 				r.result <- response
+				c.logLifecycle(env, "response_queued")
 				continue
 			}
 			if env.ID == "" {
+				c.logLifecycle(env, "rejected")
 				// The server omits IDs for unknown commands and parse errors. Fail closed
 				// instead of stranding every pending call or guessing their correlation.
 				c.fail(errors.New("omp: uncorrelated RPC response"))
@@ -419,6 +473,7 @@ func (c *Client) readLoop() {
 			}
 			// A response with an ID is never an asynchronous event. If its caller
 			// already left, it cannot safely affect a later bridge operation.
+			c.logLifecycle(env, "response_ignored")
 			continue
 		}
 		if env.Type == "command_output" && c.captureMetadata(frame) {
@@ -426,7 +481,10 @@ func (c *Client) readLoop() {
 		}
 		select {
 		case c.events <- json.RawMessage(frame):
+			// A buffered send confirms queueing, not consumption by the bridge.
+			c.logLifecycle(env, "event_queued")
 		default:
+			c.logLifecycle(env, "rejected")
 			c.fail(errors.New("omp: event queue overflow; execution state uncertain"))
 			return
 		}

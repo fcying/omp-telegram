@@ -2,6 +2,8 @@ package bridge
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -315,7 +317,7 @@ func TestRecoverySkipsNonTopicGroupsAndUnauthorizedPrivateChats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			binding := store.Binding{Bot: 99, Chat: chat, Workspace: t.TempDir(), Session: "/missing/session.jsonl", Generation: 1, Running: true}
+			binding := store.Binding{Bot: 99, Chat: chat, Workspace: t.TempDir(), Session: "/missing/session.jsonl", SessionID: "deadbeef", Generation: 1, Running: true}
 			if startup {
 				intent := store.StartIntent{Bot: 99, Chat: chat, Kind: "new", Workspace: binding.Workspace, Generation: 1}
 				err = db.PrepareStart(store.Binding{Bot: 99, Chat: chat}, intent)
@@ -408,6 +410,36 @@ func TestDaemonRecoveryHonorsReducedWorkerLimit(t *testing.T) {
 	d.stop()
 	d.cfg.MaxWorkers = 1
 	d.start()
+	waitFor(t, func() bool {
+		restored := 0
+		blocked := 0
+		for _, b := range before {
+			after := d.binding(b.Thread)
+			switch {
+			case after.Generation > b.Generation:
+				restored++
+			case after.Generation == b.Generation:
+				blocked++
+			}
+		}
+		return restored == 1 && blocked == 1
+	})
+	var blocked store.Binding
+	for _, b := range before {
+		after := d.binding(b.Thread)
+		if after.Generation == b.Generation {
+			blocked = b
+			break
+		}
+	}
+	if blocked.SessionID == "" {
+		t.Fatal("could not identify the binding blocked by worker capacity")
+	}
+	d.command(blocked.Thread, "/status")
+	waitFor(t, func() bool { return d.fake.has(blocked.Thread, "OMP: released") })
+	if !d.fake.has(blocked.Thread, "Idle: n/a") {
+		t.Fatal("capacity-blocked released status omitted unknown idle state")
+	}
 	// Each probe runs after its topic's automatic restoration attempt.
 	for _, b := range before {
 		d.command(b.Thread, "capacity-probe")
@@ -430,5 +462,9 @@ func TestDaemonRecoveryHonorsReducedWorkerLimit(t *testing.T) {
 	}
 	if restored != 1 || answered != 1 {
 		t.Fatalf("worker cap: restored=%d responding=%d, want one each", restored, answered)
+	}
+	d.command(33, "/resume "+blocked.SessionID)
+	if _, err := d.db.Binding(99, d.chat, 33); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("resume of a capacity-blocked logical session created a binding: %v", err)
 	}
 }

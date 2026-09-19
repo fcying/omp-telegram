@@ -3,9 +3,69 @@ package bridge
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"omp-telegram/internal/telegram"
 )
+
+func TestInitialProgressDelaySkipsShortTask(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.ProgressMode = "summary"
+	w.b.cfg.QueueCapacity = 1
+	command("/new " + t.TempDir())
+	ready, err := w.b.db.NextOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.b.db.MarkOutput(ready.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	w.flushPreview()
+	if w.previewBusy {
+		t.Fatal("short task started a progress send")
+	}
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"short answer"}]}]}`))
+	w.flushPreview()
+	output, err := w.b.db.NextOutput()
+	if err != nil || output.Text != "short answer" {
+		t.Fatalf("final reply = %+v, err=%v", output, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.messages) != 0 || len(f.keyboardClears) != 0 {
+		t.Fatal("short task created temporary progress or terminal UI traffic")
+	}
+}
+
+func TestInitialProgressDelaySurvivesNativeActivity(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.ProgressMode = "summary"
+	w.b.cfg.QueueCapacity = 1
+	w.previewResult = make(chan previewResult, 1)
+	command("/new " + t.TempDir())
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+	w.event([]byte(`{"type":"agent_start"}`))
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"working"}}`))
+	w.flushPreview()
+	select {
+	case result := <-w.previewResult:
+		if result.err != nil || result.id == 0 {
+			t.Fatalf("progress send failed: %+v", result)
+		}
+		w.previewFinished(result)
+	case <-time.After(time.Second):
+		t.Fatal("native activity postponed initial progress")
+	}
+	if f.button(0) == "" {
+		t.Fatal("long task progress omitted Stop button")
+	}
+}
 
 func TestProgressStopButtonAbortsOnlyItsActiveRootTask(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
@@ -29,6 +89,7 @@ func TestProgressStopButtonAbortsOnlyItsActiveRootTask(t *testing.T) {
 	if len(w.queue) != 1 {
 		t.Fatal("queued root task missing before stop")
 	}
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil || result.id == 0 {
@@ -78,6 +139,7 @@ func TestTerminalCompletionClearsProgressStopButton(t *testing.T) {
 	}
 	command("question")
 	w.dispatch()
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil {
@@ -198,6 +260,7 @@ func activeProgressStop(t *testing.T) (*worker, *fakeHTTP, string, int) {
 	}
 	command("wait")
 	w.dispatch()
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil || result.id == 0 {
@@ -382,6 +445,7 @@ func TestProgressStopAcceptsCallbackBeforeInitialResult(t *testing.T) {
 	}
 	command("wait")
 	w.dispatch()
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err != nil || result.id == 0 {

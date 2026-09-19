@@ -28,6 +28,8 @@ tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 
 arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE, omp 需要单独安装. 每次发布附带 `SHA256SUMS` 校验文件.
 
+开发构建发布在 [Development build](https://github.com/fcying/omp-telegram/releases/tag/nightly). 它是 prerelease, 可能不稳定.
+
 ### 从源码构建
 
 需要 [go.mod](go.mod) 指定的 Go 版本及 [just](https://github.com/casey/just):
@@ -67,12 +69,21 @@ max_workers = 4
 queue_capacity = 16
 progress_mode = "summary"
 database_retention_days = 90
+idle_timeout = "30m"
 ```
 
 未指定配置文件, 且默认文件不存在时, 程序会使用同样的内置默认配置, 不生成文件.
 `database_retention_days` 启用 Database Message Retention janitor. 它按最后一次状态转换时间保留设定天数的终态 inbox/outbox 记录. 默认值是 `90`; 设置为 `0` 可关闭清理. pending/submitted inbox 及 pending/sending outbox 保持持久化. 它绝不删除 binding、history、startup intent、工作目录、omp session 文件或其他 omp 数据.
 
 `progress_mode` 控制一条尽力而为、可编辑的任务实时消息: `off` 关闭它和 typing action, `summary` 显示 assistant 输出、活动工具名和任务状态, `verbose` 额外显示最近 6 条可观察的工具活动. 活跃根任务的实时进度带有 Stop 按钮, 其效果与 `/stop` 相同: 清空 bridge 延后 prompt 并发送原生 `abort`, 不关闭会话. 按钮绑定其 owner 和活跃任务, 任务结束时尽力移除. 实时进度回复对应的根用户消息. 它绝不包含 reasoning、工具参数、命令文本、结果、stdout 或 stderr; 不持久化, 不影响最终回复的可靠交付.
+
+首条进度消息至少延迟到任务运行满 3 秒后显示. 短任务只发送最终回复, 沿用现有 typing 行为. 长任务在后续 worker tick 显示进度及 Stop 按钮; 延迟期间仍可使用 `/stop`.
+
+RPC 终结事件丢失不代表成功: 至少 30 秒没有活动后, bridge 需要两次明确的原生 idle 观测, 且间隔至少 30 秒, 才会持久化标记任务为 `uncertain`, 绝不重放该任务. 恢复会停止 typing、清理任务控件, 并先关闭旧进程, 再让队列中的任务按需恢复同一已保存 session. compact、retry、工具、host request 和原生 UI 等待会阻止恢复; 缺失状态字段或探测错误都不是 idle 证据. 此安全 watchdog 独立于 `idle_timeout`.
+
+明确收到 `agent_end isTerminal=false` 后, watchdog 不会恢复正在等待原生异步续接的任务, 即使原生状态连续几分钟显示 idle. 后续 `agent_start` 才重新允许对运行中的 turn 进行恢复; 任务终结或替换会清除等待状态. 无法安全区分续接事件丢失与后台工作仍未完成, 因此不自动恢复这种等待.
+
+`idle_timeout` 会在 OMP 运行期持续空闲时关闭其进程, 但保留已验证的 session 身份和恢复资格. 默认值为 `30m`; 设置 `0` 或 `disabled` 可关闭. bridge 不会在任务、排队或准备中的 prompt、compact、handoff、会话列表请求、host request、启动转换, 或 model、thinking、fast、compact、new、原生 UI 等 runtime-bound confirmation 仍存在时释放进程; 这些 confirmation 会让 runtime 保持活跃, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 下一条 prompt 或需要 OMP 状态的原生控制命令会先恢复同一个 session, 再被接受. `/status` 显示保留的 binding 和不可用的实时指标; 如果当前 generation 尚未连接过 runtime, 显示 `Idle: n/a`. released 后 `/stop` 只清 bridge prompt, 不发送 `abort`; `/close` 清除保存的恢复资格, 不启动 omp.
 
 ### 3. 设置环境变量并启动
 
@@ -115,10 +126,10 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 | --- | --- |
 | `/new <名称或路径>` | 在指定目录开启新会话, 替换已有实例前需要确认 |
 | `/new` | 沿用历史目录开启新会话; 没有历史目录时使用 `workspace_root` |
-| `/stop` | 中止当前任务并清空排队消息, 保留会话 |
-| `/close` | 关闭 omp 实例, 保留文件和会话历史 |
+| `/stop` | 中止当前任务并清空排队消息, 保留会话; released session 只清空消息 |
+| `/close` | 关闭当前逻辑 session, 保留文件和会话历史; 不唤醒 released runtime |
 | `/resume` | 用分页按钮选择当前目录中的 omp 历史会话 |
-| `/resume <session ID>` | 按 omp 原生 ID 恢复会话及原目录, 使用前先关闭已有实例 |
+| `/resume <session ID>` | 用原生 omp session 及其原目录替换当前逻辑 session |
 | `/status` | 查看目录, 会话标题/ID, 模型, 思考等级, Fast, 上下文用量, 活动状态, 队列和速度 |
 | `/name <名称>` | 命名当前 omp session, 例如 `/name Bugfix HAL`; 不修改 Telegram topic 名称 |
 | `/model` | 用按钮选择 OMP 配置的 cycle 角色, 同时显示当前模型 |
@@ -132,7 +143,7 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 
 以上所有命令, 包括 `/new <名称或路径>` 和 `/resume`, 都可用于普通私聊和 topic. 普通私聊使用 `(chat, 0)`, 沿用 topic 的 worker 和会话生命周期, 不需要单独的私聊 worker 或数据库迁移. `/followup` 仍不支持.
 
-普通文字, 附件和 `/review` 都是由 bridge 排队的独立任务, 在每个对话内串行执行. 任务运行期间发送的消息会等待当前任务结束. `/stop` 先清空 bridge 队列, 再发送普通 `abort` 请求中止当前任务.
+普通文字, 附件和 `/review` 都是由 bridge 排队的独立任务, 在每个对话内串行执行. 任务运行期间发送的消息会等待当前任务结束. `/stop` 先清空 bridge 队列, 仅在 OMP 已连接时发送普通 `abort`; released runtime 没有原生任务, `/stop` 不会启动它.
 
 模型菜单按 OMP 的 `cycleOrder` 列出角色, 例如 `smol`, `default`, `slow`, 不罗列全部可用模型. 所选角色及其 thinking 设置由 OMP 自己解析. 打开菜单不会切换模型; 点击选择时实例必须空闲且队列为空. 选择后清除按钮, 回复实际选中的模型. 仍可手动使用 `/model provider/model`.
 
@@ -181,8 +192,9 @@ bot 菜单, 按钮和服务提示使用英语. 你可以用任意语言提问, �
 | `omp_args` | omp 额外参数, 默认读取可选的 `OMP_TELEGRAM_ARGS`; 显式空字符串禁用额外参数 |
 | `data_dir` | 数据库, 锁和待发送附件的存储目录, 默认二进制所在目录 |
 | `workspace_root` | `/new <名称>` 使用的根目录, 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/` |
-| `max_workers` | 同时运行的对话实例上限, 默认 4 |
+| `max_workers` | 同时运行的 OMP 进程上限, 默认 4 |
 | `queue_capacity` | 每个对话的等待消息上限, 默认 16 |
+| `idle_timeout` | 释放持续空闲 OMP 进程前的时长, 默认 `30m`; 设置 `0` 或 `disabled` 可关闭 |
 
 字符串支持 `$VAR` 和 `${VAR}`, `$$` 表示字面美元符号. 默认配置对 `OMP_TELEGRAM_ARGS` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 的引用允许未设置, 其他缺失引用会报错. 程序不会自动加载 `.env` 或 shell 启动文件.
 
@@ -239,5 +251,24 @@ export OMP_TELEGRAM_ARGS="--config \"$HOME/.config/omp/telegram.yml\""
 | 数据库结构不支持 | 先备份, 使用受支持的数据库或新数据目录, 不要手动改版本号 |
 
 不支持语音/转写, 自动创建 topic, 任意终端输入框或编辑器. 部分确认/选择交互可以使用 Telegram 按钮, 但并非所有工具审批都能远程完成. 桥接不会开启自动批准; 无人值守前, 先确认你依赖的审批流程能够正常使用.
+
+## 路线图
+
+以下功能均为计划项, 尚未实现.
+
+- 支持级别和组件分类的结构化日志
+- 列出已保存的对话/session 绑定
+- 查看 bridge 队列状态, 取消单个待执行任务
+- Telegram 回复上下文
+- Telegram 媒体组 / 相册支持
+- Session 导出
+- Resume 收藏 / 置顶 session
+- `/doctor` 诊断
+
+### 等待上游 OMP 支持
+
+- 可靠的活动 turn steering
+- 原生 follow-up 支持
+- 原生队列清空 / 原子 abort-and-clear
 
 开发者请参阅[架构与开发说明](doc/architecture.zh.md).

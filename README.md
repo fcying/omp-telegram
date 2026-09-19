@@ -28,6 +28,8 @@ tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 
 For arm64, use `omp-telegram-linux-arm64.txz`. Archives contain the binary and LICENSE; omp itself is installed separately. `SHA256SUMS` is provided with each release.
 
+Development builds are published as the [Development build](https://github.com/fcying/omp-telegram/releases/tag/nightly). It is a prerelease and may be unstable.
+
 ### Build from source
 
 Requires Go as specified in [go.mod](go.mod) and [just](https://github.com/casey/just):
@@ -67,12 +69,21 @@ max_workers = 4
 queue_capacity = 16
 progress_mode = "summary"
 database_retention_days = 90
+idle_timeout = "30m"
 ```
 
 If no configuration file is specified and the default file is absent, the service uses these embedded defaults without generating a file.
 `database_retention_days` enables the Database Message Retention janitor. It retains terminal inbox/outbox records for the configured number of days measured from their latest state transition. The default is `90`; set it to `0` to disable cleanup. Pending/submitted inbox and pending/sending outbox records remain durable. It never removes bindings, history, startup intents, workspaces, omp session files, or other omp data.
 
 `progress_mode` controls one best-effort, editable live task message: `off` disables it and typing actions, `summary` shows assistant output, active tool names, and task state, and `verbose` also shows the six most recent observable tool activities. A live root task includes a Stop button that has the same effect as `/stop`: it clears bridge-deferred prompts and sends native `abort`, without closing the session. The button is fenced to its owner and active task, and is removed best-effort when that task ends. Live progress replies to its root user message. It never includes reasoning, tool arguments, command text, results, stdout, or stderr; it is not persisted and does not affect durable final replies.
+
+The first progress message is delayed until the task has run for at least 3 seconds. Short tasks send only their final reply, with existing typing behavior unchanged. Progress and its Stop button appear on a subsequent worker tick for longer tasks; `/stop` remains available during the delay.
+
+Missing terminal RPC completion is not treated as success: after at least 30 seconds without activity, the bridge requires two explicit native idle observations, at least 30 seconds apart, before durably marking the task `uncertain`. It never replays that task. Recovery stops typing, clears task controls, and retires the old process before queued work lazily resumes the same saved session. Compaction, retry, tools, host requests, and native UI waits prevent this recovery; missing state fields and probe errors are not idle evidence. This safety watchdog is independent of `idle_timeout`.
+
+An explicit `agent_end` with `isTerminal=false` disables watchdog recovery while waiting for native asynchronous continuation, even if native state reports idle for minutes. Only a subsequent `agent_start` re-enables recovery for a running turn; task completion or replacement clears the wait. A lost continuation cannot safely be distinguished from pending background work and is not automatically recovered.
+
+`idle_timeout` releases an otherwise idle omp process while retaining the validated session identity and its restoration eligibility. It defaults to `30m`; set `0` or `disabled` to turn it off. The bridge never releases a runtime with a task, queued or preparing prompt, compaction, handoff, session-list request, host request, startup transition, or a runtime-bound confirmation for model, thinking, fast, compact, new, or native UI choices; those confirmations keep the runtime active until they are consumed or expire. The independent `/resume` picker does not block release and may remain actionable after the runtime is released. The next prompt or native control that requires OMP state resumes that exact session before it is accepted. `/status` shows the retained binding with unavailable live metrics and reports `Idle: n/a` when the runtime has not been connected in the current generation. After release, `/stop` only clears bridge prompts and does not send `abort`; `/close` removes the saved restoration eligibility without starting omp.
 
 ### 3. Set the environment and start
 
@@ -115,10 +126,10 @@ For a first session, plain `/new` uses `workspace_root` itself (by default, `wor
 | --- | --- |
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running instance requires confirmation |
 | `/new` | Start a fresh session in the previous directory, or `workspace_root` if none was selected |
-| `/stop` | Stop the current task and clear queued prompts, keeping the session open |
-| `/close` | Close the omp instance, preserving files and session history |
+| `/stop` | Stop the current task and clear queued prompts, keeping the session open; a released session only clears prompts |
+| `/close` | Close the current logical session, preserving files and session history without waking a released runtime |
 | `/resume` | Choose a saved omp session in the current directory using paginated buttons |
-| `/resume <session ID>` | Restore a native omp session and its original directory; close any running instance first |
+| `/resume <session ID>` | Replace the current logical session with a native omp session and its original directory |
 | `/status` | Show workspace, session title/ID, model, thinking, fast mode, context usage, activity, queue, and speed |
 | `/name <title>` | Name the current omp session, e.g. `/name Bugfix HAL`; does not rename the Telegram topic |
 | `/model` | Choose a configured OMP cycle role with buttons; shows the current model |
@@ -132,7 +143,7 @@ For a first session, plain `/new` uses `workspace_root` itself (by default, `wor
 
 All commands above, including `/new <name or path>` and `/resume`, work in ordinary private chats as well as topics. An ordinary private chat uses `(chat, 0)` with the same worker and session lifecycle as a topic; no separate private-chat worker or database migration is needed. `/followup` remains unsupported.
 
-Ordinary text, attachments, and `/review` are independent tasks queued by the bridge and run sequentially within each conversation. Messages sent while a task is running wait for it to finish. `/stop` clears the bridge queue, then sends a plain `abort` request to stop the current task.
+Ordinary text, attachments, and `/review` are independent tasks queued by the bridge and run sequentially within each conversation. Messages sent while a task is running wait for it to finish. `/stop` clears the bridge queue, then sends a plain `abort` request only when OMP is connected; a released runtime has no native task and is not started for `/stop`.
 
 The model picker follows OMP's `cycleOrder` roles, such as `smol`, `default`, and `slow`, rather than listing every available model. OMP resolves the selected role and its thinking setting. Opening the menu does not switch models; selecting requires an idle instance with an empty queue. Buttons disappear after selection, and the reply reports the actual selected model. Manual `/model provider/model` remains available.
 
@@ -181,8 +192,9 @@ An explicitly selected missing file, an unreadable file, or invalid TOML causes 
 | `omp_args` | Extra omp arguments; defaults to optional `OMP_TELEGRAM_ARGS`. An explicit empty string disables them |
 | `data_dir` | Database, lock, and outgoing attachment storage; defaults to the executable directory |
 | `workspace_root` | Base directory for `/new <name>`; defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then executable-directory `workspace/` |
-| `max_workers` | Maximum active conversation instances, default 4 |
+| `max_workers` | Maximum active OMP processes, default 4 |
 | `queue_capacity` | Waiting prompts per conversation, default 16 |
+| `idle_timeout` | Idle duration before releasing an otherwise quiescent OMP process, default `30m`; set `0` or `disabled` to turn it off |
 
 Strings support `$VAR` and `${VAR}`; use `$$` for a literal dollar sign. The default references to `OMP_TELEGRAM_ARGS` and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset; other missing references fail. `.env` files and shell startup files are not loaded automatically.
 
@@ -239,5 +251,24 @@ Check the installed application version with `~/tool/omp-telegram/omp-telegram -
 | Unsupported database schema | Back up the database and use a supported database or fresh data directory; do not change the version number by hand |
 
 Voice/transcription, automatic topic creation, and arbitrary terminal input/editor dialogs are not supported. Some confirmation/selection prompts can use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge; verify the approval workflows you rely on before leaving a session unattended.
+
+## Roadmap
+
+The following features are planned, not currently implemented.
+
+- Structured logging with levels and components
+- List saved conversation/session bindings
+- Bridge queue status and cancel individual pending tasks
+- Telegram reply context
+- Telegram media group / album support
+- Session export
+- Resume favorites / pinned sessions
+- `/doctor` diagnostics
+
+### Waiting for upstream OMP support
+
+- Reliable active-turn steering
+- Native follow-up support
+- Native queue clear / atomic abort-and-clear
 
 For contributors: [architecture and development](doc/architecture.md).

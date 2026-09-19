@@ -134,15 +134,16 @@ func (w *worker) hostResult(client *omp.Client, id, text string, failed bool) {
 }
 
 func (w *worker) hostSend(event rpcEvent) {
-	if w.client == nil {
+	client, connected := w.runtimeClient()
+	if !connected {
 		return
 	}
 	if event.ToolName != "telegram_send" {
-		w.hostResult(w.client, event.ID, "Unsupported host tool.", true)
+		w.hostResult(client, event.ID, "Unsupported host tool.", true)
 		return
 	}
 	if !w.busy || w.active == 0 {
-		w.hostResult(w.client, event.ID, "Attachments can only be sent during an active Telegram request.", true)
+		w.hostResult(client, event.ID, "Attachments can only be sent during an active Telegram request.", true)
 		return
 	}
 	w.initMedia()
@@ -150,30 +151,30 @@ func (w *worker) hostSend(event rpcEvent) {
 		return
 	}
 	if len(w.hostRequests) >= 16 {
-		w.hostResult(w.client, event.ID, "Too many pending attachment requests.", true)
+		w.hostResult(client, event.ID, "Too many pending attachment requests.", true)
 		return
 	}
 	var request struct {
-		Path    string `json:"path"`
-		Kind    string `json:"kind"`
-		Caption string `json:"caption"`
+		Path    string
+		Kind    string
+		Caption string
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(event.Arguments)))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&request) != nil || request.Path == "" {
-		w.hostResult(w.client, event.ID, "Invalid attachment request.", true)
+		w.hostResult(client, event.ID, "Invalid attachment request.", true)
 		return
 	}
 	if request.Kind == "" {
 		request.Kind = "document"
 	}
 	if request.Kind != "document" && request.Kind != "photo" {
-		w.hostResult(w.client, event.ID, "Attachment kind must be photo or document.", true)
+		w.hostResult(client, event.ID, "Attachment kind must be photo or document.", true)
 		return
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
 	w.hostRequests[event.ID] = cancel
-	workspace, generation, client := w.binding.Workspace, w.binding.Generation, w.client
+	workspace, generation := w.binding.Workspace, w.binding.Generation
 	spool := filepath.Join(w.b.cfg.DataDir, "attachments", "outbox")
 	w.background.Add(1)
 	go func() {

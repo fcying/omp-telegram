@@ -28,5 +28,5 @@ Use Chinese for conversations and explanations, and English for code comments, t
 
 - Exercise the affected scenario after behavioral changes. Prefer smoke tests against a real omp RPC process.
 - Keep tests that prevent observable behavioral regressions. Do not test source text or trivial field forwarding.
-- Run gofmt after integration. Use `just` for all subsequent builds and test execution: `just` or `just build` compiles, `just test` runs unit tests without starting or restarting a service, `just check` runs unit tests, race checks, and vet, and `just service` installs then restarts the existing supervisor service. For configuration validation, build with `just build` then run `./omp-telegram --check`. Do not bypass these recipes with direct Go build/test commands.
+- Run gofmt after integration. Use `just` for all subsequent builds and test execution: `just` or `just build` compiles, `just test` runs unit tests without starting or restarting a service, `just check` runs unit tests, race checks, and vet, and `just deploy` installs then restarts the existing supervisor service. For configuration validation, build with `just build` then run `./omp-telegram --check`. Do not bypass these recipes with direct Go build/test commands.
 - If Telegram credentials are unavailable, report unverified scenarios explicitly. Never fabricate live verification results.

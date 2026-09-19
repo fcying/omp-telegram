@@ -19,8 +19,8 @@ type modelSettings struct {
 
 // modelSelectionState gates both opening a picker and consuming a selection.
 func (w *worker) modelSelectionState() (modelSettings, bool) {
-	if w.client == nil {
-		w.say("No instance is running.")
+	if _, err := w.ensureRuntime(); err != nil {
+		w.say(err.Error())
 		return modelSettings{}, false
 	}
 	if w.busy || w.compacting || w.finishing || len(w.queue) != 0 {
@@ -87,7 +87,13 @@ func (w *worker) selectModel(c confirmation, index int) {
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
 	defer cancel()
-	model, err := w.client.SetModelRole(ctx, c.models[index].Role)
+	client, err := w.ensureRuntime()
+	if err != nil {
+		w.say(err.Error())
+		return
+	}
+	model, err := client.SetModelRole(ctx, c.models[index].Role)
+	w.touchActivity()
 	if err != nil {
 		w.say("The model switch could not be confirmed. Use /status to check the actual model before retrying.")
 		return
@@ -197,10 +203,9 @@ func (w *worker) switchFast(enabled bool) {
 	}
 	w.say(fastModeText(result.Enabled, result.Active))
 }
-
 func (w *worker) showFastStatus() {
-	if w.client == nil {
-		w.say("No instance is running.")
+	if _, err := w.ensureRuntime(); err != nil {
+		w.say(err.Error())
 		return
 	}
 	raw, err := w.call("get_state", nil)

@@ -24,13 +24,30 @@ func validSessionID(id string) bool {
 func (b *Bridge) sessionInUse(id string) bool {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
+	return b.sessionMatchesLocked(nil, id)
+}
+
+func (b *Bridge) sessionInUseByOther(owner *worker, id string) bool {
+	b.sessionMu.Lock()
+	defer b.sessionMu.Unlock()
+	return b.sessionMatchesLocked(owner, id)
+}
+
+func (b *Bridge) sessionMatchesLocked(except *worker, id string) bool {
 	id = strings.ToLower(id)
 	for _, claim := range b.sessionClaims {
-		if strings.HasPrefix(strings.ToLower(claim.id), id) {
+		if claim.owner != except && strings.HasPrefix(strings.ToLower(claim.id), id) {
 			return true
 		}
 	}
 	return false
+}
+
+func (w *worker) claimPersistedSession() bool {
+	if w.binding.Session == "" || !validSessionID(w.binding.SessionID) {
+		return false
+	}
+	return w.claimSession(w.binding.Session, w.binding.SessionID)
 }
 
 func (w *worker) claimSession(file, id string) bool {

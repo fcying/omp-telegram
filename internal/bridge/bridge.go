@@ -73,6 +73,15 @@ type confirmation struct {
 	models               []omp.ModelRole
 	page                 int
 }
+
+type runtimeState uint8
+
+const (
+	runtimeReleased runtimeState = iota
+	runtimeStarting
+	runtimeConnected
+)
+
 type worker struct {
 	b                     *Bridge
 	key                   target
@@ -94,7 +103,13 @@ type worker struct {
 	operations            chan operationResult
 	background            sync.WaitGroup
 	busy                  bool
+	awaitingContinuation  bool
+	runtime               runtimeState
+	runtimeResuming       bool
+	lastActivity          time.Time
 	lastTyping            time.Time
+	typingCancel          context.CancelFunc
+	idleProbe             idleProbeState
 	preview               string
 	lastAssistant         *terminalAssistant
 	finalAssistantTexts   []string
@@ -137,7 +152,10 @@ const (
 	maxProgressUnits = 3500
 )
 
+const progressInitialDelay = 3 * time.Second
+
 type progressState struct {
+	StartedAt   time.Time
 	ActiveTools map[string]progressTool
 	RecentTools []progressTool
 	Retrying    bool
@@ -555,6 +573,86 @@ func (w *worker) mark(id int64, state string) bool {
 	return true
 }
 
+func (w *worker) touchActivity() {
+	w.resetIdleProbe()
+	if w.runtime == runtimeConnected && w.client != nil {
+		w.lastActivity = time.Now()
+	}
+}
+
+func (w *worker) hasRuntimeConfirmation() bool {
+	for _, c := range w.confirms {
+		switch c.action {
+		case "model", "thinking", "fast", "compact", "ui", "new":
+			return true
+		}
+	}
+	return false
+}
+
+func (w *worker) idleEligible() bool {
+	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
+}
+
+func (w *worker) releaseIdleRuntime(now time.Time) {
+	if w.b.cfg.IdleTimeout <= 0 || !w.idleEligible() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout {
+		return
+	}
+	w.closeRuntime()
+}
+
+func (w *worker) runtimeClient() (*omp.Client, bool) {
+	return w.client, w.runtime == runtimeConnected && w.client != nil
+}
+
+func (w *worker) releaseRuntime(releaseSlot bool) {
+	w.stopTyping()
+	w.resetIdleProbe()
+	w.awaitingContinuation = false
+	// Disable the old client's event and Done channels before closing it, so an
+	// intentional release cannot be mistaken for an unexpected exit.
+	if client := w.client; client != nil {
+		w.client = nil
+		w.runtime = runtimeReleased
+		client.Close()
+		if releaseSlot {
+			<-w.b.slots
+		}
+	}
+	w.runtime = runtimeReleased
+	w.previewID = 0
+	w.previewStopToken = ""
+}
+
+func (w *worker) closeRuntime() { w.releaseRuntime(true) }
+
+func (w *worker) closeFailedStart() {
+	if w.runtimeResuming || w.restoring {
+		w.releaseRuntime(true)
+		return
+	}
+	w.closeLogicalSession()
+}
+
+func (w *worker) ensureRuntime() (*omp.Client, error) {
+	if client, ok := w.runtimeClient(); ok {
+		return client, nil
+	}
+	if w.runtime == runtimeStarting {
+		return nil, errors.New("OMP is starting. Try again after it is ready.")
+	}
+	if !w.binding.Running || w.binding.Session == "" || !filepath.IsAbs(w.binding.Session) || !filepath.IsAbs(w.binding.Workspace) {
+		return nil, errors.New("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
+	}
+	w.runtimeResuming, w.restoring = true, true
+	w.start(true, w.binding.Session, w.binding.Workspace, false)
+	w.restoring, w.runtimeResuming = false, false
+	if client, ok := w.runtimeClient(); ok {
+		return client, nil
+	}
+	return nil, errors.New("Failed to resume the released OMP session. No prompt was submitted.")
+}
+
 func (w *worker) submit(q queued) bool {
 	if q.id == 0 {
 		return true
@@ -570,7 +668,7 @@ func (w *worker) run() {
 	w.initMedia()
 	w.initResumePicker()
 	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults() }()
-	defer w.shutdown()
+	defer w.teardownWorker(true)
 	if w.startIntent != nil {
 		w.say("A requested " + w.startIntent.Kind + " session start was interrupted before omp identity was saved. The outcome is uncertain. Use /close to cancel it, then use /new or /resume explicitly.")
 	} else if w.restoring {
@@ -582,9 +680,9 @@ func (w *worker) run() {
 	for {
 		var events <-chan json.RawMessage
 		var done <-chan struct{}
-		if w.client != nil {
-			events = w.client.Events()
-			done = w.client.Done()
+		if client, ok := w.runtimeClient(); ok {
+			events = client.Events()
+			done = client.Done()
 		}
 		if events != nil {
 			select {
@@ -614,22 +712,25 @@ func (w *worker) run() {
 		case result := <-w.previewResult:
 			w.previewFinished(result)
 		case result := <-w.operations:
-			if result.generation == w.binding.Generation && w.client != nil {
-				w.compacting = false
-				w.busy = false
-				if result.kind == "handoff" {
-					switch {
-					case result.err != nil:
-						w.say("Handoff failed or its outcome is uncertain. It will not be replayed automatically.")
-					case result.cancelled:
-						w.say("Handoff canceled without a result.")
-					default:
-						w.say("Handoff completed.")
+			if result.generation == w.binding.Generation {
+				if _, ok := w.runtimeClient(); ok {
+					w.touchActivity()
+					w.compacting = false
+					w.busy = false
+					if result.kind == "handoff" {
+						switch {
+						case result.err != nil:
+							w.say("Handoff failed or its outcome is uncertain. It will not be replayed automatically.")
+						case result.cancelled:
+							w.say("Handoff canceled without a result.")
+						default:
+							w.say("Handoff completed.")
+						}
+					} else if result.err != nil {
+						w.say("Compaction failed.")
+					} else {
+						w.say("Compaction completed.")
 					}
-				} else if result.err != nil {
-					w.say("Compaction failed.")
-				} else {
-					w.say("Compaction completed.")
 				}
 			}
 		case result := <-w.mediaResults:
@@ -638,20 +739,22 @@ func (w *worker) run() {
 			w.preparedSend(result)
 		case result := <-w.resumeResults:
 			w.resumeListed(result)
+		case result := <-w.idleProbe.results:
+			w.idleProbeFinished(result, time.Now())
 		case <-tick.C:
 			w.typing()
 			w.flushPreview()
 			w.expire()
+			w.probeStuckTask(time.Now())
+			w.releaseIdleRuntime(time.Now())
 		}
 		w.dispatch()
 	}
 }
-func (w *worker) shutdown() { w.shutdownWithSlot(true) }
 
-func (w *worker) shutdownWithSlot(releaseSlot bool) {
-	if !w.restoring && w.ctx.Err() == nil {
-		w.persistClosed()
-	}
+func (w *worker) teardownWorker(releaseSlot bool) {
+	w.stopTyping()
+	w.resetIdleProbe()
 	w.cancelResumeList()
 	for _, q := range w.queue {
 		if q.cancel != nil {
@@ -659,6 +762,7 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 		}
 		removeIncoming(w.binding.Workspace, q.directory)
 	}
+	w.queue = nil
 	for id, cancel := range w.hostRequests {
 		cancel()
 		delete(w.hostRequests, id)
@@ -674,13 +778,7 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 	w.lastAssistant = nil
 	w.stream.Reset()
 	w.clearConfirmations()
-	if w.client != nil {
-		w.client.Close()
-		w.client = nil
-		if releaseSlot {
-			<-w.b.slots
-		}
-	}
+	w.releaseRuntime(releaseSlot)
 	w.releaseSession()
 	if w.active != 0 {
 		w.mark(w.active, "uncertain")
@@ -693,13 +791,25 @@ func (w *worker) shutdownWithSlot(releaseSlot bool) {
 		}
 	}
 }
-func (w *worker) failed() {
-	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
-	w.shutdown()
-	w.busy = false
+
+func (w *worker) closeLogicalSession() bool {
+	if !w.cancelStart() || !w.persistClosed() {
+		return false
+	}
+	w.clearQueue()
+	w.teardownWorker(true)
 	w.active = 0
 	w.activeReplyTo = 0
-	w.clearQueue()
+	w.busy = false
+	return true
+}
+
+func (w *worker) failed() {
+	if w.runtime == runtimeReleased && w.client == nil {
+		return
+	}
+	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
+	w.closeLogicalSession()
 }
 func (w *worker) clearQueue() {
 	for _, q := range w.queue {
@@ -714,18 +824,33 @@ func (w *worker) clearQueue() {
 
 func (w *worker) stop() {
 	w.clearQueue()
-	if w.client != nil {
-		if _, err := w.call("abort", nil); err != nil {
-			w.say("The abort request failed.")
-			return
-		}
+	if w.runtime == runtimeReleased {
+		w.say("No active task. Queued prompts cleared.")
+		return
+	}
+	if _, err := w.call("abort", nil); err != nil {
+		w.say("The abort request failed.")
+		return
 	}
 	w.say("Abort requested and queued prompts cleared.")
 }
+
 func (w *worker) call(kind string, fields map[string]any) (json.RawMessage, error) {
+	client, err := w.ensureRuntime()
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
 	defer cancel()
-	return w.client.Call(ctx, kind, fields)
+	raw, err := client.Call(ctx, kind, fields)
+	if err != nil {
+		// Invalidate watchdog evidence without extending the runtime idle lifetime.
+		w.resetIdleProbe()
+		log.Printf("bridge lifecycle client=%p event=request_failed active=%d busy=%t turn=%d generation=%d", client, w.active, w.busy, w.turn, w.binding.Generation)
+		return raw, err
+	}
+	w.touchActivity()
+	return raw, nil
 }
 
 func (w *worker) newWorkspace(arg string) (string, error) {
@@ -746,8 +871,12 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 }
 
 func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
-	if w.client != nil && !replace {
+	if _, connected := w.runtimeClient(); connected && !replace {
 		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
+		return
+	}
+	if w.runtime == runtimeStarting {
+		w.say("OMP is already starting.")
 		return
 	}
 	if w.startIntent != nil && !w.restoring {
@@ -772,7 +901,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			w.say("Usage: /resume, or /resume <omp session ID>.")
 			return
 		}
-		if w.b.sessionInUse(target) {
+		if !w.runtimeResuming && w.b.sessionInUseByOther(w, target) {
 			w.say("This session is already running in another conversation. Close that instance first, or use a full session ID.")
 			return
 		}
@@ -784,7 +913,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			return
 		}
 	}
-	reuseSlot := replace && w.client != nil
+	reuseSlot := replace && w.runtime == runtimeConnected && w.client != nil
 	reserved := false
 	if !reuseSlot {
 		select {
@@ -825,7 +954,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		w.binding.Running = false
 		if replace {
 			w.clearQueue()
-			w.shutdownWithSlot(false)
+			w.teardownWorker(false)
 			if reuseSlot {
 				reserved = true
 			}
@@ -833,12 +962,16 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 			w.busy = false
 		}
 	}
+	w.runtime = runtimeStarting
 	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs})
 	if e != nil {
 		if reserved {
 			<-w.b.slots
 		}
-		if resume {
+		w.runtime = runtimeReleased
+		if w.runtimeResuming {
+			w.say("Failed to resume the released OMP session. No prompt was submitted.")
+		} else if resume {
 			w.say("Failed to resume omp. The startup outcome is uncertain; use /close before retrying.")
 		} else {
 			w.say("Failed to start omp. The startup outcome is uncertain; use /close before retrying.")
@@ -846,22 +979,23 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		return
 	}
 	w.client = c
+	w.runtime = runtimeConnected
 	w.initMedia()
 	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Second)
 	info, e := c.SessionInfo(ctx)
 	cancel()
 	if e != nil {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("Cannot obtain omp session identity and working directory. The instance has been closed.")
 		return
 	}
 	if resume && !w.restoring && !strings.HasPrefix(strings.ToLower(info.ID), strings.ToLower(target)) {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("The resumed session did not match the requested omp session ID.")
 		return
 	}
 	if w.restoring && !sameSessionFile(info.File, target) {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("omp did not restore the saved session file. The instance has been closed.")
 		return
 	}
@@ -869,29 +1003,31 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		expectedCWD = cwd
 	}
 	if expectedCWD != "" && !sameWorkspace(info.CWD, expectedCWD) {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("omp selected a different working directory. The instance has been closed.")
 		return
 	}
 	if !w.claimSession(info.File, info.ID) {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("This omp session is already active in another conversation.")
 		return
 	}
 	if _, e = w.call("set_host_tools", map[string]any{"tools": telegramSendTools}); e != nil {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("Cannot register Telegram attachment delivery. The instance has been closed.")
 		return
 	}
-	interrupted := w.restoring && old.Interrupted
-	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, Generation: old.Generation + 1, Running: true}
-	if w.restoring {
+	interrupted := w.restoring && !w.runtimeResuming && old.Interrupted
+	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: old.Generation + 1, Running: true}
+	if w.runtimeResuming {
+		binding = old
+	} else if w.restoring {
 		e = w.b.db.Save(binding)
 	} else {
 		e = w.b.db.CommitStart(binding)
 	}
 	if e != nil {
-		w.shutdown()
+		w.closeFailedStart()
 		w.say("Failed to save the session binding. The instance has been closed.")
 		return
 	}
@@ -899,6 +1035,11 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	w.startIntent = nil
 	w.preview, w.lastPreview = "", ""
 	w.previewID = 0
+	w.runtime = runtimeConnected
+	w.touchActivity()
+	if w.runtimeResuming {
+		return
+	}
 	ready := "omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID
 	if interrupted {
 		ready += "\n\n⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted."
@@ -927,8 +1068,8 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	if hasAttachment {
-		if w.client == nil {
-			w.say("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
+		if _, err := w.ensureRuntime(); err != nil {
+			w.say(err.Error())
 			w.mark(in.id, "done")
 			return
 		}
@@ -975,7 +1116,7 @@ func (w *worker) handle(in incoming) {
 			w.say(err.Error())
 			return
 		}
-		if w.client != nil {
+		if w.binding.Running {
 			w.confirm(confirmation{action: "new", workspace: workspace, user: in.msg.From.ID}, "Start a new omp session in: "+workspace+"?\nExisting files and session history will be preserved.", []string{"Confirm", "Cancel"})
 		} else {
 			w.start(false, workspace, "", false)
@@ -984,17 +1125,12 @@ func (w *worker) handle(in incoming) {
 		if arg == "" {
 			w.requestResumeList(in.msg.From.ID)
 		} else {
-			w.start(true, arg, "", false)
+			w.start(true, arg, "", true)
 		}
 	case "/close":
-		if !w.cancelStart() || !w.persistClosed() {
+		if !w.closeLogicalSession() {
 			return
 		}
-		w.clearQueue()
-		w.shutdown()
-		w.active = 0
-		w.activeReplyTo = 0
-		w.busy = false
 		w.say("The instance is closed. The session has been preserved.")
 	case "/stop":
 		w.stop()
@@ -1005,8 +1141,8 @@ func (w *worker) handle(in incoming) {
 			w.say("Usage: /name <session title>")
 			return
 		}
-		if w.client == nil {
-			w.say("No instance is running.")
+		if _, err := w.ensureRuntime(); err != nil {
+			w.say(err.Error())
 			return
 		}
 		if _, err := w.call("set_session_name", map[string]any{"name": arg}); err != nil {
@@ -1045,7 +1181,7 @@ func (w *worker) handle(in incoming) {
 	case "/handoff":
 		w.handoff(arg)
 	case "/compact":
-		if w.client == nil || w.busy {
+		if _, err := w.ensureRuntime(); err != nil || w.busy {
 			w.say("An idle instance is required.")
 			return
 		}
@@ -1055,8 +1191,9 @@ func (w *worker) handle(in incoming) {
 	}
 }
 func (w *worker) handoff(instructions string) {
-	if w.client == nil {
-		w.say("No instance is running.")
+	client, err := w.ensureRuntime()
+	if err != nil {
+		w.say(err.Error())
 		return
 	}
 	if w.busy || w.compacting || w.finishing || len(w.queue) != 0 {
@@ -1068,7 +1205,8 @@ func (w *worker) handoff(instructions string) {
 		fields = map[string]any{"customInstructions": instructions}
 	}
 	w.busy, w.compacting = true, true
-	client, generation := w.client, w.binding.Generation
+	w.touchActivity()
+	generation := w.binding.Generation
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -1088,7 +1226,16 @@ func (w *worker) handoff(instructions string) {
 }
 
 func (w *worker) status() {
-	if w.client == nil {
+	home, _ := os.UserHomeDir()
+	if w.runtime == runtimeReleased && w.binding.Running {
+		idle := time.Duration(-1)
+		if !w.lastActivity.IsZero() {
+			idle = time.Since(w.lastActivity)
+		}
+		w.say(formatReleasedStatus(w.binding.Workspace, w.sessionID, home, len(w.queue), idle))
+		return
+	}
+	if _, connected := w.runtimeClient(); !connected {
 		n, _ := w.b.db.Uncertain()
 		w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
 		return
@@ -1103,14 +1250,13 @@ func (w *worker) status() {
 		w.say("Failed to read the session state.")
 		return
 	}
-	home, _ := os.UserHomeDir()
-	w.say(formatStatus(s, w.binding.Workspace, w.sessionID, home, len(w.queue)))
+	w.say(formatRuntimeStatus(s, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)))
 }
 func (w *worker) dispatch() {
-	if w.client == nil || w.busy || w.compacting || w.finishing || len(w.queue) == 0 {
+	if w.busy || w.compacting || w.finishing || len(w.queue) == 0 {
 		return
 	}
-	if w.queue[0].preparing {
+	if _, err := w.ensureRuntime(); err != nil || w.queue[0].preparing {
 		return
 	}
 	q := w.queue[0]
@@ -1121,9 +1267,12 @@ func (w *worker) dispatch() {
 	w.active = q.id
 	w.activeReplyTo = q.replyTo
 	w.owner = q.user
+	w.stopTyping()
+	w.resetIdleProbe()
+	w.awaitingContinuation = false
 	w.turn++
 	w.busy = true
-	w.progress = progressState{ActiveTools: make(map[string]progressTool)}
+	w.progress = progressState{StartedAt: time.Now(), ActiveTools: make(map[string]progressTool)}
 	w.progressSuppressed = false
 	w.preview = ""
 	w.stream.Reset()
@@ -1138,11 +1287,7 @@ func (w *worker) dispatch() {
 	if err != nil {
 		w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
 		w.mark(q.id, "uncertain")
-		w.shutdown()
-		w.clearQueue()
-		w.active = 0
-		w.busy = false
-		w.activeReplyTo = 0
+		w.closeLogicalSession()
 		return
 	}
 	var response struct {
@@ -1154,8 +1299,8 @@ func (w *worker) dispatch() {
 }
 
 func (w *worker) enqueuePrompt(in incoming, text string) {
-	if w.client == nil {
-		w.say("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
+	if _, err := w.ensureRuntime(); err != nil {
+		w.say(err.Error())
 		w.mark(in.id, "done")
 		return
 	}
@@ -1167,6 +1312,9 @@ func (w *worker) enqueuePrompt(in incoming, text string) {
 	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text})
 }
 func (w *worker) finish() {
+	w.stopTyping()
+	w.resetIdleProbe()
+	w.awaitingContinuation = false
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		text := w.preview
@@ -1205,6 +1353,9 @@ func (w *worker) finishCancelled(notice string) {
 }
 
 func (w *worker) finishIncomplete(state, notice string) {
+	w.stopTyping()
+	w.resetIdleProbe()
+	w.awaitingContinuation = false
 	if w.active == 0 {
 		w.lastAssistant = nil
 		w.finalAssistantTexts = nil
@@ -1329,10 +1480,12 @@ func (w *worker) finishPreview() {
 	}
 }
 func (w *worker) event(raw []byte) {
+	w.touchActivity()
 	var e rpcEvent
 	if json.Unmarshal(raw, &e) != nil {
 		return
 	}
+	w.logLifecycle(e)
 	switch e.Type {
 	case "host_tool_call":
 		w.renameProgressTool(e.ToolCallID, e.ToolName)
@@ -1360,6 +1513,7 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		w.awaitingContinuation = false
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)
 		w.lastAssistant = nil
@@ -1374,8 +1528,10 @@ func (w *worker) event(raw []byte) {
 		}
 	case "agent_end":
 		if e.IsTerminal != nil && !*e.IsTerminal {
+			w.awaitingContinuation = true
 			return
 		}
+		w.awaitingContinuation = false
 		texts := assistantTexts(e.Messages)
 		if len(texts) > 0 {
 			w.preview = strings.Join(texts, "\n\n")
@@ -1391,10 +1547,7 @@ func (w *worker) event(raw []byte) {
 		if !e.Success {
 			w.say("The omp request failed. Use /status to check the session state.")
 			w.mark(w.active, "uncertain")
-			w.shutdown()
-			w.clearQueue()
-			w.active = 0
-			w.busy = false
+			w.closeLogicalSession()
 		}
 	case "extension_ui_request":
 		w.ui(e)
@@ -1408,11 +1561,13 @@ func (w *worker) typing() {
 	if (!w.busy && !preparing) || time.Since(w.lastTyping) < 5*time.Second {
 		return
 	}
+	w.stopTyping()
 	w.lastTyping = time.Now()
+	ctx, cancel := context.WithTimeout(w.ctx, 4*time.Second)
+	w.typingCancel = cancel
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
-		ctx, cancel := context.WithTimeout(w.ctx, 4*time.Second)
 		defer cancel()
 		_ = w.b.tg.Typing(ctx, w.key.chat, w.key.thread)
 	}()
@@ -1689,6 +1844,10 @@ func (w *worker) flushPreview() {
 	if w.b.cfg.ProgressMode == "off" || w.progressSuppressed {
 		return
 	}
+	// Avoid creating a transient progress message for short tasks.
+	if w.previewID == 0 && !w.progress.StartedAt.IsZero() && time.Since(w.progress.StartedAt) < progressInitialDelay {
+		return
+	}
 	snapshot := w.renderProgress()
 	if w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
 		return
@@ -1752,6 +1911,7 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 		k.InlineKeyboard = append(k.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}})
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	w.touchActivity()
 	defer cancel()
 	message, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, telegram.SendOptions{Keyboard: k})
 	if e != nil {
@@ -1840,14 +2000,13 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		defer cancel()
-		if w.client == nil || w.client.Send(ctx, frame) != nil {
+		client, err := w.ensureRuntime()
+		if err != nil || client.Send(ctx, frame) != nil {
 			w.say("The confirmation could not be delivered to omp. Its state is uncertain and the instance has been closed.")
-			w.shutdown()
-			w.clearQueue()
-			w.active = 0
-			w.busy = false
+			w.closeLogicalSession()
 			return callbackUncertain
 		}
+		w.touchActivity()
 		return callbackDone
 	}
 	if c.action == "model" {
@@ -1879,13 +2038,14 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		w.start(false, c.workspace, "", true)
 	case "compact":
-		if w.client == nil || w.busy {
+		client, err := w.ensureRuntime()
+		if err != nil || w.busy {
 			w.say("The instance is not idle. Compaction was canceled.")
 			return callbackDone
 		}
 		w.busy = true
 		w.compacting = true
-		client := w.client
+		w.touchActivity()
 		generation := w.binding.Generation
 		w.background.Add(1)
 		go func() {
@@ -1977,15 +2137,15 @@ func (w *worker) ui(e rpcEvent) {
 	}
 }
 func (w *worker) cancelUI(c confirmation) {
-	if c.uiID != "" && w.client != nil {
+	if client, connected := w.runtimeClient(); c.uiID != "" && connected {
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		defer cancel()
-		_ = w.client.Send(ctx, map[string]any{"type": "extension_ui_response", "id": c.uiID, "cancelled": true})
+		_ = client.Send(ctx, map[string]any{"type": "extension_ui_response", "id": c.uiID, "cancelled": true})
 	}
 }
 
-// Programmatic invalidation does not send native UI replies. The caller owns
-// that decision, since native cancellation and old generations must not echo.
+// Programmatic invalidation removes the Telegram token first. Expiry and
+// explicit runtime teardown may then cancel a current-generation native UI.
 func (w *worker) dropConfirmation(token string, c confirmation) {
 	delete(w.confirms, token)
 	if w.previewStopToken == token {
@@ -1997,6 +2157,18 @@ func (w *worker) dropConfirmation(token string, c confirmation) {
 func (w *worker) clearConfirmations() {
 	for token, c := range w.confirms {
 		w.dropConfirmation(token, c)
+	}
+}
+
+func (w *worker) clearRuntimeConfirmations() {
+	for token, c := range w.confirms {
+		if c.action == "resume" {
+			continue
+		}
+		w.dropConfirmation(token, c)
+		if c.action == "ui" && c.generation == w.binding.Generation {
+			w.cancelUI(c)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"omp-telegram/internal/omp"
 )
@@ -70,6 +71,28 @@ func formatStatus(s statusState, workspace, sessionID, home string, queued int) 
 	return fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s\nThinking: %s\nFast: %s\nContext: %s\nRunning: %s\nCompacting: %s\nQueued: %d\nSpeed: %s",
 		clipUTF16(statusWorkspace(workspace, home), 1024), session, model, thinking, fast, context,
 		statusBool(s.IsStreaming, "yes", "no"), statusBool(s.IsCompacting, "yes", "no"), queued, speed)
+}
+
+func formatRuntimeStatus(s statusState, workspace, sessionID, home string, queued int, idle time.Duration) string {
+	return formatStatus(s, workspace, sessionID, home, queued) + "\nOMP: connected\nIdle: " + statusIdle(idle)
+}
+
+func formatReleasedStatus(workspace, sessionID, home string, queued int, idle time.Duration) string {
+	session := menuText(sessionID, 128)
+	if session == "" {
+		session = "n/a"
+	}
+	return fmt.Sprintf("Workspace: %s\nSession: %s\nOMP: released\nModel: unavailable while released\nContext: unavailable while released\nQueued: %d\nIdle: %s", clipUTF16(statusWorkspace(workspace, home), 1024), session, queued, statusIdle(idle))
+}
+
+func statusIdle(idle time.Duration) string {
+	if idle < 0 {
+		return "n/a"
+	}
+	if idle < time.Minute {
+		return idle.Round(time.Second).String()
+	}
+	return idle.Round(time.Minute).String()
 }
 
 func statusWorkspace(workspace, home string) string {

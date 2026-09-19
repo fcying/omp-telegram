@@ -13,19 +13,27 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Binding, restoring bool, intent *store.StartIntent) *worker {
+func (b *Bridge) newWorker(ctx context.Context, key target, binding store.Binding, restoring bool, intent *store.StartIntent) *worker {
 	ctx, cancel := context.WithCancel(ctx)
-	w := &worker{
+	return &worker{
 		b: b, key: key, binding: binding, restoring: restoring, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
 		operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
 	}
+}
+
+func (b *Bridge) runWorker(w *worker) {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
 		w.run()
 	}()
+}
+
+func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Binding, restoring bool, intent *store.StartIntent) *worker {
+	w := b.newWorker(ctx, key, binding, restoring, intent)
+	b.runWorker(w)
 	return w
 }
 
@@ -55,6 +63,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			}
 		}
 	}
+	restored := make([]*worker, 0, len(bindings))
 	for _, binding := range bindings {
 		if ctx.Err() != nil {
 			break
@@ -63,7 +72,15 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			continue
 		}
 		key := target{binding.Chat, binding.Thread}
-		workers[key] = b.launchWorker(ctx, key, binding, true, nil)
+		w := b.newWorker(ctx, key, binding, true, nil)
+		if !w.claimPersistedSession() {
+			return errors.New("saved session identity is unavailable or claimed by another conversation")
+		}
+		workers[key] = w
+		restored = append(restored, w)
+	}
+	for _, w := range restored {
+		b.runWorker(w)
 	}
 	for i := range intents {
 		intent := &intents[i]

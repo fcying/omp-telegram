@@ -341,7 +341,7 @@ func TestModelPickerInvalidationClearsKeyboard(t *testing.T) {
 			cleared := []int{messageID}
 			switch reason {
 			case "shutdown":
-				w.shutdown()
+				w.teardownWorker(true)
 			case "replacement":
 				command("/new")
 				confirmationID := f.messageCount()

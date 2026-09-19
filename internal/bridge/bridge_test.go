@@ -131,6 +131,8 @@ func TestMain(m *testing.M) {
 				continue
 			case "get_state":
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies}
+				resp["data"].(map[string]any)["isStreaming"] = streaming
+				resp["data"].(map[string]any)["isCompacting"] = false
 			case "set_session_name":
 				name, _ := cmd["name"].(string)
 				if strings.TrimSpace(name) == "" || modelID == "reject-name" {
@@ -210,6 +212,13 @@ func TestMain(m *testing.M) {
 				emit(resp)
 				streaming = true
 				emit(map[string]any{"type": "agent_start"})
+				if text == "missing-terminal" || text == "nonterminal-only" {
+					if text == "nonterminal-only" {
+						emit(map[string]any{"type": "agent_end", "isTerminal": false})
+					}
+					streaming = false
+					continue
+				}
 				if text == "wait" {
 					continue
 				}
@@ -282,6 +291,7 @@ type fakeHTTP struct {
 	keyboardClears    []map[string]any
 	failKeyboardClear bool
 	keyboardClearGate <-chan struct{}
+	typingRequests    chan context.Context
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -300,6 +310,16 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	var result any = true
 	switch filepath.Base(r.URL.Path) {
+	case "sendChatAction":
+		if f.typingRequests != nil {
+			select {
+			case f.typingRequests <- r.Context():
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		}
 	case "getMe":
 		result = telegram.User{ID: 99, Username: "fixture_bot", IsBot: true}
 	case "setMyCommands":
@@ -1017,7 +1037,7 @@ func TestReplacementShutdownRetainsCapacitySlot(t *testing.T) {
 	if len(w.b.slots) != 1 {
 		t.Fatal("running worker did not hold capacity slot")
 	}
-	w.shutdownWithSlot(false)
+	w.teardownWorker(false)
 	if len(w.b.slots) != 1 {
 		t.Fatal("replacement shutdown released its capacity slot")
 	}
@@ -1296,7 +1316,7 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 	w := &worker{b: &Bridge{cfg: config.Config{OMP: binary, WorkspaceRoot: t.TempDir()}, db: db, tg: telegram.New("fake"), bot: telegram.User{ID: 99}, slots: make(chan struct{}, 1)}, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)}
 	w.resumeResults = make(chan resumeListResult, 4)
 	t.Cleanup(func() {
-		w.shutdown()
+		w.teardownWorker(true)
 		cancel()
 		w.background.Wait()
 		http.DefaultTransport = old

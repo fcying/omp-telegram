@@ -18,6 +18,9 @@ max_workers = 4
 queue_capacity = 16
 # Remove terminal database messages older than this many days. Set 0 to disable cleanup.
 database_retention_days = 90
+# Release an unused OMP runtime after this duration while retaining the logical session.
+# Set 0 or disabled to turn automatic release off.
+idle_timeout = "30m"
 # Telegram live task progress.
 #
 # off: Disable live progress and typing actions.
