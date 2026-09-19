@@ -1018,6 +1018,14 @@ func (w *worker) clearQueue() {
 
 func (w *worker) stop() {
 	w.clearQueue()
+	w.requestAbort("Abort requested and queued prompts cleared.")
+}
+
+func (w *worker) stopActiveTask() {
+	w.requestAbort("Abort requested for the current task. Queued prompts will continue.")
+}
+
+func (w *worker) requestAbort(notice string) {
 	if w.runtime == runtimeReleased {
 		w.say("No active task. Queued prompts cleared.")
 		return
@@ -1026,7 +1034,7 @@ func (w *worker) stop() {
 		w.say("The abort request failed.")
 		return
 	}
-	w.say("Abort requested and queued prompts cleared.")
+	w.say(notice)
 }
 
 func (w *worker) call(kind string, fields map[string]any) (json.RawMessage, error) {
@@ -2310,7 +2318,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Stopping")
 		w.clearKeyboard(messageID)
-		w.stop()
+		w.stopActiveTask()
 		return callbackDone
 	}
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")

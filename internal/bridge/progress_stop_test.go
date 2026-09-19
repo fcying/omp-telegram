@@ -123,7 +123,7 @@ func TestInitialProgressSurvivesNativeActivity(t *testing.T) {
 	}
 }
 
-func TestProgressStopButtonAbortsOnlyItsActiveRootTask(t *testing.T) {
+func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
 	w.b.cfg.QueueCapacity = 4
@@ -172,14 +172,29 @@ func TestProgressStopButtonAbortsOnlyItsActiveRootTask(t *testing.T) {
 	clickKeyboard(w, 7, data)
 	assertKeyboardClears(t, f, int(result.id))
 	var state string
-	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "cancelled" {
-		t.Fatalf("queued root state = %q, error %v", state, err)
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "pending" {
+		t.Fatalf("queued root state = %q, error %v; want pending", state, err)
 	}
 	if got := f.deletedMessageIDs(); len(got) != 0 {
 		t.Fatalf("cancelled task deleted progress: %v", got)
 	}
-	if len(w.queue) != 0 || len(w.confirms) != 0 {
-		t.Fatal("valid progress stop did not consume its UI state")
+	if len(w.queue) != 1 || len(w.confirms) != 0 {
+		t.Fatal("valid progress stop cleared queued work or retained UI state")
+	}
+	if callbackCount(f, "Stopping") != 1 {
+		t.Fatal("progress Stop did not request one abort")
+	}
+
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted","errorMessage":"Request was aborted"}]}`))
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "cancelled" {
+		t.Fatalf("stopped root state = %q, error %v; want cancelled", state, err)
+	}
+	w.dispatch()
+	if w.active != 3 || !w.busy || len(w.queue) != 0 {
+		t.Fatalf("queued task did not continue after Stop: active=%d busy=%t queue=%d", w.active, w.busy, len(w.queue))
+	}
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "submitted" {
+		t.Fatalf("continued root state = %q, error %v; want submitted", state, err)
 	}
 }
 
