@@ -50,7 +50,10 @@ func (c *Client) Download(ctx context.Context, fileID, destination string, maxBy
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return errors.New("telegram: download transport failed")
+		if timeoutError(err) {
+			return withReason(reasonTimeout, errors.New("telegram: download transport failed"))
+		}
+		return withReason(reasonTransportFailed, errors.New("telegram: download transport failed"))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -104,7 +107,7 @@ func validFilePath(path string) bool {
 
 // SendFile streams a private local snapshot. Only explicit rate limits may retry.
 func (c *Client) SendFile(ctx context.Context, chatID, threadID int64, kind, path, name, caption string, options SendOptions) (Message, error) {
-	return sendWithReplyFallback(options, func(options SendOptions) (Message, error) {
+	return sendWithReplyFallback(c.logger, chatID, threadID, options, func(options SendOptions) (Message, error) {
 		return c.sendFile(ctx, chatID, threadID, kind, path, name, caption, options.ReplyToMessageID)
 	})
 }
@@ -235,14 +238,17 @@ func (c *Client) upload(ctx context.Context, file *os.File, chatID, threadID int
 		if ctx.Err() != nil {
 			return false, 0, ctx.Err()
 		}
-		return false, 0, errors.New("telegram: upload transport failed (delivery may be uncertain)")
+		if timeoutError(requestErr) {
+			return false, 0, withReason(reasonTimeout, errors.New("telegram: upload transport failed (delivery may be uncertain)"))
+		}
+		return false, 0, withReason(reasonTransportFailed, errors.New("telegram: upload transport failed (delivery may be uncertain)"))
 	}
 	retry, delay, responseErr := c.decodeResponse(ctx, resp, result, false)
 	if responseErr != nil {
 		return retry, delay, responseErr
 	}
 	if writeErr != nil {
-		return false, 0, errors.New("telegram: upload interrupted (delivery may be uncertain)")
+		return false, 0, withReason(reasonTransportFailed, errors.New("telegram: upload interrupted (delivery may be uncertain)"))
 	}
 	return false, 0, nil
 }

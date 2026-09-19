@@ -20,10 +20,48 @@ import (
 	"unicode/utf16"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/logging"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
+
+func testLogs(t *testing.T) *logging.Registry {
+	t.Helper()
+	logs, err := logging.New(io.Discard, logging.Options{Level: "info", Format: "text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return logs
+}
+
+func testBridge(t *testing.T, b *Bridge) *Bridge {
+	t.Helper()
+	logs := testLogs(t)
+	b.log = logs.Logger(logging.Bridge)
+	b.telegramLog = logs.Logger(logging.Telegram)
+	b.storeLog = logs.Logger(logging.Store)
+	b.mediaLog = logs.Logger(logging.Media)
+	b.rpcLog = logs.Logger(logging.RPC)
+	return b
+}
+
+func testWorker(t *testing.T, w *worker) *worker {
+	t.Helper()
+	if w.b == nil {
+		w.b = testBridge(t, &Bridge{})
+	} else if w.b.log == nil {
+		w.b = testBridge(t, w.b)
+	}
+	if w.log == nil {
+		w.log = w.b.log.With("chat_id", w.key.chat, "thread_id", w.key.thread)
+	}
+	return w
+}
+
+func newTestTelegram(t *testing.T) *telegram.Client {
+	return telegram.New("fake", testLogs(t).Logger(logging.Telegram))
+}
 
 // This subprocess speaks RPC to exercise the real pipe and actor boundaries.
 func TestMain(m *testing.M) {
@@ -400,7 +438,8 @@ func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) 
 	done := make(chan error, 1)
 	exe, _ := os.Executable()
 	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7, 8}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: 2, QueueCapacity: 4}
-	go func() { done <- Run(ctx, cfg, db) }()
+	logs := testLogs(t)
+	go func() { done <- Run(ctx, cfg, db, logs) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -430,7 +469,7 @@ func TestCommandRegistrationFailureStopsStartup(t *testing.T) {
 			defer func() { http.DefaultTransport = previous }()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			err = Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db)
+			err = Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t))
 			var apiErr *telegram.APIError
 			if !errors.As(err, &apiErr) || apiErr.Code != 400 {
 				t.Fatalf("registration failure did not stop startup: %v", err)
@@ -458,7 +497,7 @@ func TestStartIsHiddenHelpAlias(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db, fatal: make(chan error, 1)}, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db, fatal: make(chan error, 1)}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel})
 	w.handle(incoming{id: 1, msg: &telegram.Message{Text: "/start"}})
 	output, err := db.NextOutput()
 	if err != nil || output.Text != commandHelp() {
@@ -574,7 +613,7 @@ func TestTailUTF16(t *testing.T) {
 	}
 }
 func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
-	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "off"}}, busy: true}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "off"}}), busy: true})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`))
 	w.flushPreview()
@@ -591,7 +630,7 @@ func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
 }
 
 func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
-	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "summary"}}, active: 10, busy: true}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}}), active: 10, busy: true})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"PRIVATE"}}`))
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read","arguments":{"path":"SECRET path"},"result":"SECRET result"}`))
@@ -622,14 +661,14 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 }
 
 func TestManualCompactionDoesNotReuseTaskProgress(t *testing.T) {
-	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "summary"}}, busy: true, compacting: true, previewID: 42}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}}), busy: true, compacting: true, previewID: 42})
 	if got := w.renderProgress(); got != "" {
 		t.Fatalf("manual compaction rendered task progress: %q", got)
 	}
 }
 
 func TestAgentStartPreservesRetryState(t *testing.T) {
-	w := &worker{active: 10, busy: true}
+	w := testWorker(t, &worker{active: 10, busy: true})
 	w.event([]byte(`{"type":"auto_retry_start"}`))
 	if !w.progress.Retrying {
 		t.Fatal("auto_retry_start did not enable retry state")
@@ -645,7 +684,7 @@ func TestAgentStartPreservesRetryState(t *testing.T) {
 }
 
 func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
-	w := &worker{busy: true}
+	w := testWorker(t, &worker{active: 0, busy: true})
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"telegram_send"}`))
 	w.event([]byte(`{"type":"host_tool_call","id":"host-1","toolCallId":"tool-1","toolName":"telegram_send"}`))
 	w.event([]byte(`{"type":"host_tool_cancel","targetId":"host-1"}`))
@@ -659,7 +698,7 @@ func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
 }
 
 func TestProgressStatusPriorityAndBounds(t *testing.T) {
-	w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: "verbose"}}, active: 10, busy: true, preview: strings.Repeat("😀", maxProgressUnits)}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), active: 10, busy: true, preview: strings.Repeat("😀", maxProgressUnits)})
 	w.startProgressTool("tool-1", "bash")
 	w.compacting = true
 	if !strings.Contains(w.renderProgress(), "Status: Compacting context...") {
@@ -677,13 +716,13 @@ func TestProgressCompletionFences(t *testing.T) {
 		{generation: 6, turn: 8, id: 99, text: "stale generation"},
 		{generation: 7, turn: 9, id: 99, text: "stale turn"},
 	} {
-		w := &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current", finishing: true}
+		w := testWorker(t, &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current", finishing: true})
 		w.previewFinished(result)
 		if w.previewID != 42 || w.lastPreview != "current" || !w.finishing {
 			t.Fatalf("stale progress result changed current turn: %#v", w)
 		}
 	}
-	w := &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current"}
+	w := testWorker(t, &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current"})
 	w.previewFinished(previewResult{generation: 7, turn: 8, id: 42, text: "failed", err: errors.New("edit failed")})
 	if w.progressSuppressed || w.lastPreview != "current" || w.previewID != 42 {
 		t.Fatal("edit failure was not retained for a later retry")
@@ -706,7 +745,7 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := &worker{b: &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, preview: "answer", confirms: map[string]confirmation{}}
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, preview: "answer", confirms: map[string]confirmation{}})
 			w.finish()
 			output, err := db.NextOutput()
 			if err != nil || output.Text != "answer" {
@@ -727,8 +766,7 @@ func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
 	defer func() { http.DefaultTransport = old }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{
-		b:             &Bridge{cfg: config.Config{ProgressMode: "summary"}, tg: telegram.New("fake"), fatal: make(chan error, 1)},
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
 		binding:       store.Binding{Generation: 1},
 		ctx:           ctx,
 		cancel:        cancel,
@@ -738,8 +776,7 @@ func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
 		busy:          true,
 		preview:       "working",
 		previewResult: make(chan previewResult, 1),
-		confirms:      make(map[string]confirmation),
-	}
+		confirms:      make(map[string]confirmation)})
 	w.flushPreview()
 	result := <-w.previewResult
 	if result.err == nil {
@@ -777,7 +814,7 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, previewBusy: true, preview: "answer", busy: true, confirms: map[string]confirmation{}}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, previewBusy: true, preview: "answer", busy: true, confirms: map[string]confirmation{}})
 	w.finish()
 	o, e := db.NextOutput()
 	if e != nil || o.Text != "answer" {
@@ -802,7 +839,7 @@ func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"partial answer"}}`))
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"error","errorMessage":"SECRET upstream diagnostics"}]}`))
 	var state string
@@ -832,7 +869,7 @@ func TestNormalTerminalCompletionIsDone(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"final answer"}],"stopReason":"stop"}]}`))
 	var state string
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "done" {
@@ -893,7 +930,7 @@ func TestCompactedTerminalEventsUseMessageEndMetadata(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 			w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"` + tc.preview + `"}}`))
 			w.event([]byte(`{"type":"message_end","message":` + tc.message + `}`))
 			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[],"messageCount":1}`))
@@ -923,7 +960,7 @@ func TestAgentStartClearsTerminalMetadata(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"aborted","errorMessage":"Request was aborted"}}`))
 	w.event([]byte(`{"type":"agent_start"}`))
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"final answer"}}`))
@@ -965,7 +1002,7 @@ func TestTerminalAbortIsCancelled(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 			w.event([]byte(tc.event))
 			var state string
 			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "cancelled" {
@@ -993,7 +1030,7 @@ func TestNonterminalAgentEndDoesNotCompleteInput(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":[{"role":"assistant","stopReason":"error"}]}`))
 	var state string
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "submitted" || w.active != 10 {
@@ -1015,7 +1052,7 @@ func TestTerminalWithoutTextIsUncertain(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end"}`))
 	var state string
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "uncertain" {
@@ -1024,7 +1061,7 @@ func TestTerminalWithoutTextIsUncertain(t *testing.T) {
 }
 
 func TestDispatchWaitsForPreviewCleanup(t *testing.T) {
-	w := &worker{client: &omp.Client{}, finishing: true, queue: []queued{{id: 1}}}
+	w := testWorker(t, &worker{client: &omp.Client{}, finishing: true, queue: []queued{{id: 1}}})
 	w.dispatch()
 	if len(w.queue) != 1 {
 		t.Fatal("next prompt dispatched before prior preview cleanup")
@@ -1313,7 +1350,7 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 	old := http.DefaultTransport
 	http.DefaultTransport = f
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	w := &worker{b: &Bridge{cfg: config.Config{OMP: binary, WorkspaceRoot: t.TempDir()}, db: db, tg: telegram.New("fake"), bot: telegram.User{ID: 99}, slots: make(chan struct{}, 1)}, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)}
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{OMP: binary, WorkspaceRoot: t.TempDir()}, db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}, slots: make(chan struct{}, 1)}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)})
 	w.resumeResults = make(chan resumeListResult, 4)
 	t.Cleanup(func() {
 		w.teardownWorker(true)

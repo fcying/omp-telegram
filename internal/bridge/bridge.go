@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +19,7 @@ import (
 	"unicode/utf16"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/logging"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
@@ -30,6 +31,11 @@ type Bridge struct {
 	db            *store.Store
 	tg            *telegram.Client
 	bot           telegram.User
+	log           *slog.Logger
+	telegramLog   *slog.Logger
+	storeLog      *slog.Logger
+	mediaLog      *slog.Logger
+	rpcLog        *slog.Logger
 	slots         chan struct{}
 	wg            sync.WaitGroup
 	fatal         chan error
@@ -84,6 +90,7 @@ const (
 
 type worker struct {
 	b                     *Bridge
+	log                   *slog.Logger
 	key                   target
 	input                 chan incoming
 	client                *omp.Client
@@ -245,24 +252,55 @@ func commandHelp() string {
 	}
 	return help.String()
 }
+func logTelegramFailure(logger *slog.Logger, level slog.Level, event, message string, err error, extra ...slog.Attr) {
+	info := telegram.ClassifyError(err)
+	attrs := []slog.Attr{
+		slog.String("event", event),
+		slog.String("reason", info.Reason),
+		slog.Bool("uncertain", info.Uncertain),
+	}
+	if info.Code != 0 {
+		attrs = append(attrs, slog.Int("api_code", info.Code))
+	}
+	if info.RetryAfter > 0 {
+		attrs = append(attrs, slog.Int("retry_after_s", info.RetryAfter))
+	}
+	attrs = append(attrs, extra...)
+	logger.LogAttrs(context.Background(), level, message, attrs...)
+}
 
-func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
-	tg := telegram.New(cfg.Token)
+func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry) error {
+	if logs == nil {
+		return errors.New("logging registry required")
+	}
+	log := logs.Logger(logging.Bridge)
+	telegramLog := logs.Logger(logging.Telegram)
+	storeLog := logs.Logger(logging.Store)
+	mediaLog := logs.Logger(logging.Media)
+	rpcLog := logs.Logger(logging.RPC)
+	tg := telegram.New(cfg.Token, telegramLog)
 	bot, err := tg.GetMe(ctx)
 	if err != nil {
+		if ctx.Err() == nil {
+			logTelegramFailure(telegramLog, slog.LevelError, "telegram_identity_failed", "telegram identity lookup failed", err)
+		}
 		return err
 	}
 	if err = db.CheckBot(bot.ID); err != nil {
+		storeLog.Error("bot consistency check failed", "event", "bot_check_failed", "error_kind", "persistence")
 		return err
 	}
 	// Replace both previously registered lists so all clients receive English descriptions.
 	for _, language := range []string{"", "zh"} {
 		if err = tg.SetCommands(ctx, botCommands, language); err != nil {
+			if ctx.Err() == nil {
+				logTelegramFailure(telegramLog, slog.LevelError, "telegram_commands_failed", "telegram command registration failed", err)
+			}
 			return fmt.Errorf("register Telegram commands: %w", err)
 		}
 	}
-	log.Print("Telegram command menus registered (English)")
-	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2)}
+	telegramLog.Info("telegram command menu registered", "event", "command_menu_registered")
+	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2)}
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() { cancel(); b.wg.Wait() }()
 	b.cleanupDatabase(ctx)
@@ -290,6 +328,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 		for ctx.Err() == nil {
 			offset, err := db.Offset()
 			if err != nil {
+				b.storeLog.Error("database offset failed", "event", "inbox_read_failed", "reason", "offset", "error_kind", "persistence")
 				b.fail(err)
 				return
 			}
@@ -298,7 +337,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 				if ctx.Err() != nil {
 					return
 				}
-				log.Printf("Telegram polling failed: %v; retrying", err)
+				logTelegramFailure(b.telegramLog, slog.LevelWarn, "poll_failed", "telegram polling failed", err)
 				select {
 				case <-ctx.Done():
 					return
@@ -312,6 +351,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 					err = db.Accept(u.UpdateID, raw)
 				}
 				if err != nil {
+					b.storeLog.Error("update persistence failed", "event", "inbox_state_write_failed", "reason", "accept", "error_kind", "persistence")
 					b.fail(err)
 					return
 				}
@@ -328,6 +368,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 	for {
 		inputs, err := db.Pending()
 		if err != nil {
+			b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", "pending", "error_kind", "persistence")
 			return err
 		}
 		pendingIDs := make(map[int64]bool, len(inputs))
@@ -347,6 +388,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 			var u telegram.Update
 			if json.Unmarshal(in.Raw, &u) != nil {
 				if err = db.Mark(in.ID, "ignored"); err != nil {
+					b.storeLog.Error("input state persistence failed", "event", "inbox_state_write_failed")
 					return err
 				}
 				continue
@@ -362,15 +404,18 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 			}
 			if m == nil || !cfg.Authorized(user, m.Chat.ID) {
 				if err = db.Mark(in.ID, "ignored"); err != nil {
+					b.storeLog.Error("input state persistence failed", "event", "inbox_state_write_failed")
 					return err
 				}
 				continue
 			}
 			if !supportedConversation(m) {
 				if err = db.Enqueue(m.Chat.ID, 0, "This bot supports private chats and Telegram topics. In groups, use it inside a topic."); err != nil {
+					b.storeLog.Error("unsupported conversation reply failed", "event", "outbox_write_failed")
 					return err
 				}
 				if err = db.Mark(in.ID, "done"); err != nil {
+					b.storeLog.Error("input state persistence failed", "event", "inbox_state_write_failed")
 					return err
 				}
 				continue
@@ -410,15 +455,19 @@ func (b *Bridge) cleanupDatabase(ctx context.Context) {
 	}
 	result, err := b.db.CleanupMessages(ctx, time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays).Unix())
 	for _, path := range result.AttachmentPaths {
-		removeOutboxSnapshot(filepath.Join(b.cfg.DataDir, "attachments", "outbox"), path)
+		if removeErr := removeOutboxSnapshot(filepath.Join(b.cfg.DataDir, "attachments", "outbox"), path); removeErr != nil {
+			b.storeLog.Warn("database cleanup snapshot removal failed", "event", "snapshot_cleanup_failed")
+		}
 	}
 	if err != nil {
-		log.Printf("database cleanup failed: %v", err)
+		if ctx.Err() == nil {
+			b.storeLog.Warn("database cleanup failed", "event", "cleanup_failed")
+		}
 		return
 	}
 	b.reconcileOutboxSnapshots(ctx, time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays))
 	if result.Inbox != 0 || result.Outbox != 0 {
-		log.Printf("database cleanup completed: inbox=%d outbox=%d", result.Inbox, result.Outbox)
+		b.storeLog.Info("database cleanup completed", "event", "cleanup_completed", "inbox_count", result.Inbox, "outbox_count", result.Outbox)
 	}
 }
 
@@ -435,25 +484,28 @@ func (b *Bridge) runDatabaseJanitor(ctx context.Context) {
 	}
 }
 
-func removeOutboxSnapshot(spoolRoot, path string) {
+func removeOutboxSnapshot(spoolRoot, path string) error {
 	rel, err := filepath.Rel(spoolRoot, path)
 	if err != nil || !filepath.IsLocal(rel) {
-		return
+		return nil
 	}
 	root, err := os.OpenRoot(spoolRoot)
 	if err != nil {
-		return
+		return nil
 	}
 	defer root.Close()
 	if err = root.Remove(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Print("database cleanup snapshot removal failed")
+		return err
 	}
+	return nil
 }
 
 func (b *Bridge) reconcileOutboxSnapshots(ctx context.Context, cutoff time.Time) {
 	paths, err := b.db.OutboxAttachmentPaths(ctx)
 	if err != nil {
-		log.Print("database cleanup snapshot reconciliation failed")
+		if ctx.Err() == nil {
+			b.storeLog.Warn("database cleanup snapshot reconciliation failed", "event", "snapshot_cleanup_failed")
+		}
 		return
 	}
 	referenced := make(map[string]struct{}, len(paths))
@@ -463,21 +515,21 @@ func (b *Bridge) reconcileOutboxSnapshots(ctx context.Context, cutoff time.Time)
 	spoolRoot := filepath.Join(b.cfg.DataDir, "attachments", "outbox")
 	root, err := os.OpenRoot(spoolRoot)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			log.Print("database cleanup snapshot reconciliation failed")
+		if !errors.Is(err, os.ErrNotExist) && ctx.Err() == nil {
+			b.storeLog.Warn("database cleanup snapshot reconciliation failed", "event", "snapshot_cleanup_failed")
 		}
 		return
 	}
 	defer root.Close()
 	dir, err := root.Open(".")
 	if err != nil {
-		log.Print("database cleanup snapshot reconciliation failed")
+		b.storeLog.Warn("database cleanup snapshot reconciliation failed", "event", "snapshot_cleanup_failed")
 		return
 	}
 	defer dir.Close()
 	entries, err := dir.ReadDir(-1)
 	if err != nil {
-		log.Print("database cleanup snapshot reconciliation failed")
+		b.storeLog.Warn("database cleanup snapshot reconciliation failed", "event", "snapshot_cleanup_failed")
 		return
 	}
 	for _, entry := range entries {
@@ -492,7 +544,7 @@ func (b *Bridge) reconcileOutboxSnapshots(ctx context.Context, cutoff time.Time)
 			continue
 		}
 		if err = root.Remove(entry.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Print("database cleanup snapshot removal failed")
+			b.storeLog.Warn("database cleanup snapshot removal failed", "event", "snapshot_cleanup_failed")
 		}
 	}
 }
@@ -508,10 +560,11 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			continue
 		}
 		if e != nil {
-			log.Print("outbox read failed")
+			b.storeLog.Error("outbox read failed", "event", "outbox_read_failed")
 			return e
 		}
 		if e = b.db.MarkOutput(o.ID, "sending"); e != nil {
+			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", "sending")
 			return e
 		}
 		switch o.Kind {
@@ -520,24 +573,34 @@ func (b *Bridge) deliver(ctx context.Context) error {
 		case "photo", "document":
 			_, e = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		default:
+			b.storeLog.Error("unsupported outbox content kind", "event", "outbox_read_failed", "reason", "invalid_kind")
 			return errors.New("unsupported outbox content kind")
 		}
 		state := "done"
 		if e != nil {
+			info := telegram.ClassifyError(e)
 			state = "failed"
-			if telegram.DeliveryUncertain(e) {
+			if info.Uncertain {
 				state = "uncertain"
 			}
-			log.Printf("Telegram delivery %s: %v; not replaying automatically", state, e)
+			if ctx.Err() == nil && info.Reason != "cancelled" {
+				logTelegramFailure(b.telegramLog, slog.LevelWarn, "delivery_failed", "telegram delivery failed", e,
+					slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
+					slog.String("kind", o.Kind), slog.String("state", state), slog.Bool("replay", false))
+			}
 		}
 		if e = b.db.MarkOutput(o.ID, state); e != nil {
+			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", state)
 			return e
 		}
 		if o.Kind != "text" {
 			if state == "done" {
-				_ = os.Remove(o.Path)
+				if removeErr := os.Remove(o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
+				}
 			} else {
 				if e = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+state+". It will not be replayed automatically."); e != nil {
+					b.storeLog.Error("delivery failure notice persistence failed", "event", "outbox_write_failed")
 					return e
 				}
 			}
@@ -554,7 +617,7 @@ func (b *Bridge) fail(err error) {
 func (w *worker) say(s string) {
 	for _, part := range split(s, 3800) {
 		if e := w.b.db.Enqueue(w.key.chat, w.key.thread, part); e != nil {
-			log.Print("outbox write failed; stopping worker")
+			w.b.storeLog.Error("outbox write failed", "event", "outbox_write_failed")
 			w.b.fail(e)
 			w.cancel()
 			return
@@ -566,6 +629,7 @@ func (w *worker) mark(id int64, state string) bool {
 		return true
 	}
 	if e := w.b.db.Mark(id, state); e != nil {
+		w.b.storeLog.Error("input state persistence failed", "event", "inbox_state_write_failed")
 		w.b.fail(e)
 		w.cancel()
 		return false
@@ -598,37 +662,54 @@ func (w *worker) releaseIdleRuntime(now time.Time) {
 	if w.b.cfg.IdleTimeout <= 0 || !w.idleEligible() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout {
 		return
 	}
-	w.closeRuntime()
+	w.releaseRuntimeWithReason(true, "idle")
 }
 
 func (w *worker) runtimeClient() (*omp.Client, bool) {
 	return w.client, w.runtime == runtimeConnected && w.client != nil
 }
 
-func (w *worker) releaseRuntime(releaseSlot bool) {
+func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.awaitingContinuation = false
+	sessionID := w.sessionID
+	generation := w.binding.Generation
 	// Disable the old client's event and Done channels before closing it, so an
 	// intentional release cannot be mistaken for an unexpected exit.
 	if client := w.client; client != nil {
+		clientID := client.ID()
 		w.client = nil
 		w.runtime = runtimeReleased
 		client.Close()
 		if releaseSlot {
 			<-w.b.slots
 		}
+		attrs := []slog.Attr{
+			slog.String("event", "runtime_release"),
+			slog.Int64("generation", generation),
+			slog.String("reason", reason),
+			slog.Uint64("client_id", clientID),
+		}
+		if validSessionID(sessionID) {
+			attrs = append(attrs, slog.String("session_id", sessionID))
+		}
+		w.log.LogAttrs(context.Background(), slog.LevelInfo, "runtime released", attrs...)
 	}
 	w.runtime = runtimeReleased
 	w.previewID = 0
 	w.previewStopToken = ""
 }
 
-func (w *worker) closeRuntime() { w.releaseRuntime(true) }
+func (w *worker) releaseRuntime(releaseSlot bool) {
+	w.releaseRuntimeWithReason(releaseSlot, "explicit")
+}
+
+func (w *worker) closeRuntime() { w.releaseRuntimeWithReason(true, "explicit") }
 
 func (w *worker) closeFailedStart() {
 	if w.runtimeResuming || w.restoring {
-		w.releaseRuntime(true)
+		w.releaseRuntimeWithReason(true, "failure")
 		return
 	}
 	w.closeLogicalSession()
@@ -648,7 +729,11 @@ func (w *worker) ensureRuntime() (*omp.Client, error) {
 	w.start(true, w.binding.Session, w.binding.Workspace, false)
 	w.restoring, w.runtimeResuming = false, false
 	if client, ok := w.runtimeClient(); ok {
+		w.logRuntimeEvent(slog.LevelInfo, "runtime_resume", "lazy", "runtime resumed", w.sessionID)
 		return client, nil
+	}
+	if w.ctx.Err() == nil {
+		w.logRuntimeEvent(slog.LevelWarn, "restore_runtime_failed", "lazy", "runtime restore failed", w.sessionID)
 	}
 	return nil, errors.New("Failed to resume the released OMP session. No prompt was submitted.")
 }
@@ -658,22 +743,46 @@ func (w *worker) submit(q queued) bool {
 		return true
 	}
 	if err := w.b.db.Submit(q.id, q.replyTo); err != nil {
+		w.b.storeLog.Error("task submission persistence failed", "event", "inbox_state_write_failed")
 		w.b.fail(err)
 		w.cancel()
 		return false
 	}
 	return true
 }
+
+func (w *worker) logTaskSubmit(inboxID int64) {
+	attrs := []slog.Attr{
+		slog.String("event", "task_submit"),
+		slog.Int64("inbox_id", inboxID),
+		slog.Int64("generation", w.binding.Generation),
+		slog.Uint64("turn", w.turn),
+	}
+	if w.client != nil {
+		attrs = append(attrs, slog.Uint64("client_id", w.client.ID()))
+	}
+	if validSessionID(w.sessionID) {
+		attrs = append(attrs, slog.String("session_id", w.sessionID))
+	}
+	w.log.LogAttrs(context.Background(), slog.LevelInfo, "task submitted", attrs...)
+}
 func (w *worker) run() {
+	w.log.Info("worker started", "event", "worker_start")
 	w.initMedia()
 	w.initResumePicker()
 	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults() }()
-	defer w.teardownWorker(true)
+	defer func() {
+		w.teardownWorker(true)
+		w.log.Info("worker stopped", "event", "worker_stop")
+	}()
 	if w.startIntent != nil {
 		w.say("A requested " + w.startIntent.Kind + " session start was interrupted before omp identity was saved. The outcome is uncertain. Use /close to cancel it, then use /new or /resume explicitly.")
 	} else if w.restoring {
 		w.start(true, w.binding.Session, w.binding.Workspace, false)
 		w.restoring = false
+		if _, connected := w.runtimeClient(); !connected && w.ctx.Err() == nil {
+			w.logRuntimeEvent(slog.LevelWarn, "restore_runtime_failed", "resume", "runtime restore failed", w.sessionID)
+		}
 	}
 	tick := time.NewTicker(1500 * time.Millisecond)
 	defer tick.Stop()
@@ -753,6 +862,7 @@ func (w *worker) run() {
 }
 
 func (w *worker) teardownWorker(releaseSlot bool) {
+	completion := w.taskCompletionAttrs(w.active, "uncertain")
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.cancelResumeList()
@@ -760,7 +870,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 		if q.cancel != nil {
 			q.cancel()
 		}
-		removeIncoming(w.binding.Workspace, q.directory)
+		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
 	}
 	w.queue = nil
 	for id, cancel := range w.hostRequests {
@@ -780,10 +890,13 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.clearConfirmations()
 	w.releaseRuntime(releaseSlot)
 	w.releaseSession()
-	if w.active != 0 {
-		w.mark(w.active, "uncertain")
+	if activeID := w.active; activeID != 0 {
+		if w.mark(activeID, "uncertain") {
+			w.log.LogAttrs(context.Background(), slog.LevelInfo, "task completed", completion...)
+		}
 		if w.binding.Running && w.ctx.Err() != nil {
 			if err := w.b.db.SetInterrupted(w.binding, true); err != nil {
+				w.b.storeLog.Error("interrupted state persistence failed", "event", "binding_write_failed", "reason", "set_interrupted", "error_kind", "persistence")
 				w.b.fail(err)
 			} else {
 				w.binding.Interrupted = true
@@ -796,17 +909,38 @@ func (w *worker) closeLogicalSession() bool {
 	if !w.cancelStart() || !w.persistClosed() {
 		return false
 	}
+	sessionID := w.sessionID
+	generation := w.binding.Generation
+	clientID := uint64(0)
+	if w.client != nil {
+		clientID = w.client.ID()
+	}
 	w.clearQueue()
 	w.teardownWorker(true)
 	w.active = 0
 	w.activeReplyTo = 0
 	w.busy = false
+	attrs := []slog.Attr{
+		slog.String("event", "session_close"),
+		slog.Int64("generation", generation),
+		slog.String("reason", "explicit"),
+	}
+	if validSessionID(sessionID) {
+		attrs = append(attrs, slog.String("session_id", sessionID))
+	}
+	if clientID != 0 {
+		attrs = append(attrs, slog.Uint64("client_id", clientID))
+	}
+	w.log.LogAttrs(context.Background(), slog.LevelInfo, "session closed", attrs...)
 	return true
 }
 
 func (w *worker) failed() {
 	if w.runtime == runtimeReleased && w.client == nil {
 		return
+	}
+	if w.client != nil {
+		w.logRuntimeEvent(slog.LevelWarn, "runtime_exit", "failure", "runtime exited", w.sessionID)
 	}
 	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
 	w.closeLogicalSession()
@@ -816,8 +950,10 @@ func (w *worker) clearQueue() {
 		if q.cancel != nil {
 			q.cancel()
 		}
-		removeIncoming(w.binding.Workspace, q.directory)
-		w.mark(q.id, "cancelled")
+		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		if w.mark(q.id, "cancelled") {
+			w.logQueuedTaskComplete(q.id, "cancelled")
+		}
 	}
 	w.queue = nil
 }
@@ -846,7 +982,20 @@ func (w *worker) call(kind string, fields map[string]any) (json.RawMessage, erro
 	if err != nil {
 		// Invalidate watchdog evidence without extending the runtime idle lifetime.
 		w.resetIdleProbe()
-		log.Printf("bridge lifecycle client=%p event=request_failed active=%d busy=%t turn=%d generation=%d", client, w.active, w.busy, w.turn, w.binding.Generation)
+		if w.log.Enabled(context.Background(), slog.LevelDebug) {
+			attrs := []slog.Attr{
+				slog.String("event", "request_failed"),
+				slog.String("phase", "handled"),
+				slog.Uint64("client_id", client.ID()),
+				slog.Int64("generation", w.binding.Generation),
+				slog.Uint64("turn", w.turn),
+				slog.String("error_kind", omp.ClassifyError(err)),
+			}
+			if w.active != 0 {
+				attrs = append(attrs, slog.Int64("inbox_id", w.active))
+			}
+			w.log.LogAttrs(context.Background(), slog.LevelDebug, "rpc request failed", attrs...)
+		}
 		return raw, err
 	}
 	w.touchActivity()
@@ -963,7 +1112,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		}
 	}
 	w.runtime = runtimeStarting
-	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs})
+	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs}, w.b.rpcLog)
 	if e != nil {
 		if reserved {
 			<-w.b.slots
@@ -985,6 +1134,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	info, e := c.SessionInfo(ctx)
 	cancel()
 	if e != nil {
+		w.logRuntimeEvent(slog.LevelError, "runtime_identity_invalid", "failure", "runtime session identity unavailable", "")
 		w.closeFailedStart()
 		w.say("Cannot obtain omp session identity and working directory. The instance has been closed.")
 		return
@@ -1027,6 +1177,7 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		e = w.b.db.CommitStart(binding)
 	}
 	if e != nil {
+		w.b.storeLog.Error("session binding persistence failed", "event", "binding_write_failed", "reason", "commit_start", "error_kind", "persistence")
 		w.closeFailedStart()
 		w.say("Failed to save the session binding. The instance has been closed.")
 		return
@@ -1037,6 +1188,23 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	w.previewID = 0
 	w.runtime = runtimeConnected
 	w.touchActivity()
+	if !w.runtimeResuming {
+		if replace {
+			w.logSessionEvent("session_replace", "replace", "session replaced", info.ID)
+		} else if resume {
+			w.logSessionEvent("session_resume", "resume", "session resumed", info.ID)
+		} else {
+			w.logSessionEvent("session_new", "new", "session created", info.ID)
+		}
+	}
+	runtimeReason := "new"
+	if resume {
+		runtimeReason = "resume"
+	}
+	if w.runtimeResuming {
+		runtimeReason = "lazy"
+	}
+	w.logRuntimeEvent(slog.LevelInfo, "runtime_connected", runtimeReason, "runtime connected", info.ID)
 	if w.runtimeResuming {
 		return
 	}
@@ -1075,7 +1243,9 @@ func (w *worker) handle(in incoming) {
 		}
 		if len(w.queue) >= w.b.cfg.QueueCapacity {
 			w.say("The queue is full. This message was not submitted.")
-			w.mark(in.id, "cancelled")
+			if w.mark(in.id, "cancelled") {
+				w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
+			}
 			return
 		}
 		w.queueMedia(in)
@@ -1273,6 +1443,7 @@ func (w *worker) dispatch() {
 	w.turn++
 	w.busy = true
 	w.progress = progressState{StartedAt: time.Now(), ActiveTools: make(map[string]progressTool)}
+	w.logTaskSubmit(q.id)
 	w.progressSuppressed = false
 	w.preview = ""
 	w.stream.Reset()
@@ -1306,26 +1477,102 @@ func (w *worker) enqueuePrompt(in incoming, text string) {
 	}
 	if len(w.queue) >= w.b.cfg.QueueCapacity {
 		w.say("The queue is full. This message was not submitted.")
-		w.mark(in.id, "cancelled")
+		if w.mark(in.id, "cancelled") {
+			w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
+		}
 		return
 	}
 	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text})
 }
+func (w *worker) logQueuedTaskComplete(inboxID int64, result string) {
+	if inboxID == 0 {
+		return
+	}
+	attrs := []slog.Attr{
+		slog.String("event", "task_complete"),
+		slog.Int64("inbox_id", inboxID),
+		slog.String("result", result),
+		slog.Int64("generation", w.binding.Generation),
+	}
+	if validSessionID(w.sessionID) {
+		attrs = append(attrs, slog.String("session_id", w.sessionID))
+	}
+	w.log.LogAttrs(context.Background(), slog.LevelInfo, "task completed", attrs...)
+}
+
+func (w *worker) taskCompletionAttrs(inboxID int64, result string) []slog.Attr {
+	if inboxID == 0 {
+		return nil
+	}
+	attrs := []slog.Attr{
+		slog.String("event", "task_complete"),
+		slog.Int64("inbox_id", inboxID),
+		slog.String("result", result),
+		slog.Int64("generation", w.binding.Generation),
+		slog.Uint64("turn", w.turn),
+	}
+	if w.client != nil {
+		attrs = append(attrs, slog.Uint64("client_id", w.client.ID()))
+	}
+	if started := w.progress.StartedAt; !started.IsZero() {
+		duration := time.Since(started).Milliseconds()
+		if duration < 0 {
+			duration = 0
+		}
+		attrs = append(attrs, slog.Int64("duration_ms", duration))
+	}
+	if validSessionID(w.sessionID) {
+		attrs = append(attrs, slog.String("session_id", w.sessionID))
+	}
+	return attrs
+}
+
+func (w *worker) logTaskComplete(inboxID int64, result string) {
+	if attrs := w.taskCompletionAttrs(inboxID, result); len(attrs) != 0 {
+		w.log.LogAttrs(context.Background(), slog.LevelInfo, "task completed", attrs...)
+	}
+}
+
+func (w *worker) lifecycleAttrs(event, reason, sessionID string) []slog.Attr {
+	attrs := []slog.Attr{
+		slog.String("event", event),
+		slog.Int64("generation", w.binding.Generation),
+		slog.String("reason", reason),
+	}
+	if validSessionID(sessionID) {
+		attrs = append(attrs, slog.String("session_id", sessionID))
+	}
+	if w.client != nil {
+		attrs = append(attrs, slog.Uint64("client_id", w.client.ID()))
+	}
+	return attrs
+}
+
+func (w *worker) logSessionEvent(event, reason, message, sessionID string) {
+	w.log.LogAttrs(context.Background(), slog.LevelInfo, message, w.lifecycleAttrs(event, reason, sessionID)...)
+}
+
+func (w *worker) logRuntimeEvent(level slog.Level, event, reason, message, sessionID string) {
+	w.log.LogAttrs(context.Background(), level, message, w.lifecycleAttrs(event, reason, sessionID)...)
+}
+
 func (w *worker) finish() {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.awaitingContinuation = false
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
+		taskID := w.active
 		text := w.preview
-		if err := w.b.db.CompleteInboxWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
+		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
 			if w.ctx.Err() == nil {
-				log.Print("final result commit failed; stopping worker")
+				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
 				w.cancel()
 			}
 			return
 		}
+		w.logTaskComplete(taskID, "done")
 		w.active = 0
 		w.activeReplyTo = 0
 		w.busy = false
@@ -1344,23 +1591,24 @@ func (w *worker) finish() {
 	w.finishPreview()
 }
 
-func (w *worker) finishUncertain(notice string) {
-	w.finishIncomplete("uncertain", notice)
+func (w *worker) finishUncertain(notice string) bool {
+	return w.finishIncomplete("uncertain", notice)
 }
 
-func (w *worker) finishCancelled(notice string) {
-	w.finishIncomplete("cancelled", notice)
+func (w *worker) finishCancelled(notice string) bool {
+	return w.finishIncomplete("cancelled", notice)
 }
 
-func (w *worker) finishIncomplete(state, notice string) {
+func (w *worker) finishIncomplete(state, notice string) bool {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.awaitingContinuation = false
 	if w.active == 0 {
 		w.lastAssistant = nil
 		w.finalAssistantTexts = nil
-		return
+		return false
 	}
+	taskID := w.active
 	text := w.preview
 	if text != "" {
 		text += "\n\n"
@@ -1369,20 +1617,21 @@ func (w *worker) finishIncomplete(state, notice string) {
 	var err error
 	switch state {
 	case "uncertain":
-		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800))
+		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, split(text, 3800))
 	case "cancelled":
-		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800))
+		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, split(text, 3800))
 	default:
 		panic("invalid terminal state")
 	}
 	if err != nil {
 		if w.ctx.Err() == nil {
-			log.Print("incomplete result commit failed; stopping worker")
+			w.b.storeLog.Error("incomplete result commit failed", "event", "final_commit_failed")
 			w.b.fail(err)
 			w.cancel()
 		}
-		return
+		return false
 	}
+	w.logTaskComplete(taskID, state)
 	w.active = 0
 	w.activeReplyTo = 0
 	w.busy = false
@@ -1393,9 +1642,10 @@ func (w *worker) finishIncomplete(state, notice string) {
 	w.clearConfirmations()
 	if w.previewBusy {
 		w.finishing = true
-		return
+		return true
 	}
 	w.finishPreview()
+	return true
 }
 
 func lastAssistant(messages []message) (message, bool) {

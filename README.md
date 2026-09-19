@@ -58,32 +58,52 @@ For the simplest setup, use an ordinary private chat with the bot. Topics are op
 Save the default configuration below as `~/tool/omp-telegram/config.toml`, beside the binary. You can also copy the repository's [config.toml](config.toml) and adjust it as needed:
 
 ```toml
+[telegram]
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
-omp = "omp"
-omp_args = "${OMP_TELEGRAM_ARGS}"
+# Telegram live task progress.
+progress_mode = "summary"
+
+[omp]
+binary = "omp"
+args = "${OMP_TELEGRAM_ARGS}"
+
+[storage]
 data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
+database_retention_days = 90
+
+[worker]
 max_workers = 4
 queue_capacity = 16
-progress_mode = "summary"
-database_retention_days = 90
 idle_timeout = "30m"
+
+[logging]
+level = "info"
+format = "text"
+
+[logging.component_levels]
+# daemon = "debug"
+# bridge = "debug"
+# rpc = "debug"
+# telegram = "warn"
+# store = "debug"
+# media = "debug"
 ```
 
 If no configuration file is specified and the default file is absent, the service uses these embedded defaults without generating a file.
-`database_retention_days` enables the Database Message Retention janitor. It retains terminal inbox/outbox records for the configured number of days measured from their latest state transition. The default is `90`; set it to `0` to disable cleanup. Pending/submitted inbox and pending/sending outbox records remain durable. It never removes bindings, history, startup intents, workspaces, omp session files, or other omp data.
+`storage.database_retention_days` enables the Database Message Retention janitor. It retains terminal inbox/outbox records for the configured number of days measured from their latest state transition. The default is `90`; set it to `0` to disable cleanup. Pending/submitted inbox and pending/sending outbox records remain durable. It never removes bindings, history, startup intents, workspaces, omp session files, or other omp data.
 
-`progress_mode` controls one best-effort, editable live task message: `off` disables it and typing actions, `summary` shows assistant output, active tool names, and task state, and `verbose` also shows the six most recent observable tool activities. A live root task includes a Stop button that has the same effect as `/stop`: it clears bridge-deferred prompts and sends native `abort`, without closing the session. The button is fenced to its owner and active task, and is removed best-effort when that task ends. Live progress replies to its root user message. It never includes reasoning, tool arguments, command text, results, stdout, or stderr; it is not persisted and does not affect durable final replies.
+`telegram.progress_mode` controls one best-effort, editable live task message: `off` disables it and typing actions, `summary` shows assistant output, active tool names, and task state, and `verbose` also shows the six most recent observable tool activities. A live root task includes a Stop button that has the same effect as `/stop`: it clears bridge-deferred prompts and sends native `abort`, without closing the session. The button is fenced to its owner and active task, and is removed best-effort when that task ends. Live progress replies to its root user message. It never includes reasoning, tool arguments, command text, results, stdout, or stderr; it is not persisted and does not affect durable final replies.
 
 The first progress message is delayed until the task has run for at least 3 seconds. Short tasks send only their final reply, with existing typing behavior unchanged. Progress and its Stop button appear on a subsequent worker tick for longer tasks; `/stop` remains available during the delay.
 
-Missing terminal RPC completion is not treated as success: after at least 30 seconds without activity, the bridge requires two explicit native idle observations, at least 30 seconds apart, before durably marking the task `uncertain`. It never replays that task. Recovery stops typing, clears task controls, and retires the old process before queued work lazily resumes the same saved session. Compaction, retry, tools, host requests, and native UI waits prevent this recovery; missing state fields and probe errors are not idle evidence. This safety watchdog is independent of `idle_timeout`.
+Missing terminal RPC completion is not treated as success: after at least 30 seconds without activity, the bridge requires two explicit native idle observations, at least 30 seconds apart, before durably marking the task `uncertain`. It never replays that task. Recovery stops typing, clears task controls, and retires the old process before queued work lazily resumes the same saved session. Compaction, retry, tools, host requests, and native UI waits prevent this recovery; missing state fields and probe errors are not idle evidence. This safety watchdog is independent of `worker.idle_timeout`.
 
 An explicit `agent_end` with `isTerminal=false` disables watchdog recovery while waiting for native asynchronous continuation, even if native state reports idle for minutes. Only a subsequent `agent_start` re-enables recovery for a running turn; task completion or replacement clears the wait. A lost continuation cannot safely be distinguished from pending background work and is not automatically recovered.
 
-`idle_timeout` releases an otherwise idle omp process while retaining the validated session identity and its restoration eligibility. It defaults to `30m`; set `0` or `disabled` to turn it off. The bridge never releases a runtime with a task, queued or preparing prompt, compaction, handoff, session-list request, host request, startup transition, or a runtime-bound confirmation for model, thinking, fast, compact, new, or native UI choices; those confirmations keep the runtime active until they are consumed or expire. The independent `/resume` picker does not block release and may remain actionable after the runtime is released. The next prompt or native control that requires OMP state resumes that exact session before it is accepted. `/status` shows the retained binding with unavailable live metrics and reports `Idle: n/a` when the runtime has not been connected in the current generation. After release, `/stop` only clears bridge prompts and does not send `abort`; `/close` removes the saved restoration eligibility without starting omp.
+`worker.idle_timeout` releases an otherwise idle omp process while retaining the validated session identity and its restoration eligibility. It defaults to `30m`; set `0` or `disabled` to turn it off. The bridge never releases a runtime with a task, queued or preparing prompt, compaction, handoff, session-list request, host request, startup transition, or a runtime-bound confirmation for model, thinking, fast, compact, new, or native UI choices; those confirmations keep the runtime active until they are consumed or expire. The independent `/resume` picker does not block release and may remain actionable after the runtime is released. The next prompt or native control that requires OMP state resumes that exact session before it is accepted. `/status` shows the retained binding with unavailable live metrics and reports `Idle: n/a` when the runtime has not been connected in the current generation. After release, `/stop` only clears bridge prompts and does not send `abort`; `/close` removes the saved restoration eligibility without starting omp.
 
 ### 3. Set the environment and start
 
@@ -118,14 +138,14 @@ With the default workspace root, this creates or opens `workspace/demo` beside t
 
 Wait for the ready message, then send ordinary text. Missing directories are created; existing files are not copied or cleared.
 
-For a first session, plain `/new` uses `workspace_root` itself (by default, `workspace/` beside the executable). Later uses keep this conversation's last selected directory. Different conversations using the default have independent sessions but share files; use `/new <project-name>` for separate project directories.
+For a first session, plain `/new` uses `storage.workspace_root` itself (by default, `workspace/` beside the executable). Later uses keep this conversation's last selected directory. Different conversations using the default have independent sessions but share files; use `/new <project-name>` for separate project directories.
 
 ## Conversation commands
 
 | Command | What it does |
 | --- | --- |
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running instance requires confirmation |
-| `/new` | Start a fresh session in the previous directory, or `workspace_root` if none was selected |
+| `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected |
 | `/stop` | Stop the current task and clear queued prompts, keeping the session open; a released session only clears prompts |
 | `/close` | Close the current logical session, preserving files and session history without waking a released runtime |
 | `/resume` | Choose a saved omp session in the current directory using paginated buttons |
@@ -147,7 +167,7 @@ Ordinary text, attachments, and `/review` are independent tasks queued by the br
 
 The model picker follows OMP's `cycleOrder` roles, such as `smol`, `default`, and `slow`, rather than listing every available model. OMP resolves the selected role and its thinking setting. Opening the menu does not switch models; selecting requires an idle instance with an empty queue. Buttons disappear after selection, and the reply reports the actual selected model. Manual `/model provider/model` remains available.
 
-The role picker supports `omp_args` with `--config path` or `--config=path`, including multiple files in their original order. The native query loads inherited `PI_CONFIG_FILES` first, followed by these overlays; relative paths are resolved from the worker workspace. It does not rewrite configuration files. Runtime `--profile`, `--smol`, `--slow`, and `--plan` overrides still require explicit `/model provider/model` selection.
+The role picker supports `omp.args` with `--config path` or `--config=path`, including multiple files in their original order. The native query loads inherited `PI_CONFIG_FILES` first, followed by these overlays; relative paths are resolved from the worker workspace. It does not rewrite configuration files. Runtime `--profile`, `--smol`, `--slow`, and `--plan` overrides still require explicit `/model provider/model` selection.
 
 `/thinking` offers the fixed levels `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. The menu marks the current effective level; OMP may adjust the requested level for the current model. The bridge does not send the undocumented `auto` value through `set_thinking_level`. Existing OMP configuration and model-role thinking settings remain unchanged.
 
@@ -182,21 +202,38 @@ Settings are loaded in this order:
 2. Otherwise, `config.toml` beside the real executable, after resolving symlinks.
 3. If that default file is absent, the embedded configuration. No file is generated.
 
-An explicitly selected missing file, an unreadable file, or invalid TOML causes startup to fail. The default configuration above includes the required allowlists.
+An explicitly selected missing file, an unreadable file, or invalid TOML causes startup to fail. The grouped default configuration above includes the required allowlists.
+
+Configuration uses grouped TOML tables: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]`, and optional `[logging.component_levels]`. Flat root fields, the former `[log_component_levels]` table, fields in the wrong table, and mixed flat/grouped layouts are rejected. This is an intentional breaking cutover: existing private configuration files must be migrated manually before upgrading; the service does not rewrite them automatically.
 
 | Setting | Purpose |
 | --- | --- |
-| `token` | Bot token; prefer an environment reference |
-| `allowed_users`, `allowed_chats` | Required numeric ID allowlists; literal integers or comma-separated environment values |
-| `omp` | Executable name found through `PATH`, or an absolute path; not a shell command |
-| `omp_args` | Extra omp arguments; defaults to optional `OMP_TELEGRAM_ARGS`. An explicit empty string disables them |
-| `data_dir` | Database, lock, and outgoing attachment storage; defaults to the executable directory |
-| `workspace_root` | Base directory for `/new <name>`; defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then executable-directory `workspace/` |
-| `max_workers` | Maximum active OMP processes, default 4 |
-| `queue_capacity` | Waiting prompts per conversation, default 16 |
-| `idle_timeout` | Idle duration before releasing an otherwise quiescent OMP process, default `30m`; set `0` or `disabled` to turn it off |
+| `telegram.token` | Bot token; prefer an environment reference |
+| `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists; literal integers or comma-separated environment values |
+| `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`; default `summary` |
+| `omp.binary` | Executable name found through `PATH`, or an absolute path; not a shell command |
+| `omp.args` | Extra omp arguments; defaults to optional `OMP_TELEGRAM_ARGS`. An explicit empty string disables them |
+| `storage.data_dir` | Database, lock, and outgoing attachment storage; defaults to the executable directory |
+| `storage.workspace_root` | Base directory for `/new <name>`; defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then executable-directory `workspace/` |
+| `storage.database_retention_days` | Terminal database message retention in days; default `90`, or `0` to disable cleanup |
+| `worker.max_workers` | Maximum active OMP processes, default 4 |
+| `worker.queue_capacity` | Waiting prompts per conversation, default 16 |
+| `worker.idle_timeout` | Idle duration before releasing an otherwise quiescent OMP process, default `30m`; set `0` or `disabled` to turn it off |
+| `logging.level` | Global structured-log threshold: `debug`, `info`, `warn`, or `error`; default `info` |
+| `logging.format` | Structured-log encoding, `text` or `json`; default `text` |
+| `[logging.component_levels]` | Optional per-component thresholds for `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media` |
 
-Strings support `$VAR` and `${VAR}`; use `$$` for a literal dollar sign. The default references to `OMP_TELEGRAM_ARGS` and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset; other missing references fail. `.env` files and shell startup files are not loaded automatically.
+Strings support `$VAR` and `${VAR}`; use `$$` for a literal dollar sign. Every string in the grouped tables uses the same expansion rules after TOML parsing and is expanded exactly once. The default references to `OMP_TELEGRAM_ARGS` (`omp.args`) and `OMP_TELEGRAM_WORKSPACE_ROOT` (`storage.workspace_root`) may be unset; other missing references, including the token and required allowlists, fail. `.env` files and shell startup files are not loaded automatically.
+
+Structured logging is configured only in TOML; there are no dedicated logging environment variables. The normal `$VAR`, `${VAR}`, and `$$` expansion rules apply to `logging.level`, `logging.format`, and values in `[logging.component_levels]`. Component names are validated against the six supported names before override values are expanded. Text mode uses compact `YYYY-MM-DD HH:MM:SS LEVEL [component] message key=value` lines, preserving the original message and all remaining structured attributes without `time=`, `level=`, `msg=`, or `component=` header labels. Strings and control characters are escaped as needed to keep each record on one line. JSON mode remains standard `slog.JSONHandler` output, one independently parseable object per line including the `component` field. The component table overrides `logging.level` only for the named component; unspecified components inherit the global level.
+
+Text example:
+
+```text
+2026-09-19 13:20:01 WARN [telegram] telegram polling failed event=poll_failed reason=timeout
+```
+
+`--version` and successful `--check` output remain unchanged. Configuration and CLI errors that occur before the logger registry is created remain ordinary human-readable text, even when `logging.format = "json"`. After registry creation, daemon logs, including lock and database startup failures, use the selected format on stderr. The process manager remains responsible for log storage and rotation.
 
 To select another bridge configuration:
 
@@ -212,7 +249,7 @@ For example, to use an omp configuration overlay you have prepared:
 export OMP_TELEGRAM_ARGS="--config \"$HOME/.config/omp/telegram.yml\""
 ```
 
-This configures **omp**, not the bridge. You can also set `omp_args` in TOML. Arguments support quoting but are passed directly without a shell; use absolute paths for configuration files. The bridge does not change omp's configuration, credentials, tools, or approval policy automatically. RPC mode, working directory, and session lifecycle options are reserved for the bridge.
+This configures **omp**, not the bridge. You can also set `omp.args` in TOML. Arguments support quoting but are passed directly without a shell; use absolute paths for configuration files. The bridge does not change omp's configuration, credentials, tools, or approval policy automatically. RPC mode, working directory, and session lifecycle options are reserved for the bridge.
 
 Restart the service after changing configuration or its environment. For background operation, use your preferred process manager and explicitly provide the environment and a `PATH` containing both omp and its runtime.
 
@@ -229,14 +266,14 @@ By default, runtime data stays beside the installed binary:
 └── workspace/
 ```
 
-**Relative `data_dir` and `workspace_root` paths are based on the executable directory**, not the launch directory or configuration file's location. Moving the binary can therefore select a different database. Use absolute paths when keeping data elsewhere. An explicit relative `--config` path is the exception: it is caller-relative.
+**Relative `storage.data_dir` and `storage.workspace_root` paths are based on the executable directory**, not the launch directory or configuration file's location. Moving the binary can therefore select a different database. Use absolute paths when keeping data elsewhere. An explicit relative `--config` path is the exception: it is caller-relative.
 
 Before upgrading, stop the service and back up its data directory, working directories, and omp's own session storage. The bridge database alone is not a backup of omp conversations. Do not delete SQLite's `-wal`/`-shm` files or copy only the main database while it is being written. Older unversioned development databases are not automatically upgraded; back them up and use a fresh data directory if startup reports an unsupported schema.
 
 Check the installed application version with `~/tool/omp-telegram/omp-telegram --version` or `-v`.
 
 - Authorize trusted users only. omp runs with the service user's filesystem permissions and environment. Separate conversation sessions are not a filesystem or credential sandbox.
-- Group members may see prompts and replies even when they cannot control the bot. The database stores message content and currently has no automatic retention cleanup.
+- Group members may see prompts and replies even when they cannot control the bot. The database stores message content and applies the configured `storage.database_retention_days` policy.
 - A send timeout may still mean a message arrived. Do not assume a missing reply means the task did not run.
 - Prefer normal shutdown over `kill -9`; forced termination does not guarantee that every tool subprocess exits.
 
@@ -256,7 +293,6 @@ Voice/transcription, automatic topic creation, and arbitrary terminal input/edit
 
 The following features are planned, not currently implemented.
 
-- Structured logging with levels and components
 - List saved conversation/session bindings
 - Bridge queue status and cancel individual pending tasks
 - Telegram reply context

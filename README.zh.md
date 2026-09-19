@@ -58,32 +58,52 @@ just install
 将下面的默认配置保存为 `~/tool/omp-telegram/config.toml`, 放在二进制旁. 也可以复制仓库中的 [config.toml](config.toml), 再按需修改:
 
 ```toml
+[telegram]
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
-omp = "omp"
-omp_args = "${OMP_TELEGRAM_ARGS}"
+# Telegram 任务实时进度.
+progress_mode = "summary"
+
+[omp]
+binary = "omp"
+args = "${OMP_TELEGRAM_ARGS}"
+
+[storage]
 data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
+database_retention_days = 90
+
+[worker]
 max_workers = 4
 queue_capacity = 16
-progress_mode = "summary"
-database_retention_days = 90
 idle_timeout = "30m"
+
+[logging]
+level = "info"
+format = "text"
+
+[logging.component_levels]
+# daemon = "debug"
+# bridge = "debug"
+# rpc = "debug"
+# telegram = "warn"
+# store = "debug"
+# media = "debug"
 ```
 
 未指定配置文件, 且默认文件不存在时, 程序会使用同样的内置默认配置, 不生成文件.
-`database_retention_days` 启用 Database Message Retention janitor. 它按最后一次状态转换时间保留设定天数的终态 inbox/outbox 记录. 默认值是 `90`; 设置为 `0` 可关闭清理. pending/submitted inbox 及 pending/sending outbox 保持持久化. 它绝不删除 binding、history、startup intent、工作目录、omp session 文件或其他 omp 数据.
+`storage.database_retention_days` 启用 Database Message Retention janitor. 它按最后一次状态转换时间保留设定天数的终态 inbox/outbox 记录. 默认值是 `90`; 设置为 `0` 可关闭清理. pending/submitted inbox 及 pending/sending outbox 保持持久化. 它绝不删除 binding、history、startup intent、工作目录、omp session 文件或其他 omp 数据.
 
-`progress_mode` 控制一条尽力而为、可编辑的任务实时消息: `off` 关闭它和 typing action, `summary` 显示 assistant 输出、活动工具名和任务状态, `verbose` 额外显示最近 6 条可观察的工具活动. 活跃根任务的实时进度带有 Stop 按钮, 其效果与 `/stop` 相同: 清空 bridge 延后 prompt 并发送原生 `abort`, 不关闭会话. 按钮绑定其 owner 和活跃任务, 任务结束时尽力移除. 实时进度回复对应的根用户消息. 它绝不包含 reasoning、工具参数、命令文本、结果、stdout 或 stderr; 不持久化, 不影响最终回复的可靠交付.
+`telegram.progress_mode` 控制一条尽力而为、可编辑的任务实时消息: `off` 关闭它和 typing action, `summary` 显示 assistant 输出、活动工具名和任务状态, `verbose` 额外显示最近 6 条可观察的工具活动. 活跃根任务的实时进度带有 Stop 按钮, 其效果与 `/stop` 相同: 清空 bridge 延后 prompt 并发送原生 `abort`, 不关闭会话. 按钮绑定其 owner 和活跃任务, 任务结束时尽力移除. 实时进度回复对应的根用户消息. 它绝不包含 reasoning、工具参数、命令文本、结果、stdout 或 stderr; 不持久化, 不影响最终回复的可靠交付.
 
 首条进度消息至少延迟到任务运行满 3 秒后显示. 短任务只发送最终回复, 沿用现有 typing 行为. 长任务在后续 worker tick 显示进度及 Stop 按钮; 延迟期间仍可使用 `/stop`.
 
-RPC 终结事件丢失不代表成功: 至少 30 秒没有活动后, bridge 需要两次明确的原生 idle 观测, 且间隔至少 30 秒, 才会持久化标记任务为 `uncertain`, 绝不重放该任务. 恢复会停止 typing、清理任务控件, 并先关闭旧进程, 再让队列中的任务按需恢复同一已保存 session. compact、retry、工具、host request 和原生 UI 等待会阻止恢复; 缺失状态字段或探测错误都不是 idle 证据. 此安全 watchdog 独立于 `idle_timeout`.
+RPC 终结事件丢失不代表成功: 至少 30 秒没有活动后, bridge 需要两次明确的原生 idle 观测, 且间隔至少 30 秒, 才会持久化标记任务为 `uncertain`, 绝不重放该任务. 恢复会停止 typing、清理任务控件, 并先关闭旧进程, 再让队列中的任务按需恢复同一已保存 session. compact、retry、工具、host request 和原生 UI 等待会阻止恢复; 缺失状态字段或探测错误都不是 idle 证据. 此安全 watchdog 独立于 `worker.idle_timeout`.
 
 明确收到 `agent_end isTerminal=false` 后, watchdog 不会恢复正在等待原生异步续接的任务, 即使原生状态连续几分钟显示 idle. 后续 `agent_start` 才重新允许对运行中的 turn 进行恢复; 任务终结或替换会清除等待状态. 无法安全区分续接事件丢失与后台工作仍未完成, 因此不自动恢复这种等待.
 
-`idle_timeout` 会在 OMP 运行期持续空闲时关闭其进程, 但保留已验证的 session 身份和恢复资格. 默认值为 `30m`; 设置 `0` 或 `disabled` 可关闭. bridge 不会在任务、排队或准备中的 prompt、compact、handoff、会话列表请求、host request、启动转换, 或 model、thinking、fast、compact、new、原生 UI 等 runtime-bound confirmation 仍存在时释放进程; 这些 confirmation 会让 runtime 保持活跃, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 下一条 prompt 或需要 OMP 状态的原生控制命令会先恢复同一个 session, 再被接受. `/status` 显示保留的 binding 和不可用的实时指标; 如果当前 generation 尚未连接过 runtime, 显示 `Idle: n/a`. released 后 `/stop` 只清 bridge prompt, 不发送 `abort`; `/close` 清除保存的恢复资格, 不启动 omp.
+`worker.idle_timeout` 会在 OMP 运行期持续空闲时关闭其进程, 但保留已验证的 session 身份和恢复资格. 默认值为 `30m`; 设置 `0` 或 `disabled` 可关闭. bridge 不会在任务、排队或准备中的 prompt、compact、handoff、会话列表请求、host request、启动转换, 或 model、thinking、fast、compact、new、原生 UI 等 runtime-bound confirmation 仍存在时释放进程; 这些 confirmation 会让 runtime 保持活跃, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 下一条 prompt 或需要 OMP 状态的原生控制命令会先恢复同一个 session, 再被接受. `/status` 显示保留的 binding 和不可用的实时指标; 如果当前 generation 尚未连接过 runtime, 显示 `Idle: n/a`. released 后 `/stop` 只清 bridge prompt, 不发送 `abort`; `/close` 清除保存的恢复资格, 不启动 omp.
 
 ### 3. 设置环境变量并启动
 
@@ -118,14 +138,14 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 
 等收到就绪消息后, 直接发送普通文字即可. 已有文件不会被复制或清空.
 
-首次直接发送 `/new` 会使用 `workspace_root` 本身, 默认是可执行文件旁的 `workspace/`. 后续沿用当前对话上次选择的目录. 不同对话使用默认目录时会话独立, 但文件共享; 需要独立项目目录时使用 `/new <项目名>`.
+首次直接发送 `/new` 会使用 `storage.workspace_root` 本身, 默认是可执行文件旁的 `workspace/`. 后续沿用当前对话上次选择的目录. 不同对话使用默认目录时会话独立, 但文件共享; 需要独立项目目录时使用 `/new <项目名>`.
 
 ## 对话命令
 
 | 命令 | 用途 |
 | --- | --- |
 | `/new <名称或路径>` | 在指定目录开启新会话, 替换已有实例前需要确认 |
-| `/new` | 沿用历史目录开启新会话; 没有历史目录时使用 `workspace_root` |
+| `/new` | 沿用历史目录开启新会话; 没有历史目录时使用 `storage.workspace_root` |
 | `/stop` | 中止当前任务并清空排队消息, 保留会话; released session 只清空消息 |
 | `/close` | 关闭当前逻辑 session, 保留文件和会话历史; 不唤醒 released runtime |
 | `/resume` | 用分页按钮选择当前目录中的 omp 历史会话 |
@@ -147,7 +167,7 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 
 模型菜单按 OMP 的 `cycleOrder` 列出角色, 例如 `smol`, `default`, `slow`, 不罗列全部可用模型. 所选角色及其 thinking 设置由 OMP 自己解析. 打开菜单不会切换模型; 点击选择时实例必须空闲且队列为空. 选择后清除按钮, 回复实际选中的模型. 仍可手动使用 `/model provider/model`.
 
-角色菜单支持 `omp_args` 中的 `--config 路径` 和 `--config=路径`, 多个文件按原顺序应用. 原生查询先加载继承的 `PI_CONFIG_FILES`, 再加载这些覆盖文件; 相对路径以 worker 工作目录为基准. 不改写配置文件. `--profile`, `--smol`, `--slow`, `--plan` 等运行时覆盖项仍需使用明确的 `/model provider/model` 切换.
+角色菜单支持 `omp.args` 中的 `--config 路径` 和 `--config=路径`, 多个文件按原顺序应用. 原生查询先加载继承的 `PI_CONFIG_FILES`, 再加载这些覆盖文件; 相对路径以 worker 工作目录为基准. 不改写配置文件. `--profile`, `--smol`, `--slow`, `--plan` 等运行时覆盖项仍需使用明确的 `/model provider/model` 切换.
 
 `/thinking` 提供固定等级 `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. 菜单标记当前实际生效等级; OMP 可能按模型能力调整请求等级. bridge 不通过 `set_thinking_level` 发送类型契约未声明的 `auto`. OMP 已有配置和模型角色的 thinking 设置保持不变.
 
@@ -182,21 +202,38 @@ bot 菜单, 按钮和服务提示使用英语. 你可以用任意语言提问, �
 2. 未指定时, 读取真实二进制所在目录的 `config.toml`, 符号链接会先解析.
 3. 默认文件不存在时, 使用内嵌配置, 不生成文件.
 
-显式指定的文件不存在, 文件不可读或 TOML 格式错误时都会报错. 上面的默认配置已包含必填白名单.
+显式指定的文件不存在, 文件不可读或 TOML 格式错误时都会报错. 上面的分组默认配置已包含必填白名单.
+
+配置现在使用分组 TOML table: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]` 和可选 `[logging.component_levels]`. 根级 flat 字段, 原 `[log_component_levels]` table, 放错 table 的字段以及 flat/grouped 混合布局都会拒绝. 这是有意的 breaking cutover: 升级前必须手动迁移现有私有配置; 程序不会自动重写.
 
 | 配置项 | 说明 |
 | --- | --- |
-| `token` | Bot token, 推荐引用环境变量 |
-| `allowed_users`, `allowed_chats` | 必填的数字 ID 白名单, 可直接填写整数, 或引用逗号分隔的环境变量值 |
-| `omp` | 从 `PATH` 查找的可执行文件名, 或绝对路径, 不是 shell 命令 |
-| `omp_args` | omp 额外参数, 默认读取可选的 `OMP_TELEGRAM_ARGS`; 显式空字符串禁用额外参数 |
-| `data_dir` | 数据库, 锁和待发送附件的存储目录, 默认二进制所在目录 |
-| `workspace_root` | `/new <名称>` 使用的根目录, 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/` |
-| `max_workers` | 同时运行的 OMP 进程上限, 默认 4 |
-| `queue_capacity` | 每个对话的等待消息上限, 默认 16 |
-| `idle_timeout` | 释放持续空闲 OMP 进程前的时长, 默认 `30m`; 设置 `0` 或 `disabled` 可关闭 |
+| `telegram.token` | Bot token, 推荐引用环境变量 |
+| `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单, 可直接填写整数, 或引用逗号分隔的环境变量值 |
+| `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`; 默认 `summary` |
+| `omp.binary` | 从 `PATH` 查找的可执行文件名, 或绝对路径, 不是 shell 命令 |
+| `omp.args` | omp 额外参数, 默认读取可选的 `OMP_TELEGRAM_ARGS`; 显式空字符串禁用额外参数 |
+| `storage.data_dir` | 数据库, 锁和待发送附件的存储目录, 默认二进制所在目录 |
+| `storage.workspace_root` | `/new <名称>` 使用的根目录, 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/` |
+| `storage.database_retention_days` | 终态数据库消息保留天数, 默认 `90`, 设置为 `0` 可关闭清理 |
+| `worker.max_workers` | 同时运行的 OMP 进程上限, 默认 4 |
+| `worker.queue_capacity` | 每个对话的等待消息上限, 默认 16 |
+| `worker.idle_timeout` | 释放持续空闲 OMP 进程前的时长, 默认 `30m`; 设置 `0` 或 `disabled` 可关闭 |
+| `logging.level` | 全局结构化日志级别: `debug`, `info`, `warn` 或 `error`; 默认 `info` |
+| `logging.format` | 结构化日志格式, `text` 或 `json`; 默认 `text` |
+| `[logging.component_levels]` | 可选的组件级别覆盖, 组件只能是 `daemon`, `bridge`, `rpc`, `telegram`, `store` 和 `media` |
 
-字符串支持 `$VAR` 和 `${VAR}`, `$$` 表示字面美元符号. 默认配置对 `OMP_TELEGRAM_ARGS` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 的引用允许未设置, 其他缺失引用会报错. 程序不会自动加载 `.env` 或 shell 启动文件.
+字符串支持 `$VAR` 和 `${VAR}`, `$$` 表示字面美元符号. 所有分组 table 中的字符串都在 TOML 解析后按相同规则展开, 且每个值只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS` (`omp.args`) 和 `OMP_TELEGRAM_WORKSPACE_ROOT` (`storage.workspace_root`) 可以未设置; 包括 token 和必填白名单在内的其他缺失引用会报错. 程序不会自动加载 `.env` 或 shell 启动文件.
+
+结构化日志只在 TOML 中配置, 没有专用的日志环境变量. `logging.level`, `logging.format` 以及 `[logging.component_levels]` 中的值沿用 `$VAR`, `${VAR}` 和 `$$` 规则. 组件名会先按六个支持的名称校验, 再展开覆盖值. `text` 使用紧凑的 `YYYY-MM-DD HH:MM:SS LEVEL [component] message key=value` 单行格式, 保留原始消息和其余所有结构化属性, 头部不再包含 `time=`, `level=`, `msg=` 或 `component=` 标签. 字符串和控制字符按需转义, 确保每条记录只有一行. `json` 保持标准 `slog.JSONHandler` 输出不变, 每行一个可独立解析的对象, 包含 `component` 字段. 组件表只覆盖指定组件的 `logging.level`; 未指定的组件继承全局级别.
+
+text 示例:
+
+```text
+2026-09-19 13:20:01 WARN [telegram] telegram polling failed event=poll_failed reason=timeout
+```
+
+`--version` 和成功的 `--check` 输出保持不变. logger registry 创建前发生的配置和 CLI 错误保持普通可读文本, 即使配置了 `logging.format = "json"`. registry 创建后, daemon 日志包含锁和数据库启动失败, 都按所选格式输出到 stderr. 日志存储和轮转仍由进程管理器负责.
 
 使用其他位置的桥接配置:
 
@@ -212,7 +249,7 @@ bot 菜单, 按钮和服务提示使用英语. 你可以用任意语言提问, �
 export OMP_TELEGRAM_ARGS="--config \"$HOME/.config/omp/telegram.yml\""
 ```
 
-这是 **omp 的配置**, 不是桥接配置. 也可以直接在 TOML 中设置 `omp_args`. 参数支持引号, 但不会经过 shell 执行; 配置文件请使用绝对路径. 桥接不会自动修改 omp 的配置, 凭据, 工具或审批策略. RPC 模式, 工作目录及会话生命周期参数由桥接管理, 不能自行覆盖.
+这是 **omp 的配置**, 不是桥接配置. 也可以直接在 TOML 中设置 `omp.args`. 参数支持引号, 但不会经过 shell 执行; 配置文件请使用绝对路径. 桥接不会自动修改 omp 的配置, 凭据, 工具或审批策略. RPC 模式, 工作目录及会话生命周期参数由桥接管理, 不能自行覆盖.
 
 修改配置或环境变量后需重启服务. 后台运行方式由你自行选择, 请给进程管理器明确配置环境变量, 并确保它的 `PATH` 能找到 omp 及其运行时.
 
@@ -229,14 +266,14 @@ export OMP_TELEGRAM_ARGS="--config \"$HOME/.config/omp/telegram.yml\""
 └── workspace/
 ```
 
-**相对 `data_dir` 和 `workspace_root` 均以二进制目录为基准**, 不是启动目录或配置文件所在目录. 移动二进制可能会使用另一份数据库, 数据需要独立存放时请使用绝对路径. 显式传入的相对 `--config` 路径是例外, 它相对于调用目录.
+**相对 `storage.data_dir` 和 `storage.workspace_root` 均以二进制目录为基准**, 不是启动目录或配置文件所在目录. 移动二进制可能会使用另一份数据库, 数据需要独立存放时请使用绝对路径. 显式传入的相对 `--config` 路径是例外, 它相对于调用目录.
 
 升级前先停止服务, 备份数据目录, 工作目录和 omp 自己的会话存储. 只备份桥接数据库并不等于备份完整 omp 对话. 不要删除 SQLite 的 `-wal`/`-shm` 文件, 也不要在写入期间只复制主数据库. 旧的无版本开发数据库不会自动升级; 若启动提示结构不支持, 先备份并使用新的数据目录.
 
 用 `~/tool/omp-telegram/omp-telegram --version` 或 `-v` 查看安装版本.
 
 - 只授权可信用户. omp 拥有服务用户的文件访问权限和环境变量, 不同对话的独立会话不是文件系统或凭据沙箱.
-- 群成员可能看到提问和回复, 即使他们无权控制 bot. 数据库也会保存消息内容, 目前没有自动清理保留期.
+- 群成员可能看到提问和回复, 即使他们无权控制 bot. 数据库也会保存消息内容, 并按配置的 `storage.database_retention_days` 策略清理.
 - 发送超时仍可能已经送达, 不要把没有收到回复理解为任务没有执行.
 - 优先正常退出服务, 不使用 `kill -9`; 强制终止不能保证所有工具子进程都退出.
 
@@ -256,7 +293,6 @@ export OMP_TELEGRAM_ARGS="--config \"$HOME/.config/omp/telegram.yml\""
 
 以下功能均为计划项, 尚未实现.
 
-- 支持级别和组件分类的结构化日志
 - 列出已保存的对话/session 绑定
 - 查看 bridge 队列状态, 取消单个待执行任务
 - Telegram 回复上下文

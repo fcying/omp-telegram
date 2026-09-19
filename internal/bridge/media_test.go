@@ -333,7 +333,7 @@ func TestDatabaseCleanupReconcilesOrphanedSnapshots(t *testing.T) {
 	if err = db.EnqueueAttachment(1, 2, "document", referenced, "file", ""); err != nil {
 		t.Fatal(err)
 	}
-	b := Bridge{cfg: config.Config{DataDir: dir}, db: db}
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dir}, db: db})
 	b.reconcileOutboxSnapshots(context.Background(), time.Now().AddDate(0, 0, -90))
 	if _, err = os.Stat(orphan); !os.IsNotExist(err) {
 		t.Fatalf("orphan snapshot remained: %v", err)
@@ -342,5 +342,45 @@ func TestDatabaseCleanupReconcilesOrphanedSnapshots(t *testing.T) {
 		if _, err = os.Stat(path); err != nil {
 			t.Fatalf("retained snapshot %q: %v", path, err)
 		}
+	}
+}
+
+func TestFullQueueRejectsAttachmentBeforePreparation(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 1
+	command("/new " + t.TempDir())
+	command("accepted task")
+	acceptedID := w.queue[0].id
+	u := update(3, 11, "")
+	u.Message.Caption = "rejected attachment"
+	u.Message.Document = &telegram.Document{FileID: "rejected", FileName: "rejected.txt", MimeType: "text/plain", FileSize: 4}
+	f.files = map[string][]byte{"rejected": []byte("data")}
+	raw, err := json.Marshal(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.b.db.Accept(u.UpdateID, raw); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(incoming{id: u.UpdateID, msg: u.Message})
+	if len(w.queue) != 1 || w.queue[0].id != acceptedID {
+		t.Fatal("rejected attachment was admitted beyond queue capacity")
+	}
+	w.background.Wait()
+	f.mu.Lock()
+	requests := f.fileRequests
+	f.mu.Unlock()
+	if requests != 0 {
+		t.Fatal("rejected attachment triggered Telegram file access")
+	}
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	w.dispatch()
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", u.UpdateID).Scan(&state); err != nil || state != "cancelled" {
+		t.Fatalf("rejected attachment state=%q err=%v", state, err)
+	}
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", acceptedID).Scan(&state); err != nil || state != "done" {
+		t.Fatalf("accepted task did not complete: state=%q err=%v", state, err)
 	}
 }

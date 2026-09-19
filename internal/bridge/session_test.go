@@ -15,7 +15,7 @@ func TestResumeNativeIDRestoresDirectoryAcrossTopics(t *testing.T) {
 	}
 	original, id := first.binding, first.sessionID
 	ctx, cancel := context.WithCancel(first.ctx)
-	second := &worker{b: first.b, key: target{chat: -10, thread: 22}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)}
+	second := testWorker(t, &worker{b: first.b, key: target{chat: -10, thread: 22}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)})
 	t.Cleanup(func() { second.teardownWorker(true); cancel(); second.background.Wait(); second.drainMediaResults() })
 	second.start(true, id, "", false)
 	if second.client != nil {
@@ -34,10 +34,10 @@ func TestResumeNativeIDRestoresDirectoryAcrossTopics(t *testing.T) {
 
 func TestSessionPrefixClaimDoesNotBypassOtherOwner(t *testing.T) {
 	current, other := &worker{}, &worker{}
-	b := &Bridge{sessionClaims: map[string]sessionClaim{
+	b := testBridge(t, &Bridge{sessionClaims: map[string]sessionClaim{
 		"current": {owner: current, id: "abcdef0123456789"},
 		"other":   {owner: other, id: "abcdef0fedcba987"},
-	}}
+	}})
 	if !b.sessionInUseByOther(current, "abcdef0") {
 		t.Fatal("another owner with the same session prefix was not detected")
 	}

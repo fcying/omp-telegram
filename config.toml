@@ -1,26 +1,13 @@
 # Default test configuration. Keep credentials in environment variables.
 # Use --config config.local.toml or -c config.local.toml for private overrides.
 # References are expanded once after TOML parsing; $$ is a literal dollar sign.
+
+[telegram]
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 # Allowlist variables accept comma-separated numeric IDs.
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 
-omp = "omp"
-# Optional shell-style quoting only; never executed by a shell. Unset/empty means no args.
-omp_args = "${OMP_TELEGRAM_ARGS}"
-# Example: omp_args = '--config "${HOME}/.config/omp/telegram.yml"'
-# Relative data paths resolve beside the executable, not the shell working directory.
-data_dir = "."
-# Unset or empty OMP_TELEGRAM_WORKSPACE_ROOT uses workspace/ beside the executable.
-workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
-max_workers = 4
-queue_capacity = 16
-# Remove terminal database messages older than this many days. Set 0 to disable cleanup.
-database_retention_days = 90
-# Release an unused OMP runtime after this duration while retaining the logical session.
-# Set 0 or disabled to turn automatic release off.
-idle_timeout = "30m"
 # Telegram live task progress.
 #
 # off: Disable live progress and typing actions.
@@ -28,3 +15,43 @@ idle_timeout = "30m"
 # verbose: Also show recent observable tool activity.
 # Raw thinking/reasoning and unfiltered tool arguments are never sent.
 progress_mode = "summary"
+
+[omp]
+binary = "omp"
+# Optional shell-style quoting only; never executed by a shell. Unset/empty means no args.
+args = "${OMP_TELEGRAM_ARGS}"
+# Example: args = '--config "${HOME}/.config/omp/telegram.yml"'
+
+[storage]
+# Relative data paths resolve beside the executable, not the shell working directory.
+data_dir = "."
+# Unset or empty OMP_TELEGRAM_WORKSPACE_ROOT uses workspace/ beside the executable.
+workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
+# Remove terminal database messages older than this many days. Set 0 to disable cleanup.
+database_retention_days = 90
+
+[worker]
+max_workers = 4
+queue_capacity = 16
+# Release an unused OMP runtime after this duration while retaining the logical session.
+# Set 0 or disabled to turn automatic release off.
+idle_timeout = "30m"
+
+[logging]
+# Structured logs default to text at info level. The per-component table is optional.
+level = "info"
+# Format: text (compact timestamp LEVEL [component] message key=value attrs)
+# or json (unchanged standard slog.JSONHandler, one JSON object per line).
+# Text example: 2026-09-19 13:20:01 WARN [telegram] telegram polling failed event=poll_failed reason=timeout
+# Both formats write to stderr.
+format = "text"
+
+[logging.component_levels]
+# Unspecified components inherit logging.level (info by default).
+# Uncomment only the components whose level should differ from the global level.
+# daemon = "debug"
+# bridge = "debug"
+# rpc = "debug"
+# telegram = "warn"
+# store = "debug"
+# media = "debug"

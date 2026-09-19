@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
@@ -28,6 +28,8 @@ const (
 
 var errProtocol = errors.New("omp: invalid RPC frame")
 
+var nextClientID atomic.Uint64
+
 type Config struct {
 	Binary, CWD, Resume string
 	Args                []string
@@ -43,21 +45,30 @@ type request struct {
 
 // Client owns a process group. Raw events can contain sensitive content and must not be logged.
 type Client struct {
-	cmd                  *exec.Cmd
-	stdin, stdout        *os.File
-	events               chan json.RawMessage
-	ready                chan struct{}
-	readDone, done, stop chan struct{}
-	stopOnce             sync.Once
-	writeGate            chan struct{}
-	next                 atomic.Uint64
-	frameLimit           atomic.Int64
-	mu                   sync.Mutex
-	pending              map[string]request
-	err                  error
-	metadataBusy         bool
-	metadataUnavailable  bool
-	metadata             *metadataQuery
+	id                        uint64
+	log                       *slog.Logger
+	cmd                       *exec.Cmd
+	stdin, stdout             *os.File
+	events                    chan json.RawMessage
+	ready                     chan struct{}
+	readDone, done, stop      chan struct{}
+	stopOnce                  sync.Once
+	writeGate                 chan struct{}
+	next                      atomic.Uint64
+	frameLimit                atomic.Int64
+	closeRequested            atomic.Bool
+	transportEndedBeforeClose atomic.Bool
+	failureStop               atomic.Bool
+	contextCanceled           atomic.Bool
+	protocolLogOnce           sync.Once
+	queueOverflowLogOnce      sync.Once
+	exitLogOnce               sync.Once
+	mu                        sync.Mutex
+	pending                   map[string]request
+	err                       error
+	metadataBusy              bool
+	metadataUnavailable       bool
+	metadata                  *metadataQuery
 }
 
 // ValidateArgs protects the transport and session lifecycle owned by the bridge.
@@ -66,19 +77,22 @@ func ValidateArgs(args []string) error {
 		name, _, _ := strings.Cut(arg, "=")
 		switch name {
 		case "--", "--mode", "--cwd", "--resume", "--session", "--continue", "--print", "--no-session":
-			return errors.New("omp_args cannot override RPC mode, working directory, or session lifecycle")
+			return errors.New("omp.args cannot override RPC mode, working directory, or session lifecycle")
 		}
 		if strings.HasPrefix(arg, "-r") || strings.HasPrefix(arg, "-c") || strings.HasPrefix(arg, "-p") {
-			return errors.New("omp_args cannot override RPC mode, working directory, or session lifecycle")
+			return errors.New("omp.args cannot override RPC mode, working directory, or session lifecycle")
 		}
 		if strings.ContainsRune(arg, 0) {
-			return errors.New("omp_args cannot contain NUL bytes")
+			return errors.New("omp.args cannot contain NUL bytes")
 		}
 	}
 	return nil
 }
 
-func Start(ctx context.Context, cfg Config) (*Client, error) {
+func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, error) {
+	if rpcLogger == nil {
+		return nil, errors.New("omp: RPC logger is required")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -88,6 +102,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Binary == "" {
 		cfg.Binary = "omp"
 	}
+	clientID := nextClientID.Add(1)
 	args := make([]string, 0, 6+len(cfg.Args))
 	args = append(args, "--mode", "rpc")
 	if cfg.CWD != "" {
@@ -126,7 +141,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	inRead.Close()
 	outWrite.Close()
-	c := &Client{cmd: cmd, stdin: inWrite, stdout: outRead, events: make(chan json.RawMessage, 128), ready: make(chan struct{}), readDone: make(chan struct{}), done: make(chan struct{}), stop: make(chan struct{}), writeGate: make(chan struct{}, 1), pending: make(map[string]request)}
+	c := &Client{id: clientID, log: rpcLogger.With("client_id", clientID), cmd: cmd, stdin: inWrite, stdout: outRead, events: make(chan json.RawMessage, 128), ready: make(chan struct{}), readDone: make(chan struct{}), done: make(chan struct{}), stop: make(chan struct{}), writeGate: make(chan struct{}, 1), pending: make(map[string]request)}
 	c.frameLimit.Store(maxFrame)
 	go c.readLoop()
 	go c.supervise(ctx, waited)
@@ -154,6 +169,7 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 
 func (c *Client) Events() <-chan json.RawMessage { return c.events }
 func (c *Client) Done() <-chan struct{}          { return c.done }
+func (c *Client) ID() uint64                     { return c.id }
 
 func (c *Client) failure() error {
 	c.mu.Lock()
@@ -161,10 +177,11 @@ func (c *Client) failure() error {
 	if c.err != nil {
 		return c.err
 	}
-	return errors.New("omp: process closed")
+	return &classifiedError{kind: "client_closed", err: errors.New("omp: process closed")}
 }
 
 func (c *Client) fail(err error) {
+	c.failureStop.Store(true)
 	c.mu.Lock()
 	if c.err == nil {
 		c.err = err
@@ -173,8 +190,23 @@ func (c *Client) fail(err error) {
 	c.stopOnce.Do(func() { close(c.stop) })
 }
 
+func (c *Client) transportEnded(err error) {
+	c.mu.Lock()
+	if !c.closeRequested.Load() && !c.failureStop.Load() && !c.contextCanceled.Load() {
+		c.transportEndedBeforeClose.Store(true)
+	}
+	if c.err == nil {
+		c.err = &classifiedError{kind: "process_exit", err: err}
+	}
+	c.mu.Unlock()
+	c.stopOnce.Do(func() { close(c.stop) })
+}
+
 // Close drains stdout while allowing a short graceful shutdown, then kills the process group.
 func (c *Client) Close() error {
+	c.mu.Lock()
+	c.closeRequested.Store(true)
+	c.mu.Unlock()
 	c.stopOnce.Do(func() { close(c.stop) })
 	<-c.done
 	c.mu.Lock()
@@ -182,18 +214,45 @@ func (c *Client) Close() error {
 	return c.err
 }
 
+func (c *Client) logProcessExit(level slog.Level, reason string) {
+	c.exitLogOnce.Do(func() {
+		c.log.LogAttrs(context.Background(), level, "rpc process exit", slog.String("event", "rpc_process_exit"), slog.String("reason", reason))
+	})
+}
+
+func (c *Client) processExited(ctx context.Context) {
+	if ctx.Err() != nil {
+		c.contextCanceled.Store(true)
+	}
+	switch {
+	case c.contextCanceled.Load():
+		c.logProcessExit(slog.LevelDebug, "context_canceled")
+	case c.transportEndedBeforeClose.Load() && !c.failureStop.Load():
+		c.logProcessExit(slog.LevelWarn, "unexpected")
+	case c.closeRequested.Load() && !c.failureStop.Load():
+		c.logProcessExit(slog.LevelDebug, "closed")
+	case c.failureStop.Load():
+		// The owning failure boundary already recorded the durable error.
+		c.logProcessExit(slog.LevelDebug, "failure")
+	default:
+		c.logProcessExit(slog.LevelWarn, "unexpected")
+	}
+}
+
 func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 	exited := false
 	select {
 	case err := <-waited:
 		exited = true
+		c.processExited(ctx)
 		if err != nil {
-			c.fail(errors.New("omp: process exited unsuccessfully"))
+			c.fail(&classifiedError{kind: "process_exit", err: errors.New("omp: process exited unsuccessfully")})
 		} else {
-			c.fail(errors.New("omp: process exited"))
+			c.fail(&classifiedError{kind: "process_exit", err: errors.New("omp: process exited")})
 		}
 	case <-ctx.Done():
-		c.fail(errors.New("omp: process context canceled"))
+		c.contextCanceled.Store(true)
+		c.fail(&classifiedError{kind: "cancelled", err: errors.New("omp: process context canceled")})
 	case <-c.stop:
 	}
 	c.stdin.Close()
@@ -202,6 +261,7 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 		select {
 		case <-waited:
 			exited = true
+			c.processExited(ctx)
 		case <-timer.C:
 		}
 		timer.Stop()
@@ -212,6 +272,7 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 		select {
 		case <-waited:
 			exited = true
+			c.processExited(ctx)
 		case <-timer.C:
 		}
 		timer.Stop()
@@ -220,6 +281,7 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 	syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
 	if !exited {
 		<-waited
+		c.processExited(ctx)
 	}
 	timer := time.NewTimer(time.Second)
 	select {
@@ -335,14 +397,26 @@ func (t *terminalMetadata) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (c *Client) logLifecycle(env envelope, phase string) {
-	switch env.Type {
-	case "agent_start", "agent_end", "prompt_result", "auto_compaction_start", "auto_compaction_end":
-	case "response":
-		if env.Success == nil || *env.Success {
-			return
-		}
+func lifecycleEventAllowed(event string) bool {
+	switch event {
+	case "agent_start", "agent_end", "prompt_result", "auto_compaction_start", "auto_compaction_end", "response":
+		return true
 	default:
+		return false
+	}
+}
+
+func lifecyclePhaseAllowed(phase string) bool {
+	switch phase {
+	case "received", "event_queued", "response_queued", "response_ignored", "rejected":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) logLifecycle(env envelope, phase string) {
+	if !lifecycleEventAllowed(env.Type) || !lifecyclePhaseAllowed(phase) || !c.log.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
 	terminal := "absent"
@@ -354,15 +428,34 @@ func (c *Client) logLifecycle(env envelope, phase string) {
 	case 3:
 		terminal = "invalid"
 	}
-	// Request IDs are local decimal counters; never log arbitrary peer strings.
-	var requestID uint64
-	requestIDValid := false
-	if env.ID != "" {
-		var err error
-		requestID, err = strconv.ParseUint(env.ID, 10, 64)
-		requestIDValid = err == nil
+	attrs := []slog.Attr{
+		slog.String("event", "rpc_lifecycle"),
+		slog.String("rpc_event", env.Type),
+		slog.String("phase", phase),
+		slog.String("terminal", terminal),
 	}
-	log.Printf("omp RPC lifecycle client=%p event=%s phase=%s terminal=%s request_id=%d request_id_valid=%t", c, env.Type, phase, terminal, requestID, requestIDValid)
+	// Request IDs are local decimal counters; never log arbitrary peer strings.
+	requestID, err := strconv.ParseUint(env.ID, 10, 64)
+	requestIDValid := env.ID != "" && err == nil
+	attrs = append(attrs, slog.Bool("request_id_valid", requestIDValid))
+	if requestIDValid {
+		attrs = append(attrs, slog.Uint64("request_id", requestID))
+	}
+	c.log.LogAttrs(context.Background(), slog.LevelDebug, "rpc lifecycle", attrs...)
+}
+
+func (c *Client) protocolFailure(err error) {
+	c.protocolLogOnce.Do(func() {
+		c.log.LogAttrs(context.Background(), slog.LevelError, "rpc protocol error", slog.String("event", "rpc_protocol_error"))
+	})
+	c.fail(&classifiedError{kind: "protocol", err: err})
+}
+
+func (c *Client) queueOverflow(err error) {
+	c.queueOverflowLogOnce.Do(func() {
+		c.log.LogAttrs(context.Background(), slog.LevelError, "rpc queue overflow", slog.String("event", "rpc_queue_overflow"))
+	})
+	c.fail(&classifiedError{kind: "queue_overflow", err: err})
 }
 
 func decodeObject(data []byte) (envelope, error) {
@@ -390,12 +483,16 @@ func (c *Client) readLoop() {
 				return
 			default:
 			}
-			c.fail(errors.New("omp: RPC output ended or exceeded its frame limit"))
+			if errors.Is(err, errProtocol) {
+				c.protocolFailure(errProtocol)
+			} else {
+				c.transportEnded(errors.New("omp: RPC output ended or exceeded its frame limit"))
+			}
 			return
 		}
 		frame, err := decoder.push(data)
 		if err != nil {
-			c.fail(errProtocol)
+			c.protocolFailure(errProtocol)
 			return
 		}
 		if frame == nil {
@@ -403,7 +500,7 @@ func (c *Client) readLoop() {
 		}
 		env, err := decodeObject(frame)
 		if err != nil {
-			c.fail(errProtocol)
+			c.protocolFailure(errProtocol)
 			return
 		}
 		if !ready {
@@ -414,7 +511,7 @@ func (c *Client) readLoop() {
 				Logical         int   `json:"maxReassembledFrameBytes"`
 			}
 			if env.Type != "ready" || json.Unmarshal(frame, &announcement) != nil || announcement.ProtocolVersion != 1 || announcement.Frame < 1024 || announcement.Frame > maxFrame || announcement.Logical < announcement.Frame || announcement.Logical > maxLogical {
-				c.fail(errors.New("omp: invalid ready transport limits"))
+				c.protocolFailure(errors.New("omp: invalid ready transport limits"))
 				return
 			}
 			v2 := false
@@ -424,7 +521,7 @@ func (c *Client) readLoop() {
 				}
 			}
 			if !v2 {
-				c.fail(errors.New("omp: protocol v2 is required"))
+				c.protocolFailure(errors.New("omp: protocol v2 is required"))
 				return
 			}
 			decoder.physical, decoder.logical = announcement.Frame, announcement.Logical
@@ -434,14 +531,14 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if env.Type == "ready" {
-			c.fail(errProtocol)
+			c.protocolFailure(errProtocol)
 			return
 		}
 		c.logLifecycle(env, "received")
 		if env.Type == "response" {
 			if env.Success == nil || env.Command == "" {
 				c.logLifecycle(env, "rejected")
-				c.fail(errors.New("omp: malformed RPC response"))
+				c.protocolFailure(errors.New("omp: malformed RPC response"))
 				return
 			}
 			c.mu.Lock()
@@ -453,12 +550,12 @@ func (c *Client) readLoop() {
 			if found {
 				if r.command != env.Command {
 					c.logLifecycle(env, "rejected")
-					c.fail(errors.New("omp: RPC response command mismatch"))
+					c.protocolFailure(errors.New("omp: RPC response command mismatch"))
 					return
 				}
 				response := result{data: env.Data}
 				if !*env.Success {
-					response.err = errors.New("omp: RPC command rejected")
+					response.err = &classifiedError{kind: "rejected", err: errors.New("omp: RPC command rejected")}
 				}
 				r.result <- response
 				c.logLifecycle(env, "response_queued")
@@ -468,7 +565,7 @@ func (c *Client) readLoop() {
 				c.logLifecycle(env, "rejected")
 				// The server omits IDs for unknown commands and parse errors. Fail closed
 				// instead of stranding every pending call or guessing their correlation.
-				c.fail(errors.New("omp: uncorrelated RPC response"))
+				c.protocolFailure(errors.New("omp: uncorrelated RPC response"))
 				return
 			}
 			// A response with an ID is never an asynchronous event. If its caller
@@ -485,7 +582,7 @@ func (c *Client) readLoop() {
 			c.logLifecycle(env, "event_queued")
 		default:
 			c.logLifecycle(env, "rejected")
-			c.fail(errors.New("omp: event queue overflow; execution state uncertain"))
+			c.queueOverflow(errors.New("omp: event queue overflow; execution state uncertain"))
 			return
 		}
 	}

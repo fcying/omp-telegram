@@ -15,8 +15,9 @@ import (
 
 func (b *Bridge) newWorker(ctx context.Context, key target, binding store.Binding, restoring bool, intent *store.StartIntent) *worker {
 	ctx, cancel := context.WithCancel(ctx)
+	workerLog := b.log.With("chat_id", key.chat, "thread_id", key.thread)
 	return &worker{
-		b: b, key: key, binding: binding, restoring: restoring, startIntent: intent,
+		b: b, log: workerLog, key: key, binding: binding, restoring: restoring, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
 		operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
@@ -40,15 +41,18 @@ func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Bin
 func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker) error {
 	intents, err := b.db.PendingStarts(b.bot.ID)
 	if err != nil {
+		b.storeLog.Error("startup intent read failed", "event", "binding_read_failed", "reason", "pending_starts", "error_kind", "persistence")
 		return err
 	}
 	bindings, err := b.db.RunningBindings(b.bot.ID)
 	if err != nil {
+		b.storeLog.Error("session binding read failed", "event", "binding_read_failed", "reason", "running_bindings", "error_kind", "persistence")
 		return err
 	}
 	// Snapshot before polling starts: restoring an instance must not restart old prompts.
 	pending, err := b.db.Pending()
 	if err != nil {
+		b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", "restore", "error_kind", "persistence")
 		return err
 	}
 	for _, in := range pending {
@@ -59,6 +63,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		message := update.Message
 		if deferredPrompt(message) {
 			if err := b.db.Mark(in.ID, "cancelled"); err != nil {
+				b.storeLog.Error("input cancellation persistence failed", "event", "inbox_state_write_failed", "reason", "restore", "inbox_id", in.ID, "error_kind", "persistence")
 				return err
 			}
 		}
@@ -74,8 +79,10 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		key := target{binding.Chat, binding.Thread}
 		w := b.newWorker(ctx, key, binding, true, nil)
 		if !w.claimPersistedSession() {
+			w.log.Error("saved session claim failed", "event", "restore_claim", "generation", binding.Generation, "result", "failed", "reason", "identity_conflict")
 			return errors.New("saved session identity is unavailable or claimed by another conversation")
 		}
+		w.log.Debug("saved session claim restored", "event", "restore_claim", "generation", binding.Generation, "session_id", binding.SessionID, "result", "done")
 		workers[key] = w
 		restored = append(restored, w)
 	}
@@ -98,6 +105,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		if errors.Is(err, sql.ErrNoRows) {
 			binding = store.Binding{Bot: intent.Bot, Chat: intent.Chat, Thread: intent.Thread}
 		} else if err != nil {
+			b.storeLog.Error("session binding read failed", "event", "binding_read_failed", "reason", "restore_intent", "error_kind", "persistence")
 			return err
 		}
 		workers[key] = b.launchWorker(ctx, key, binding, false, intent)
@@ -128,12 +136,12 @@ func sameSessionFile(left, right string) bool {
 	b, err := os.Stat(right)
 	return err == nil && os.SameFile(a, b)
 }
-
 func (w *worker) persistClosed() bool {
 	if !w.binding.Running {
 		return true
 	}
 	if err := w.b.db.SetRunning(w.binding, false); err != nil {
+		w.b.storeLog.Error("session close persistence failed", "event", "binding_write_failed", "reason", "set_running", "error_kind", "persistence")
 		w.b.fail(err)
 		return false
 	}

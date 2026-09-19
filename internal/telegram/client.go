@@ -7,11 +7,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
+)
+
+const (
+	reasonMessageThreadNotFound = "message_thread_not_found"
+	reasonReplyTargetNotFound   = "reply_target_not_found"
+	reasonRateLimited           = "rate_limited"
+	reasonTransportFailed       = "transport_failed"
+	reasonTimeout               = "timeout"
+	reasonAPIBadRequest         = "api_bad_request"
+	reasonAPIError              = "api_error"
+	reasonCancelled             = "cancelled"
+	reasonUnknown               = "unknown"
 )
 
 type User struct {
@@ -94,6 +107,116 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("telegram API %d: %s", e.Code, e.Description)
 }
 
+// ErrorInfo is a bounded description of a Telegram operation failure.
+type ErrorInfo struct {
+	Code       int
+	Reason     string
+	RetryAfter int
+	Uncertain  bool
+}
+
+type reasonError struct {
+	reason string
+	err    error
+}
+
+func (e *reasonError) Error() string { return e.err.Error() }
+func (e *reasonError) Unwrap() error { return e.err }
+
+func withReason(reason string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &reasonError{reason: reason, err: err}
+}
+
+func timeoutError(err error) bool {
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// ClassifyError returns only stable metadata and never copies an error message.
+func ClassifyError(err error) ErrorInfo {
+	info := ErrorInfo{Reason: reasonUnknown}
+	if err == nil {
+		return info
+	}
+	if errors.Is(err, context.Canceled) {
+		info.Reason = reasonCancelled
+		var delivery *deliveryError
+		if errors.As(err, &delivery) && delivery != nil {
+			info.Uncertain = delivery.uncertain
+		}
+		return info
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		info.Reason = reasonTimeout
+		var delivery *deliveryError
+		if errors.As(err, &delivery) && delivery != nil {
+			info.Uncertain = delivery.uncertain
+		}
+		return info
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr != nil {
+		info.Code = apiErr.Code
+		info.RetryAfter = apiErr.RetryAfter
+		info.Uncertain = DeliveryUncertain(err)
+		var delivery *deliveryError
+		if !errors.As(err, &delivery) {
+			info.Uncertain = apiErrorUncertain(apiErr)
+		}
+		switch {
+		case apiErr.Code == http.StatusTooManyRequests:
+			info.Reason = reasonRateLimited
+		case apiErr.Code == http.StatusBadRequest && messageThreadNotFound(apiErr.Description):
+			info.Reason = reasonMessageThreadNotFound
+		case apiErr.Code == http.StatusBadRequest && replyTargetNotFound(apiErr.Description):
+			info.Reason = reasonReplyTargetNotFound
+		case apiErr.Code == http.StatusBadRequest:
+			info.Reason = reasonAPIBadRequest
+		default:
+			info.Reason = reasonAPIError
+		}
+		return info
+	}
+	var classified *reasonError
+	if errors.As(err, &classified) && classified != nil {
+		info.Reason = classified.reason
+		info.Uncertain = DeliveryUncertain(err)
+		return info
+	}
+	if timeoutError(err) {
+		info.Reason = reasonTimeout
+		info.Uncertain = DeliveryUncertain(err)
+		return info
+	}
+	info.Uncertain = DeliveryUncertain(err)
+	return info
+}
+
+func apiErrorUncertain(err *APIError) bool {
+	return err == nil || err.Code < 400 || err.Code > 599 || strings.TrimSpace(err.Description) == ""
+}
+
+func messageThreadNotFound(description string) bool {
+	switch strings.ToLower(strings.TrimSpace(description)) {
+	case "bad request: message thread not found", "message thread not found":
+		return true
+	default:
+		return false
+	}
+}
+
+func replyTargetNotFound(description string) bool {
+	switch strings.ToLower(strings.TrimSpace(description)) {
+	case "bad request: reply message not found", "reply message not found", "bad request: message to reply not found", "message to reply not found", "bad request: message to be replied not found", "message to be replied not found":
+		return true
+	default:
+		return false
+	}
+}
+
 type deliveryError struct {
 	error
 	uncertain bool
@@ -125,9 +248,10 @@ type Client struct {
 	token   string
 	baseURL string
 	http    *http.Client
+	logger  *slog.Logger
 }
 
-func New(token string) *Client {
+func New(token string, logger *slog.Logger) *Client {
 	return &Client{
 		token:   token,
 		baseURL: "https://api.telegram.org",
@@ -136,6 +260,7 @@ func New(token string) *Client {
 			// Never forward the token or request body to a redirect target.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
+		logger: logger,
 	}
 }
 
@@ -164,7 +289,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 }
 
 func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, options SendOptions) (Message, error) {
-	return sendWithReplyFallback(options, func(options SendOptions) (Message, error) {
+	return sendWithReplyFallback(c.logger, chatID, threadID, options, func(options SendOptions) (Message, error) {
 		fields := map[string]any{"chat_id": chatID, "text": text}
 		if threadID != 0 {
 			fields["message_thread_id"] = threadID
@@ -181,18 +306,19 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 	})
 }
 
-func sendWithReplyFallback(options SendOptions, send func(SendOptions) (Message, error)) (Message, error) {
+func sendWithReplyFallback(logger *slog.Logger, chatID, threadID int64, options SendOptions, send func(SendOptions) (Message, error)) (Message, error) {
 	message, err := send(options)
 	if err == nil || options.ReplyToMessageID == 0 || !replyRejected(err) {
 		return message, err
 	}
+	logger.Warn("reply target unavailable; retrying without reply", "event", "reply_fallback", "chat_id", chatID, "thread_id", threadID, "reason", reasonReplyTargetNotFound, "api_code", http.StatusBadRequest)
 	options.ReplyToMessageID = 0
 	return send(options)
 }
 
 func replyRejected(err error) bool {
 	var apiErr *APIError
-	return errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(apiErr.Description), "reply")
+	return errors.As(err, &apiErr) && apiErr != nil && apiErr.Code == http.StatusBadRequest && replyTargetNotFound(apiErr.Description)
 }
 
 func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string, keyboard *Keyboard) error {
@@ -270,8 +396,11 @@ func (c *Client) request(ctx context.Context, method string, body []byte, result
 		if ctx.Err() != nil {
 			return false, 0, ctx.Err()
 		}
+		if timeoutError(err) {
+			return safe, -1, withReason(reasonTimeout, errors.New("telegram: transport failed (delivery may be uncertain)"))
+		}
 		// net/http errors include the credential-bearing URL. Do not wrap them.
-		return safe, -1, errors.New("telegram: transport failed (delivery may be uncertain)")
+		return safe, -1, withReason(reasonTransportFailed, errors.New("telegram: transport failed (delivery may be uncertain)"))
 	}
 	return c.decodeResponse(ctx, resp, result, safe)
 }
@@ -284,10 +413,13 @@ func (c *Client) decodeResponse(ctx context.Context, resp *http.Response, result
 		if ctx.Err() != nil {
 			return false, 0, ctx.Err()
 		}
-		return safe, -1, errors.New("telegram: response read failed (delivery may be uncertain)")
+		if timeoutError(err) {
+			return safe, -1, withReason(reasonTimeout, errors.New("telegram: response read failed (delivery may be uncertain)"))
+		}
+		return safe, -1, withReason(reasonTransportFailed, errors.New("telegram: response read failed (delivery may be uncertain)"))
 	}
 	if len(data) > maxResponse {
-		return false, 0, errors.New("telegram: response exceeds size limit")
+		return false, 0, withReason(reasonAPIError, errors.New("telegram: response exceeds size limit"))
 	}
 	var envelope struct {
 		OK          *bool           `json:"ok"`
@@ -299,7 +431,7 @@ func (c *Client) decodeResponse(ctx context.Context, resp *http.Response, result
 		} `json:"parameters"`
 	}
 	if json.Unmarshal(data, &envelope) != nil {
-		return safe && resp.StatusCode >= 500, -1, fmt.Errorf("telegram: invalid API response (HTTP %d)", resp.StatusCode)
+		return safe && resp.StatusCode >= 500, -1, withReason(reasonAPIError, fmt.Errorf("telegram: invalid API response (HTTP %d)", resp.StatusCode))
 	}
 	if envelope.OK == nil || !*envelope.OK || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		code := envelope.Code
@@ -328,7 +460,7 @@ func (c *Client) decodeResponse(ctx context.Context, resp *http.Response, result
 	}
 	if result != nil {
 		if len(envelope.Result) == 0 || string(envelope.Result) == "null" || json.Unmarshal(envelope.Result, result) != nil {
-			return false, 0, errors.New("telegram: invalid API result")
+			return false, 0, withReason(reasonAPIError, errors.New("telegram: invalid API result"))
 		}
 	}
 	return false, 0, nil

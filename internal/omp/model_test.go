@@ -165,7 +165,7 @@ func TestSetModelRoleVerifiesStateAndPreservesUnrelatedOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := Start(context.Background(), Config{Binary: exe})
+	client, err := Start(context.Background(), Config{Binary: exe}, testRPCLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestSetModelRoleStopsUncertainClient(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			client, err := Start(context.Background(), Config{Binary: exe})
+			client, err := Start(context.Background(), Config{Binary: exe}, testRPCLogger())
 			if err != nil {
 				t.Fatal(err)
 			}

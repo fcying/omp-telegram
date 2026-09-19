@@ -33,7 +33,7 @@ func init() {
 		if os.Getenv("OMP_DEATH_TRANSPORT") == "acp" {
 			_, _ = ListSessions(context.Background(), cfg)
 		} else {
-			_, _ = Start(context.Background(), cfg)
+			_, _ = Start(context.Background(), cfg, testRPCLogger())
 		}
 		os.Exit(92)
 	case "direct":

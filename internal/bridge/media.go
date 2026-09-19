@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
+	"omp-telegram/internal/telegram"
 )
 
 var telegramSendTools = []map[string]any{{
@@ -28,6 +30,7 @@ type mediaResult struct {
 	workspace      string
 	input          media.Input
 	err            error
+	logger         *slog.Logger
 }
 type sendResult struct {
 	id         string
@@ -35,6 +38,32 @@ type sendResult struct {
 	file       media.File
 	err        error
 	client     *omp.Client
+	logger     *slog.Logger
+}
+
+func (w *worker) mediaTaskLogger(taskID int64) *slog.Logger {
+	logger := w.b.mediaLog.With("chat_id", w.key.chat, "thread_id", w.key.thread, "generation", w.binding.Generation)
+	if taskID != 0 {
+		logger = logger.With("inbox_id", taskID)
+		if taskID == w.active {
+			logger = logger.With("turn", w.turn)
+		}
+	}
+	if w.client != nil {
+		logger = logger.With("client_id", w.client.ID())
+	}
+	return logger
+}
+
+func mediaCancellation(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+func mediaErrorKind(err error) string {
+	if telegram.ClassifyError(err).Reason == "timeout" {
+		return "timeout"
+	}
+	return "unknown"
 }
 
 func (w *worker) initMedia() {
@@ -58,6 +87,7 @@ func (w *worker) queueMedia(in incoming) {
 	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, preparing: true, cancel: cancel})
 	workspace, generation := w.binding.Workspace, w.binding.Generation
 	message := *in.msg
+	mediaLogger := w.mediaTaskLogger(in.id)
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -71,16 +101,16 @@ func (w *worker) queueMedia(in incoming) {
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := mediaResult{id: in.id, generation: generation, workspace: workspace, input: prepared, err: err}
+		result := mediaResult{id: in.id, generation: generation, workspace: workspace, input: prepared, err: err, logger: mediaLogger}
 		select {
 		case w.mediaResults <- result:
 		case <-w.ctx.Done():
-			removeIncoming(workspace, prepared.Directory)
+			removeIncoming(workspace, prepared.Directory, mediaLogger)
 		}
 	}()
 }
 
-func removeIncoming(workspace, directory string) {
+func removeIncoming(workspace, directory string, logger *slog.Logger) {
 	if directory == "" {
 		return
 	}
@@ -90,10 +120,24 @@ func removeIncoming(workspace, directory string) {
 	}
 	root, err := os.OpenRoot(workspace)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
+		}
 		return
 	}
 	defer root.Close()
-	_ = root.RemoveAll(rel)
+	if err := root.RemoveAll(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logger.Warn("attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
+	}
+}
+
+func removeMediaSnapshot(path string, logger *slog.Logger) {
+	if path == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logger.Warn("attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
+	}
 }
 
 func (w *worker) preparedMedia(result mediaResult) {
@@ -107,13 +151,16 @@ func (w *worker) preparedMedia(result mediaResult) {
 		}
 	}
 	if index < 0 {
-		removeIncoming(result.workspace, result.input.Directory)
+		removeIncoming(result.workspace, result.input.Directory, result.logger)
 		return
 	}
 	if result.err != nil {
-		removeIncoming(result.workspace, result.input.Directory)
+		removeIncoming(result.workspace, result.input.Directory, result.logger)
 		w.queue = append(w.queue[:index], w.queue[index+1:]...)
 		w.mark(result.id, "failed")
+		if !mediaCancellation(result.err) {
+			result.logger.Warn("attachment preparation failed", "event", "prepare_failed", "error_kind", mediaErrorKind(result.err))
+		}
 		if !errors.Is(result.err, context.Canceled) {
 			w.say("Attachment could not be prepared: " + result.err.Error())
 		}
@@ -176,6 +223,7 @@ func (w *worker) hostSend(event rpcEvent) {
 	w.hostRequests[event.ID] = cancel
 	workspace, generation := w.binding.Workspace, w.binding.Generation
 	spool := filepath.Join(w.b.cfg.DataDir, "attachments", "outbox")
+	mediaLogger := w.mediaTaskLogger(w.active)
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -189,13 +237,11 @@ func (w *worker) hostSend(event rpcEvent) {
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := sendResult{id: event.ID, generation: generation, client: client, file: file, err: err}
+		result := sendResult{id: event.ID, generation: generation, client: client, file: file, err: err, logger: mediaLogger}
 		select {
 		case w.sendResults <- result:
 		case <-w.ctx.Done():
-			if file.Path != "" {
-				_ = os.Remove(file.Path)
-			}
+			removeMediaSnapshot(file.Path, mediaLogger)
 		}
 	}()
 }
@@ -203,20 +249,22 @@ func (w *worker) hostSend(event rpcEvent) {
 func (w *worker) preparedSend(result sendResult) {
 	cancel, pending := w.hostRequests[result.id]
 	if !pending || w.client != result.client || result.generation != w.binding.Generation {
-		if result.file.Path != "" {
-			_ = os.Remove(result.file.Path)
-		}
+		removeMediaSnapshot(result.file.Path, result.logger)
 		return
 	}
 	cancel()
 	delete(w.hostRequests, result.id)
 	if result.err != nil {
+		if !mediaCancellation(result.err) {
+			result.logger.Warn("attachment snapshot failed", "event", "snapshot_failed", "error_kind", mediaErrorKind(result.err))
+		}
 		w.hostResult(result.client, result.id, result.err.Error(), true)
 		return
 	}
 	file := result.file
 	if err := w.b.db.EnqueueAttachment(w.key.chat, w.key.thread, file.Kind, file.Path, file.Name, file.Caption); err != nil {
-		_ = os.Remove(file.Path)
+		result.logger.Error("attachment persistence failed", "event", "attachment_persist_failed", "error_kind", "persistence")
+		removeMediaSnapshot(file.Path, result.logger)
 		w.hostResult(result.client, result.id, "Cannot persist attachment delivery.", true)
 		w.b.fail(err)
 		return
@@ -228,7 +276,7 @@ func (w *worker) drainMediaResults() {
 	for {
 		select {
 		case result := <-w.mediaResults:
-			removeIncoming(result.workspace, result.input.Directory)
+			removeIncoming(result.workspace, result.input.Directory, result.logger)
 		default:
 			goto outgoing
 		}
@@ -237,9 +285,7 @@ outgoing:
 	for {
 		select {
 		case result := <-w.sendResults:
-			if result.file.Path != "" {
-				_ = os.Remove(result.file.Path)
-			}
+			removeMediaSnapshot(result.file.Path, result.logger)
 		default:
 			return
 		}

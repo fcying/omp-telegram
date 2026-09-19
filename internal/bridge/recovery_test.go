@@ -66,7 +66,8 @@ func (d *recoveryDaemon) start() {
 	d.cancel = cancel
 	d.done = make(chan error, 1)
 	cfg, db, done := d.cfg, d.db, d.done
-	go func() { done <- Run(ctx, cfg, db) }()
+	logs := testLogs(d.t)
+	go func() { done <- Run(ctx, cfg, db, logs) }()
 }
 
 func (d *recoveryDaemon) stop() {
@@ -327,11 +328,9 @@ func TestRecoverySkipsNonTopicGroupsAndUnauthorizedPrivateChats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			b := &Bridge{
-				cfg: config.Config{AllowedChats: []int64{-10, 0}, QueueCapacity: 4},
-				db:  db, bot: telegram.User{ID: 99}, tg: telegram.New("fake"),
-				slots: make(chan struct{}, 1), fatal: make(chan error, 1),
-			}
+			b := testBridge(t, &Bridge{cfg: config.Config{AllowedChats: []int64{-10, 0}, QueueCapacity: 4},
+				db: db, bot: telegram.User{ID: 99}, tg: newTestTelegram(t),
+				slots: make(chan struct{}, 1), fatal: make(chan error, 1)})
 			ctx, cancel := context.WithCancel(context.Background())
 			workers := make(map[target]*worker)
 			err = b.restoreWorkers(ctx, workers)

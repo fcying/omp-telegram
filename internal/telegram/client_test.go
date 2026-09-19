@@ -1,10 +1,13 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,9 +18,14 @@ import (
 
 func localClient(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
+	return localClientWithLogger(t, handler, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func localClientWithLogger(t *testing.T, handler http.HandlerFunc, logger *slog.Logger) *Client {
+	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	client := New("123:secret-token")
+	client := New("123:secret-token", logger)
 	client.baseURL = server.URL
 	return client
 }
@@ -418,5 +426,85 @@ func TestSendIncompleteResponseRemainsUncertain(t *testing.T) {
 	_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 	if err == nil || !DeliveryUncertain(err) || attempts.Load() != 1 {
 		t.Fatalf("error=%v uncertain=%v attempts=%d", err, DeliveryUncertain(err), attempts.Load())
+	}
+}
+
+func TestClassifyErrorReturnsSafeMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		reason     string
+		code       int
+		retryAfter int
+		uncertain  bool
+	}{
+		{"nil", nil, "unknown", 0, 0, false},
+		{"cancelled", context.Canceled, "cancelled", 0, 0, false},
+		{"timeout", context.DeadlineExceeded, "timeout", 0, 0, false},
+		{"thread", &APIError{Code: 400, Description: "Bad Request: message thread not found"}, "message_thread_not_found", 400, 0, false},
+		{"reply", &APIError{Code: 400, Description: "Bad Request: reply message not found"}, "reply_target_not_found", 400, 0, false},
+		{"rate", &APIError{Code: 429, Description: "Too Many Requests", RetryAfter: 7}, "rate_limited", 429, 7, false},
+		{"transport", withReason(reasonTransportFailed, errors.New("token https://private.invalid")), "transport_failed", 0, 0, true},
+		{"bad request", &APIError{Code: 400, Description: "Bad Request"}, "api_bad_request", 400, 0, false},
+		{"api", &APIError{Code: 401, Description: "Unauthorized"}, "api_error", 401, 0, false},
+		{"unknown", errors.New("message thread not found token https://private.invalid"), "unknown", 0, 0, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			info := ClassifyError(test.err)
+			if info.Reason != test.reason || info.Code != test.code || info.RetryAfter != test.retryAfter || info.Uncertain != test.uncertain {
+				t.Fatalf("classification = %+v", info)
+			}
+			if strings.Contains(fmt.Sprintf("%+v", info), "private.invalid") || strings.Contains(fmt.Sprintf("%+v", info), "token") {
+				t.Fatalf("classification leaked unsafe input: %+v", info)
+			}
+		})
+	}
+}
+
+func TestReplyFallbackLogsSafeEventInTextAndJSON(t *testing.T) {
+	for _, format := range []string{"text", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var logs bytes.Buffer
+			var handler slog.Handler
+			if format == "json" {
+				handler = slog.NewJSONHandler(&logs, nil)
+			} else {
+				handler = slog.NewTextHandler(&logs, nil)
+			}
+			client := localClientWithLogger(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Content-Type") == "application/json" {
+					var fields map[string]json.RawMessage
+					if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+						t.Error(err)
+						return
+					}
+					if _, exists := fields["reply_to_message_id"]; exists {
+						w.WriteHeader(http.StatusBadRequest)
+						fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}`)
+						return
+					}
+				}
+				fmt.Fprint(w, `{"ok":true,"result":{"message_id":43}}`)
+			}, slog.New(handler))
+			_, err := client.Send(context.Background(), 1, 0, "answer", SendOptions{ReplyToMessageID: 42})
+			if err != nil || !strings.Contains(logs.String(), "reply_fallback") || strings.Contains(logs.String(), "secret-token") || strings.Contains(logs.String(), "private.invalid") {
+				t.Fatalf("fallback log or result unsafe: err=%v logs=%s", err, logs.String())
+			}
+		})
+	}
+}
+
+func TestSendDoesNotFallbackForDeletedTopic(t *testing.T) {
+	var attempts atomic.Int32
+	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}`)
+	})
+	_, err := client.Send(context.Background(), 1, 8, "answer", SendOptions{ReplyToMessageID: 42})
+	info := ClassifyError(err)
+	if attempts.Load() != 1 || info.Reason != reasonMessageThreadNotFound || info.Uncertain {
+		t.Fatalf("deleted topic fallback attempts=%d info=%+v error=%v", attempts.Load(), info, err)
 	}
 }

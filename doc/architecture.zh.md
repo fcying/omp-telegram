@@ -52,7 +52,7 @@ flowchart LR
 - 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
 - 附件准备和上传异步且有并发上限. 尚在准备的附件保留其队列位置.
 - RPC stdout reader 不执行 Telegram HTTP 交付. 事件缓冲有界, 协议错误或持续积压会使 client 失败, 不允许内存无限增长.
-- `max_workers` 限制已连接的 OMP 进程, 不限制逻辑 session. 正数 `idle_timeout` 可释放空闲 worker 的进程并归还 slot, 同时保留已验证的 binding 和 session claim.
+- `worker.max_workers` 限制已连接的 OMP 进程, 不限制逻辑 session. 正数 `worker.idle_timeout` 可释放空闲 worker 的进程并归还 slot, 同时保留已验证的 binding 和 session claim.
 
 Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关联响应. `Call("prompt")` 成功只代表请求被接受, 不代表任务完成. 只有 `isTerminal` 不为 `false` 的 `agent_end` 事件或本地命令完成信号才能结束任务, 非终结事件不能开始下一条排队 prompt. 终结 assistant message 的 `stopReason=error` 或非空 `errorMessage` 使输入以 `uncertain` 提交; `stopReason=aborted` 以 `cancelled` 提交; 其他有确认文本的情况以 `done` 提交. `uncertain` 和 `cancelled` 的终态结果仍可交付 partial text, 但绝不转发 provider diagnostics. 分帧和重组都有明确边界, 不回退到 PTY/ANSI 解析.
 
@@ -70,7 +70,34 @@ Actor 生命周期日志为 `agent_start`、`agent_end`、`prompt_result`、自�
 
 RPC client 日志用同一 client 身份区分接收、事件入队、失败响应分发及拒绝. `event_queued` 只确认写入缓冲队列, 不代表 actor 已消费; 应与 actor 的 `phase=received` 对照. 请求 ID 仅以数字记录, 不记录任意 peer ID 字符串或响应正文.
 
-实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 清空 bridge 延后 prompt, 发送与 `/stop` 相同的原生 `abort`; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
+### 结构化日志
+
+daemon 在配置成功后创建一个 `slog` registry, 且只有六个组件 logger: `daemon`、`bridge`、`rpc`、`telegram`、`store` 和 `media`. text 与 JSON handler 共用一个同步 writer, 因而并发记录完整且可独立解析. `logging.level` 设置默认级别 (`debug`、`info`、`warn` 或 `error`), `logging.format` 选择 text 或 JSON 输出, `[logging.component_levels]` 可为指定组件覆盖级别. 组件名、级别、格式、事件名和 RPC phase 都是固定白名单, 不是用户自定义 label.
+
+text 输出采用紧凑的 `YYYY-MM-DD HH:MM:SS LEVEL [component] message key=value` 单行格式, 例如 `2026-09-19 13:20:01 WARN [telegram] telegram polling failed event=poll_failed reason=timeout`. 组件头部来自 registry. 原始消息内容和其余所有结构化属性均保留, 头部不再包含 `time=`, `level=`, `msg=` 或 `component=` 标签. 字符串和控制字符按需转义, 确保每条记录只有一行. JSON 输出保持标准 `slog.JSONHandler` 格式不变, 包含 `component` 字段. 仅支持这两种格式; 未指定的组件继承 `logging.level`.
+
+事件使用简短稳定的 `snake_case` 名称. `debug` 用于 RPC/probe 细节及 bridge handled 路径; `info` 记录成功的生命周期节点; `warn` 记录可恢复的 delivery、media 或 watchdog 故障; `error` 记录持久化失败、协议违反及缓冲区溢出. 普通用户取消不会产生 warning 或 error. 每个故障只在负责其策略的层记录, 调用层不重复记录同一错误.
+
+RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单值 (`agent_start`、`agent_end`、`prompt_result`、`auto_compaction_start`、`auto_compaction_end` 或 `response`), phase 只能是 `received`、`event_queued`、`response_queued`、`response_ignored`、`rejected` 或 `handled`. `terminal` 只能是 `absent`、`true`、`false` 或 `invalid`. 只有能安全解析为无符号整数的本地十进制 request ID 才会记录 `request_id`. Bridge 生命周期记录保持组件和稳定事件字段; handled bridge 路径保持 debug 级别.
+
+日志元数据遵循审查过的白名单: 可按需记录 component/event 身份, 有界的 chat/thread ID 等数字状态, turn/generation, retry 次数, 错误分类和内部 session UUID 以便关联. 日志绝不包含 prompt、output、reasoning、token、header、URL、raw error 或 frame、tool 参数/结果、callback token、文件名、workspace/session 路径、配置或 `omp.args`. 异步 callback 捕获排队时的操作身份, 不从复用的 worker 读取动态身份. registry 创建前的配置和 CLI 错误保持普通文本, 不格式化为 JSON.
+
+两种格式都输出到 stderr. 文件保存和轮转交给 supervisor/journald; 不增加异步日志队列、采样、网络上传或运行时级别重载. 共享 writer 只串行化此 registry 的记录, 不控制其他进程的输出. 日志写入错误不进入任务状态转换.
+
+| 组件 | 主要事件 |
+| --- | --- |
+| `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
+| `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
+| `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
+| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_failed`, `delivery_uncertain`, `reply_fallback` |
+| `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed` |
+| `media` | `prepare_failed`, `snapshot_failed`, `attachment_persist_failed`, `cleanup_failed` |
+
+根任务按场景使用 `chat_id`, `thread_id`, `generation`, `turn`, `inbox_id` 和 `client_id` 关联. 私聊的 `thread_id=0` 是有效身份. 原生 `session_id` 仅在验证后完整记录; 文件路径不作为日志会话身份. `client_id` 在进程内递增, 不持久化. `task_complete` 在持久化事务成功后记录 `result=done|cancelled|uncertain`, 根任务开始时间已知时附带 `duration_ms`. 交付 metadata 使用 `outbox_id`, `kind`, `api_code`, `retry_after_s`, `uncertain` 和 `replay=false`; 不记录 Description 或响应正文. 跟踪从接收到 actor 处理的完整链路时, 设置 `logging.component_levels.rpc = "debug"` 和 `logging.component_levels.bridge = "debug"`.
+
+Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务一个 bot, 因此日志中不重复记录. Chat 和 thread ID 不是凭据, 但可以关联具体对话; 应限制日志访问权限, 公开日志前将其替换为一致的占位符.
+
+实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 清空 bridge 延后 prompt, 发送与 `/stop` 相同的原生 `abort`; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
 
 首条进度通过 `progressState.StartedAt` 从根任务派发时计时, 延迟 3 秒, 与空闲活动计时独立. 事件及重复 `agent_start` 不重置此延迟. 沿用 1.5 秒 tick 检查, 因此通常在约 3–4.5 秒开始显示, 还受 actor 和网络延迟影响. 仅延迟首次创建; 已有消息更新、typing、持久化最终回复和在途进度终结清理保持原行为.
 
@@ -94,7 +121,7 @@ RPC client 日志用同一 client 身份区分接收、事件入队、失败响�
 
 ## SQLite
 
-数据库是 `data_dir` 下的 `omp-telegram.db`, 使用 WAL, busy timeout 和单连接. 保存桥接状态及 Telegram 消息内容, 不维护另一份 omp 模型上下文.
+数据库是 `storage.data_dir` 下的 `omp-telegram.db`, 使用 WAL, busy timeout 和单连接. 保存桥接状态及 Telegram 消息内容, 不维护另一份 omp 模型上下文.
 
 | 表 | 键 / 字段 | 用途 |
 | --- | --- | --- |
@@ -107,11 +134,11 @@ RPC client 日志用同一 client 身份区分接收、事件入队、失败响�
 
 ### Database Message Retention
 
-`database_retention_days` 默认值是 90. `0` 关闭自动清理; 正数按 `updated_at` 即最后一次状态转换时间保留相应天数的终态 Telegram bridge 消息记录. Bridge 会在启动时执行一次, 并在之后每 24 小时执行一次这个 best-effort janitor. 失败只记录日志, 在下一个周期重试, 不会停止 Telegram 或 omp 处理.
+`storage.database_retention_days` 默认值是 90. `0` 关闭自动清理; 正数按 `updated_at` 即最后一次状态转换时间保留相应天数的终态 Telegram bridge 消息记录. Bridge 会在启动时执行一次, 并在之后每 24 小时执行一次这个 best-effort janitor. 失败只记录日志, 在下一个周期重试, 不会停止 Telegram 或 omp 处理.
 
 只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
 
-保留策略绝不删除 binding, history, startup intent, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+保留策略绝不删除 binding, history, startup intent, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `storage.data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 ### Schema 版本
 
@@ -159,7 +186,7 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 
 `/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
 
-无参数 `/new` 优先沿用对话保存的工作目录. 没有历史目录时解析并使用 `workspace_root` 本身, 不另建按对话划分的子目录. 数据库读取失败仍报错, 不回退默认目录. 选择同一目录的对话共享文件, 不共享原生 session 身份.
+无参数 `/new` 优先沿用对话保存的工作目录. 没有历史目录时解析并使用 `storage.workspace_root` 本身, 不另建按对话划分的子目录. 数据库读取失败仍报错, 不回退默认目录. 选择同一目录的对话共享文件, 不共享原生 session 身份.
 
 合法的最终选择或取消会先消费 confirmation token, 再尽力通过 `editMessageReplyMarkup` 移除 inline keyboard, 不修改消息正文. 清理失败不阻止实际操作. 翻页直接更新原菜单. 已知的过期菜单也会清理; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启持久化.
 
@@ -194,28 +221,32 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 
 ### 空闲运行期释放
 
-`idle_timeout` 默认值为 `30m`; 设置为 `0` 或 `disabled` 可关闭. 设置为其他正时长后, worker 只有在已连接进程完整空闲达到该时长, 且没有活动任务、队列项(包括附件准备)、compact 或 handoff operation、结束预览、host request、会话列表请求、启动意图或 runtime-bound confirmation 时才释放进程. model、thinking、fast、compact、new 和原生 UI 选择的 runtime-bound confirmation 会阻止空闲释放, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 满足条件后, worker 关闭 client 并归还全局进程 slot. 不修改 binding、generation、已验证 session 文件身份、session claim、工作目录或原生历史.
+`worker.idle_timeout` 默认值为 `30m`; 设置为 `0` 或 `disabled` 可关闭. 设置为其他正时长后, worker 只有在已连接进程完整空闲达到该时长, 且没有活动任务、队列项(包括附件准备)、compact 或 handoff operation、结束预览、host request、会话列表请求、启动意图或 runtime-bound confirmation 时才释放进程. model、thinking、fast、compact、new 和原生 UI 选择的 runtime-bound confirmation 会阻止空闲释放, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 满足条件后, worker 关闭 client 并归还全局进程 slot. 不修改 binding、generation、已验证 session 文件身份、session claim、工作目录或原生历史.
 
 下一条普通 prompt、附件、`/review` 或需要 OMP 状态的原生控制命令会在入队或 RPC 调用前, 通过正常原生身份和工作目录校验懒恢复已保存的 session. 懒恢复失败不会提交或重放根任务. `/status`、`/help`、`/stop` 和 `/close` 不会唤醒已释放运行期; `/stop` 只清 bridge 延后 prompt, `/close` 直接清除恢复资格. 显式 `/resume ID` 替换逻辑 binding 并启动指定原生 session. actor 会先移除 client 并标记运行期 released, 再关闭它, 所以迟到的关闭事件不会进入 failure handling; 仍连接时 OMP 真正退出继续走既有 uncertain/failure 路径. 原生事件、confirmation 展示和成功的原生调用会刷新空闲计时.
 
 成功 RPC 会刷新空闲计时并使 watchdog 证据失效. 失败 RPC 只使 watchdog 证据及正在进行的探测失效, 不刷新空闲计时.
 
-重启后, 已提交且 `running=1` 的 binding 会恢复准确的 session 文件和目录. 在恢复任何 OMP 进程前, daemon 根据每个符合条件 binding 已持久化的原生 session ID 重建逻辑 session claim; 被 `max_workers` 阻塞的 binding 会持续持有该 claim, 直到显式 `/close`, 因而其他对话不能恢复同一 session. 被标记为中断的 binding 会在 `omp is ready` 消息中追加 warning, 并在新 generation 中清除标记; 空闲会话恢复保持静默. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
+重启后, 已提交且 `running=1` 的 binding 会恢复准确的 session 文件和目录. 在恢复任何 OMP 进程前, daemon 根据每个符合条件 binding 已持久化的原生 session ID 重建逻辑 session claim; 被 `worker.max_workers` 阻塞的 binding 会持续持有该 claim, 直到显式 `/close`, 因而其他对话不能恢复同一 session. 被标记为中断的 binding 会在 `omp is ready` 消息中追加 warning, 并在新 generation 中清除标记; 空闲会话恢复保持静默. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
 
 ## 进程与文件安全
 
-- 使用 argv 直接启动, 不经过 shell. 显式 `omp_args` 不允许覆盖桥接管理的 RPC 模式, cwd 或会话生命周期选项.
+- 使用 argv 直接启动, 不经过 shell. 显式 `omp.args` 不允许覆盖桥接管理的 RPC 模式, cwd 或会话生命周期选项.
 - 正常关闭先关闭 stdin 并继续读取输出, 必要时升级到进程组终止. 每个子进程只有一个 `Wait` 所有者.
 - Linux RPC/ACP 启动使用父死亡 SIGTERM. Linux 将此信号关联到创建子进程的 OS 线程, 因此线程锁定到 `Wait` 完成, 每个存活原生子进程占一个锁定线程.
 - 父死亡信号不是整个进程树 containment. 忽略信号, 后代残留, 脱离进程组或清除父死亡设置的程序, 仍需要部署层边界. 项目不强制 systemd/supervisor 配置.
-- 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `data_dir/attachments/outbox/` 私有快照后入队, 交付确认后删除快照, 失败则保留.
+- 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `storage.data_dir/attachments/outbox/` 私有快照后入队, 交付确认后删除快照, 失败则保留.
 - Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
 
 ## 配置与路径契约
 
-桥接默认路径以解析符号链接后的真实可执行文件目录为基准, 不是调用者 cwd. 显式相对 `--config` 路径相对于调用目录; 相对 `data_dir` 和 `workspace_root` 即使配置文件放在别处, 仍相对于二进制目录.
+桥接默认路径以解析符号链接后的真实可执行文件目录为基准, 不是调用者 cwd. 显式相对 `--config` 路径相对于调用目录; 相对 `storage.data_dir` 和 `storage.workspace_root` 即使配置文件放在别处, 仍相对于二进制目录.
 
-根目录 `config.toml` 只内嵌一份. 仅当隐式默认文件不存在时才使用内嵌配置, 显式缺失文件及不可读/无效文件均报错. 环境变量在 TOML 解析后只展开一次. `omp_args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 omp 自身默认值.
+根目录 `config.toml` 只内嵌一份. 仅当隐式默认文件不存在时才使用内嵌配置, 显式缺失文件及不可读/无效文件均报错.
+
+桥接配置使用分组 TOML table: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]` 和可选 `[logging.component_levels]`. 根级 flat 字段, 原 `[log_component_levels]` table, 放错 table 的字段以及 flat/grouped 混合布局都会拒绝. 这是有意的 breaking cutover: 升级前必须手动迁移现有私有配置; 程序不会自动重写.
+
+环境变量在 TOML 解析后对每个字符串值只展开一次, 包括 `logging.level`、`logging.format` 以及 `[logging.component_levels]` 中的值. 组件名会先按六个支持的名称校验, 再展开覆盖值. `omp.args` 和 `storage.workspace_root` 使用的可选引用 `OMP_TELEGRAM_ARGS` 与 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置; 其他缺失引用会报错. 不读取专用日志环境变量. `logging.level` 默认 `info`, `logging.format` 默认 `text`, 组件覆盖只能使用六个固定组件名. `omp.args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 omp 自身默认值.
 
 ## 开发与发布
 

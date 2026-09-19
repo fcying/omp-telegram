@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/shlex"
 	"github.com/pelletier/go-toml/v2"
 	defaults "omp-telegram"
+	"omp-telegram/internal/logging"
 	"omp-telegram/internal/omp"
 )
 
@@ -30,32 +32,58 @@ type Config struct {
 	DatabaseRetentionDays int
 	ProgressMode          string
 	IdleTimeout           time.Duration
+	LogLevel              string
+	LogFormat             string
+	LogComponentLevels    map[string]string
 }
 
 // fileConfig accepts quoted environment references in otherwise numeric fields.
 type fileConfig struct {
-	Token                 string `toml:"token"`
-	AllowedUsers          []any  `toml:"allowed_users"`
-	AllowedChats          []any  `toml:"allowed_chats"`
-	WorkspaceRoot         string `toml:"workspace_root"`
-	OMP                   string `toml:"omp"`
-	OMPArgs               string `toml:"omp_args"`
+	Telegram telegramFileConfig `toml:"telegram"`
+	OMP      ompFileConfig      `toml:"omp"`
+	Storage  storageFileConfig  `toml:"storage"`
+	Worker   workerFileConfig   `toml:"worker"`
+	Logging  loggingFileConfig  `toml:"logging"`
+}
+
+type telegramFileConfig struct {
+	Token        string `toml:"token"`
+	AllowedUsers []any  `toml:"allowed_users"`
+	AllowedChats []any  `toml:"allowed_chats"`
+	ProgressMode string `toml:"progress_mode"`
+}
+
+type ompFileConfig struct {
+	Binary string `toml:"binary"`
+	Args   string `toml:"args"`
+}
+
+type storageFileConfig struct {
 	DataDir               string `toml:"data_dir"`
-	MaxWorkers            any    `toml:"max_workers"`
-	QueueCapacity         any    `toml:"queue_capacity"`
+	WorkspaceRoot         string `toml:"workspace_root"`
 	DatabaseRetentionDays any    `toml:"database_retention_days"`
-	ProgressMode          string `toml:"progress_mode"`
-	IdleTimeout           string `toml:"idle_timeout"`
+}
+
+type workerFileConfig struct {
+	MaxWorkers    any    `toml:"max_workers"`
+	QueueCapacity any    `toml:"queue_capacity"`
+	IdleTimeout   string `toml:"idle_timeout"`
+}
+
+type loggingFileConfig struct {
+	Level           string            `toml:"level"`
+	Format          string            `toml:"format"`
+	ComponentLevels map[string]string `toml:"component_levels"`
 }
 
 func Load(path string) (Config, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return Config{}, fmt.Errorf("locate bridge executable: %w", err)
+		return Config{}, errors.New("cannot locate bridge executable")
 	}
 	executable, err = filepath.EvalSymlinks(executable)
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve bridge executable: %w", err)
+		return Config{}, errors.New("cannot resolve bridge executable")
 	}
 	return load(path, filepath.Dir(executable))
 }
@@ -66,7 +94,30 @@ func load(path, baseDir string) (Config, error) {
 		path = filepath.Join(baseDir, "config.toml")
 	}
 	var c Config
-	raw := fileConfig{Token: "${OMP_TELEGRAM_BOT_TOKEN}", WorkspaceRoot: "${OMP_TELEGRAM_WORKSPACE_ROOT}", OMP: "omp", OMPArgs: "${OMP_TELEGRAM_ARGS}", DataDir: ".", MaxWorkers: int64(4), QueueCapacity: int64(16), DatabaseRetentionDays: int64(90), ProgressMode: "summary", IdleTimeout: "30m"}
+	raw := fileConfig{
+		Telegram: telegramFileConfig{
+			Token:        "${OMP_TELEGRAM_BOT_TOKEN}",
+			ProgressMode: "summary",
+		},
+		OMP: ompFileConfig{
+			Binary: "omp",
+			Args:   "${OMP_TELEGRAM_ARGS}",
+		},
+		Storage: storageFileConfig{
+			WorkspaceRoot:         "${OMP_TELEGRAM_WORKSPACE_ROOT}",
+			DataDir:               ".",
+			DatabaseRetentionDays: int64(90),
+		},
+		Worker: workerFileConfig{
+			MaxWorkers:    int64(4),
+			QueueCapacity: int64(16),
+			IdleTimeout:   "30m",
+		},
+		Logging: loggingFileConfig{
+			Level:  "info",
+			Format: "text",
+		},
+	}
 	f, err := os.Open(path)
 	var reader io.Reader
 	if err == nil {
@@ -75,7 +126,10 @@ func load(path, baseDir string) (Config, error) {
 	} else if implicit && errors.Is(err, os.ErrNotExist) {
 		reader = strings.NewReader(defaults.DefaultConfig)
 	} else {
-		return c, err
+		if errors.Is(err, os.ErrNotExist) {
+			return c, fmt.Errorf("cannot read configuration: %w", os.ErrNotExist)
+		}
+		return c, errors.New("cannot read configuration")
 	}
 	d := toml.NewDecoder(reader).DisallowUnknownFields()
 	if err = d.Decode(&raw); err != nil {
@@ -85,101 +139,131 @@ func load(path, baseDir string) (Config, error) {
 	for _, field := range []struct {
 		name  string
 		value *string
-	}{{"token", &raw.Token}, {"omp", &raw.OMP}, {"data_dir", &raw.DataDir}} {
+	}{
+		{"telegram.token", &raw.Telegram.Token},
+		{"telegram.progress_mode", &raw.Telegram.ProgressMode},
+		{"omp.binary", &raw.OMP.Binary},
+		{"storage.data_dir", &raw.Storage.DataDir},
+		{"logging.level", &raw.Logging.Level},
+		{"logging.format", &raw.Logging.Format},
+	} {
 		value, e := expand(*field.value)
 		if e != nil {
 			return c, fmt.Errorf("%s: %w", field.name, e)
 		}
 		*field.value = value
 	}
-	argText := raw.OMPArgs
+	keys := make([]string, 0, len(raw.Logging.ComponentLevels))
+	for component := range raw.Logging.ComponentLevels {
+		keys = append(keys, component)
+	}
+	sort.Strings(keys)
+	for _, component := range keys {
+		if err := logging.ValidateComponent(component); err != nil {
+			return c, err
+		}
+	}
+	for _, component := range keys {
+		level := raw.Logging.ComponentLevels[component]
+		expanded, e := expand(level)
+		if e != nil {
+			return c, fmt.Errorf("logging.component_levels.%s: %w", component, e)
+		}
+		raw.Logging.ComponentLevels[component] = expanded
+	}
+	if err = logging.Validate(logging.Options{Level: raw.Logging.Level, Format: raw.Logging.Format, ComponentLevels: raw.Logging.ComponentLevels}); err != nil {
+		return c, err
+	}
+
+	argText := raw.OMP.Args
 	if argText == "${OMP_TELEGRAM_ARGS}" || argText == "$OMP_TELEGRAM_ARGS" {
 		argText = os.Getenv("OMP_TELEGRAM_ARGS")
 	} else {
 		argText, err = expand(argText)
 		if err != nil {
-			return c, fmt.Errorf("omp_args: %w", err)
+			return c, fmt.Errorf("omp.args: %w", err)
 		}
 	}
 	c.OMPArgs, err = shlex.Split(argText)
 	if err != nil {
-		return c, errors.New("omp_args contains invalid quoting or escaping")
+		return c, errors.New("omp.args contains invalid quoting or escaping")
 	}
 	if err = omp.ValidateArgs(c.OMPArgs); err != nil {
 		return c, err
 	}
-	c.Token, c.OMP, c.DataDir = raw.Token, raw.OMP, raw.DataDir
+	c.Token, c.OMP, c.DataDir = raw.Telegram.Token, raw.OMP.Binary, raw.Storage.DataDir
+	c.LogLevel, c.LogFormat, c.LogComponentLevels = raw.Logging.Level, raw.Logging.Format, raw.Logging.ComponentLevels
 	if c.Token == "" || c.OMP == "" || c.DataDir == "" {
-		return c, errors.New("token, omp and data_dir must be nonempty")
+		return c, errors.New("telegram.token, omp.binary and storage.data_dir must be nonempty")
 	}
-	ompPath, err := exec.LookPath(c.OMP)
+	opmPath, err := exec.LookPath(c.OMP)
 	if err != nil {
-		return c, errors.New("omp executable not found")
+		return c, errors.New("omp.binary executable not found")
 	}
-	c.OMP, err = filepath.Abs(ompPath)
+	c.OMP, err = filepath.Abs(opmPath)
 	if err != nil {
-		return c, errors.New("cannot resolve omp executable path")
+		return c, errors.New("cannot resolve omp.binary executable path")
 	}
-	if c.AllowedUsers, err = integers(raw.AllowedUsers, "allowed_users"); err != nil {
+	if c.AllowedUsers, err = integers(raw.Telegram.AllowedUsers, "telegram.allowed_users"); err != nil {
 		return c, err
 	}
-	if c.AllowedChats, err = integers(raw.AllowedChats, "allowed_chats"); err != nil {
+	if c.AllowedChats, err = integers(raw.Telegram.AllowedChats, "telegram.allowed_chats"); err != nil {
 		return c, err
 	}
-	workers, err := integer(raw.MaxWorkers, "max_workers")
-	if err != nil {
-		return c, err
-	}
-	capacity, err := integer(raw.QueueCapacity, "queue_capacity")
+	workers, err := integer(raw.Worker.MaxWorkers, "worker.max_workers")
 	if err != nil {
 		return c, err
 	}
-	retentionDays, err := integer(raw.DatabaseRetentionDays, "database_retention_days")
+	capacity, err := integer(raw.Worker.QueueCapacity, "worker.queue_capacity")
+	if err != nil {
+		return c, err
+	}
+	retentionDays, err := integer(raw.Storage.DatabaseRetentionDays, "storage.database_retention_days")
 	if err != nil {
 		return c, err
 	}
 	if int64(int(workers)) != workers || int64(int(capacity)) != capacity || int64(int(retentionDays)) != retentionDays {
-		return c, errors.New("worker, queue, or retention limit exceeds platform integer range")
+		return c, errors.New("worker.max_workers, worker.queue_capacity, or storage.database_retention_days exceeds platform integer range")
 	}
 	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
-	switch raw.ProgressMode {
+	switch raw.Telegram.ProgressMode {
 	case "off", "summary", "verbose":
-		c.ProgressMode = raw.ProgressMode
+		c.ProgressMode = raw.Telegram.ProgressMode
 	default:
-		return c, errors.New("progress_mode must be off, summary, or verbose")
+		return c, errors.New("telegram.progress_mode must be off, summary, or verbose")
 	}
-	idleTimeout, err := parseIdleTimeout(raw.IdleTimeout)
+	idleTimeout, err := parseIdleTimeout(raw.Worker.IdleTimeout, "worker.idle_timeout")
 	if err != nil {
 		return c, err
 	}
 	c.IdleTimeout = idleTimeout
 	if len(c.AllowedUsers) == 0 || len(c.AllowedChats) == 0 {
-		return c, errors.New("allowed_users and allowed_chats must be nonempty")
+		return c, errors.New("telegram.allowed_users and telegram.allowed_chats must be nonempty")
 	}
 	for _, id := range c.AllowedUsers {
 		if id <= 0 {
-			return c, errors.New("allowed_users must contain positive user IDs")
+			return c, errors.New("telegram.allowed_users must contain positive user IDs")
 		}
 	}
 	for _, id := range c.AllowedChats {
 		if id == 0 {
-			return c, errors.New("allowed_chats cannot contain zero")
+			return c, errors.New("telegram.allowed_chats cannot contain zero")
 		}
 	}
 	if c.MaxWorkers < 1 || c.QueueCapacity < 1 {
-		return c, errors.New("worker and queue limits must be positive")
+		return c, errors.New("worker.max_workers and worker.queue_capacity must be positive")
 	}
 	if c.DatabaseRetentionDays < 0 {
-		return c, errors.New("database_retention_days must be zero or positive")
+		return c, errors.New("storage.database_retention_days must be zero or positive")
 	}
-	workspace := raw.WorkspaceRoot
+	workspace := raw.Storage.WorkspaceRoot
 	if workspace == "${OMP_TELEGRAM_WORKSPACE_ROOT}" || workspace == "$OMP_TELEGRAM_WORKSPACE_ROOT" {
 		// This optional default is resolved once; environment contents remain literal.
 		workspace = os.Getenv("OMP_TELEGRAM_WORKSPACE_ROOT")
 	} else {
 		workspace, err = expand(workspace)
 		if err != nil {
-			return c, fmt.Errorf("workspace_root: %w", err)
+			return c, fmt.Errorf("storage.workspace_root: %w", err)
 		}
 	}
 	if workspace == "" {
@@ -190,19 +274,21 @@ func load(path, baseDir string) (Config, error) {
 	}
 	c.WorkspaceRoot = workspace
 	if err = os.MkdirAll(c.WorkspaceRoot, 0700); err != nil {
-		return c, errors.New("workspace_root must be a writable directory")
+		return c, errors.New("storage.workspace_root must be a writable directory")
 	}
 	if !filepath.IsAbs(c.DataDir) {
 		c.DataDir = filepath.Join(baseDir, c.DataDir)
 	}
 	if err = os.MkdirAll(c.DataDir, 0700); err != nil {
-		return c, err
+		return c, errors.New("storage.data_dir must be a writable directory")
 	}
 	return c, nil
 }
+
 func (c Config) Authorized(user, chat int64) bool {
 	return contains(c.AllowedUsers, user) && contains(c.AllowedChats, chat)
 }
+
 func contains(xs []int64, x int64) bool {
 	for _, v := range xs {
 		if x == v {
@@ -255,10 +341,10 @@ func integer(value any, field string) (int64, error) {
 	return 0, fmt.Errorf("%s must contain an integer or a decimal integer string", field)
 }
 
-func parseIdleTimeout(value string) (time.Duration, error) {
+func parseIdleTimeout(value, field string) (time.Duration, error) {
 	value, err := expand(value)
 	if err != nil {
-		return 0, fmt.Errorf("idle_timeout: %w", err)
+		return 0, fmt.Errorf("%s: %w", field, err)
 	}
 	value = strings.TrimSpace(value)
 	if value == "" || value == "0" || strings.EqualFold(value, "disabled") {
@@ -266,7 +352,7 @@ func parseIdleTimeout(value string) (time.Duration, error) {
 	}
 	duration, err := time.ParseDuration(value)
 	if err != nil || duration <= 0 {
-		return 0, errors.New("idle_timeout must be 0, disabled, or a positive Go duration")
+		return 0, fmt.Errorf("%s must be 0, disabled, or a positive Go duration", field)
 	}
 	return duration, nil
 }
