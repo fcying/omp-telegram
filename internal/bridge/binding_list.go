@@ -278,6 +278,9 @@ func queueTaskText(q queued) string {
 	if q.preparing {
 		return "Preparing attachment..."
 	}
+	if text := menuText(q.displayText, 80); text != "" {
+		return text
+	}
 	if text := menuText(q.text, 80); text != "" {
 		return text
 	}

@@ -84,9 +84,13 @@ func (w *worker) initMedia() {
 func (w *worker) queueMedia(in incoming) {
 	w.initMedia()
 	ctx, cancel := context.WithCancel(w.ctx)
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, preparing: true, cancel: cancel})
-	workspace, generation := w.binding.Workspace, w.binding.Generation
 	message := *in.msg
+	displayText := strings.TrimSpace(message.Caption)
+	if displayText == "" {
+		displayText = "Queued attachment"
+	}
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, displayText: displayText, reply: &message, preparing: true, cancel: cancel})
+	workspace, generation := w.binding.Workspace, w.binding.Generation
 	mediaLogger := w.mediaTaskLogger(in.id)
 	w.background.Add(1)
 	go func() {
@@ -168,7 +172,8 @@ func (w *worker) preparedMedia(result mediaResult) {
 	}
 	q := &w.queue[index]
 	q.preparing = false
-	q.text = result.input.Text
+	q.text = preparePromptText(q.reply, result.input.Text)
+	q.reply = nil
 	q.images = result.input.Images
 	q.directory = result.input.Directory
 	q.cancel = nil

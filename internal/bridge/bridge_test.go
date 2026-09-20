@@ -250,6 +250,9 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
+				if (text == "/review" || strings.HasPrefix(text, "/review ")) && strings.Contains(text, replyContextStart) {
+					text = "native review: " + text
+				}
 				rootPrompts++
 				if text == "failed-prompt-ack" {
 					emit(map[string]any{"type": "agent_start"})

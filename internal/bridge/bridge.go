@@ -59,14 +59,16 @@ func supportedConversation(m *telegram.Message) bool {
 }
 
 type queued struct {
-	id        int64
-	user      int64
-	replyTo   int64
-	text      string
-	images    []media.Image
-	preparing bool
-	cancel    context.CancelFunc
-	directory string
+	id          int64
+	user        int64
+	replyTo     int64
+	text        string
+	displayText string
+	reply       *telegram.Message
+	images      []media.Image
+	preparing   bool
+	cancel      context.CancelFunc
+	directory   string
 }
 
 type confirmation struct {
@@ -1409,7 +1411,7 @@ func (w *worker) handle(in incoming) {
 		if arg != "" {
 			prompt += " " + arg
 		}
-		w.enqueuePrompt(in, prompt)
+		w.enqueueReviewPrompt(in, prompt)
 		return
 	}
 	if !w.mark(in.id, "submitted") {
@@ -1623,6 +1625,14 @@ func (w *worker) dispatch() {
 }
 
 func (w *worker) enqueuePrompt(in incoming, text string) {
+	w.enqueuePreparedPrompt(in, preparePromptText(in.msg, text), text)
+}
+
+func (w *worker) enqueueReviewPrompt(in incoming, review string) {
+	w.enqueuePreparedPrompt(in, prepareReviewPrompt(in.msg, review), review)
+}
+
+func (w *worker) enqueuePreparedPrompt(in incoming, prompt, displayText string) {
 	if _, err := w.ensureRuntime(); err != nil {
 		w.say(err.Error())
 		w.mark(in.id, "done")
@@ -1635,7 +1645,7 @@ func (w *worker) enqueuePrompt(in incoming, text string) {
 		}
 		return
 	}
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text})
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: prompt, displayText: displayText})
 }
 func (w *worker) logQueuedTaskComplete(inboxID int64, result string) {
 	if inboxID == 0 {

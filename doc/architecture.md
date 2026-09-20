@@ -167,6 +167,10 @@ Telegram update
 
 For ordinary root tasks, submission durably records the originating Telegram message ID before OMP accepts the prompt. Completion requires that submitted input and commits all final text parts, their persisted reply target, and the terminal inbox state in one transaction. Normal terminal output is `done`; a provider/model error is `uncertain`; an explicit OMP abort is `cancelled`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
 
+When an inbound message replies to another Telegram message, the bridge composes a separate input-only context before `prompt`: a non-empty Telegram `quote.text` wins, otherwise it uses one level of replied text, photo/document metadata and caption, caption-only content, or an unsupported marker. The complete quoted block is capped at 3000 UTF-16 code units and receives `...[truncated]` when necessary. It labels the sender only as `From: bot` or `From: user`. The current message follows under `[Current user message]` and is never truncated. The bridge never follows `ReplyToMessage` recursively, downloads or re-imports replied attachments, or changes the existing output `reply_to` target. Queue previews use the current user text rather than this synthetic wrapper.
+
+Reply context is derived only from the current Update's decoded `ReplyToMessage` and `Quote`; the durable source remains `inbox.raw`. No Telegram history lookup, extra history API request, or reply-context database column is used.
+
 A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages, attachments, and `/review` commands are canceled rather than replayed. Other pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
 
 ### Output delivery and progress cleanup

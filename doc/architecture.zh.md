@@ -167,6 +167,10 @@ Telegram update
 
 普通根任务在 OMP 接受 prompt 前, 持久化记录原始 Telegram message ID. 完成要求该输入处于 submitted, 并在同一事务中提交全部最终文本分段、其持久化 reply target 和终态 inbox 状态. 正常终结输出为 `done`; provider/model error 为 `uncertain`; 明确的 OMP abort 为 `cancelled`. 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
 
+收到的消息如果 reply 了另一条 Telegram 消息, bridge 会在调用 `prompt` 前构造只用于输入的独立上下文: 非空 Telegram `quote.text` 优先, 否则只读取一层被回复文字、photo/document metadata 和 caption、caption-only 内容或 unsupported 标记. 完整引用块最多 3000 个 UTF-16 code units, 超限时追加 `...[truncated]`. sender 只标记为 `From: bot` 或 `From: user`. 当前消息位于 `[Current user message]` 下方且不会被截断. Bridge 不递归跟随 `ReplyToMessage`, 不下载或重新导入被回复附件, 也不改变现有输出 `reply_to` target. Queue preview 显示当前用户文字, 不显示这个 synthetic wrapper.
+
+Reply context 只来自当前 Update 解码出的 `ReplyToMessage` 和 `Quote`; durable source 仍是 `inbox.raw`. 不查询 Telegram 历史, 不新增历史 API 请求, 也不增加 reply-context 数据库列.
+
 完成事务失败时停止 worker, 不伪装成任务完成. 重启时 submitted 输入转为 `uncertain`, 旧的 pending 普通消息, 附件和 `/review` 取消, 不自动重放. 其他待处理控制命令仍正常鉴权; 依赖内存状态的旧 callback token 会随状态丢失而失效.
 
 ### 输出交付与 progress 清理

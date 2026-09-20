@@ -236,6 +236,16 @@ Incoming files are stored under `.telegram/incoming/` in the selected workspace.
 
 Outgoing attachments are copied into a private delivery snapshot before being queued for Telegram delivery, so later changes to the original file do not change the queued payload.
 
+## Telegram reply context
+
+Replying to a previous Telegram message adds one level of quoted context to ordinary text, attachments, and `/review` prompts. A non-empty Telegram quote is preferred. Otherwise the bridge uses the replied text, a photo marker, a document marker with its filename, or a caption-only message. Unsupported replied messages are represented explicitly and do not block the current prompt.
+
+The context identifies the replied sender as `From: bot` or `From: user`. Replied photos and documents are described only; the bridge never downloads or re-imports historical attachments for this feature, and it does not expand a reply chain. The final Telegram response still replies to the current user message; reply context is input to OMP only.
+
+Reply context is capped at 3000 UTF-16 code units and is marked with `...[truncated]` when needed. The current user message is never truncated. `/queue` previews the current user text or attachment caption, not the synthetic OMP wrapper.
+
+Reply context is derived only from the current Update's decoded `ReplyToMessage` and `Quote`. The original update remains in `inbox.raw`; no Telegram history lookup, extra history API request, or reply-context database column is used.
+
 ## Sessions and Recovery
 
 Committed sessions survive daemon restarts.
@@ -336,7 +346,6 @@ just deploy
 
 Planned features:
 
-- Telegram reply context
 - Telegram media group / album support
 - Session export
 - Resume favorites / pinned sessions

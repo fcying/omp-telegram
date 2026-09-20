@@ -38,6 +38,12 @@ type Chat struct {
 	Type string `json:"type"`
 }
 
+type TextQuote struct {
+	Text     string `json:"text"`
+	Position int    `json:"position"`
+	IsManual bool   `json:"is_manual"`
+}
+
 type Message struct {
 	MessageID       int64       `json:"message_id"`
 	MessageThreadID int64       `json:"message_thread_id"`
@@ -48,6 +54,8 @@ type Message struct {
 	Photo           []PhotoSize `json:"photo"`
 	Document        *Document   `json:"document"`
 	MediaGroupID    string      `json:"media_group_id"`
+	ReplyToMessage  *Message    `json:"reply_to_message"`
+	Quote           *TextQuote  `json:"quote"`
 }
 
 type PhotoSize struct {

@@ -236,6 +236,16 @@ Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以
 
 输出附件会在加入 Telegram 交付队列前复制到私有 delivery snapshot, 因此源文件之后的变化不会改变已经排队的内容.
 
+## Telegram reply context
+
+回复 Telegram 历史消息后发送普通文字、附件或 `/review`, bridge 会把一层引用上下文加入 OMP prompt. Telegram 非空 quote 优先; 否则按被回复文字、photo 标记、带文件名的 document 标记或仅 caption 的消息提取. 无法识别的被回复消息会明确标记, 但不会阻止当前 prompt.
+
+上下文只标记 `From: bot` 或 `From: user`. 被回复的 photo 和 document 只作为描述, 本功能不会下载或重新导入历史附件, 也不会展开 reply chain. Telegram 最终回复仍定位到当前用户消息; reply context 只作为 OMP 输入.
+
+Reply context 最多 3000 个 UTF-16 code units, 超限时追加 `...[truncated]`. 当前用户消息不会被截断. `/queue` 显示当前用户文字或附件 caption, 不显示给 OMP 的 synthetic wrapper.
+
+Reply context 只来自当前 Update 解码出的 `ReplyToMessage` 和 `Quote`. 原始 update 保存在 `inbox.raw`; 不查询 Telegram 历史, 不新增历史 API 请求, 也不增加 reply-context 数据库列.
+
 ## Sessions and Recovery
 
 已提交的 session 会在 daemon 重启后保留.
@@ -333,7 +343,6 @@ just deploy
 ## 路线图
 
 计划功能:
-- Telegram 回复上下文
 - Telegram 媒体组 / 相册支持
 - Session 导出
 - Resume 收藏 / 置顶 session
