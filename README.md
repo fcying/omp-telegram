@@ -170,6 +170,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session open. A released session only clears queued tasks. |
+| `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List saved conversation/session bindings for this Telegram chat, including native session names when available. Pending, open, and current entries cannot be deleted; a closed entry from another topic can delete bridge metadata without deleting workspace or native OMP history. |
 | `/resume` | Choose a saved native OMP session from the current workspace. |
@@ -213,6 +214,8 @@ Supported values:
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
+`/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
+
 Progress is best-effort UI and does not affect durable final-reply delivery.
 
 Progress does not display model reasoning, raw tool arguments or results, command text, or process output.
@@ -242,7 +245,7 @@ Uncertain in-flight operations are not automatically replayed.
 Tasks that were still waiting when the daemon stopped are cancelled. Check the conversation and workspace before deciding to resend a request.
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
-- A missing OMP session file or workspace causes recovery to fail rather than creating a replacement session. If session switching fails, use `/close` followed by `/new` or `/resume`.
+- If the saved OMP session file or workspace is unavailable at startup, including a fresh session with no persisted history, recovery is skipped, the binding is kept closed, and the bridge tells you to use `/new`; it never creates a replacement session. For other session-switching failures, use `/close` followed by `/new` or `/resume`.
 - `worker.idle_timeout` may release an unused OMP process without closing the session, but only after OMP has written a recoverable session file. A fresh native session may remain connected until then. The next prompt or OMP control command resumes the same session.
 - **Send `/close` before deleting a Telegram topic.** Deleting a topic does not automatically stop its OMP session.
 
@@ -333,7 +336,6 @@ just deploy
 
 Planned features:
 
-- Bridge queue status and cancel individual pending tasks
 - Telegram reply context
 - Telegram media group / album support
 - Session export

@@ -372,7 +372,7 @@ func TestDaemonRecoverySkipsRemovedChatAuthorization(t *testing.T) {
 	}
 }
 
-func TestDaemonRecoveryMissingSessionPreservesIntent(t *testing.T) {
+func TestDaemonRecoverySkipsMissingSessionWithoutReplacement(t *testing.T) {
 	d := newRecoveryDaemon(t, 1)
 	d.command(11, "/new "+t.TempDir())
 	before := d.binding(11)
@@ -381,27 +381,30 @@ func TestDaemonRecoveryMissingSessionPreservesIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.start()
+	waitFor(t, func() bool { return !d.binding(11).Running })
+	waitFor(t, func() bool { return d.fake.has(11, "startup restore was skipped") })
+	after := d.binding(11)
+	if after.Session != before.Session || after.Workspace != before.Workspace || after.Generation != before.Generation || after.Running {
+		t.Fatalf("skipped restoration changed the saved binding: before=%+v after=%+v", before, after)
+	}
 	d.command(11, "missing-session-probe")
-	if got := d.binding(11); got != before {
-		t.Fatalf("failed restoration changed durable intent: before=%+v after=%+v", before, got)
+	if d.fake.has(11, "answer: missing-session-probe") {
+		t.Fatal("missing session silently started a replacement")
 	}
 	if _, err := os.Stat(before.Session); !os.IsNotExist(err) {
 		t.Fatalf("missing native session was recreated: %v", err)
 	}
-	if d.fake.has(11, "answer: missing-session-probe") {
-		t.Fatal("failed restoration silently started a replacement")
-	}
-	// The failed attempt must release its process slot.
+	// Closing the unavailable runtime must release the only process slot.
 	d.command(22, "/new "+t.TempDir())
 	if !d.binding(22).Running {
-		t.Fatal("failed restoration leaked the only process slot")
+		t.Fatal("skipped restoration leaked the only process slot")
 	}
 	bindings, err := d.db.RunningBindings(99)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bindings) != 2 {
-		t.Fatalf("failed restoration erased intent: %+v", bindings)
+	if len(bindings) != 1 || bindings[0].Thread != 22 {
+		t.Fatalf("skipped restoration left an ineligible binding running: %+v", bindings)
 	}
 }
 
@@ -469,5 +472,34 @@ func TestDaemonRecoveryHonorsReducedWorkerLimit(t *testing.T) {
 	d.command(33, "/resume "+blocked.SessionID)
 	if _, err := d.db.Binding(99, d.chat, 33); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("resume of a capacity-blocked logical session created a binding: %v", err)
+	}
+}
+
+func TestDaemonShutdownCancelsPendingQueue(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+	d := newRecoveryDaemon(t, 1)
+	d.command(11, "/new "+t.TempDir())
+	active := d.send(11, "wait")
+	waitFor(t, func() bool {
+		var state string
+		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", active).Scan(&state) == nil && state == "submitted"
+	})
+	queued := d.send(11, "/review queued-before-shutdown")
+	waitFor(t, func() bool {
+		var state string
+		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
+	})
+	d.stop()
+	reopened, err := store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.DB.Close()
+	var state string
+	if err := reopened.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "cancelled" {
+		t.Fatalf("pending task after daemon shutdown = %q", state)
 	}
 }

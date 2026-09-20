@@ -170,6 +170,7 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 | `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session. released session 只清空排队任务. |
+| `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 Telegram chat 的已保存 conversation/session binding, 并在可用时显示原生 session name. Pending, open 和当前对话不能删除; 其他 topic 的 closed binding 确认后可删除, 只删除 bridge metadata, 不删除 workspace 或 OMP 原生 history. |
 | `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. |
@@ -213,6 +214,8 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 
 新任务的 progress 会延迟约三秒, 因此短任务通常只发送最终回复. 活跃任务带有 **Stop** 按钮. 它只中止当前任务; `/stop` 还会清除对话中已经排队的任务, 按钮则让这些任务在取消完成后继续执行.
 
+`/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
+
 Progress 是 best-effort UI, 不影响最终回复的持久化交付.
 
 Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以及进程输出.
@@ -242,7 +245,7 @@ Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以
 daemon 停止时仍在等待的任务会取消. 决定重发前先检查聊天和 workspace.
 
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
-- OMP session 文件或 workspace 缺失时恢复失败, 不会创建替代 session. 如果 session 切换失败, 执行 `/close`, 再执行 `/new` 或 `/resume`.
+- 服务启动时如果已保存的 OMP session 文件或 workspace 不可用, 包括尚未持久化 history 的新 session, bridge 会跳过恢复并将 binding 保持为 closed, 提示使用 `/new`; 不会创建替代 session. 其他 session 切换失败时, 执行 `/close`, 再执行 `/new` 或 `/resume`.
 - `worker.idle_timeout` 可能释放空闲 OMP 进程, 但只有在 OMP 已写入可恢复的 session 文件后才会释放. 新建 native session 在此之前可能保持 connected. 下一条 prompt 或 OMP 控制命令会恢复同一个 session.
 - **删除 Telegram topic 前先发送 `/close`.** 删除 topic 不会自动停止对应的 OMP session.
 
@@ -330,7 +333,6 @@ just deploy
 ## 路线图
 
 计划功能:
-- Bridge 队列状态和单个待执行任务取消
 - Telegram 回复上下文
 - Telegram 媒体组 / 相册支持
 - Session 导出

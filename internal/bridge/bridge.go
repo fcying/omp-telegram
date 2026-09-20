@@ -238,6 +238,7 @@ const (
 var botCommands = []telegram.BotCommand{
 	{Command: "new", Description: "New session: /new <name or project path>"},
 	{Command: "stop", Description: "Stop task and clear queue"},
+	{Command: "queue", Description: "Show and cancel pending bridge tasks"},
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
 	{Command: "resume", Description: "Choose an omp session in this working directory"},
@@ -858,7 +859,7 @@ func (w *worker) run() {
 	} else if w.restoring {
 		w.start(true, w.binding.Session, w.binding.Workspace, false)
 		w.restoring = false
-		if _, connected := w.runtimeClient(); !connected && w.ctx.Err() == nil {
+		if _, connected := w.runtimeClient(); !connected && w.ctx.Err() == nil && w.binding.Running {
 			w.logRuntimeEvent(slog.LevelWarn, "restore_runtime_failed", "resume", "runtime restore failed", w.sessionID)
 		}
 	}
@@ -949,13 +950,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.resetIdleProbe()
 	w.cancelResumeList()
 	w.cancelBindingNameLookup()
-	for _, q := range w.queue {
-		if q.cancel != nil {
-			q.cancel()
-		}
-		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
-	}
-	w.queue = nil
+	w.clearQueue()
 	for id, cancel := range w.hostRequests {
 		cancel()
 		delete(w.hostRequests, id)
@@ -1028,17 +1023,29 @@ func (w *worker) failed() {
 	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
 	w.closeLogicalSession()
 }
-func (w *worker) clearQueue() {
-	for _, q := range w.queue {
+func (w *worker) cancelQueuedTask(id int64) bool {
+	for i := range w.queue {
+		if w.queue[i].id != id {
+			continue
+		}
+		q := w.queue[i]
 		if q.cancel != nil {
 			q.cancel()
 		}
 		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		w.queue = append(w.queue[:i], w.queue[i+1:]...)
 		if w.mark(q.id, "cancelled") {
 			w.logQueuedTaskComplete(q.id, "cancelled")
 		}
+		return true
 	}
-	w.queue = nil
+	return false
+}
+
+func (w *worker) clearQueue() {
+	for len(w.queue) > 0 {
+		w.cancelQueuedTask(w.queue[0].id)
+	}
 }
 
 func (w *worker) stop() {
@@ -1152,7 +1159,17 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	if resume {
 		if w.restoring {
 			info, err := os.Stat(target)
-			if !filepath.IsAbs(target) || err != nil || !info.Mode().IsRegular() || !filepath.IsAbs(expectedCWD) {
+			workspaceInfo, workspaceErr := os.Stat(expectedCWD)
+			if !filepath.IsAbs(target) || err != nil || !info.Mode().IsRegular() || !filepath.IsAbs(expectedCWD) || workspaceErr != nil || !workspaceInfo.IsDir() {
+				if !w.runtimeResuming {
+					sessionID := w.sessionID
+					if w.persistClosed() {
+						w.releaseSession()
+						w.logRuntimeEvent(slog.LevelInfo, "restore_runtime_skipped", "session_file_unavailable", "startup restore skipped", sessionID)
+						w.say("The saved omp session file or working directory is unavailable, so startup restore was skipped. Use /new to start a new session.")
+					}
+					return
+				}
 				w.say("Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session.")
 				return
 			}
@@ -1432,6 +1449,12 @@ func (w *worker) handle(in incoming) {
 		w.say("The instance is closed. The session has been preserved.")
 	case "/stop":
 		w.stop()
+	case "/queue":
+		if arg != "" {
+			w.say("Usage: /queue")
+			return
+		}
+		w.showQueue(in.msg.From.ID)
 	case "/status":
 		w.status()
 	case "/name":
@@ -1708,7 +1731,7 @@ func (w *worker) finish() {
 		w.busy = false
 		w.preview = ""
 		w.stream.Reset()
-		w.clearConfirmations()
+		w.clearTaskConfirmations()
 	} else if w.preview != "" {
 		w.say(w.preview)
 	}
@@ -1769,7 +1792,7 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.lastAssistant = nil
 	w.finalAssistantTexts = nil
 	w.stream.Reset()
-	w.clearConfirmations()
+	w.clearTaskConfirmations()
 	if w.previewBusy {
 		w.finishing = true
 		return true
@@ -2333,6 +2356,51 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	c.messageID = message.MessageID
 	w.confirms[token] = c
 }
+func (w *worker) queueCallback(ctx context.Context, q *telegram.CallbackQuery, token, action string, c confirmation) callbackResult {
+	if (!c.expires.IsZero() && time.Now().After(c.expires)) || c.generation != w.conversationGeneration() || q.Message == nil || q.Message.MessageID != c.messageID {
+		delete(w.confirms, token)
+		if q.Message != nil && q.Message.MessageID == c.messageID {
+			w.clearKeyboard(c.messageID)
+		}
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return callbackDone
+	}
+	switch {
+	case action == "close":
+		delete(w.confirms, token)
+		w.clearKeyboard(c.messageID)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Closed")
+	case action == "previous":
+		delete(w.confirms, token)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+		w.showQueuePage(c, c.page-1, c.messageID)
+	case action == "next":
+		delete(w.confirms, token)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+		w.showQueuePage(c, c.page+1, c.messageID)
+	case strings.HasPrefix(action, "cancel:"):
+		id, err := strconv.ParseInt(strings.TrimPrefix(action, "cancel:"), 10, 64)
+		if err != nil || id <= 0 {
+			delete(w.confirms, token)
+			w.clearKeyboard(c.messageID)
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			return callbackDone
+		}
+		delete(w.confirms, token)
+		if w.cancelQueuedTask(id) {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Cancelled queued task.")
+		} else {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Task is no longer queued.")
+		}
+		w.showQueuePage(c, c.page, c.messageID)
+	default:
+		delete(w.confirms, token)
+		w.clearKeyboard(c.messageID)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+	}
+	return callbackDone
+}
+
 func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
@@ -2348,6 +2416,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	if c.user != q.From.ID {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
+	}
+	if c.action == "queue" {
+		return w.queueCallback(ctx, q, token, index, c)
 	}
 	if c.action == "bindings" || c.action == "binding_delete" {
 		return w.bindingCallback(ctx, q, token, index, c)
@@ -2571,6 +2642,15 @@ func (w *worker) dropConfirmation(token string, c confirmation) {
 
 func (w *worker) clearConfirmations() {
 	for token, c := range w.confirms {
+		w.dropConfirmation(token, c)
+	}
+}
+
+func (w *worker) clearTaskConfirmations() {
+	for token, c := range w.confirms {
+		if c.action == "queue" {
+			continue
+		}
 		w.dropConfirmation(token, c)
 	}
 }

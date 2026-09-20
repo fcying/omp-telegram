@@ -22,7 +22,10 @@ type bindingNamesResult struct {
 	names      map[string]string
 }
 
-const bindingPageSize = 6
+const (
+	bindingPageSize = 6
+	queuePageSize   = 6
+)
 
 func (w *worker) conversationGeneration() int64 {
 	if w.startIntent != nil {
@@ -258,6 +261,90 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 	}
 	if err != nil {
 		w.say("Failed to display saved bindings. Use /bindings to try again.")
+		return
+	}
+	c.messageID = messageID
+	if w.confirms == nil {
+		w.confirms = make(map[string]confirmation)
+	}
+	w.confirms[token] = c
+}
+
+func (w *worker) showQueue(user int64) {
+	w.showQueuePage(confirmation{action: "queue", user: user}, 0, 0)
+}
+
+func queueTaskText(q queued) string {
+	if q.preparing {
+		return "Preparing attachment..."
+	}
+	if text := menuText(q.text, 80); text != "" {
+		return text
+	}
+	return "Queued task"
+}
+
+func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
+	pages := (len(w.queue) + queuePageSize - 1) / queuePageSize
+	if pages == 0 {
+		pages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= pages {
+		page = pages - 1
+	}
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		w.say("Cannot create the queue menu.")
+		return
+	}
+	token := hex.EncodeToString(random[:])
+	c.action = "queue"
+	c.page = page
+	c.expires = time.Now().Add(2 * time.Minute)
+	c.generation = w.conversationGeneration()
+	c.options = nil
+	start, end := page*queuePageSize, min((page+1)*queuePageSize, len(w.queue))
+	running := "no"
+	if w.active != 0 && w.busy {
+		running = "yes"
+	}
+	var text strings.Builder
+	fmt.Fprintf(&text, "Queue\nRunning: %s\nPending: %d\nPage %d/%d", running, len(w.queue), page+1, pages)
+	keyboard := &telegram.Keyboard{}
+	for i, q := range w.queue[start:end] {
+		if i == 0 {
+			text.WriteString("\n")
+		}
+		label := menuText(fmt.Sprintf("%d. %s", start+i+1, queueTaskText(q)), 128)
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{
+			{Text: label, Disabled: &telegram.DisabledButton{}},
+			{Text: "Cancel", CallbackData: fmt.Sprintf("%s:cancel:%d", token, q.id), Style: "danger"},
+		})
+	}
+	navigation := []telegram.Button{}
+	if page > 0 {
+		navigation = append(navigation, telegram.Button{Text: "Previous", CallbackData: token + ":previous"})
+	}
+	if page+1 < pages {
+		navigation = append(navigation, telegram.Button{Text: "Next", CallbackData: token + ":next"})
+	}
+	navigation = append(navigation, telegram.Button{Text: "Close", CallbackData: token + ":close"})
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+	var err error
+	if messageID != 0 {
+		err = w.b.tg.Edit(ctx, w.key.chat, messageID, text.String(), keyboard)
+	} else {
+		var message telegram.Message
+		message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text.String(), telegram.SendOptions{Keyboard: keyboard})
+		messageID = message.MessageID
+	}
+	if err != nil {
+		w.say("Failed to display the queue. Use /queue to try again.")
 		return
 	}
 	c.messageID = messageID
