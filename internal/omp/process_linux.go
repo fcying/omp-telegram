@@ -1,6 +1,7 @@
 package omp
 
 import (
+	"os"
 	"os/exec"
 	"runtime"
 	"syscall"
@@ -30,4 +31,9 @@ func startProcess(cmd *exec.Cmd) (<-chan error, error) {
 		return nil, err
 	}
 	return waited, nil
+}
+func killProcessGroup(process *os.Process) {
+	if process != nil {
+		_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
+	}
 }

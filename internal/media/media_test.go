@@ -103,6 +103,15 @@ func TestSnapshotBudgetsAndCancellation(t *testing.T) {
 	}
 }
 
+func TestSafeFilenameRemovesUnicodeFormattingControls(t *testing.T) {
+	for _, r := range []rune{'\u202e', '\u2028', '\u2029', '\u200d'} {
+		name := "report" + string(r) + ".txt"
+		if got := SafeFilename(name); strings.ContainsRune(got, r) {
+			t.Fatalf("SafeFilename retained formatting rune U+%04X in %q", r, got)
+		}
+	}
+}
+
 func TestImageInlineAndPreview(t *testing.T) {
 	for _, large := range []bool{false, true} {
 		var encoded bytes.Buffer

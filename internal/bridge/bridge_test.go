@@ -97,6 +97,10 @@ func TestMain(m *testing.M) {
 		runResumeListFixture()
 		os.Exit(0)
 	}
+	if len(os.Args) > 1 && os.Args[1] == "render" {
+		runResumeRenderFixture()
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
 		out := json.NewEncoder(os.Stdout)
 		emit := func(v any) {
@@ -105,7 +109,8 @@ func TestMain(m *testing.M) {
 			}
 		}
 		root := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT")
-		session := filepath.Join(root, fmt.Sprintf("%08x-0000-4000-8000-%012x.jsonl", os.Getpid(), os.Getpid()))
+		sessionID := fmt.Sprintf("%08x-0000-4000-8000-%012x", os.Getpid(), os.Getpid())
+		session := filepath.Join(root, sessionID+".jsonl")
 		var resume string
 		for i, arg := range os.Args {
 			if arg == "--resume" && i+1 < len(os.Args) {
@@ -146,12 +151,12 @@ func TestMain(m *testing.M) {
 			if err != nil {
 				os.Exit(2)
 			}
-			data, _ := json.Marshal(map[string]string{"cwd": cwd})
+			data, _ := json.Marshal(map[string]string{"type": "session", "id": sessionID, "cwd": cwd})
 			if os.WriteFile(session, data, 0600) != nil {
 				os.Exit(2)
 			}
 		}
-		sessionID := strings.TrimSuffix(filepath.Base(session), ".jsonl")
+		sessionID = strings.TrimSuffix(filepath.Base(session), ".jsonl")
 		emit(map[string]any{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": []int{1, 2}, "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
 		streaming := false
 		modelProvider, modelID := "fixture", "safe"
@@ -532,6 +537,21 @@ func TestStartIsHiddenHelpAlias(t *testing.T) {
 	if err != nil || output.Text != commandHelp() {
 		t.Fatalf("hidden start reply = %#v, err = %v", output, err)
 	}
+}
+
+func TestQueueCommandIsVisible(t *testing.T) {
+	for _, command := range botCommands {
+		if command.Command == "queue" {
+			if !strings.Contains(command.Description, "pending") {
+				t.Fatalf("queue command description = %q", command.Description)
+			}
+			if !strings.Contains(commandHelp(), "/queue - "+command.Description) {
+				t.Fatal("queue command missing from help")
+			}
+			return
+		}
+	}
+	t.Fatal("queue command missing from Telegram menu")
 }
 func update(id, thread int64, text string) telegram.Update {
 	return telegram.Update{UpdateID: id, Message: &telegram.Message{MessageID: id, MessageThreadID: thread, From: &telegram.User{ID: 7}, Chat: telegram.Chat{ID: -10}, Text: text}}

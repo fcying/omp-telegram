@@ -96,8 +96,7 @@ func load(path, baseDir string) (Config, error) {
 	var c Config
 	raw := fileConfig{
 		Telegram: telegramFileConfig{
-			Token:        "${OMP_TELEGRAM_BOT_TOKEN}",
-			ProgressMode: "summary",
+			Token: "${OMP_TELEGRAM_BOT_TOKEN}",
 		},
 		OMP: ompFileConfig{
 			Binary: "omp",
@@ -118,6 +117,7 @@ func load(path, baseDir string) (Config, error) {
 			Format: "text",
 		},
 	}
+
 	f, err := os.Open(path)
 	var reader io.Reader
 	if err == nil {
@@ -141,7 +141,6 @@ func load(path, baseDir string) (Config, error) {
 		value *string
 	}{
 		{"telegram.token", &raw.Telegram.Token},
-		{"telegram.progress_mode", &raw.Telegram.ProgressMode},
 		{"omp.binary", &raw.OMP.Binary},
 		{"storage.data_dir", &raw.Storage.DataDir},
 		{"logging.level", &raw.Logging.Level},
@@ -153,6 +152,12 @@ func load(path, baseDir string) (Config, error) {
 		}
 		*field.value = value
 	}
+
+	progressMode, err := expand(raw.Telegram.ProgressMode)
+	if err != nil {
+		progressMode = ""
+	}
+
 	keys := make([]string, 0, len(raw.Logging.ComponentLevels))
 	for component := range raw.Logging.ComponentLevels {
 		keys = append(keys, component)
@@ -226,11 +231,11 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("worker.max_workers, worker.queue_capacity, or storage.database_retention_days exceeds platform integer range")
 	}
 	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
-	switch raw.Telegram.ProgressMode {
+	switch progressMode {
 	case "off", "summary", "verbose":
-		c.ProgressMode = raw.Telegram.ProgressMode
+		c.ProgressMode = progressMode
 	default:
-		return c, errors.New("telegram.progress_mode must be off, summary, or verbose")
+		c.ProgressMode = "summary"
 	}
 	idleTimeout, err := parseIdleTimeout(raw.Worker.IdleTimeout, "worker.idle_timeout")
 	if err != nil {

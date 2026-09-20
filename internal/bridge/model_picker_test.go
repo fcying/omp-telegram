@@ -75,7 +75,7 @@ func TestModelPickerUsesCycleRolesAndOwner(t *testing.T) {
 }
 
 func TestModelPickerRejectsUnavailableSelection(t *testing.T) {
-	for _, scenario := range []string{"generation", "busy", "compacting", "finishing", "queued"} {
+	for _, scenario := range []string{"generation", "busy", "compacting", "finishing", "queued", "exporting"} {
 		t.Run(scenario, func(t *testing.T) {
 			w, f, command := setupWorkspaceWorker(t)
 			command("/new " + t.TempDir())
@@ -93,11 +93,14 @@ func TestModelPickerRejectsUnavailableSelection(t *testing.T) {
 				w.finishing = true
 			case "queued":
 				w.queue = []queued{{text: "pending"}}
+			case "exporting":
+				w.exportingSession = w.sessionID
 			}
 			clickKeyboard(w, 7, data)
 			assertPickerModel(t, w, "fixture", "safe")
 			assertKeyboardClears(t, f, messageID)
 			w.busy, w.compacting, w.finishing = false, false, false
+			w.exportingSession = ""
 			w.queue = nil
 			clickKeyboard(w, 7, data)
 			assertPickerModel(t, w, "fixture", "safe")

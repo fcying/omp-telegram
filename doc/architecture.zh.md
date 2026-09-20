@@ -18,8 +18,8 @@
 | [`internal/config`](../internal/config/config.go) | TOML, 环境变量引用, 路径默认值, 启动参数校验 |
 | [`internal/bridge`](../internal/bridge/bridge.go) | worker actor, 命令, prompt 队列, 预览, 最终回复和 host tool |
 | [`internal/bridge/recovery.go`](../internal/bridge/recovery.go) | 启动恢复和关闭状态持久化 |
-| [`internal/bridge/resume_picker.go`](../internal/bridge/resume_picker.go) | 原生会话列表, 带鉴权和过期控制的选择菜单 |
-| [`internal/omp`](../internal/omp/client.go) | RPC 分帧, 请求关联, 事件, 原生会话元数据及 ACP 列表 |
+| [`internal/bridge/resume_picker.go`](../internal/bridge/resume_picker.go) | 原生 session 列表, 导出任务, 带鉴权和过期控制的选择菜单 |
+| [`internal/omp`](../internal/omp/client.go) | RPC 分帧, 请求关联, 事件, 原生 session metadata, ACP 列表及原生导出委托 |
 | [`internal/telegram`](../internal/telegram/client.go) | Bot API, 附件传输, 错误脱敏及交付确定性 |
 | [`internal/media`](../internal/media/media.go) | 限定工作目录的文件处理, 图片准备和发送快照 |
 | [`internal/store`](../internal/store/store.go) | SQLite schema, 绑定, 持久化输入/输出及完成事务 |
@@ -131,9 +131,10 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 | 表 | 键 / 字段 | 用途 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
-| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | 最后一次已验证的会话绑定, 恢复资格, 最后使用时间 metadata 和活动任务中断标记 |
+| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | 最后一次已验证的 session binding, 恢复资格, 最后使用时间 metadata 和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
-| `history` | `bot,chat,thread,workspace,session,generation` | 旧绑定快照, 不是会话浏览器 |
+| `history` | `bot,chat,thread,workspace,session,generation` | 旧 binding 快照, 不是会话浏览器 |
+| `session_favorites` | 主键 `(bot,chat,thread,workspace,session_id)` | `/resume` picker 的 pinned 原生 session identity, 不保存 session 内容 |
 | `inbox` | 主键 `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | update 去重、处理状态和可选的实时进度身份 |
 | `outbox` | 自增 `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,created_at,updated_at` | 与根输入关联的文字/附件顺序交付 |
 
@@ -144,12 +145,11 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
 
 带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
-
-保留策略绝不删除 binding, history, startup intent, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `storage.data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+保留策略绝不删除 binding, history, startup intent, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `storage.data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 8. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 7 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联以及 `bindings.last_used_at` 的事务迁移后才推进 `user_version`. v8 不猜测历史使用时间, 旧 binding 的 `last_used_at` 保持为 0. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 9. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 8 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at` 以及 conversation 级 `/resume` favorites 的事务迁移后才推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -202,12 +202,75 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 workspace 的 `.telegram/incoming/` 下. 它们属于 workspace 文件, 不会被 bridge 消息 retention 删除. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. 确认送达后删除 snapshot; 失败或不确定交付会在 outbox 持有该文件, 直到终态 retention 清理. retention 只会在对应 outbox 行删除后删除 snapshot, janitor 也只会在这个私有 spool 内删除过期且无引用的 `attachment-*` 文件. 该清理不会删除 workspace 源文件.
 确认送达后的 snapshot 删除是 best-effort; 暂时无法删除的 snapshot 由 retention 和 spool janitor 后续处理.
 
+`/export` 只使用已提交 binding 的 workspace 和原生 session identity. 它不会调用 `ensureRuntime`, 修改 binding 状态, claim session, touch `last_used_at`, 或占用普通 runtime slot. 如果 selected ID 等于 committed binding 的 `session_id`, 即使 idle release 或 `/close` 之后也直接使用已保存的 `session` path; 其他 ID 通过 OMP 原生 `omp <omp.args...> render <session-id> -q -t` 命令, 使用 configured working directory 解析, 再严格校验返回的第一条 `session  <absolute-path>` diagnostic line 及持久化 session header. 如果 `omp.args` 或 `PI_CODING_AGENT_SESSION_DIR` 指定 custom session directory, inactive session export 会直接拒绝, 因为 native render 不会接收这个 launch-global store override. bridge 不发现或模拟 OMP session storage 规则. raw 导出以只读且禁止跟随 symlink 的方式打开 absolute source, 再通过 `Fstat` 检查打开的文件, 使用有界的 `MaxDocumentBytes` 读取复制到私有 attachment outbox spool, fsync 后设置 `0400`, 并保留经过安全处理的 OMP basename 作为 Telegram filename. HTML 导出也先以相同的 no-follow 规则, 只把选中的 main session JSONL snapshot 到 bridge-owned 私有 spool, 再把这个稳定 snapshot 交给 OMP 原生 exporter; 不复制 companion 或 subagent transcript. HTML 生成期间监控 output 增长, 超过 `MaxDocumentBytes` 就终止并清理. 只导出 main session JSONL, 不创建 zip 或 subagent bundle.
+
 带非空 `media_group_id` 的 photo 和 document 消息由所属 worker 按 `(media_group_id,sender_id)` 聚合. 第一条成员消息立即占用一个 bridge queue slot, 同时作为 logical task 和 inbox owner; 后续成员在被消费后直接标记为 `done`, 不再进入队列. 首条消息后的 500 ms quiet period 会收集新成员, 从首条消息起最多等待 2 秒, 并使用 version fence 忽略旧 timer. 一个相册最多接受 10 个成员. 封存后按 Telegram message ID 排序, 使用带序号的文件名下载到同一个 incoming directory, 作为一次 prompt 提交并使用第一个非空 caption, 携带所有可用的 inline images. 按顺序找到的第一个带 reply context 的成员提供一次上下文, 最终 reply target 是相册第一条消息. preparation 采用 all-or-nothing: 任一成员失败都会删除 directory 和 owner queue entry, 将 owner 标记为 `failed`, 并只发送一次 album 专用提示. 没有 media group 的附件继续单消息路径. Album collection 只存在于 worker 内存中; 取消、拒绝、封存或 teardown 后会在短暂窗口内抑制迟到成员, daemon 重启时取消尚未完成的 owner, 不自动重放 album state.
 
 ## 会话生命周期
 
-`/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
-由于其他 worker 可以删除 closed binding 而不更新当前 worker 的内存, bridge 会在 session-list 结果到达时以及真正执行 picker selection 前重新检查持久化 binding generation, 并把 picker 的 generation 带入 startup transaction. `PrepareStart` 在同一事务中确认预期的旧 row 仍存在 (generation 为 0 时确认当前没有 row), 然后才插入 `startup_intents`; `DeleteClosedBinding` 使用同一事务边界, 因此要么 intent 先成功使删除失败, 要么删除先成功使该 generation 的启动失败. binding 缺失或 generation 变化时清理旧菜单, 且不能重新创建该 binding. 如果显式启动发现当前 worker 的非零 generation binding 已被删除, 会先使内存中的 confirmation 全部失效, 再允许新 binding 从 generation 1 开始.
+`/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录. Resume pin 只保存 `(bot,chat,thread,workspace,session_id)` identity metadata; pinned session 排在前面, stale pin 在 native listing 返回同一 identity 前保持隐藏. Pin 和 Unpin 是 picker 控件, 不修改原生 session 或 binding lifecycle. 显式删除 closed binding 时也会删除其 pinned metadata, 但不会触碰原生 session history.
+
+`/export` 使用 generation 和 binding identity 双重 fence 的 picker, 默认导出原生 session JSONL; `/export html` 使用同一个 picker 进行原生 HTML 渲染. `/export <session ID>` 和 `/export html <session ID>` 不列出 session, 会先校验原生 identity 和 workspace, 再直接导出指定 session. 因为列举是只读操作, 当前 worker 忙碌时仍可打开 picker. 选择当前 session 前必须等待 active task、compaction/finalization 和 queued prompt 结束; 其他 inactive 且未被 claim 的 session 可以并行导出. 每个进行中的 export 都会 reservation 选中的 session identity, 因此其他 conversation 在操作结束前不能 claim 或 export 同一 session. 导出文件作为 document 排入当前 conversation; 成功 export 只代表 durable outbox item 已创建, Telegram delivery 状态单独确认.`
+
+Session export 是 bridge control-plane operation, 不属于 OMP task queue. 原生 JSONL 数据流:
+
+```text
+/export
+  |
+  v
+读取 committed binding
+  |
+  v
+校验 workspace
+  |
+  v
+omp.ListSessions(workspace)
+  |
+  v
+Telegram session picker
+  |
+  v
+omp <omp.args...> render <session-id> -q -t -> native session path
+  |
+  v
+snapshot JSONL
+  |
+  v
+durable attachment outbox
+  |
+  v
+Telegram document
+```
+
+HTML 使用相同的 control-plane 路径, 在解析 session 后交给 OMP 原生 exporter:
+
+```text
+/export html
+  |
+  v
+读取 committed binding -> 校验 workspace -> omp.ListSessions(workspace)
+  |
+  v
+选择 session -> omp <omp.args...> render <session-id> -q -t -> bridge-owned main JSONL snapshot -> omp --export
+  |
+  v
+private HTML spool file -> durable attachment outbox -> Telegram document
+```
+
+Export 不会:
+
+- 提交 prompt;
+- 修改 session;
+- 改变 binding generation;
+- 更新 `last_used_at`;
+- 唤醒 idle runtime;
+- 占用正常 runtime slot;
+- 创建 `startup_intents` row;
+- 修改 session claim.
+
+Outbox 永远不指向原生 session 文件. Confirmed delivery 只删除 private snapshot; failed 或 uncertain delivery 遵循现有 attachment outbox 语义.
+
+`/export` 返回的原生 JSONL 可以在另一台电脑上使用: 准备对应的源码目录, 下载文件, 然后在目标项目目录执行 `omp --resume /path/to/exported-session.jsonl`. 如果记录的旧工作目录不可用, OMP 可能要求将 session re-root 到当前目录. 该导出不是项目归档, 不包含源码文件, Git 状态, 未提交文件, OMP 配置, API credentials 或 shell environment; 这些内容需要单独同步. JSONL 和 HTML 导出可能包含敏感的 conversation 和 tool 数据, 包括 prompts, responses, tool calls 和 results, 本地路径, 命令输出, 源码片段以及意外捕获的 secrets. 只应将它们发送到可信的 Telegram 对话; 用户输入 `/export` 就是明确确认.
 
 无参数 `/new` 优先沿用对话保存的工作目录. 没有历史目录时解析并使用 `storage.workspace_root` 本身, 不另建按对话划分的子目录. 数据库读取失败仍报错, 不回退默认目录. 选择同一目录的对话共享文件, 不共享原生 session 身份.
 
@@ -293,7 +356,7 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 
 桥接配置使用分组 TOML table: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]` 和可选 `[logging.component_levels]`. 根级 flat 字段, 原 `[log_component_levels]` table, 放错 table 的字段以及 flat/grouped 混合布局都会拒绝. 这是有意的 breaking cutover: 升级前必须手动迁移现有私有配置; 程序不会自动重写.
 
-环境变量在 TOML 解析后对每个字符串值只展开一次, 包括 `logging.level`、`logging.format` 以及 `[logging.component_levels]` 中的值. 组件名会先按六个支持的名称校验, 再展开覆盖值. `omp.args` 和 `storage.workspace_root` 使用的可选引用 `OMP_TELEGRAM_ARGS` 与 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置; 其他缺失引用会报错. 不读取专用日志环境变量. `logging.level` 默认 `info`, `logging.format` 默认 `text`, 组件覆盖只能使用六个固定组件名. `omp.args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 omp 自身默认值.
+环境变量在 TOML 解析后对每个字符串值只展开一次, 包括 `logging.level`、`logging.format` 以及 `[logging.component_levels]` 中的值. 组件名会先按六个支持的名称校验, 再展开覆盖值. `OMP_TELEGRAM_ARGS`、`OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 的可选引用可以未设置. 内嵌配置中的 `telegram.progress_mode` 读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空、未设置或非法时回退到 `summary`. 不读取专用日志环境变量. `logging.level` 默认 `info`, `logging.format` 默认 `text`, 组件覆盖只能使用六个固定组件名. `omp.args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 omp 自身默认值.
 
 ## 开发与发布
 

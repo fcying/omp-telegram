@@ -20,6 +20,7 @@ func configFixture(t *testing.T) (string, string) {
 	t.Setenv("BRIDGE_TEST_ROOT", root)
 	t.Setenv("BRIDGE_TEST_OMP", exe)
 	t.Setenv("BRIDGE_TEST_TOKEN", "test-secret")
+	t.Setenv("OMP_TELEGRAM_PROGRESS_MODE", "")
 	t.Setenv("OMP_TELEGRAM_ARGS", "")
 	source := `[telegram]
 token = "${BRIDGE_TEST_TOKEN}"
@@ -108,8 +109,37 @@ func TestProgressMode(t *testing.T) {
 			t.Fatalf("progress mode %q = %q, err = %v", mode, c.ProgressMode, err)
 		}
 	}
-	if _, err = loadSource(t, path, setTOMLField(source, "telegram", "progress_mode", `"detailed"`)); err == nil || !strings.Contains(err.Error(), "telegram.progress_mode") {
-		t.Fatalf("invalid progress mode error = %v", err)
+	c, err = loadSource(t, path, setTOMLField(source, "telegram", "progress_mode", `"detailed"`))
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("invalid progress mode = %q, err = %v", c.ProgressMode, err)
+	}
+	empty := setTOMLField(source, "telegram", "progress_mode", `""`)
+	c, err = loadSource(t, path, empty)
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("empty progress mode = %q, err = %v", c.ProgressMode, err)
+	}
+}
+
+func TestProgressModeEnvironmentReference(t *testing.T) {
+	path, source := configFixture(t)
+	source = setTOMLField(source, "telegram", "progress_mode", `"$OMP_TELEGRAM_PROGRESS_MODE"`)
+	for _, tc := range []struct {
+		name        string
+		environment string
+		want        string
+	}{
+		{name: "verbose", environment: "verbose", want: "verbose"},
+		{name: "off", environment: "off", want: "off"},
+		{name: "empty", environment: "", want: "summary"},
+		{name: "invalid", environment: "invalid", want: "summary"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OMP_TELEGRAM_PROGRESS_MODE", tc.environment)
+			c, err := loadSource(t, path, source)
+			if err != nil || c.ProgressMode != tc.want {
+				t.Fatalf("progress mode = %q, want %q, err = %v", c.ProgressMode, tc.want, err)
+			}
+		})
 	}
 }
 
@@ -123,22 +153,27 @@ func TestProgressModeEnvironmentExpansion(t *testing.T) {
 	}
 	t.Setenv("BRIDGE_TEST_PROGRESS", "${BRIDGE_TEST_SECOND_PROGRESS}")
 	t.Setenv("BRIDGE_TEST_SECOND_PROGRESS", "off")
-	if _, err := loadSource(t, path, configured); err == nil {
-		t.Fatal("progress mode was recursively expanded")
+	c, err = loadSource(t, path, configured)
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("nested progress mode = %q, err = %v", c.ProgressMode, err)
 	}
 	t.Setenv("BRIDGE_TEST_PROGRESS", "summary")
-	if _, err := loadSource(t, path, setTOMLField(source, "telegram", "progress_mode", `"$${BRIDGE_TEST_PROGRESS}"`)); err == nil {
-		t.Fatal("escaped progress reference was expanded twice")
+	escaped := setTOMLField(source, "telegram", "progress_mode", `"$${BRIDGE_TEST_PROGRESS}"`)
+	c, err = loadSource(t, path, escaped)
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("escaped progress mode = %q, err = %v", c.ProgressMode, err)
 	}
 	t.Setenv("BRIDGE_TEST_PROGRESS", "SECRET_INVALID_PROGRESS")
-	if _, err := loadSource(t, path, configured); err == nil || strings.Contains(err.Error(), "SECRET_INVALID_PROGRESS") {
-		t.Fatalf("invalid progress mode was accepted or exposed: %v", err)
+	c, err = loadSource(t, path, configured)
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("invalid expanded progress mode = %q, err = %v", c.ProgressMode, err)
 	}
 	if err := os.Unsetenv("BRIDGE_TEST_PROGRESS"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadSource(t, path, configured); err == nil {
-		t.Fatal("unset progress mode reference was accepted")
+	c, err = loadSource(t, path, configured)
+	if err != nil || c.ProgressMode != "summary" {
+		t.Fatalf("missing progress mode = %q, err = %v", c.ProgressMode, err)
 	}
 }
 
@@ -558,6 +593,7 @@ func TestBundledConfigFallback(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_ALLOWED_CHATS", "-10")
 	t.Setenv("OMP_TELEGRAM_ARGS", "")
 	t.Setenv("OMP_TELEGRAM_WORKSPACE_ROOT", "")
+	t.Setenv("OMP_TELEGRAM_PROGRESS_MODE", "verbose")
 	// Config loading only needs an executable lookup, not a running omp.
 	if err := os.WriteFile(filepath.Join(base, "omp"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
 		t.Fatal(err)
@@ -569,6 +605,9 @@ func TestBundledConfigFallback(t *testing.T) {
 	}
 	if !c.Authorized(7, -10) || c.Authorized(8, -10) || c.DataDir != base || c.WorkspaceRoot != filepath.Join(base, "workspace") {
 		t.Fatal("bundled config lost authorization or executable-relative paths")
+	}
+	if c.ProgressMode != "verbose" {
+		t.Fatalf("bundled config ignored progress mode environment: %q", c.ProgressMode)
 	}
 	path := filepath.Join(base, "config.toml")
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {

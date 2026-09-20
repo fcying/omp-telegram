@@ -82,13 +82,41 @@ func runResumeListFixture() {
 	}
 }
 
+func runResumeRenderFixture() {
+	if len(os.Args) < 5 || os.Args[1] != "render" || os.Args[3] != "-q" || os.Args[4] != "-t" {
+		os.Exit(2)
+	}
+	requested := strings.ToLower(os.Args[2])
+	root := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT")
+	if marker := os.Getenv("OMP_TELEGRAM_FIXTURE_RENDER_MARKER"); marker != "" {
+		if err := os.WriteFile(marker, []byte("render\n"), 0600); err != nil {
+			os.Exit(2)
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		os.Exit(2)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".jsonl") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		if strings.HasPrefix(strings.ToLower(id), requested) {
+			fmt.Fprintf(os.Stderr, "session  %s\nopen  fixture\n", filepath.Join(root, entry.Name()))
+			return
+		}
+	}
+	os.Exit(2)
+}
+
 func setResumeFixtures(t *testing.T, cwd string, count int) []resumeFixtureSession {
 	t.Helper()
 	sessions := make([]resumeFixtureSession, 0, count+1)
 	for i := range count {
 		s := resumeFixtureSession{ID: fmt.Sprintf("abcd%04x-0000-4000-8000-%012x", i, i), CWD: cwd, Title: fmt.Sprintf("native-choice-%02d", i), UpdatedAt: fmt.Sprintf("2026-09-%02dT12:00:00Z", 20-i)}
 		sessions = append(sessions, s)
-		data, err := json.Marshal(map[string]string{"cwd": cwd})
+		data, err := json.Marshal(map[string]string{"type": "session", "id": s.ID, "cwd": cwd})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -118,7 +146,7 @@ func finishResumeList(t *testing.T, w *worker) resumeListResult {
 	}
 }
 
-func resumeButtons(t *testing.T, f *fakeHTTP) []map[string]any {
+func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -141,6 +169,20 @@ func resumeButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 	}
 	t.Fatal("session picker keyboard missing")
 	return nil
+}
+
+func resumeButtons(t *testing.T, f *fakeHTTP) []map[string]any {
+	t.Helper()
+	buttons := pickerButtons(t, f)
+	filtered := buttons[:0]
+	for _, button := range buttons {
+		label, _ := button["text"].(string)
+		if label == "Pin" || label == "Unpin" {
+			continue
+		}
+		filtered = append(filtered, button)
+	}
+	return filtered
 }
 
 func clickResume(w *worker, user int64, data string) {
@@ -185,6 +227,77 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 		if strings.Contains(string(data), "foreign-directory-choice") {
 			t.Fatal("picker exposed a session from another directory")
 		}
+	}
+}
+
+func TestResumePickerPinsAndSortsSessions(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	before := w.binding
+	sessions := setResumeFixtures(t, before.Workspace, 3)
+	requireStoreOK(t, w.b.db.SetPinnedSession(w.b.bot.ID, w.key.chat, w.key.thread, before.Workspace, sessions[1].ID, true))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	buttons := pickerButtons(t, f)
+	if !strings.Contains(buttons[0]["text"].(string), sessions[1].Title) || buttons[1]["text"] != "Unpin" {
+		t.Fatalf("pinned session was not first: %v", buttons[:2])
+	}
+	clickResume(w, 7, buttons[1]["callback_data"].(string))
+	if !sameBindingIdentity(w.binding, before) {
+		t.Fatal("pin toggle changed the active session")
+	}
+	pinned, err := w.b.db.PinnedSessions(w.b.bot.ID, w.key.chat, w.key.thread, before.Workspace)
+	requireStoreOK(t, err)
+	if len(pinned) != 0 {
+		t.Fatalf("unpin left favorites: %+v", pinned)
+	}
+	buttons = pickerButtons(t, f)
+	if !strings.Contains(buttons[0]["text"].(string), sessions[0].Title) || buttons[1]["text"] != "Pin" {
+		t.Fatalf("native order was not restored after unpin: %v", buttons[:2])
+	}
+	var pinData string
+	for i, button := range buttons {
+		if strings.Contains(button["text"].(string), sessions[2].Title) && i+1 < len(buttons) {
+			pinData = buttons[i+1]["callback_data"].(string)
+			break
+		}
+	}
+	if pinData == "" {
+		t.Fatal("session pin button missing")
+	}
+	clickResume(w, 7, pinData)
+	if !sameBindingIdentity(w.binding, before) {
+		t.Fatal("pin toggle changed the active session")
+	}
+	pinned, err = w.b.db.PinnedSessions(w.b.bot.ID, w.key.chat, w.key.thread, before.Workspace)
+	requireStoreOK(t, err)
+	if _, ok := pinned[strings.ToLower(sessions[2].ID)]; !ok || len(pinned) != 1 {
+		t.Fatalf("pinned session state = %+v", pinned)
+	}
+	buttons = pickerButtons(t, f)
+	if !strings.Contains(buttons[0]["text"].(string), sessions[2].Title) || buttons[1]["text"] != "Unpin" {
+		t.Fatalf("newly pinned session was not promoted: %v", buttons[:2])
+	}
+}
+
+func TestResumePickerPinRejectsDeletedPersistedBinding(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	command("/close")
+	generation := w.binding.Generation
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	buttons := pickerButtons(t, f)
+	deleted, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, generation)
+	if err != nil || !deleted {
+		t.Fatalf("test binding deletion = %t, error %v", deleted, err)
+	}
+	clickResume(w, 7, buttons[1]["callback_data"].(string))
+	pinned, err := w.b.db.PinnedSessions(w.b.bot.ID, w.key.chat, w.key.thread, w.binding.Workspace)
+	requireStoreOK(t, err)
+	if len(pinned) != 0 {
+		t.Fatalf("stale pin callback changed favorites: %+v", pinned)
 	}
 }
 
@@ -428,5 +541,33 @@ func TestResumePickerRefusesAnotherTopicsActiveSession(t *testing.T) {
 	clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
 	if w.client != client || !sameBindingIdentity(w.binding, before) || other.client != otherClient || !sameBindingIdentity(other.binding, otherBinding) {
 		t.Fatal("selection of an owned session interrupted a topic or opened it concurrently")
+	}
+}
+
+func TestExportPickerRejectsCallbackFromDifferentMessage(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/export")
+	w.resumeListed(finishResumeList(t, w))
+	data := resumeButtons(t, f)[0]["callback_data"].(string)
+	before := w.binding
+	w.callback(&telegram.CallbackQuery{ID: "stale-export-picker", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: 999}, Data: data})
+	if len(w.confirms) != 0 || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("export callback from another message remained actionable")
+	}
+}
+
+func TestExportPickerRejectsGenerationChange(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/export")
+	w.resumeListed(finishResumeList(t, w))
+	data := resumeButtons(t, f)[0]["callback_data"].(string)
+	w.binding.Generation++
+	clickResume(w, 7, data)
+	if len(w.confirms) != 0 || w.exportCancel != nil {
+		t.Fatal("generation-stale export picker remained actionable")
 	}
 }

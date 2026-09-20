@@ -18,8 +18,8 @@ The deployment model is one bot per database and one worker per conversation: an
 | [`internal/config`](../internal/config/config.go) | TOML, environment references, path defaults, startup-argument validation |
 | [`internal/bridge`](../internal/bridge/bridge.go) | Worker actors, commands, prompt queues, previews, final replies, host tools |
 | [`internal/bridge/recovery.go`](../internal/bridge/recovery.go) | Startup restoration and persisted close state |
-| [`internal/bridge/resume_picker.go`](../internal/bridge/resume_picker.go) | Native session listing and authorized, expiring selection menus |
-| [`internal/omp`](../internal/omp/client.go) | RPC framing, request correlation, events, native session metadata and ACP listing |
+| [`internal/bridge/resume_picker.go`](../internal/bridge/resume_picker.go) | Native session listing, export jobs, and authorized, expiring selection menus |
+| [`internal/omp`](../internal/omp/client.go) | RPC framing, request correlation, events, native session metadata, ACP listing, and native export delegation |
 | [`internal/telegram`](../internal/telegram/client.go) | Bot API, attachment transport, sanitized errors and delivery certainty |
 | [`internal/media`](../internal/media/media.go) | Workspace-confined file handling, image preparation and outgoing snapshots |
 | [`internal/store`](../internal/store/store.go) | SQLite schema, bindings, durable input/output and completion transactions |
@@ -134,6 +134,7 @@ The database is `omp-telegram.db` under `storage.data_dir`. It uses WAL, a busy 
 | `bindings` | PK `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | Last validated session binding, restoration eligibility, last-use metadata, and active-task interruption marker |
 | `startup_intents` | PK `(bot,chat,thread)`; `kind,workspace,session,generation` | Durable uncommitted `/new` or `/resume` transition |
 | `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots, not a session browser |
+| `session_favorites` | PK `(bot,chat,thread,workspace,session_id)` | Pinned native session identities for the `/resume` picker; no session content |
 | `inbox` | PK `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | Update deduplication, processing state, and optional live-progress identity |
 | `outbox` | Autoincrement `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,created_at,updated_at` | Ordered text/attachment delivery associated with its root input |
 
@@ -144,12 +145,11 @@ The database is `omp-telegram.db` under `storage.data_dir`. It uses WAL, a busy 
 Only explicitly enumerated terminal states are eligible: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, legacy `sent`, `failed`, `uncertain`, `cancelled`. Inbox `pending`/`submitted` and outbox `pending`/`sending` remain durable. Deletion uses committed batches of 1000 rows; the service never automatically runs `VACUUM`.
 
 Terminal inbox rows with a nonzero `progress_message_id`, and their associated outbox rows, remain outside retention cleanup until the Telegram progress deletion succeeds, a confirmed non-retryable rejection clears the association, or the retention cutoff is reached with no associated `pending` or `sending` outbox work. The last case clears only the local association and does not call Telegram Delete.
-
-Retention never deletes bindings, history, startup intents, workspaces, omp session files, or other omp data. Terminal outbox attachment snapshots become unowned after their corresponding delete commits and are removed best-effort only when confined to `storage.data_dir/attachments/outbox/`. Each janitor run also removes unreferenced `attachment-*` snapshots in that private spool once their file modification time exceeds the retention cutoff.
+Retention never deletes bindings, history, startup intents, session favorites, workspaces, omp session files, or other omp data. Terminal outbox attachment snapshots become unowned after their corresponding delete commits and are removed best-effort only when confined to `storage.data_dir/attachments/outbox/`. Each janitor run also removes unreferenced `attachment-*` snapshots in that private spool once their file modification time exceeds the retention cutoff.
 
 ### Schema version
 
-`PRAGMA user_version` is the schema version, currently 8. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 7 migrate transactionally through `startup_intents`, the binding interruption marker, message timestamps, reply targets, native session IDs, inbox/outbox progress associations, and `bindings.last_used_at` before advancing `user_version`. The v8 migration leaves existing `last_used_at` values at zero; it never guesses historical use time. Application versions and database versions evolve independently.
+`PRAGMA user_version` is the schema version, currently 9. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 8 migrate transactionally through `startup_intents`, the binding interruption marker, message timestamps, reply targets, native session IDs, inbox/outbox progress associations, `bindings.last_used_at`, and per-conversation `/resume` favorites before advancing `user_version`. The v8 migration leaves existing `last_used_at` values at zero; it never guesses historical use time. Application versions and database versions evolve independently.
 
 ### Input and completion transactions
 
@@ -199,15 +199,78 @@ Each progress preview is associated with its root inbox, and every final outbox 
 
 ### Attachment lifecycle
 
-Incoming Telegram attachments are downloaded only after authorization and remain under the selected workspace's `.telegram/incoming/` directory. They are workspace files and are not removed by bridge message retention. Outgoing `telegram_send` files must be regular files inside the active workspace. The bridge copies each file into a private `storage.data_dir/attachments/outbox/` snapshot before enqueueing it, so delivery is independent of later changes to the source file. A confirmed delivery removes the snapshot; failed or uncertain delivery leaves it owned by the outbox until terminal retention cleanup. Retention removes snapshots only after the corresponding outbox row is deleted, and the janitor removes old unreferenced `attachment-*` files only inside that private spool. Source workspace files are never removed by this cleanup.
+Incoming Telegram attachments are downloaded only after authorization and remain under the selected workspace's `.telegram/incoming/` directory. They are workspace files and are not removed by bridge message retention. Outgoing `telegram_send` files must be regular files inside the active workspace. The bridge copies each file into a private `storage.data_dir/attachments/outbox/` snapshot before enqueueing it, so delivery is independent of later changes to the source file. A confirmed delivery removes the snapshot; failed or uncertain delivery leaves it owned by the outbox until terminal retention cleanup. Retention removes snapshots only after the corresponding outbox row is deleted, and the janitor removes old unreferenced `attachment-*` files only inside the private spool.
 Snapshot removal after confirmed delivery is best-effort; retention and the spool janitor handle snapshots that cannot be removed immediately.
+
+`/export` uses only the committed binding workspace and native session identity. It never calls `ensureRuntime`, changes binding state, claims a session, touches `last_used_at`, or consumes the normal runtime slot. If the selected ID is the committed binding's `session_id`, export uses the committed `session` path directly, including after idle release or `/close`; other IDs are resolved by OMP's native `omp <omp.args...> render <session-id> -q -t` command with the configured working directory, then validated against the returned first `session  <absolute-path>` diagnostic line and the persisted session header. Inactive-session export is rejected when `omp.args` or `PI_CODING_AGENT_SESSION_DIR` selects a custom session directory, because native render does not receive that launch-global store override. The bridge does not discover or emulate OMP session storage rules. Raw export opens the absolute source read-only with no-follow semantics, checks it against `Fstat`, copies it with a bounded `MaxDocumentBytes` limit into the private attachment outbox spool, fsyncs it, sets mode `0400`, and preserves a sanitized OMP basename as the Telegram filename. HTML export first makes the same no-follow stable snapshot of only the selected main JSONL, then passes that bridge-owned snapshot to OMP's native exporter; companion and subagent transcript files are not copied. HTML output is monitored during generation and is removed when it exceeds `MaxDocumentBytes`. Only the main session JSONL is exported; the bridge does not create zips or subagent bundles.
 
 Photo and document messages with a non-empty `media_group_id` are collected in the owning worker by `(media_group_id,sender_id)`. The first member immediately reserves one bridge queue slot and owns the logical task and inbox; later members are marked `done` as consumed continuations and never enter the queue. A 500 ms quiet-period timer, capped at 2 seconds from the first member, seals the ordered group with a version fence. An album accepts at most 10 members. The sealed members are sorted by Telegram message ID, downloaded into one incoming directory with indexed filenames, and submitted as one prompt with the first non-empty caption and all available inline images. A reply context from the first member that has one is applied once, and the final reply targets the first album message. Preparation is all-or-nothing; a member failure removes the directory and owner queue entry, marks the owner `failed`, and emits one album-specific notice. Attachments without a media group keep the existing single-message path. Album collection is worker-local transient state; cancellation, rejection, sealing, and teardown suppress late members for a short window, and daemon restart cancels unfinished owners without replaying album state.
 
 ## Session lifecycle
 
-`/new` resolves a working directory and, when replacing a live instance, requires confirmation. `/new <name or path>`, `/resume`, and the other existing commands work in ordinary private chats and topics alike. `/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, conversation, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory.
-Because another worker can delete a closed binding without updating this worker's memory, the bridge rechecks the persisted binding generation when a session-list result arrives and immediately before executing a picker selection, then carries that picker generation into the startup transaction. `PrepareStart` verifies inside the same transaction that the expected previous row still exists (or, for generation zero, that no row exists) before inserting `startup_intents`; `DeleteClosedBinding` uses the same transaction boundary, so either the intent wins and deletion is rejected or the deleted generation makes the start fail. A missing or changed row clears the old menu and cannot recreate the binding. If an explicit start observes that this worker's nonzero binding row disappeared, it invalidates in-memory confirmations before allowing a new binding to reuse generation 1.
+`/new` resolves a working directory and, when replacing a live instance, requires confirmation. `/new <name or path>`, `/resume`, and the other existing commands work in ordinary private chats and topics alike. `/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, conversation, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory. Resume pins store only `(bot,chat,thread,workspace,session_id)` identity metadata; pinned entries sort first, while stale pins simply remain hidden until native listing returns the same identity. Pin and Unpin are picker controls and do not alter native sessions or binding lifecycle. Explicit deletion of a closed binding also removes its pinned metadata without touching native session history.
+
+`/export` opens the generation- and binding-identity-fenced picker with native session JSONL as the default format; `/export html` opens the same picker for native HTML rendering. `/export <session ID>` and `/export html <session ID>` list no sessions and export the requested session directly after native identity and workspace validation. The picker may open while the current worker is busy because listing is read-only. Selecting the current session is rejected until its active task, compaction/finalization, and queued prompts finish; another inactive, unclaimed session may export concurrently. Each in-flight export reserves its selected session identity, so another conversation cannot claim or export that session until the operation finishes. Export delivery is queued to the current conversation as a document; successful export only means that a durable outbox item was created, while Telegram delivery is confirmed separately.`
+
+Session export is a bridge control-plane operation, not an OMP task-queue item. The native JSONL path is:
+
+```text
+/export
+  |
+  v
+read committed binding
+  |
+  v
+validate workspace
+  |
+  v
+omp.ListSessions(workspace)
+  |
+  v
+Telegram session picker
+  |
+  v
+omp <omp.args...> render <session-id> -q -t -> native session path
+  |
+  v
+snapshot JSONL
+  |
+  v
+durable attachment outbox
+  |
+  v
+Telegram document
+```
+
+HTML follows the same control-plane path until session resolution, then delegates rendering to the native exporter:
+
+```text
+/export html
+  |
+  v
+read committed binding -> validate workspace -> omp.ListSessions(workspace)
+  |
+  v
+select session -> omp <omp.args...> render <session-id> -q -t -> bridge-owned main JSONL snapshot -> omp --export
+  |
+  v
+private HTML spool file -> durable attachment outbox -> Telegram document
+```
+
+Export does not:
+
+- submit a prompt;
+- mutate the session;
+- change binding generation;
+- update `last_used_at`;
+- wake an idle runtime;
+- consume a normal runtime slot;
+- create a `startup_intents` row;
+- mutate session claims.
+
+The outbox never points at the original native session file. Confirmed delivery removes only the private snapshot; failed or uncertain delivery follows the existing attachment outbox semantics.
+
+The native JSONL returned by `/export` can be used on another computer by preparing the corresponding source directory, downloading the file, and running `omp --resume /path/to/exported-session.jsonl` in the target project directory. If the recorded old working directory is unavailable, OMP may require re-rooting the session to the current directory. The export is not a project archive and does not include source files, Git state, uncommitted files, OMP configuration, API credentials, or the shell environment; synchronize those separately. JSONL and HTML exports may contain sensitive conversation and tool data, including prompts, responses, tool calls and results, local paths, command output, source snippets, and accidentally captured secrets. Send them only to trusted Telegram conversations; entering `/export` is the explicit confirmation.
 
 Without arguments, `/new` reuses the saved conversation workspace. With no saved workspace, it resolves and uses `storage.workspace_root` itself; it does not create a per-conversation subdirectory. Database read failures still fail instead of falling back. Conversations selecting the same directory share files, not native session identities.
 
@@ -292,7 +355,7 @@ The root `config.toml` is embedded once. Only an absent implicit default file se
 
 The bridge configuration uses grouped TOML tables: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]`, and optional `[logging.component_levels]`. Flat root fields, the former `[log_component_levels]` table, fields in the wrong table, and mixed flat/grouped layouts are rejected. This intentional breaking cutover requires existing private configuration files to be migrated manually before upgrade; the service does not rewrite them automatically.
 
-Environment expansion happens after TOML parsing and exactly once for every string value, including `logging.level`, `logging.format`, and values in `[logging.component_levels]`. Component names are validated against the six supported names before override values are expanded. The optional `OMP_TELEGRAM_ARGS` and `OMP_TELEGRAM_WORKSPACE_ROOT` references used by `omp.args` and `storage.workspace_root` may be unset; other missing references fail. No dedicated logging environment variables are read. `logging.level` defaults to `info`, `logging.format` to `text`, and component overrides accept only the six fixed component names. `omp.args` uses quoting-aware tokenization, not shell execution. omp's own defaults remain untouched unless explicitly configured or changed by a requested RPC command.
+Environment expansion happens after TOML parsing and exactly once for every string value, including `logging.level`, `logging.format`, and values in `[logging.component_levels]`. Component names are validated against the six supported names before override values are expanded. The optional `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` references may be unset. The bundled `telegram.progress_mode` reads `OMP_TELEGRAM_PROGRESS_MODE`; empty, missing, or invalid values fall back to `summary`. No dedicated logging environment variables are read. `logging.level` defaults to `info`, `logging.format` to `text`, and component overrides accept only the six fixed component names. `omp.args` uses quoting-aware tokenization, not shell execution. omp's own defaults remain untouched unless explicitly configured or changed through a user-requested RPC command.
 
 ## Development and release
 

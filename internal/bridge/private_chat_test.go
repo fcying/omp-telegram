@@ -131,9 +131,10 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 	})
 	buttons := resumeButtons(t, d.fake)
 	token := buttons[0]["callback_data"].(string)
+	pickerMessageID := int64(d.fake.messageCount())
 	callback := func(user int64) int64 {
 		d.nextID++
-		m := &telegram.Message{MessageID: 1, Chat: telegram.Chat{ID: 7, Type: "private"}}
+		m := &telegram.Message{MessageID: pickerMessageID, Chat: telegram.Chat{ID: 7, Type: "private"}}
 		d.fake.updates <- telegram.Update{UpdateID: d.nextID, CallbackQuery: &telegram.CallbackQuery{ID: "private-picker", From: telegram.User{ID: user}, Message: m, Data: token}}
 		return d.nextID
 	}

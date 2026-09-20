@@ -64,7 +64,7 @@ go build -o omp-telegram ./cmd/omp-telegram
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
-progress_mode = "summary"
+progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
 [omp]
 binary = "omp"
@@ -103,7 +103,7 @@ format = "text"
 
 显式指定的文件不存在, 文件不可读或 TOML 无效时, 启动都会失败. 配置必须使用上面示例中的分组 table; 旧的 flat 字段和 flat/grouped 混合布局不再接受.
 
-字符串支持 `$VAR` 和 `${VAR}`, `$$` 表示字面美元符号. TOML 解析后每个环境变量引用只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置; token 和白名单必须提供. 程序不会自动加载 `.env` 文件.
+字符串支持 `$VAR` 和 `${VAR}`, `$$` 表示字面美元符号. TOML 解析后每个环境变量引用只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置. `telegram.progress_mode` 为空或非法时回退到 `summary`. token 和白名单必须提供. 程序不会自动加载 `.env` 文件.
 
 `telegram.allowed_users` 和 `telegram.allowed_chats` 都是必填项. 只有发送者和 chat 同时命中白名单时才接受 update. 普通私聊的 chat ID 通常等于 user ID; 群组 chat ID 通常是负数.
 
@@ -113,7 +113,7 @@ format = "text"
 | --- | --- |
 | `telegram.token` | Telegram bot token. 推荐引用环境变量. |
 | `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单. 可直接填写整数, 或引用逗号分隔的环境变量值. |
-| `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认 `summary`. 见 [Progress UI](#progress-ui). |
+| `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见 [Progress UI](#progress-ui). |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | OMP 额外参数. 默认读取可选的 `OMP_TELEGRAM_ARGS`; 显式空字符串禁用额外参数. |
 | `storage.data_dir` | 数据库, lock 和待发送附件的存储目录. 默认是二进制所在目录. |
@@ -145,6 +145,8 @@ format = "text"
 export OMP_TELEGRAM_BOT_TOKEN='your-bot-token'
 export OMP_TELEGRAM_ALLOWED_USERS=123456789
 export OMP_TELEGRAM_ALLOWED_CHATS=123456789
+# 可选: off, summary 或 verbose.
+export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 ~/tool/omp-telegram/omp-telegram --check
 ~/tool/omp-telegram/omp-telegram
@@ -173,8 +175,11 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 | `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 Telegram chat 的已保存 conversation/session binding, 并在可用时显示原生 session name. Pending, open 和当前对话不能删除; 其他 topic 的 closed binding 确认后可删除, 只删除 bridge metadata, 不删除 workspace 或 OMP 原生 history. |
-| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. |
+| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 当前 conversation 和 workspace 的 pinned session 会排在前面; 每行都有 Pin 或 Unpin 按钮. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
+| `/export` | 从当前 workspace 打开原生 OMP session 导出 picker. 默认导出原始 main session JSONL; 源文件会复制到私有 attachment outbox, 保留经过安全处理的原文件名, 并受 50 MB document 限制. 当前 session 在 task 或队列活跃时会直接拒绝, 空闲后需要重新执行 `/export`. |
+| `/export html` | 打开原生 OMP HTML 导出的 picker. bridge 会先把选中的 main session JSONL snapshot 到私有 spool, 再从这个稳定 snapshot 调用原生 exporter; 不包含 companion 或 subagent transcript. 结果文件名为 `omp-session-<short-id>.html`; exporter 超时为 30 秒, 输出增长受 50 MB document 限制. |
+| `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
 | `/status` | 查看 workspace, session, model, thinking, fast, context, 活动状态, 队列和速度. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
 | `/model` | 用按钮选择 OMP 配置的 model role. |
@@ -189,6 +194,27 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 普通文字, 附件和 `/review` 都按对话排队并串行执行. 任务运行期间发送的消息会等待当前任务结束, 不会打断活动任务. 不同对话可以并行工作, 受 worker 配置上限影响.
 
 以上命令都可用于普通私聊和 topic. bot 菜单, 按钮和服务提示使用英语; 可以用任意语言提问, bridge 不翻译模型回复.
+
+### Session 导出
+
+`/export` 会列出当前 workspace 中保存的 OMP session, 并将选中的原生 `.jsonl` session 文件发送到 Telegram. 默认格式是 OMP 原始 main-session JSONL. `/export html` 则将选中的 session 导出为 standalone HTML viewer.
+
+也支持直接指定 session:
+
+```text
+/export <session-id>
+/export html <session-id>
+```
+
+要在另一台电脑上使用原生 JSONL 导出, 准备对应的源码目录, 下载文件, 然后在目标项目目录执行:
+
+```sh
+omp --resume /path/to/session.jsonl
+```
+
+如果 session 中记录的旧工作目录已经不存在, OMP 可能要求将 session re-root 到当前目录. Session 导出不包含 workspace 源码文件, 源码树, Git 状态, 未提交文件, credentials, OMP 配置或 shell environment. 项目文件需要单独通过 `git clone`, `git pull`, `scp`, `rsync` 或其他方式同步.
+
+导出的 session 文件可能包含敏感的 conversation, tool, command 和 path 数据, 包括 prompts, assistant responses, tool calls, tool results, 本地路径, 命令输出, 源码片段以及意外出现在 transcript 中的 secrets. 只应将这些文件发送到可信的 Telegram 对话. 不会额外要求二次确认; 用户输入 `/export` 本身就是明确确认.
 
 ### 常见问题与限制
 
@@ -345,8 +371,6 @@ just deploy
 ## 路线图
 
 计划功能:
-- Session 导出
-- Resume 收藏 / 置顶 session
 - `/doctor` 诊断
 
 ### 等待上游 OMP 支持

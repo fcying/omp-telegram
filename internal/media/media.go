@@ -191,11 +191,12 @@ func attachmentInfo(message telegram.Message) (id, name string, size int64) {
 	return "", "", 0
 }
 
-func safeName(name string) string {
+// SafeFilename keeps a Telegram-visible filename local, bounded, and free of control characters.
+func SafeFilename(name string) string {
 	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
 	var b strings.Builder
 	for _, r := range name {
-		if unicode.IsControl(r) || r == '/' || r == '\\' {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || r == '/' || r == '\\' {
 			r = '_'
 		}
 		if b.Len()+len(string(r)) > 160 {
@@ -208,6 +209,10 @@ func safeName(name string) string {
 		return "attachment"
 	}
 	return name
+}
+
+func safeName(name string) string {
+	return SafeFilename(name)
 }
 
 func dimensionsOK(c image.Config) bool {

@@ -45,6 +45,7 @@ type Bridge struct {
 	resumeSlots   chan struct{}
 	sessionMu     sync.Mutex
 	sessionClaims map[string]sessionClaim
+	exportClaims  map[*worker]string
 	bindingsEpoch atomic.Uint64
 }
 type incoming struct {
@@ -97,6 +98,7 @@ type albumEvent struct {
 type confirmation struct {
 	action, uiID, method string
 	workspace            string
+	exportFormat         string
 	options              []string
 	expires              time.Time
 	generation, active   int64
@@ -105,6 +107,9 @@ type confirmation struct {
 	user                 int64
 	messageID            int64
 	sessions             []omp.SessionSummary
+	nativeSessions       []omp.SessionSummary
+	pickerOptions        []resumePickerOption
+	pinnedSessions       map[string]struct{}
 	models               []omp.ModelRole
 	bindings             []store.BindingListEntry
 	deleteBot            int64
@@ -171,6 +176,10 @@ type worker struct {
 	resumeResults         chan resumeListResult
 	resumeCancel          context.CancelFunc
 	resumeRequest         uint64
+	exportResults         chan exportResult
+	exportCancel          context.CancelFunc
+	exportRequest         uint64
+	exportingSession      string
 	bindingNameResults    chan bindingNamesResult
 	bindingNameCancel     context.CancelFunc
 	bindingNameRequest    uint64
@@ -268,9 +277,10 @@ var botCommands = []telegram.BotCommand{
 	{Command: "new", Description: "New session: /new <name or project path>"},
 	{Command: "stop", Description: "Stop task and clear queue"},
 	{Command: "queue", Description: "Show and cancel pending bridge tasks"},
+	{Command: "resume", Description: "Choose or pin an omp session in this working directory"},
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
-	{Command: "resume", Description: "Choose an omp session in this working directory"},
+	{Command: "export", Description: "Export an omp session: /export [html] [session-id]"},
 	{Command: "bindings", Description: "List saved conversation/session bindings"},
 	{Command: "status", Description: "Show session, model, context, speed and queue"},
 	{Command: "name", Description: "Name the omp session: /name <title>"},
@@ -743,6 +753,10 @@ func (w *worker) touchActivity() {
 	}
 }
 
+func (w *worker) sessionControlBusy() bool {
+	return w.busy || w.compacting || w.finishing || w.exportingSession != ""
+}
+
 func (w *worker) hasRuntimeConfirmation() bool {
 	for _, c := range w.confirms {
 		switch c.action {
@@ -754,7 +768,7 @@ func (w *worker) hasRuntimeConfirmation() bool {
 }
 
 func (w *worker) idleEligible() bool {
-	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
+	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
 }
 
 func (w *worker) sessionDurable() bool {
@@ -878,7 +892,7 @@ func (w *worker) run() {
 	w.log.Info("worker started", "event", "worker_start")
 	w.initMedia()
 	w.initResumePicker()
-	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults() }()
+	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults(); w.drainExportResults() }()
 	defer func() {
 		w.teardownWorker(true)
 		w.log.Info("worker stopped", "event", "worker_stop")
@@ -960,6 +974,8 @@ func (w *worker) run() {
 			w.preparedSend(result)
 		case result := <-w.resumeResults:
 			w.resumeListed(result)
+		case result := <-w.exportResults:
+			w.exportFinished(result)
 		case result := <-w.bindingNameResults:
 			w.bindingNamesLoaded(result)
 		case result := <-w.idleProbe.results:
@@ -1180,6 +1196,10 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	}
 	if w.startIntent != nil && !w.restoring {
 		w.say("A previous session start is still uncertain. Use /close before starting another session.")
+		return
+	}
+	if w.exportCancel != nil && !w.restoring {
+		w.say("The omp session operation is still loading. Wait for the export to finish.")
 		return
 	}
 	old, e := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
@@ -1483,6 +1503,17 @@ func (w *worker) handle(in incoming) {
 		} else {
 			w.start(true, arg, "", true)
 		}
+	case "/export":
+		format, sessionID, ok := parseExportArgs(arg)
+		if !ok {
+			w.say("Usage: /export [html] [session-id].")
+			return
+		}
+		if sessionID == "" {
+			w.requestExportList(in.msg.From.ID, format)
+		} else {
+			w.requestDirectExport(in.msg.From.ID, format, sessionID)
+		}
 	case "/bindings":
 		if arg != "" {
 			w.say("Usage: /bindings")
@@ -1507,6 +1538,10 @@ func (w *worker) handle(in incoming) {
 	case "/name":
 		if arg == "" {
 			w.say("Usage: /name <session title>")
+			return
+		}
+		if w.exportingSession != "" {
+			w.say("Wait for the current session export to finish before changing its name.")
 			return
 		}
 		if _, err := w.ensureRuntime(); err != nil {
@@ -1550,7 +1585,11 @@ func (w *worker) handle(in incoming) {
 	case "/handoff":
 		w.handoff(arg)
 	case "/compact":
-		if _, err := w.ensureRuntime(); err != nil || w.busy {
+		if w.sessionControlBusy() {
+			w.say("An idle instance is required.")
+			return
+		}
+		if _, err := w.ensureRuntime(); err != nil {
 			w.say("An idle instance is required.")
 			return
 		}
@@ -1560,13 +1599,13 @@ func (w *worker) handle(in incoming) {
 	}
 }
 func (w *worker) handoff(instructions string) {
+	if w.sessionControlBusy() || len(w.queue) != 0 {
+		w.say("Wait for the current task and queue to finish before handoff.")
+		return
+	}
 	client, err := w.ensureRuntime()
 	if err != nil {
 		w.say(err.Error())
-		return
-	}
-	if w.busy || w.compacting || w.finishing || len(w.queue) != 0 {
-		w.say("Wait for the current task and queue to finish before handoff.")
 		return
 	}
 	var fields map[string]any
@@ -1622,7 +1661,7 @@ func (w *worker) status() {
 	w.say(formatRuntimeStatus(s, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)))
 }
 func (w *worker) dispatch() {
-	if w.busy || w.compacting || w.finishing || len(w.queue) == 0 {
+	if w.busy || w.compacting || w.finishing || w.exportingSession != "" || len(w.queue) == 0 {
 		return
 	}
 	if _, err := w.ensureRuntime(); err != nil || w.queue[0].preparing {
@@ -2472,6 +2511,11 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
 	}
+	if (c.action == "resume" || c.action == "export") && (q.Message == nil || q.Message.MessageID != c.messageID) {
+		delete(w.confirms, token)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return callbackDone
+	}
 	if c.action == "queue" {
 		return w.queueCallback(ctx, q, token, index, c)
 	}
@@ -2518,17 +2562,21 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
-	if c.action == "resume" {
+	if c.action == "resume" || c.action == "export" {
 		delete(w.confirms, token)
 		messageID := c.messageID
 		if messageID == 0 && q.Message != nil {
 			messageID = q.Message.MessageID
 		}
-		w.selectResume(c, n, messageID)
+		w.selectSession(c, n, messageID)
 		return callbackDone
 	}
 	delete(w.confirms, token)
 	w.clearKeyboard(c.messageID)
+	if c.action == "ui" && w.exportingSession != "" {
+		w.say("Wait for the current session export to finish.")
+		return callbackDone
+	}
 	if c.action == "ui" {
 		frame := map[string]any{"type": "extension_ui_response", "id": c.uiID}
 		if c.method == "confirm" {
@@ -2579,8 +2627,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		w.start(false, c.workspace, "", true)
 	case "compact":
+		if w.sessionControlBusy() {
+			w.say("The instance is not idle. Compaction was canceled.")
+			return callbackDone
+		}
 		client, err := w.ensureRuntime()
-		if err != nil || w.busy {
+		if err != nil {
 			w.say("The instance is not idle. Compaction was canceled.")
 			return callbackDone
 		}
@@ -2703,7 +2755,7 @@ func (w *worker) clearConfirmations() {
 
 func (w *worker) clearTaskConfirmations() {
 	for token, c := range w.confirms {
-		if c.action == "queue" {
+		if c.action == "queue" || c.action == "resume" || c.action == "export" {
 			continue
 		}
 		w.dropConfirmation(token, c)

@@ -19,12 +19,12 @@ type modelSettings struct {
 
 // modelSelectionState gates both opening a picker and consuming a selection.
 func (w *worker) modelSelectionState() (modelSettings, bool) {
-	if _, err := w.ensureRuntime(); err != nil {
-		w.say(err.Error())
+	if w.sessionControlBusy() || len(w.queue) != 0 {
+		w.say("Wait for the current task and queue to finish before changing model settings.")
 		return modelSettings{}, false
 	}
-	if w.busy || w.compacting || w.finishing || len(w.queue) != 0 {
-		w.say("Wait for the current task and queue to finish before changing model settings.")
+	if _, err := w.ensureRuntime(); err != nil {
+		w.say(err.Error())
 		return modelSettings{}, false
 	}
 	raw, err := w.call("get_state", nil)
@@ -208,6 +208,10 @@ func (w *worker) switchFast(enabled bool) {
 	w.say(fastModeText(result.Enabled, result.Active))
 }
 func (w *worker) showFastStatus() {
+	if w.sessionControlBusy() {
+		w.say("Wait for the current task and queue to finish before reading fast mode state.")
+		return
+	}
 	if _, err := w.ensureRuntime(); err != nil {
 		w.say(err.Error())
 		return

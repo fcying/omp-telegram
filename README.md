@@ -64,7 +64,7 @@ Copy [config.toml](config.toml) beside the binary, or create a configuration fil
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
-progress_mode = "summary"
+progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
 [omp]
 binary = "omp"
@@ -103,7 +103,7 @@ Configuration is selected in this order:
 
 An explicitly selected missing file, unreadable file, or invalid TOML causes startup to fail. Configuration uses the grouped tables shown above; legacy flat fields and mixed layouts are not accepted.
 
-Strings support `$VAR` and `${VAR}`. Use `$$` for a literal dollar sign. Environment references are expanded once after TOML parsing. The default references to `OMP_TELEGRAM_ARGS` and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset; the token and allowlists must be provided. `.env` files are not loaded automatically.
+Strings support `$VAR` and `${VAR}`. Use `$$` for a literal dollar sign. Environment references are expanded once after TOML parsing. The default references to `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset. An empty or invalid `telegram.progress_mode` falls back to `summary`. The token and allowlists must be provided. `.env` files are not loaded automatically.
 
 Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An update is accepted only when both the sender and chat match their allowlists. Private-chat IDs normally match the user ID; group IDs are usually negative numbers.
 
@@ -113,7 +113,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | --- | --- |
 | `telegram.token` | Telegram bot token. Prefer an environment reference. |
 | `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists. Values may be literal integers or comma-separated environment values. |
-| `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. Default: `summary`. See [Progress UI](#progress-ui). |
+| `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Additional OMP arguments. Defaults to optional `OMP_TELEGRAM_ARGS`; an explicit empty string disables them. |
 | `storage.data_dir` | Database, lock, and outgoing attachment storage. Default: the executable directory. |
@@ -145,6 +145,8 @@ Set the variables referenced by the configuration, then validate and start the s
 export OMP_TELEGRAM_BOT_TOKEN='your-bot-token'
 export OMP_TELEGRAM_ALLOWED_USERS=123456789
 export OMP_TELEGRAM_ALLOWED_CHATS=123456789
+# Optional: off, summary, or verbose.
+export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 ~/tool/omp-telegram/omp-telegram --check
 ~/tool/omp-telegram/omp-telegram
@@ -173,8 +175,11 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List saved conversation/session bindings for this Telegram chat, including native session names when available. Pending, open, and current entries cannot be deleted; a closed entry from another topic can delete bridge metadata without deleting workspace or native OMP history. |
-| `/resume` | Choose a saved native OMP session from the current workspace. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Pinned sessions for this conversation and workspace appear first; each row has a Pin or Unpin button. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
+| `/export` | Open a read-only picker for native OMP session export from the current workspace. The default format is the original main-session JSONL; the source is copied to the private attachment outbox, its filename is retained after sanitization, and the 50 MB document limit applies. Selecting the current session is rejected while its task or queue is active; run `/export` again after it becomes idle. |
+| `/export html` | Open the export picker for native OMP HTML rendering. The bridge first snapshots only the selected main-session JSONL into its private spool, then invokes the native exporter from that stable snapshot; companion or subagent transcripts are not included. The result is stored as `omp-session-<short-id>.html`; exporter timeout is 30 seconds and output growth is bounded by the 50 MB document limit. |
+| `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
 | `/status` | Show workspace, session, model, thinking, fast mode, context, activity, queue, and speed. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
 | `/model` | Choose a configured OMP model role with buttons. |
@@ -189,6 +194,27 @@ A named workspace is created when it does not exist. Existing files are not copi
 Ordinary text, attachments, and `/review` are queued per conversation and run sequentially. A message sent while another task is running waits in that conversation; it does not interrupt the active task. Different conversations can run concurrently up to the configured worker capacity.
 
 All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.
+
+### Session export
+
+`/export` lists saved OMP sessions in the current workspace and sends the selected native `.jsonl` session file to Telegram. The default format is the original OMP main-session JSONL. `/export html` exports the selected session as a standalone HTML viewer instead.
+
+Direct forms are also supported:
+
+```text
+/export <session-id>
+/export html <session-id>
+```
+
+To use a native JSONL export on another computer, prepare the corresponding source directory, download the file, and run this in the target project directory:
+
+```sh
+omp --resume /path/to/session.jsonl
+```
+
+If the old working directory recorded in the session no longer exists, OMP may ask you to re-root the session in the current directory. Session export does not include workspace source files, the source tree, Git state, uncommitted files, credentials, OMP configuration, or the shell environment. Synchronize project files separately with `git clone`, `git pull`, `scp`, `rsync`, or another method.
+
+Exported session files may contain sensitive conversation, tool, command, and path data, including prompts, assistant responses, tool calls, tool results, local paths, command output, source snippets, and secrets accidentally present in the transcript. Only send them to trusted Telegram conversations. No additional confirmation is requested; entering `/export` is the explicit user action.
 
 ### Troubleshooting and limitations
 
@@ -348,8 +374,6 @@ just deploy
 
 Planned features:
 
-- Session export
-- Resume favorites / pinned sessions
 - `/doctor` diagnostics
 
 ### Waiting for upstream OMP support

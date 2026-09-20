@@ -14,7 +14,8 @@ allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 # summary: Show assistant activity, active tools, and task state.
 # verbose: Also show recent observable tool activity.
 # Raw thinking/reasoning and unfiltered tool arguments are never sent.
-progress_mode = "summary"
+# Unset, empty, or invalid values fall back to summary.
+progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
 [omp]
 binary = "omp"

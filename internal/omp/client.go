@@ -76,7 +76,7 @@ func ValidateArgs(args []string) error {
 	for _, arg := range args {
 		name, _, _ := strings.Cut(arg, "=")
 		switch name {
-		case "--", "--mode", "--cwd", "--resume", "--session", "--continue", "--print", "--no-session":
+		case "--", "--mode", "--cwd", "--resume", "--session", "--continue", "--print", "--no-session", "--export":
 			return errors.New("omp.args cannot override RPC mode, working directory, or session lifecycle")
 		}
 		if strings.HasPrefix(arg, "-r") || strings.HasPrefix(arg, "-c") || strings.HasPrefix(arg, "-p") {

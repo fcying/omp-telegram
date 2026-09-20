@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 8
+const schemaVersion = 9
 const messageCleanupBatchSize = 1000
 
 type Store struct{ DB *sql.DB }
@@ -128,6 +128,7 @@ func initialize(db *sql.DB) error {
  CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,last_used_at INTEGER NOT NULL DEFAULT 0,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
+ CREATE TABLE session_favorites(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(bot,chat,thread,workspace,session_id));
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX idx_inbox_state ON inbox(state,id);
@@ -208,6 +209,13 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 8
+	}
+	if version == 8 {
+		_, e = tx.Exec("CREATE TABLE session_favorites(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(bot,chat,thread,workspace,session_id))")
+		if e != nil {
+			return e
+		}
+		version = 9
 	}
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
@@ -299,6 +307,73 @@ func scanBinding(scanner interface{ Scan(...any) error }) (Binding, error) {
 	var b Binding
 	err := scanner.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.LastUsedAt, &b.Running, &b.Interrupted)
 	return b, err
+}
+
+func (s *Store) PinnedSessions(bot, chat, thread int64, workspace string) (map[string]struct{}, error) {
+	rows, err := s.DB.Query("SELECT session_id FROM session_favorites WHERE bot=? AND chat=? AND thread=? AND workspace=?", bot, chat, thread, workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	pinned := make(map[string]struct{})
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			return nil, err
+		}
+		pinned[strings.ToLower(sessionID)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return pinned, nil
+}
+
+func (s *Store) SetPinnedSession(bot, chat, thread int64, workspace, sessionID string, pinned bool) error {
+	if workspace == "" || sessionID == "" {
+		return errors.New("invalid pinned session")
+	}
+	if pinned {
+		_, err := s.DB.Exec("INSERT INTO session_favorites(bot,chat,thread,workspace,session_id) VALUES(?,?,?,?,?) ON CONFLICT(bot,chat,thread,workspace,session_id) DO NOTHING", bot, chat, thread, workspace, strings.ToLower(sessionID))
+		return err
+	}
+	_, err := s.DB.Exec("DELETE FROM session_favorites WHERE bot=? AND chat=? AND thread=? AND workspace=? AND session_id=?", bot, chat, thread, workspace, strings.ToLower(sessionID))
+	return err
+}
+
+// SetPinnedSessionIfGeneration changes a favorite only while the conversation
+// still has the picker generation that produced the action.
+func (s *Store) SetPinnedSessionIfGeneration(bot, chat, thread, generation int64, workspace, sessionID string, pinned bool) (bool, error) {
+	if workspace == "" || sessionID == "" {
+		return false, errors.New("invalid pinned session")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var current int64
+	if err = tx.QueryRow("SELECT generation FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if current != generation {
+		return false, nil
+	}
+	if pinned {
+		_, err = tx.Exec("INSERT INTO session_favorites(bot,chat,thread,workspace,session_id) VALUES(?,?,?,?,?) ON CONFLICT(bot,chat,thread,workspace,session_id) DO NOTHING", bot, chat, thread, workspace, strings.ToLower(sessionID))
+	} else {
+		_, err = tx.Exec("DELETE FROM session_favorites WHERE bot=? AND chat=? AND thread=? AND workspace=? AND session_id=?", bot, chat, thread, workspace, strings.ToLower(sessionID))
+	}
+	if err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) Save(b Binding) error {
@@ -403,6 +478,9 @@ func (s *Store) DeleteClosedBinding(bot, chat, thread, generation int64) (bool, 
 		return false, nil
 	}
 	if _, err = tx.Exec("DELETE FROM history WHERE bot=? AND chat=? AND thread=?", bot, chat, thread); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec("DELETE FROM session_favorites WHERE bot=? AND chat=? AND thread=?", bot, chat, thread); err != nil {
 		return false, err
 	}
 	if err = tx.Commit(); err != nil {

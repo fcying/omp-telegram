@@ -40,6 +40,11 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	if indexCount != 1 {
 		t.Fatalf("new database progress association index count = %d, want 1", indexCount)
 	}
+	var favoriteTableCount int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='session_favorites'").Scan(&favoriteTableCount))
+	if favoriteTableCount != 1 {
+		t.Fatalf("session favorites table count = %d, want 1", favoriteTableCount)
+	}
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -811,6 +816,11 @@ PRAGMA user_version=7;`)
 	if version != schemaVersion || lastUsed != 0 {
 		t.Fatalf("v7 migration = version=%d last_used_at=%d, want version=%d and zero timestamp", version, lastUsed, schemaVersion)
 	}
+	var favoriteTableCount int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='session_favorites'").Scan(&favoriteTableCount))
+	if favoriteTableCount != 1 {
+		t.Fatalf("v7 migration did not create session favorites table")
+	}
 	binding, err := s.Binding(1, 2, 3)
 	requireStoreOK(t, err)
 	if binding.Workspace != "/workspace" || binding.Session != "/sessions/old.jsonl" || binding.Generation != 7 {
@@ -850,6 +860,7 @@ func TestTouchAndDeleteClosedBindingFenceGeneration(t *testing.T) {
 	second := first
 	second.Generation = 2
 	second.Session = "/sessions/two.jsonl"
+	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/one", "pinned-session", true))
 	requireStoreOK(t, s.Save(second))
 	changed, err := s.TouchBinding(1, 2, 3, first.Generation)
 	requireStoreOK(t, err)
@@ -884,6 +895,11 @@ func TestTouchAndDeleteClosedBindingFenceGeneration(t *testing.T) {
 	if history != 0 {
 		t.Fatalf("binding history survived deletion: %d", history)
 	}
+	pinned, err := s.PinnedSessions(1, 2, 3, "/one")
+	requireStoreOK(t, err)
+	if len(pinned) != 0 {
+		t.Fatalf("binding deletion left pinned sessions: %+v", pinned)
+	}
 	third := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/three", Session: "/sessions/three.jsonl", Generation: 3}
 	requireStoreOK(t, s.Save(third))
 	requireStoreOK(t, s.PrepareStart(third, StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/four", Generation: 4}))
@@ -894,6 +910,61 @@ func TestTouchAndDeleteClosedBindingFenceGeneration(t *testing.T) {
 	}
 	if _, err = s.Binding(1, 2, 3); err != nil {
 		t.Fatalf("pending binding disappeared: %v", err)
+	}
+}
+
+func TestPinnedSessionsAreScopedAndIdempotent(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/workspace", "ABCD-SESSION", true))
+	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/workspace", "abcd-session", true))
+	pinned, err := s.PinnedSessions(1, 2, 3, "/workspace")
+	requireStoreOK(t, err)
+	if len(pinned) != 1 {
+		t.Fatalf("duplicate pinned session rows = %d, want 1", len(pinned))
+	}
+	if _, ok := pinned["abcd-session"]; !ok {
+		t.Fatalf("pinned session identity = %+v", pinned)
+	}
+	for _, scope := range []struct {
+		bot, chat, thread int64
+		workspace         string
+	}{{1, 2, 4, "/workspace"}, {1, 2, 3, "/other"}, {2, 2, 3, "/workspace"}} {
+		scoped, err := s.PinnedSessions(scope.bot, scope.chat, scope.thread, scope.workspace)
+		requireStoreOK(t, err)
+		if len(scoped) != 0 {
+			t.Fatalf("pinned session leaked into scope %+v: %+v", scope, scoped)
+		}
+	}
+	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/workspace", "ABCD-SESSION", false))
+	pinned, err = s.PinnedSessions(1, 2, 3, "/workspace")
+	requireStoreOK(t, err)
+	if len(pinned) != 0 {
+		t.Fatalf("unpinned session remained: %+v", pinned)
+	}
+}
+
+func TestPinnedSessionGenerationFence(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/one", Generation: 1}
+	requireStoreOK(t, s.Save(first))
+	changed, err := s.SetPinnedSessionIfGeneration(1, 2, 3, 1, "/one", "abcd-session", true)
+	requireStoreOK(t, err)
+	if !changed {
+		t.Fatal("current generation did not update pinned session")
+	}
+	second := first
+	second.Generation = 2
+	second.Workspace = "/two"
+	requireStoreOK(t, s.Save(second))
+	changed, err = s.SetPinnedSessionIfGeneration(1, 2, 3, 1, "/one", "abcd-session", false)
+	requireStoreOK(t, err)
+	if changed {
+		t.Fatal("stale generation changed pinned session")
+	}
+	pinned, err := s.PinnedSessions(1, 2, 3, "/one")
+	requireStoreOK(t, err)
+	if _, ok := pinned["abcd-session"]; !ok {
+		t.Fatalf("stale generation removed pinned session: %+v", pinned)
 	}
 }
 
