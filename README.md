@@ -222,7 +222,9 @@ Progress does not display model reasoning, raw tool arguments or results, comman
 
 ## Attachments
 
-Send photos or documents with Telegram's attachment button. Add a caption describing what OMP should do. Without a caption, OMP is asked to inspect the attachment. Albums are processed as separate messages.
+Send photos or documents with Telegram's attachment button. Add a caption describing what OMP should do. Without a caption, OMP is asked to inspect the attachment. Photo and document albums are aggregated into one OMP task; the first message reserves one bridge queue slot and later members join it instead of creating separate prompts.
+
+Album members are ordered by Telegram message ID before download. An album accepts at most 10 members. The first non-empty caption is used once; if none is present, the prompt uses `Please inspect the attached files.`. A reply context from the first member that has one is added once, and the final response replies to the first album message. Preparation is all-or-nothing: a failed member download removes the whole incoming directory, removes the owner task, and emits one album failure notice. If collection is canceled, rejected, or sealed, later members for the same media group are consumed without recreating a task during a short suppression window.
 
 To receive a file, ask OMP directly, for example, "Send me the report as a file." OMP can return regular files from the current working directory. A message saying that an attachment was queued does not mean it has arrived; check the chat for the actual file.
 
@@ -346,7 +348,6 @@ just deploy
 
 Planned features:
 
-- Telegram media group / album support
 - Session export
 - Resume favorites / pinned sessions
 - `/doctor` diagnostics

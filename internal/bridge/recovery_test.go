@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -501,5 +502,48 @@ func TestDaemonShutdownCancelsPendingQueue(t *testing.T) {
 	}
 	if state != "cancelled" {
 		t.Fatalf("pending task after daemon shutdown = %q", state)
+	}
+}
+
+func TestPendingAlbumIsCancelledOnRecovery(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	owner := update(1, 11, "")
+	owner.Message.MediaGroupID = "album-recovery"
+	owner.Message.Photo = []telegram.PhotoSize{{FileID: "photo-a", Width: 8, Height: 8}}
+	member := update(2, 11, "")
+	member.Message.MediaGroupID = "album-recovery"
+	member.Message.Photo = []telegram.PhotoSize{{FileID: "photo-b", Width: 8, Height: 8}}
+	for _, u := range []telegram.Update{owner, member} {
+		raw, marshalErr := json.Marshal(u)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if err := db.Accept(u.UpdateID, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Mark(2, "done"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := testBridge(t, &Bridge{db: db, bot: telegram.User{ID: 99}, cfg: config.Config{AllowedChats: []int64{-10}}})
+	workers := make(map[target]*worker)
+	if err := b.restoreWorkers(ctx, workers); err != nil {
+		t.Fatal(err)
+	}
+	var ownerState, memberState string
+	if err := db.DB.QueryRow("SELECT state FROM inbox WHERE id=1").Scan(&ownerState); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&memberState); err != nil {
+		t.Fatal(err)
+	}
+	if ownerState != "cancelled" || memberState != "done" {
+		t.Fatalf("recovered album states = owner:%q member:%q", ownerState, memberState)
 	}
 }

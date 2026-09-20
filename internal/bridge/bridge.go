@@ -66,9 +66,32 @@ type queued struct {
 	displayText string
 	reply       *telegram.Message
 	images      []media.Image
+	albumKey    albumKey
+	album       bool
 	preparing   bool
 	cancel      context.CancelFunc
 	directory   string
+}
+
+type albumKey struct {
+	group string
+	user  int64
+}
+
+type pendingAlbum struct {
+	key       albumKey
+	ownerID   int64
+	startedAt time.Time
+	version   uint64
+	messages  []telegram.Message
+	caption   string
+	reply     *telegram.Message
+	timer     *time.Timer
+}
+
+type albumEvent struct {
+	key     albumKey
+	version uint64
 }
 
 type confirmation struct {
@@ -118,6 +141,10 @@ type worker struct {
 	compacting            bool
 	progress              progressState
 	operations            chan operationResult
+	albums                map[albumKey]*pendingAlbum
+	albumEvents           chan albumEvent
+	albumVersion          uint64
+	albumSuppressed       map[albumKey]time.Time
 	background            sync.WaitGroup
 	busy                  bool
 	awaitingContinuation  bool
@@ -925,6 +952,8 @@ func (w *worker) run() {
 					}
 				}
 			}
+		case event := <-w.albumEvents:
+			w.sealAlbum(event)
 		case result := <-w.mediaResults:
 			w.preparedMedia(result)
 		case result := <-w.sendResults:
@@ -953,6 +982,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.cancelResumeList()
 	w.cancelBindingNameLookup()
 	w.clearQueue()
+	w.clearAlbums()
 	for id, cancel := range w.hostRequests {
 		cancel()
 		delete(w.hostRequests, id)
@@ -1031,6 +1061,17 @@ func (w *worker) cancelQueuedTask(id int64) bool {
 			continue
 		}
 		q := w.queue[i]
+		if q.album {
+			if q.preparing && q.cancel == nil {
+				count := 1
+				if album, ok := w.albums[q.albumKey]; ok {
+					count = len(album.messages)
+				}
+				w.log.Info("album preparation finished", "event", "album_prepare", "inbox_id", q.id, "count", count, "result", "cancelled")
+			}
+			w.suppressAlbum(q.albumKey)
+			w.cancelAlbum(q.id)
+		}
 		if q.cancel != nil {
 			q.cancel()
 		}
@@ -1377,6 +1418,10 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	if hasAttachment {
+		if in.msg.MediaGroupID != "" {
+			w.collectAlbum(in)
+			return
+		}
 		if _, err := w.ensureRuntime(); err != nil {
 			w.say(err.Error())
 			w.mark(in.id, "done")
@@ -2678,14 +2723,16 @@ func (w *worker) clearRuntimeConfirmations() {
 }
 
 func (w *worker) expire() {
+	now := time.Now()
 	for token, c := range w.confirms {
-		if !c.expires.IsZero() && time.Now().After(c.expires) {
+		if !c.expires.IsZero() && now.After(c.expires) {
 			w.dropConfirmation(token, c)
 			if c.generation == w.binding.Generation {
 				w.cancelUI(c)
 			}
 		}
 	}
+	w.expireAlbums(now)
 }
 func split(s string, limit int) []string {
 	var out []string

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,12 +26,20 @@ var telegramSendTools = []map[string]any{{
 	}, "required": []string{"path"}, "additionalProperties": false},
 }}
 
+const (
+	albumQuietPeriod = 500 * time.Millisecond
+	albumMaxWait     = 2 * time.Second
+	maxAlbumItems    = 10
+)
+
 type mediaResult struct {
 	id, generation int64
 	workspace      string
 	input          media.Input
 	err            error
 	logger         *slog.Logger
+	album          bool
+	count          int
 }
 type sendResult struct {
 	id         string
@@ -59,11 +68,32 @@ func mediaCancellation(err error) bool {
 	return errors.Is(err, context.Canceled)
 }
 
+func albumPreparationResult(err error) string {
+	if err == nil {
+		return "done"
+	}
+	if mediaCancellation(err) {
+		return "cancelled"
+	}
+	return "failed"
+}
+
 func mediaErrorKind(err error) string {
 	if telegram.ClassifyError(err).Reason == "timeout" {
 		return "timeout"
 	}
 	return "unknown"
+}
+func (w *worker) initAlbums() {
+	if w.albums == nil {
+		w.albums = make(map[albumKey]*pendingAlbum)
+	}
+	if w.albumSuppressed == nil {
+		w.albumSuppressed = make(map[albumKey]time.Time)
+	}
+	if w.albumEvents == nil {
+		w.albumEvents = make(chan albumEvent, w.b.cfg.QueueCapacity+1)
+	}
 }
 
 func (w *worker) initMedia() {
@@ -76,22 +106,282 @@ func (w *worker) initMedia() {
 	if w.hostRequests == nil {
 		w.hostRequests = make(map[string]context.CancelFunc)
 	}
+	w.initAlbums()
 	if w.b.mediaSlots == nil {
 		w.b.mediaSlots = make(chan struct{}, 2)
 	}
 }
-
 func (w *worker) queueMedia(in incoming) {
 	w.initMedia()
-	ctx, cancel := context.WithCancel(w.ctx)
 	message := *in.msg
 	displayText := strings.TrimSpace(message.Caption)
 	if displayText == "" {
 		displayText = "Queued attachment"
 	}
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, displayText: displayText, reply: &message, preparing: true, cancel: cancel})
+	user := int64(0)
+	if message.From != nil {
+		user = message.From.ID
+	}
+	w.queue = append(w.queue, queued{id: in.id, user: user, replyTo: message.MessageID, displayText: displayText, reply: &message, preparing: true})
+	w.startMediaPreparation(in.id, []telegram.Message{message}, false)
+}
+
+func (w *worker) collectAlbum(in incoming) {
+	w.initAlbums()
+	message := *in.msg
+	user := int64(0)
+	if message.From != nil {
+		user = message.From.ID
+	}
+	key := albumKey{group: message.MediaGroupID, user: user}
+	if w.albumIsSuppressed(key) {
+		w.mark(in.id, "cancelled")
+		return
+	}
+	if album, ok := w.albums[key]; ok {
+		for _, existing := range album.messages {
+			if existing.MessageID == message.MessageID {
+				w.mark(in.id, "done")
+				return
+			}
+		}
+		if len(album.messages) >= maxAlbumItems {
+			w.rejectAlbum(album)
+			w.mark(in.id, "cancelled")
+			return
+		}
+		if !w.mark(in.id, "done") {
+			return
+		}
+		album.messages = append(album.messages, message)
+		caption := albumCaption(album.messages)
+		if strings.TrimSpace(caption) != "" {
+			album.caption = caption
+			for i := range w.queue {
+				if w.queue[i].id == album.ownerID && w.queue[i].album {
+					w.queue[i].displayText = caption
+					break
+				}
+			}
+		}
+		w.log.Info("album member collected", "event", "album_collect", "inbox_id", album.ownerID, "count", len(album.messages))
+		w.scheduleAlbum(album)
+		return
+	}
+	if _, err := w.ensureRuntime(); err != nil {
+		w.suppressAlbum(key)
+		w.say(err.Error())
+		w.mark(in.id, "done")
+		return
+	}
+	if len(w.queue) >= w.b.cfg.QueueCapacity {
+		w.suppressAlbum(key)
+		w.say("The queue is full. This album was not submitted.")
+		if w.mark(in.id, "cancelled") {
+			w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
+		}
+		return
+	}
+	displayText := strings.TrimSpace(message.Caption)
+	if displayText == "" {
+		displayText = "Queued album"
+	}
+	album := &pendingAlbum{
+		key:       key,
+		ownerID:   in.id,
+		startedAt: time.Now(),
+		messages:  []telegram.Message{message},
+		caption:   message.Caption,
+	}
+	w.albums[key] = album
+	w.queue = append(w.queue, queued{id: in.id, user: user, replyTo: message.MessageID, displayText: displayText, albumKey: key, album: true, preparing: true})
+	w.log.Info("album member collected", "event", "album_collect", "inbox_id", in.id, "count", 1)
+	w.scheduleAlbum(album)
+}
+
+func (w *worker) suppressAlbum(key albumKey) {
+	w.initAlbums()
+	now := time.Now()
+	w.expireAlbums(now)
+	w.albumSuppressed[key] = now.Add(albumMaxWait + time.Second)
+}
+
+func (w *worker) expireAlbums(now time.Time) {
+	for key, until := range w.albumSuppressed {
+		if !now.Before(until) {
+			delete(w.albumSuppressed, key)
+		}
+	}
+}
+
+func (w *worker) albumIsSuppressed(key albumKey) bool {
+	until, ok := w.albumSuppressed[key]
+	if !ok {
+		return false
+	}
+	if !time.Now().Before(until) {
+		delete(w.albumSuppressed, key)
+		return false
+	}
+	return true
+}
+
+func (w *worker) rejectAlbum(album *pendingAlbum) {
+	if album.timer != nil {
+		album.timer.Stop()
+		album.timer = nil
+	}
+	delete(w.albums, album.key)
+	w.suppressAlbum(album.key)
+	for i, q := range w.queue {
+		if q.id != album.ownerID || !q.album {
+			continue
+		}
+		if q.cancel != nil {
+			q.cancel()
+		}
+		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		w.queue = append(w.queue[:i], w.queue[i+1:]...)
+		break
+	}
+	w.mark(album.ownerID, "failed")
+	w.say("Album contains too many items.")
+	w.log.Warn("album rejected", "event", "album_rejected", "inbox_id", album.ownerID, "count", len(album.messages)+1, "reason", "too_many_items")
+}
+
+func (w *worker) scheduleAlbum(album *pendingAlbum) {
+	if album.timer != nil {
+		album.timer.Stop()
+	}
+	w.albumVersion++
+	album.version = w.albumVersion
+	version := album.version
+	key := album.key
+	ready := w.albumEvents
+	ctx := w.ctx
+	deadline := time.Now().Add(albumQuietPeriod)
+	if maxDeadline := album.startedAt.Add(albumMaxWait); maxDeadline.Before(deadline) {
+		deadline = maxDeadline
+	}
+	delay := time.Until(deadline)
+	if delay < 0 {
+		delay = 0
+	}
+	album.timer = time.AfterFunc(delay, func() {
+		select {
+		case ready <- albumEvent{key: key, version: version}:
+		case <-ctx.Done():
+		}
+	})
+}
+
+func albumCaption(messages []telegram.Message) string {
+	selected := -1
+	for i := range messages {
+		if strings.TrimSpace(messages[i].Caption) == "" {
+			continue
+		}
+		if selected < 0 || messages[i].MessageID < messages[selected].MessageID {
+			selected = i
+		}
+	}
+	if selected < 0 {
+		return ""
+	}
+	return messages[selected].Caption
+}
+
+func albumReply(messages []telegram.Message) *telegram.Message {
+	for i := range messages {
+		if formatReplyContext(extractReplyContext(&messages[i])) != "" {
+			return &messages[i]
+		}
+	}
+	return nil
+}
+
+func (w *worker) sealAlbum(result albumEvent) {
+	album, ok := w.albums[result.key]
+	if !ok || album.version != result.version {
+		return
+	}
+	if album.timer != nil {
+		album.timer.Stop()
+		album.timer = nil
+	}
+	delete(w.albums, result.key)
+	w.suppressAlbum(result.key)
+	messages := append([]telegram.Message(nil), album.messages...)
+	sort.SliceStable(messages, func(i, j int) bool {
+		return messages[i].MessageID < messages[j].MessageID
+	})
+	if len(messages) == 0 {
+		w.suppressAlbum(result.key)
+		w.mark(album.ownerID, "cancelled")
+		return
+	}
+	caption := albumCaption(messages)
+	reply := albumReply(messages)
+	index := -1
+	for i, queued := range w.queue {
+		if queued.id == album.ownerID && queued.album && queued.preparing {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		w.suppressAlbum(result.key)
+		w.mark(album.ownerID, "cancelled")
+		return
+	}
+	album.messages = messages
+	album.caption = caption
+	album.reply = reply
+	q := &w.queue[index]
+	q.replyTo = messages[0].MessageID
+	q.reply = reply
+	q.displayText = strings.TrimSpace(caption)
+	if q.displayText == "" {
+		q.displayText = "Queued album"
+	}
+	w.startMediaPreparation(album.ownerID, messages, true)
+}
+
+func (w *worker) cancelAlbum(ownerID int64) {
+	for key, album := range w.albums {
+		if album.ownerID != ownerID {
+			continue
+		}
+		if album.timer != nil {
+			album.timer.Stop()
+		}
+		delete(w.albums, key)
+		return
+	}
+}
+
+func (w *worker) clearAlbums() {
+	for key, album := range w.albums {
+		w.suppressAlbum(key)
+		if album.timer != nil {
+			album.timer.Stop()
+		}
+		delete(w.albums, key)
+	}
+}
+
+func (w *worker) startMediaPreparation(id int64, messages []telegram.Message, album bool) {
+	w.initMedia()
+	ctx, cancel := context.WithCancel(w.ctx)
+	for i := range w.queue {
+		if w.queue[i].id == id {
+			w.queue[i].cancel = cancel
+			break
+		}
+	}
+	members := append([]telegram.Message(nil), messages...)
 	workspace, generation := w.binding.Workspace, w.binding.Generation
-	mediaLogger := w.mediaTaskLogger(in.id)
+	mediaLogger := w.mediaTaskLogger(id)
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -100,12 +390,16 @@ func (w *worker) queueMedia(in incoming) {
 		var err error
 		select {
 		case w.b.mediaSlots <- struct{}{}:
-			prepared, err = media.Prepare(ctx, w.b.tg, workspace, message)
+			if album {
+				prepared, err = media.PrepareAlbum(ctx, w.b.tg, workspace, members)
+			} else {
+				prepared, err = media.Prepare(ctx, w.b.tg, workspace, members[0])
+			}
 			<-w.b.mediaSlots
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := mediaResult{id: in.id, generation: generation, workspace: workspace, input: prepared, err: err, logger: mediaLogger}
+		result := mediaResult{id: id, generation: generation, workspace: workspace, input: prepared, err: err, logger: mediaLogger, album: album, count: len(members)}
 		select {
 		case w.mediaResults <- result:
 		case <-w.ctx.Done():
@@ -155,18 +449,30 @@ func (w *worker) preparedMedia(result mediaResult) {
 		}
 	}
 	if index < 0 {
+		if result.album {
+			result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", albumPreparationResult(result.err))
+		}
 		removeIncoming(result.workspace, result.input.Directory, result.logger)
 		return
 	}
 	if result.err != nil {
+		q := w.queue[index]
+		if q.album {
+			w.suppressAlbum(q.albumKey)
+		}
+		if result.album {
+			result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", albumPreparationResult(result.err))
+		}
 		removeIncoming(result.workspace, result.input.Directory, result.logger)
 		w.queue = append(w.queue[:index], w.queue[index+1:]...)
 		w.mark(result.id, "failed")
 		if !mediaCancellation(result.err) {
 			result.logger.Warn("attachment preparation failed", "event", "prepare_failed", "error_kind", mediaErrorKind(result.err))
-		}
-		if !errors.Is(result.err, context.Canceled) {
-			w.say("Attachment could not be prepared: " + result.err.Error())
+			message := "Attachment could not be prepared: " + result.err.Error()
+			if q.album {
+				message = "Album could not be prepared: " + result.err.Error()
+			}
+			w.say(message)
 		}
 		return
 	}
@@ -177,6 +483,9 @@ func (w *worker) preparedMedia(result mediaResult) {
 	q.images = result.input.Images
 	q.directory = result.input.Directory
 	q.cancel = nil
+	if result.album {
+		result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", "done")
+	}
 }
 
 func (w *worker) hostResult(client *omp.Client, id, text string, failed bool) {

@@ -295,6 +295,9 @@ func TestMain(m *testing.M) {
 						os.Exit(2)
 					}
 					text = fmt.Sprintf("image=%dx%d; %s", cfg.Width, cfg.Height, text)
+					if len(images) > 1 {
+						text = fmt.Sprintf("images=%d; %s", len(images), text)
+					}
 				}
 				if text == "cwd" {
 					text, _ = os.Getwd()

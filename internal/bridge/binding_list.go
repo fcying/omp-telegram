@@ -276,6 +276,12 @@ func (w *worker) showQueue(user int64) {
 
 func queueTaskText(q queued) string {
 	if q.preparing {
+		if q.album {
+			if text := menuText(q.displayText, 80); text != "" {
+				return text
+			}
+			return "Queued album"
+		}
 		return "Preparing attachment..."
 	}
 	if text := menuText(q.displayText, 80); text != "" {

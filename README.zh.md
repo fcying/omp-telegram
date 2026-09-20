@@ -222,7 +222,9 @@ Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以
 
 ## 附件
 
-使用 Telegram 附件按钮发送照片或文档, 在 caption 中说明要让 OMP 做什么. 没有 caption 时, 默认请 OMP 查看附件. 相册按多条消息分别处理.
+使用 Telegram 附件按钮发送照片或文档, 在 caption 中说明要让 OMP 做什么. 没有 caption 时, 默认请 OMP 查看附件. Photo 和 document 相册会聚合为一个 OMP task; 第一条消息立即占用一个 bridge queue slot, 后续成员加入该任务而不会创建独立 prompt.
+
+相册成员会先按 Telegram message ID 排序, 再下载. 一个相册最多接受 10 个成员. 只使用一次按顺序找到的第一个非空 caption; 如果全部为空, prompt 使用 `Please inspect the attached files.`. 按顺序找到的第一个带 reply context 的成员提供一次上下文, 最终回复定位到相册第一条消息. preparation 采用 all-or-nothing: 任一成员下载失败都会删除整个 incoming directory, 删除 owner task, 并只发送一次 album 失败提示. 如果相册收集被取消、拒绝或封存, 同一 media group 的迟到成员会在短暂抑制窗口内被消费, 不会重新创建任务.
 
 需要回传文件时, 可以直接告诉 OMP, 例如: "把报告作为文件发给我". OMP 可以发送当前 workspace 中的普通文件. "附件已加入队列" 不代表已经送达, 请检查聊天中是否出现实际文件.
 
@@ -343,7 +345,6 @@ just deploy
 ## 路线图
 
 计划功能:
-- Telegram 媒体组 / 相册支持
 - Session 导出
 - Resume 收藏 / 置顶 session
 - `/doctor` 诊断
