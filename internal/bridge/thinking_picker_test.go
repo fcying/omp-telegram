@@ -40,7 +40,7 @@ func TestThinkingPickerOwnerAdjustmentAndReplay(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM outbox WHERE text LIKE 'Thinking level: high%')").Scan(&actualReply); err != nil || !actualReply {
 		t.Fatalf("adjusted thinking level was not reported: %v", err)
 	}
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("thinking change replaced the session")
 	}
 	if _, err := w.call("set_thinking_level", map[string]any{"level": "low"}); err != nil {

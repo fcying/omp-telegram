@@ -486,7 +486,7 @@ func TestBindingReplacementRollsBackHistory(t *testing.T) {
 
 func TestStartupIntentCommitsReplacementAtomically(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
-	old := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/old", Session: "/sessions/old.jsonl", Generation: 1, Running: true}
+	old := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/old", Session: "/sessions/old.jsonl", Generation: 1, LastUsedAt: 123, Running: true}
 	requireStoreOK(t, s.Save(old))
 	intent := StartIntent{Bot: old.Bot, Chat: old.Chat, Thread: old.Thread, Kind: "new", Workspace: "/workspaces/new", Generation: 2}
 	requireStoreOK(t, s.PrepareStart(old, intent))
@@ -513,9 +513,10 @@ func TestStartupIntentCommitsReplacementAtomically(t *testing.T) {
 	next := Binding{Bot: old.Bot, Chat: old.Chat, Thread: old.Thread, Workspace: intent.Workspace, Session: "/sessions/new.jsonl", Generation: intent.Generation, Running: true}
 	requireStoreOK(t, s.CommitStart(next))
 	stored, err = s.Binding(old.Bot, old.Chat, old.Thread)
-	requireStoreOK(t, err)
-	if stored != next {
-		t.Fatalf("committed binding = %+v, want %+v", stored, next)
+	expected := next
+	expected.LastUsedAt = old.LastUsedAt
+	if stored != expected {
+		t.Fatalf("committed binding = %+v, want %+v", stored, expected)
 	}
 	intents, err = s.PendingStarts(old.Bot)
 	requireStoreOK(t, err)
@@ -782,6 +783,148 @@ func TestCleanupMessagesUsesLatestStateTransitionAndBatches(t *testing.T) {
 	}
 	var state string
 	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=2502").Scan(&state))
+}
+
+func TestVersionSevenMigratesLastUsedAtWithoutChangingHistory(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+	requireStoreOK(t, err)
+	_, err = db.Exec(`CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
+CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX idx_inbox_state ON inbox(state,id);
+CREATE INDEX idx_outbox_state ON outbox(state,id);
+CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state);
+INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,running,interrupted) VALUES(1,2,3,'/workspace','/sessions/old.jsonl','old-session',7,0,0);
+INSERT INTO history(bot,chat,thread,workspace,session,generation) VALUES(1,2,3,'/previous','/sessions/previous.jsonl',6);
+PRAGMA user_version=7;`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, db.Close())
+	s := openTestStore(t, dir)
+	var version int
+	var lastUsed int64
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	requireStoreOK(t, s.DB.QueryRow("SELECT last_used_at FROM bindings WHERE bot=1 AND chat=2 AND thread=3").Scan(&lastUsed))
+	if version != schemaVersion || lastUsed != 0 {
+		t.Fatalf("v7 migration = version=%d last_used_at=%d, want version=%d and zero timestamp", version, lastUsed, schemaVersion)
+	}
+	binding, err := s.Binding(1, 2, 3)
+	requireStoreOK(t, err)
+	if binding.Workspace != "/workspace" || binding.Session != "/sessions/old.jsonl" || binding.Generation != 7 {
+		t.Fatalf("migration changed binding: %+v", binding)
+	}
+	var history int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM history WHERE bot=1 AND chat=2 AND thread=3").Scan(&history))
+	if history != 1 {
+		t.Fatalf("migration changed history row count: %d", history)
+	}
+}
+
+func TestBindingsForChatMergesPendingIntents(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	old := Binding{Bot: 1, Chat: 2, Thread: 10, Workspace: "/old", Session: "/sessions/old.jsonl", SessionID: "old-session", Generation: 3, LastUsedAt: time.Now().Add(-12 * 24 * time.Hour).Unix(), Running: true}
+	requireStoreOK(t, s.Save(old))
+	requireStoreOK(t, s.PrepareStart(old, StartIntent{Bot: 1, Chat: 2, Thread: 10, Kind: "resume", Workspace: "/old", Session: "old-session", Generation: 4}))
+	requireStoreOK(t, s.PrepareStart(Binding{Bot: 1, Chat: 2, Thread: 20}, StartIntent{Bot: 1, Chat: 2, Thread: 20, Kind: "new", Workspace: "/new", Generation: 1}))
+	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 99, Thread: 30, Workspace: "/other", Generation: 1}))
+	entries, err := s.BindingsForChat(1, 2)
+	requireStoreOK(t, err)
+	if len(entries) != 2 || entries[0].Binding == nil || entries[0].Intent == nil || entries[1].Binding != nil || entries[1].Intent == nil {
+		t.Fatalf("merged binding entries = %+v", entries)
+	}
+	if entries[0].Binding.Thread != 10 || entries[0].Intent.Kind != "resume" || entries[0].Binding.LastUsedAt != old.LastUsedAt {
+		t.Fatalf("pending resume entry = %+v", entries[0])
+	}
+	if entries[1].Intent.Thread != 20 || entries[1].Intent.Kind != "new" || entries[1].Intent.Workspace != "/new" {
+		t.Fatalf("pending new entry = %+v", entries[1])
+	}
+}
+
+func TestTouchAndDeleteClosedBindingFenceGeneration(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/one", Session: "/sessions/one.jsonl", Generation: 1}
+	requireStoreOK(t, s.Save(first))
+	second := first
+	second.Generation = 2
+	second.Session = "/sessions/two.jsonl"
+	requireStoreOK(t, s.Save(second))
+	changed, err := s.TouchBinding(1, 2, 3, first.Generation)
+	requireStoreOK(t, err)
+	if changed {
+		t.Fatal("stale generation was touched")
+	}
+	changed, err = s.TouchBinding(1, 2, 3, second.Generation)
+	requireStoreOK(t, err)
+	if !changed {
+		t.Fatal("current generation was not touched")
+	}
+	current, err := s.Binding(1, 2, 3)
+	requireStoreOK(t, err)
+	if current.LastUsedAt <= 0 {
+		t.Fatal("touch did not persist last-used timestamp")
+	}
+	deleted, err := s.DeleteClosedBinding(1, 2, 3, first.Generation)
+	requireStoreOK(t, err)
+	if deleted {
+		t.Fatal("stale generation deleted current binding")
+	}
+	deleted, err = s.DeleteClosedBinding(1, 2, 3, second.Generation)
+	requireStoreOK(t, err)
+	if !deleted {
+		t.Fatal("closed binding was not deleted")
+	}
+	if _, err = s.Binding(1, 2, 3); err != sql.ErrNoRows {
+		t.Fatalf("deleted binding lookup = %v", err)
+	}
+	var history int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM history WHERE bot=1 AND chat=2 AND thread=3").Scan(&history))
+	if history != 0 {
+		t.Fatalf("binding history survived deletion: %d", history)
+	}
+	third := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/three", Session: "/sessions/three.jsonl", Generation: 3}
+	requireStoreOK(t, s.Save(third))
+	requireStoreOK(t, s.PrepareStart(third, StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/four", Generation: 4}))
+	deleted, err = s.DeleteClosedBinding(1, 2, 3, third.Generation)
+	requireStoreOK(t, err)
+	if deleted {
+		t.Fatal("pending transition binding was deleted")
+	}
+	if _, err = s.Binding(1, 2, 3); err != nil {
+		t.Fatalf("pending binding disappeared: %v", err)
+	}
+}
+
+func TestPrepareStartRejectsDeletedClosedBinding(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	previous := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/one", Session: "/sessions/one.jsonl", Generation: 1}
+	requireStoreOK(t, s.Save(previous))
+	deleted, err := s.DeleteClosedBinding(previous.Bot, previous.Chat, previous.Thread, previous.Generation)
+	requireStoreOK(t, err)
+	if !deleted {
+		t.Fatal("closed binding was not deleted")
+	}
+	intent := StartIntent{Bot: previous.Bot, Chat: previous.Chat, Thread: previous.Thread, Kind: "resume", Workspace: previous.Workspace, Session: "old-session", Generation: 2}
+	if err = s.PrepareStart(previous, intent); err == nil {
+		t.Fatal("startup intent recreated a deleted binding")
+	}
+	intents, err := s.PendingStarts(previous.Bot)
+	requireStoreOK(t, err)
+	if len(intents) != 0 {
+		t.Fatalf("failed stale start left pending intents: %+v", intents)
+	}
+
+	first := Binding{Bot: 1, Chat: 2, Thread: 4}
+	newIntent := StartIntent{Bot: first.Bot, Chat: first.Chat, Thread: first.Thread, Kind: "new", Workspace: "/new", Generation: 1}
+	requireStoreOK(t, s.PrepareStart(first, newIntent))
+
+	existing := Binding{Bot: 1, Chat: 2, Thread: 5, Generation: 1}
+	requireStoreOK(t, s.Save(existing))
+	if err = s.PrepareStart(Binding{Bot: existing.Bot, Chat: existing.Chat, Thread: existing.Thread}, StartIntent{Bot: existing.Bot, Chat: existing.Chat, Thread: existing.Thread, Kind: "new", Workspace: "/other", Generation: 1}); err == nil {
+		t.Fatal("generation-zero startup ignored an existing binding")
+	}
 }
 
 func setMessageTimes(s *Store, created, updated int64, inbox, outbox []int64) error {

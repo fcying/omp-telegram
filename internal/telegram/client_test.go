@@ -30,6 +30,23 @@ func localClientWithLogger(t *testing.T, handler http.HandlerFunc, logger *slog.
 	return client
 }
 
+func TestDisabledButtonOmitsCallbackData(t *testing.T) {
+	data, err := json.Marshal(Button{Text: "Del", Disabled: &DisabledButton{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"text":"Del","disabled":{}}` {
+		t.Fatalf("disabled button JSON = %s", data)
+	}
+	data, err = json.Marshal(Button{Text: "Del", CallbackData: "token:0", Style: "danger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"text":"Del","callback_data":"token:0","style":"danger"}` {
+		t.Fatalf("danger button JSON = %s", data)
+	}
+}
+
 func TestConversationMessages(t *testing.T) {
 	for _, conversation := range []struct {
 		name     string

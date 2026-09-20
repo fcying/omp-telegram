@@ -48,7 +48,7 @@ func TestModelPickerUsesCycleRolesAndOwner(t *testing.T) {
 		t.Fatal("picker omitted the actual current model")
 	}
 	assertPickerModel(t, w, "fixture", "safe")
-	if w.binding != original || w.busy || len(w.queue) != 0 {
+	if !sameBindingIdentity(w.binding, original) || w.busy || len(w.queue) != 0 {
 		t.Fatal("opening picker changed session or work state")
 	}
 	messageID := f.messageCount()
@@ -63,7 +63,7 @@ func TestModelPickerUsesCycleRolesAndOwner(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM outbox WHERE text LIKE '%fixture/deep%')").Scan(&reply); err != nil || !reply {
 		t.Fatal("successful selection did not display resolved RPC model identity")
 	}
-	if w.binding != original {
+	if !sameBindingIdentity(w.binding, original) {
 		t.Fatal("model selection replaced the session")
 	}
 	// A consumed button cannot switch back after another model is selected.

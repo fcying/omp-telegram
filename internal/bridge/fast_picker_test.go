@@ -47,7 +47,7 @@ func TestFastPickerOwnershipCancelReplayAndBusy(t *testing.T) {
 	clickKeyboard(w, 7, buttons[0]["callback_data"].(string))
 	command("/fast on")
 	assertFastState(t, w, false, false)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("fast mode command changed session identity")
 	}
 }

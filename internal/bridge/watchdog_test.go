@@ -101,7 +101,7 @@ func TestMissingTerminalRecoveryRetiresClientAndPreservesQueue(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", active).Scan(&state); err != nil || state != "uncertain" {
 		t.Fatalf("missing completion state=%q err=%v", state, err)
 	}
-	if w.client != nil || w.busy || w.binding != binding || w.claimedSession != claim || len(w.queue) != 1 {
+	if w.client != nil || w.busy || !sameBindingIdentity(w.binding, binding) || w.claimedSession != claim || len(w.queue) != 1 {
 		t.Fatal("recovery lost logical session/queue or retained old runtime")
 	}
 	select {

@@ -33,6 +33,12 @@ func requireStoreOK(t *testing.T, err error) {
 	}
 }
 
+func sameBindingIdentity(left, right store.Binding) bool {
+	left.LastUsedAt = 0
+	right.LastUsedAt = 0
+	return left == right
+}
+
 func testLogs(t *testing.T) *logging.Registry {
 	t.Helper()
 	logs, err := logging.New(io.Discard, logging.Options{Level: "info", Format: "text"})

@@ -203,13 +203,17 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
 	})
+	lastUsedBeforeRestart := map[int64]int64{11: d.binding(11).LastUsedAt, 22: d.binding(22).LastUsedAt}
 	d.stop()
 	// A changed discovery root makes ID-based resume fail; only the saved
 	// absolute native file path can recover these sessions.
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
 	d.start()
-	d.restored(live)
-	d.restored(stopped)
+	restoredLive := d.restored(live)
+	restoredStopped := d.restored(stopped)
+	if restoredLive.LastUsedAt != lastUsedBeforeRestart[11] || restoredStopped.LastUsedAt != lastUsedBeforeRestart[22] {
+		t.Fatalf("startup restore changed last-used timestamps: before=%v live=%d stopped=%d", lastUsedBeforeRestart, restoredLive.LastUsedAt, restoredStopped.LastUsedAt)
+	}
 	waitFor(t, func() bool { return d.fake.has(11, "Gateway restarted while the previous task was active") })
 	if d.fake.has(22, "Gateway restarted while the previous task was active") {
 		t.Fatal("idle session restoration published an interruption warning")

@@ -56,6 +56,12 @@ func (w *worker) cancelResumeList() {
 		}
 	}
 }
+
+func (w *worker) persistedBindingGenerationMatches(generation int64) bool {
+	binding, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
+	return err == nil && binding.Generation == generation
+}
+
 func (w *worker) resumeBusy() bool { return w.busy || w.compacting || len(w.queue) != 0 }
 
 func (w *worker) requestResumeList(user int64) {
@@ -86,7 +92,7 @@ func (w *worker) requestResumeList(user int64) {
 	w.cancelResumeList()
 	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
 	w.resumeCancel = cancel
-	request, generation := w.resumeRequest, w.binding.Generation
+	request, generation := w.resumeRequest, binding.Generation
 	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: w.b.cfg.OMPArgs}
 	w.background.Add(1)
 	go func() {
@@ -115,6 +121,10 @@ func (w *worker) resumeListed(result resumeListResult) {
 	w.resumeCancel()
 	w.resumeCancel = nil
 	if result.generation != w.binding.Generation {
+		return
+	}
+	if !w.persistedBindingGenerationMatches(result.generation) {
+		w.say("The saved binding changed. Use /resume again.")
 		return
 	}
 	if result.err != nil {
@@ -230,6 +240,11 @@ func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 	}
 	rows := end - start
 	if index < rows {
+		if !w.persistedBindingGenerationMatches(c.generation) {
+			w.clearKeyboard(messageID)
+			w.say("The saved binding changed. Use /resume again.")
+			return
+		}
 		w.clearKeyboard(messageID)
 		selected := c.sessions[start+index]
 		if !sameWorkspace(selected.CWD, c.workspace) {
@@ -248,7 +263,7 @@ func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 			w.say("omp returned an unsupported session ID.")
 			return
 		}
-		w.start(true, selected.ID, c.workspace, true)
+		w.startFenced(true, selected.ID, c.workspace, true, c.generation)
 		return
 	}
 	if c.page > 0 {

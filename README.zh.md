@@ -171,7 +171,8 @@ export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session. released session 只清空排队任务. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
-| `/resume` | 用分页按钮选择当前目录中的 OMP 历史 session. |
+| `/bindings` | 列出当前 Telegram chat 的已保存 conversation/session binding, 并在可用时显示原生 session name. Pending, open 和当前对话不能删除; 其他 topic 的 closed binding 确认后可删除, 只删除 bridge metadata, 不删除 workspace 或 OMP 原生 history. |
+| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
 | `/status` | 查看 workspace, session, model, thinking, fast, context, 活动状态, 队列和速度. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
@@ -242,10 +243,11 @@ daemon 停止时仍在等待的任务会取消. 决定重发前先检查聊天�
 
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
 - OMP session 文件或 workspace 缺失时恢复失败, 不会创建替代 session. 如果 session 切换失败, 执行 `/close`, 再执行 `/new` 或 `/resume`.
-- `worker.idle_timeout` 可能释放空闲 OMP 进程, 但不关闭 session. 下一条 prompt 或 OMP 控制命令会恢复同一个 session.
+- `worker.idle_timeout` 可能释放空闲 OMP 进程, 但只有在 OMP 已写入可恢复的 session 文件后才会释放. 新建 native session 在此之前可能保持 connected. 下一条 prompt 或 OMP 控制命令会恢复同一个 session.
 - **删除 Telegram topic 前先发送 `/close`.** 删除 topic 不会自动停止对应的 OMP session.
 
 每个对话有独立的 session, 但使用同一 workspace 的 session 会共享文件. 不同对话不是文件系统或凭据沙箱.
+`/bindings` 列出当前 Telegram chat 的已保存 binding. Pending, open 和当前对话的删除按钮会禁用. 其他 topic 的 closed binding 可在确认后忘记; 只删除 bridge metadata 和 history snapshot, 不删除 workspace 或 OMP 原生 session history.
 
 ## 数据与保留
 
@@ -328,9 +330,7 @@ just deploy
 ## 路线图
 
 计划功能:
-
-- 列出已保存的对话/session 绑定
-- 查看 bridge 队列状态并取消单个待执行任务
+- Bridge 队列状态和单个待执行任务取消
 - Telegram 回复上下文
 - Telegram 媒体组 / 相册支持
 - Session 导出

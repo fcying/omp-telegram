@@ -104,7 +104,7 @@ func TestNameChangesTitleWithoutInterruptingTasks(t *testing.T) {
 	if statusFields(text)["Session"] != "Bugfix HAL" {
 		t.Fatalf("status did not expose native session title: %q", text)
 	}
-	if w.binding != before || !w.busy || w.active != active || len(w.queue) != 1 {
+	if !sameBindingIdentity(w.binding, before) || !w.busy || w.active != active || len(w.queue) != 1 {
 		t.Fatal("renaming changed session identity or active/queued work")
 	}
 	raw, err := w.call("get_state", nil)
@@ -137,7 +137,7 @@ func TestRejectedNamePreservesTitleAndSession(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil || statusFields(text)["Session"] != "Existing title" {
 		t.Fatal("rejected name changed the displayed native title")
 	}
-	if w.client == nil || w.binding != before {
+	if w.client == nil || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("rejected metadata update closed or replaced the session")
 	}
 }

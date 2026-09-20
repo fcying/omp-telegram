@@ -46,7 +46,7 @@ func TestNewConfirmationClearsKeyboardOnce(t *testing.T) {
 			clickKeyboard(w, 7, buttons[index]["callback_data"].(string))
 			assertKeyboardClears(t, f, messageID)
 			if scenario == "cancel" {
-				if w.binding != before || w.client != client {
+				if !sameBindingIdentity(w.binding, before) || w.client != client {
 					t.Fatal("cancel replaced the running session")
 				}
 			} else if w.binding.Session == before.Session || w.binding.Generation <= before.Generation || w.binding.Workspace != before.Workspace || w.client == nil {
@@ -56,7 +56,7 @@ func TestNewConfirmationClearsKeyboardOnce(t *testing.T) {
 			// Both approval replay and approval after cancellation must be inert.
 			clickKeyboard(w, 7, buttons[0]["callback_data"].(string))
 			assertKeyboardClears(t, f, messageID)
-			if w.binding != after {
+			if !sameBindingIdentity(w.binding, after) {
 				t.Fatal("consumed confirmation changed the session again")
 			}
 		})
@@ -72,7 +72,7 @@ func TestConfirmationOwnerAndExpiryKeyboardCleanup(t *testing.T) {
 	messageID := f.messageCount()
 	clickKeyboard(w, 8, data)
 	assertKeyboardClears(t, f)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("another user replaced the session")
 	}
 	// The owner can still use the same menu after an unauthorized click.
@@ -97,7 +97,7 @@ func TestConfirmationOwnerAndExpiryKeyboardCleanup(t *testing.T) {
 	assertKeyboardClears(t, f, messageID, expiredMessageID)
 	clickKeyboard(w, 7, data)
 	assertKeyboardClears(t, f, messageID, expiredMessageID)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("expired confirmation replaced the session")
 	}
 }
@@ -181,7 +181,7 @@ func TestNativeSelectionCleanupFailureDoesNotCloseSession(t *testing.T) {
 	f.failKeyboardClear = true
 	result := w.callback(&telegram.CallbackQuery{ID: "native-selection", From: telegram.User{ID: 7}, Data: data})
 	assertKeyboardClears(t, f, messageID)
-	if result != callbackDone || w.client == nil || w.binding != before || len(w.confirms) != 0 {
+	if result != callbackDone || w.client == nil || !sameBindingIdentity(w.binding, before) || len(w.confirms) != 0 {
 		t.Fatal("keyboard cleanup failure prevented native selection delivery")
 	}
 	f.failKeyboardClear = false
@@ -201,7 +201,7 @@ func TestNativeSelectionCleanupFailureDoesNotCloseSession(t *testing.T) {
 	assertKeyboardClears(t, f, messageID, expiredMessageID)
 	clickKeyboard(w, 7, data)
 	assertKeyboardClears(t, f, messageID, expiredMessageID)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("scheduled expiry allowed a stale confirmation to replace the session")
 	}
 }
@@ -216,7 +216,7 @@ func TestCompactConfirmationClearsBeforeCompletion(t *testing.T) {
 	messageID := f.messageCount()
 	clickKeyboard(w, 7, data)
 	assertKeyboardClears(t, f, messageID)
-	if !w.busy || !w.compacting || w.binding != before {
+	if !w.busy || !w.compacting || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("compaction confirmation did not start compaction in the current session")
 	}
 	select {
@@ -246,18 +246,18 @@ func TestResumeKeyboardNavigationAndSelection(t *testing.T) {
 	// A callback from the replaced page cannot clear the new page or select.
 	clickResume(w, 7, first[0]["callback_data"].(string))
 	assertKeyboardClears(t, f)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("stale first-page selection changed the session")
 	}
 	clickResume(w, 7, second[2]["callback_data"].(string))
 	current := resumeButtons(t, f)
 	assertKeyboardClears(t, f)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("navigation changed the session")
 	}
 	clickResume(w, 7, second[0]["callback_data"].(string))
 	assertKeyboardClears(t, f)
-	if w.binding != before {
+	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("stale second-page selection changed the session")
 	}
 	data := current[1]["callback_data"].(string)
@@ -270,7 +270,7 @@ func TestResumeKeyboardNavigationAndSelection(t *testing.T) {
 	after := w.binding
 	clickResume(w, 7, data)
 	assertKeyboardClears(t, f, messageID)
-	if w.binding != after {
+	if !sameBindingIdentity(w.binding, after) {
 		t.Fatal("replayed picker selection restarted the session")
 	}
 }
@@ -297,7 +297,7 @@ func TestResumePickerCloseClearsKeyboard(t *testing.T) {
 	waitKeyboardClears(t, f, messageID)
 	before := w.binding
 	clickKeyboard(w, 7, data)
-	if w.client != nil || w.binding != before || len(w.confirms) != 0 {
+	if w.client != nil || !sameBindingIdentity(w.binding, before) || len(w.confirms) != 0 {
 		t.Fatal("closed session picker remained actionable")
 	}
 	assertKeyboardClears(t, f, messageID)
@@ -361,7 +361,7 @@ func TestModelPickerInvalidationClearsKeyboard(t *testing.T) {
 			waitKeyboardClears(t, f, cleared...)
 			before := w.binding
 			clickKeyboard(w, 7, data)
-			if w.binding != before || len(w.confirms) != 0 {
+			if !sameBindingIdentity(w.binding, before) || len(w.confirms) != 0 {
 				t.Fatal("invalidated model picker remained actionable")
 			}
 			assertKeyboardClears(t, f, cleared...)

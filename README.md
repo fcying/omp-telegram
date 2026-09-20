@@ -171,7 +171,8 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session open. A released session only clears queued tasks. |
 | `/close` | Close the current session while preserving its files and OMP history. |
-| `/resume` | Choose a saved OMP session in the current directory with paginated buttons. |
+| `/bindings` | List saved conversation/session bindings for this Telegram chat, including native session names when available. Pending, open, and current entries cannot be deleted; a closed entry from another topic can delete bridge metadata without deleting workspace or native OMP history. |
+| `/resume` | Choose a saved native OMP session from the current workspace. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
 | `/status` | Show workspace, session, model, thinking, fast mode, context, activity, queue, and speed. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
@@ -242,10 +243,11 @@ Tasks that were still waiting when the daemon stopped are cancelled. Check the c
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
 - A missing OMP session file or workspace causes recovery to fail rather than creating a replacement session. If session switching fails, use `/close` followed by `/new` or `/resume`.
-- `worker.idle_timeout` may release an unused OMP process without closing the session. The next prompt or OMP control command resumes the same session.
+- `worker.idle_timeout` may release an unused OMP process without closing the session, but only after OMP has written a recoverable session file. A fresh native session may remain connected until then. The next prompt or OMP control command resumes the same session.
 - **Send `/close` before deleting a Telegram topic.** Deleting a topic does not automatically stop its OMP session.
 
 Each conversation has its own session, but sessions that use the same workspace share files. Separate conversations are not filesystem or credential sandboxes.
+`/bindings` lists the saved bindings for the current Telegram chat. Pending, open, and current-conversation entries have disabled delete buttons. A closed binding from another topic can be forgotten after confirmation; this removes only bridge metadata and history snapshots, not the workspace or native OMP session history.
 
 ## Data and Retention
 
@@ -331,7 +333,6 @@ just deploy
 
 Planned features:
 
-- List saved conversation/session bindings
 - Bridge queue status and cancel individual pending tasks
 - Telegram reply context
 - Telegram media group / album support

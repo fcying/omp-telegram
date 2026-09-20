@@ -98,6 +98,7 @@ func (w *worker) selectModel(c confirmation, index int) {
 		w.say("The model switch could not be confirmed. Use /status to check the actual model before retrying.")
 		return
 	}
+	w.touchBinding()
 	w.say("Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + ".")
 }
 
@@ -111,6 +112,7 @@ func (w *worker) switchModel(provider, id string) {
 		w.say("The model switch could not be confirmed. Use /status to check the actual model before retrying.")
 		return
 	}
+	w.touchBinding()
 	w.say("Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + ".")
 }
 
@@ -150,6 +152,7 @@ func (w *worker) selectThinking(c confirmation, index int) {
 		w.say("The thinking level change could not be confirmed. Open /thinking to check before retrying.")
 		return
 	}
+	w.touchBinding()
 	state, ok := w.modelSelectionState()
 	if !ok {
 		return
@@ -201,6 +204,7 @@ func (w *worker) switchFast(enabled bool) {
 		w.say("The fast mode change could not be confirmed. It may be unsupported by this model. Use /fast status to check before retrying.")
 		return
 	}
+	w.touchBinding()
 	w.say(fastModeText(result.Enabled, result.Active))
 }
 func (w *worker) showFastStatus() {

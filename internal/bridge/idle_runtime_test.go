@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func releasedIdleWorker(t *testing.T) (*worker, *fakeHTTP, func(string), store.B
 	}
 	w.lastActivity = time.Now().Add(-2 * time.Minute)
 	w.releaseIdleRuntime(time.Now())
-	if w.client != nil || w.runtime != runtimeReleased || w.binding != before {
+	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) {
 		t.Fatalf("idle release changed logical binding or retained runtime: binding=%+v runtime=%d client=%t", w.binding, w.runtime, w.client != nil)
 	}
 	if !w.b.sessionInUse(w.sessionID) {
@@ -48,10 +49,69 @@ func TestDisabledIdleTimeoutNeverReleasesRuntime(t *testing.T) {
 	}
 }
 
+func TestIdleReleaseRequiresDurableSessionFile(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *worker)
+	}{
+		{name: "missing", setup: func(t *testing.T, w *worker) {
+			if err := os.Remove(w.binding.Session); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "directory", setup: func(t *testing.T, w *worker) {
+			w.binding.Session = w.binding.Workspace
+		}},
+		{name: "relative", setup: func(t *testing.T, w *worker) {
+			w.binding.Session = "session.jsonl"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			w.b.cfg.IdleTimeout = time.Minute
+			command("/new " + t.TempDir())
+			if w.client == nil || w.runtime != runtimeConnected {
+				t.Fatal("fixture did not start a connected runtime")
+			}
+			tc.setup(t, w)
+			w.lastActivity = time.Now().Add(-2 * time.Minute)
+			w.releaseIdleRuntime(time.Now())
+			if w.client == nil || w.runtime != runtimeConnected || !w.binding.Running {
+				t.Fatalf("idle release discarded non-durable session: runtime=%d client=%t running=%t", w.runtime, w.client != nil, w.binding.Running)
+			}
+		})
+	}
+}
+
+func TestIdleReleaseAfterSessionFileAppears(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.IdleTimeout = time.Minute
+	command("/new " + t.TempDir())
+	if w.client == nil || !w.binding.Running {
+		t.Fatal("fixture did not start a running runtime")
+	}
+	path := w.binding.Session
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	w.lastActivity = time.Now().Add(-2 * time.Minute)
+	w.releaseIdleRuntime(time.Now())
+	if w.client == nil || w.runtime != runtimeConnected || !w.binding.Running {
+		t.Fatal("missing session file released the runtime")
+	}
+	if err := os.WriteFile(path, []byte("session history"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	w.releaseIdleRuntime(time.Now())
+	if w.client != nil || w.runtime != runtimeReleased || !w.binding.Running {
+		t.Fatalf("durable session was not released: runtime=%d client=%t running=%t", w.runtime, w.client != nil, w.binding.Running)
+	}
+}
+
 func TestIdleReleasePreservesLogicalSessionAndStatusDoesNotWake(t *testing.T) {
 	w, _, command, before := releasedIdleWorker(t)
 	command("/status")
-	if w.client != nil || w.runtime != runtimeReleased || w.binding != before {
+	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("released status woke or changed the logical session")
 	}
 	out, err := w.b.db.NextOutput()
@@ -72,7 +132,7 @@ func TestReleasedStatusShowsRunningBindingWithoutActivity(t *testing.T) {
 	w, _, command, before := releasedIdleWorker(t)
 	w.lastActivity = time.Time{}
 	command("/status")
-	if w.client != nil || w.runtime != runtimeReleased || w.binding != before {
+	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("released status woke or changed the logical session")
 	}
 	out, err := w.b.db.NextOutput()
@@ -90,7 +150,7 @@ func TestReleasedStatusShowsRunningBindingWithoutActivity(t *testing.T) {
 func TestReleasedRuntimeIgnoresStaleExitSignal(t *testing.T) {
 	w, _, _, before := releasedIdleWorker(t)
 	w.failed()
-	if w.client != nil || w.runtime != runtimeReleased || w.binding != before {
+	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) {
 		t.Fatalf("stale exit changed released logical session: %+v", w.binding)
 	}
 }
@@ -147,7 +207,7 @@ func TestStopReleasedRuntimeDoesNotResume(t *testing.T) {
 func TestReleasedRuntimeResumesBeforeSubmittingPrompt(t *testing.T) {
 	w, _, command, before := releasedIdleWorker(t)
 	command("after idle")
-	if w.client == nil || w.runtime != runtimeConnected || w.binding != before {
+	if w.client == nil || w.runtime != runtimeConnected || !sameBindingIdentity(w.binding, before) {
 		out, _ := w.b.db.NextOutput()
 		t.Fatalf("lazy resume changed logical binding or did not connect: binding=%+v runtime=%d client=%t session=%q output=%+v", w.binding, w.runtime, w.client != nil, w.sessionID, out)
 	}
@@ -184,7 +244,7 @@ func TestReleasedRuntimeResumesForReviewAndNativeControls(t *testing.T) {
 		t.Run(commandText, func(t *testing.T) {
 			w, _, command, before := releasedIdleWorker(t)
 			command(commandText)
-			if w.client == nil || w.runtime != runtimeConnected || w.binding != before {
+			if w.client == nil || w.runtime != runtimeConnected || !sameBindingIdentity(w.binding, before) {
 				t.Fatalf("%s did not resume the saved session: %+v", commandText, w.binding)
 			}
 		})
@@ -198,7 +258,7 @@ func TestReleasedRuntimeFailureDoesNotSubmitPrompt(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state == "submitted" {
 		t.Fatalf("failed lazy resume prompt state = %q, error %v", state, err)
 	}
-	if w.client != nil || w.runtime != runtimeReleased || w.binding != before || w.startIntent != nil {
+	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) || w.startIntent != nil {
 		t.Fatalf("failed lazy resume changed logical state: binding=%+v runtime=%d client=%t intent=%+v", w.binding, w.runtime, w.client != nil, w.startIntent)
 	}
 }
@@ -211,7 +271,7 @@ func TestFailedStartupRestorePreservesLogicalSession(t *testing.T) {
 	w.restoring = true
 	w.closeFailedStart()
 	w.restoring = false
-	if w.client != nil || w.runtime != runtimeReleased || w.binding != before || !w.b.sessionInUse(w.sessionID) {
+	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) || !w.b.sessionInUse(w.sessionID) {
 		t.Fatalf("failed startup restoration closed logical session: binding=%+v runtime=%d client=%t", w.binding, w.runtime, w.client != nil)
 	}
 }

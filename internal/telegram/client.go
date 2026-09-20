@@ -77,9 +77,13 @@ type Update struct {
 	CallbackQuery *CallbackQuery `json:"callback_query"`
 }
 
+type DisabledButton struct{}
+
 type Button struct {
-	Text         string `json:"text"`
-	CallbackData string `json:"callback_data"`
+	Text         string          `json:"text"`
+	CallbackData string          `json:"callback_data,omitempty"`
+	Style        string          `json:"style,omitempty"`
+	Disabled     *DisabledButton `json:"disabled,omitempty"`
 }
 
 type Keyboard struct {

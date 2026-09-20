@@ -23,8 +23,13 @@ func TestHandoffResultPreservesSessionAndReleasesQueue(t *testing.T) {
 			waitFor(t, func() bool { return f.has(11, "answer: after handoff") })
 			waitInputDone(t, db, 3)
 			after, err := db.Binding(99, -10, 11)
+			lastUsed := after.LastUsedAt
+			after.LastUsedAt = before.LastUsedAt
 			if err != nil || after != before {
 				t.Fatalf("handoff changed session binding: %+v, %v", after, err)
+			}
+			if lastUsed < before.LastUsedAt {
+				t.Fatalf("handoff moved last-used timestamp backwards: before=%d after=%d", before.LastUsedAt, lastUsed)
 			}
 		})
 	}

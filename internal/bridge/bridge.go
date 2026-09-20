@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -44,6 +45,7 @@ type Bridge struct {
 	resumeSlots   chan struct{}
 	sessionMu     sync.Mutex
 	sessionClaims map[string]sessionClaim
+	bindingsEpoch atomic.Uint64
 }
 type incoming struct {
 	id       int64
@@ -73,14 +75,19 @@ type confirmation struct {
 	options              []string
 	expires              time.Time
 	generation, active   int64
+	epoch                uint64
 	turn                 uint64
 	user                 int64
 	messageID            int64
 	sessions             []omp.SessionSummary
 	models               []omp.ModelRole
+	bindings             []store.BindingListEntry
+	deleteBot            int64
+	deleteChat           int64
+	deleteThread         int64
+	deleteGeneration     int64
 	page                 int
 }
-
 type runtimeState uint8
 
 const (
@@ -135,6 +142,9 @@ type worker struct {
 	resumeResults         chan resumeListResult
 	resumeCancel          context.CancelFunc
 	resumeRequest         uint64
+	bindingNameResults    chan bindingNamesResult
+	bindingNameCancel     context.CancelFunc
+	bindingNameRequest    uint64
 	ctx                   context.Context
 	cancel                context.CancelFunc
 }
@@ -231,6 +241,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
 	{Command: "resume", Description: "Choose an omp session in this working directory"},
+	{Command: "bindings", Description: "List saved conversation/session bindings"},
 	{Command: "status", Description: "Show session, model, context, speed and queue"},
 	{Command: "name", Description: "Name the omp session: /name <title>"},
 	{Command: "model", Description: "Choose a cycle role or /model provider/model"},
@@ -716,8 +727,17 @@ func (w *worker) idleEligible() bool {
 	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
 }
 
+func (w *worker) sessionDurable() bool {
+	path := w.binding.Session
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 func (w *worker) releaseIdleRuntime(now time.Time) {
-	if w.b.cfg.IdleTimeout <= 0 || !w.idleEligible() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout {
+	if w.b.cfg.IdleTimeout <= 0 || !w.idleEligible() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout || !w.sessionDurable() {
 		return
 	}
 	w.releaseRuntimeWithReason(true, "idle")
@@ -891,11 +911,13 @@ func (w *worker) run() {
 						case result.cancelled:
 							w.say("Handoff canceled without a result.")
 						default:
+							w.touchBinding()
 							w.say("Handoff completed.")
 						}
 					} else if result.err != nil {
 						w.say("Compaction failed.")
 					} else {
+						w.touchBinding()
 						w.say("Compaction completed.")
 					}
 				}
@@ -906,6 +928,8 @@ func (w *worker) run() {
 			w.preparedSend(result)
 		case result := <-w.resumeResults:
 			w.resumeListed(result)
+		case result := <-w.bindingNameResults:
+			w.bindingNamesLoaded(result)
 		case result := <-w.idleProbe.results:
 			w.idleProbeFinished(result, time.Now())
 		case <-tick.C:
@@ -924,6 +948,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.cancelResumeList()
+	w.cancelBindingNameLookup()
 	for _, q := range w.queue {
 		if q.cancel != nil {
 			q.cancel()
@@ -1034,6 +1059,7 @@ func (w *worker) requestAbort(notice string) {
 		w.say("The abort request failed.")
 		return
 	}
+	w.touchBinding()
 	w.say(notice)
 }
 
@@ -1086,6 +1112,14 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 }
 
 func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
+	w.startInternal(resume, target, expectedCWD, replace, 0, false)
+}
+
+func (w *worker) startFenced(resume bool, target, expectedCWD string, replace bool, generation int64) {
+	w.startInternal(resume, target, expectedCWD, replace, generation, true)
+}
+
+func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool) {
 	if _, connected := w.runtimeClient(); connected && !replace {
 		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
 		return
@@ -1103,7 +1137,18 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		w.say("Failed to read the session.")
 		return
 	}
+	oldMissing := errors.Is(e, sql.ErrNoRows)
+	if oldMissing && !w.restoring {
+		w.cancelResumeList()
+		w.clearConfirmations()
+	}
+	previousGeneration := old.Generation
+	if fenced {
+		previousGeneration = expectedGeneration
+	}
+	nextGeneration := previousGeneration + 1
 	var cwd, session string
+
 	if resume {
 		if w.restoring {
 			info, err := os.Stat(target)
@@ -1153,11 +1198,18 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		if intentWorkspace == "" {
 			intentWorkspace = old.Workspace
 		}
-		intent := store.StartIntent{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: intentWorkspace, Session: session, Generation: old.Generation + 1, Kind: "new"}
+		intent := store.StartIntent{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: intentWorkspace, Session: session, Generation: nextGeneration, Kind: "new"}
 		if resume {
 			intent.Kind = "resume"
 		}
-		if e = w.b.db.PrepareStart(old, intent); e != nil {
+		previous := old
+		if fenced {
+			previous.Generation = previousGeneration
+			if oldMissing || old.Generation != previousGeneration {
+				previous.Running = false
+			}
+		}
+		if e = w.b.db.PrepareStart(previous, intent); e != nil {
 			if reserved {
 				<-w.b.slots
 			}
@@ -1234,7 +1286,8 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 		return
 	}
 	interrupted := w.restoring && !w.runtimeResuming && old.Interrupted
-	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: old.Generation + 1, Running: true}
+	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: nextGeneration, LastUsedAt: old.LastUsedAt, Running: true}
+
 	if w.runtimeResuming {
 		binding = old
 	} else if w.restoring {
@@ -1254,6 +1307,9 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
 	w.previewID = 0
 	w.runtime = runtimeConnected
 	w.touchActivity()
+	if !w.runtimeResuming && !w.restoring {
+		w.touchBinding()
+	}
 	if !w.runtimeResuming {
 		if replace {
 			w.logSessionEvent("session_replace", "replace", "session replaced", info.ID)
@@ -1363,6 +1419,12 @@ func (w *worker) handle(in incoming) {
 		} else {
 			w.start(true, arg, "", true)
 		}
+	case "/bindings":
+		if arg != "" {
+			w.say("Usage: /bindings")
+			return
+		}
+		w.showBindings(in.msg.From.ID)
 	case "/close":
 		if !w.closeLogicalSession() {
 			return
@@ -1385,6 +1447,7 @@ func (w *worker) handle(in incoming) {
 			w.say("The session name change could not be confirmed. Use /status to check before retrying.")
 			return
 		}
+		w.touchBinding()
 		w.say("Session named: " + menuText(arg, 160))
 	case "/model":
 		if arg == "" {
@@ -1527,6 +1590,7 @@ func (w *worker) dispatch() {
 		w.closeLogicalSession()
 		return
 	}
+	w.touchBinding()
 	var response struct {
 		AgentInvoked *bool `json:"agentInvoked"`
 	}
@@ -2247,6 +2311,9 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	token := hex.EncodeToString(data[:])
 	c.expires = time.Now().Add(2 * time.Minute)
 	c.generation = w.binding.Generation
+	if c.action == "binding_delete" {
+		c.generation = w.conversationGeneration()
+	}
 	if c.user == 0 {
 		c.user = w.owner
 	}
@@ -2281,6 +2348,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	if c.user != q.From.ID {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
+	}
+	if c.action == "bindings" || c.action == "binding_delete" {
+		return w.bindingCallback(ctx, q, token, index, c)
 	}
 	messageID := c.messageID
 	if c.action == "stop" && messageID == 0 && q.Message != nil {
@@ -2351,6 +2421,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			return callbackUncertain
 		}
 		w.touchActivity()
+		w.touchBinding()
 		return callbackDone
 	}
 	if c.action == "model" {

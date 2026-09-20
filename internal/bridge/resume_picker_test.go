@@ -175,7 +175,7 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	if len(buttons) != 10 || !strings.Contains(buttons[0]["text"].(string), sessions[0].Title) {
 		t.Fatal("previous did not return to first page")
 	}
-	if w.binding != original {
+	if !sameBindingIdentity(w.binding, original) {
 		t.Fatal("page navigation changed active session")
 	}
 	f.mu.Lock()
@@ -207,7 +207,7 @@ func TestResumePickerSelectionRestoresNativeSession(t *testing.T) {
 	}
 	restored := w.binding
 	clickResume(w, 7, token)
-	if w.binding != restored {
+	if !sameBindingIdentity(w.binding, restored) {
 		t.Fatal("replayed selection restarted native session")
 	}
 }
@@ -221,7 +221,7 @@ func TestResumePickerCurrentSelectionKeepsProcess(t *testing.T) {
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
 	clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
-	if w.client != client || w.binding != before {
+	if w.client != client || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("selecting active native session restarted it")
 	}
 }
@@ -254,7 +254,7 @@ func TestResumePickerRejectsInvalidCallbacks(t *testing.T) {
 			}
 			token := buttons[index]["callback_data"].(string)
 			clickResume(w, user, token)
-			if w.binding != before || w.client != client {
+			if !sameBindingIdentity(w.binding, before) || w.client != client {
 				t.Fatal("invalid picker callback switched the active session")
 			}
 			if scenario == "busy" && !w.busy {
@@ -262,7 +262,7 @@ func TestResumePickerRejectsInvalidCallbacks(t *testing.T) {
 			}
 			if scenario == "cancel" {
 				clickResume(w, 7, buttons[0]["callback_data"].(string))
-				if w.binding != before || w.client != client {
+				if !sameBindingIdentity(w.binding, before) || w.client != client {
 					t.Fatal("cancelled picker accepted an old selection")
 				}
 			}
@@ -282,7 +282,7 @@ func TestResumePickerMissingBindingEmptyListAndBusy(t *testing.T) {
 	setResumeFixtures(t, before.Workspace, 0)
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
-	if len(w.confirms) != 0 || w.binding != before {
+	if len(w.confirms) != 0 || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("empty native list created a picker or changed the binding")
 	}
 	for _, state := range []string{"busy", "compacting", "queued"} {
@@ -296,7 +296,7 @@ func TestResumePickerMissingBindingEmptyListAndBusy(t *testing.T) {
 			w.queue = []queued{{}}
 		}
 		command("/resume")
-		if len(w.confirms) != 0 || w.binding != before {
+		if len(w.confirms) != 0 || !sameBindingIdentity(w.binding, before) {
 			t.Fatalf("%s picker request changed current session", state)
 		}
 		select {
@@ -306,6 +306,79 @@ func TestResumePickerMissingBindingEmptyListAndBusy(t *testing.T) {
 		}
 	}
 	w.busy, w.compacting, w.queue = false, false, nil
+}
+
+func TestResumePickerRejectsDeletedPersistedBinding(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	command("/close")
+	generation := w.binding.Generation
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	buttons := resumeButtons(t, f)
+	data := buttons[0]["callback_data"].(string)
+	deleted, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, generation)
+	if err != nil || !deleted {
+		t.Fatalf("test binding deletion = %t, error %v", deleted, err)
+	}
+	clickResume(w, 7, data)
+	if _, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread); err == nil {
+		t.Fatal("stale picker recreated the deleted binding")
+	}
+	if w.binding.Generation != generation || w.binding.Running {
+		t.Fatalf("stale picker changed in-memory binding: %+v", w.binding)
+	}
+}
+
+func TestResumePickerInvalidatedBeforeGenerationReuse(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	command("/close")
+	generation := w.binding.Generation
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	data := resumeButtons(t, f)[0]["callback_data"].(string)
+	token, _, _ := strings.Cut(data, ":")
+	deleted, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, generation)
+	if err != nil || !deleted {
+		t.Fatalf("test binding deletion = %t, error %v", deleted, err)
+	}
+	// A successful deletion targeting this worker clears its in-memory binding identity.
+	w.binding.Generation = 0
+
+	command("/new test")
+	if _, exists := w.confirms[token]; exists {
+		t.Fatal("old picker confirmation survived deleted-binding recreation")
+	}
+	if w.binding.Generation != generation {
+		t.Fatalf("test did not exercise generation reuse: got %d, want %d", w.binding.Generation, generation)
+	}
+	client, binding := w.client, w.binding
+	clickResume(w, 7, data)
+	if w.client != client || !sameBindingIdentity(w.binding, binding) {
+		t.Fatal("stale picker restarted the generation-reused binding")
+	}
+}
+
+func TestResumePickerDoesNotPublishAfterPersistedBindingDeletion(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	command("/close")
+	generation := w.binding.Generation
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/resume")
+	result := finishResumeList(t, w)
+	deleted, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, generation)
+	if err != nil || !deleted {
+		t.Fatalf("test binding deletion = %t, error %v", deleted, err)
+	}
+	messageCount := f.messageCount()
+	w.resumeListed(result)
+	if len(w.confirms) != 0 || f.messageCount() != messageCount {
+		t.Fatal("stale session listing published an actionable picker")
+	}
 }
 
 func TestResumePickerIgnoresStaleListResults(t *testing.T) {
@@ -353,7 +426,7 @@ func TestResumePickerRefusesAnotherTopicsActiveSession(t *testing.T) {
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
 	clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
-	if w.client != client || w.binding != before || other.client != otherClient || other.binding != otherBinding {
+	if w.client != client || !sameBindingIdentity(w.binding, before) || other.client != otherClient || !sameBindingIdentity(other.binding, otherBinding) {
 		t.Fatal("selection of an owned session interrupted a topic or opened it concurrently")
 	}
 }

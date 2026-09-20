@@ -128,7 +128,7 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 | 表 | 键 / 字段 | 用途 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
-| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running,interrupted` | 最后一次已验证的会话绑定, 恢复资格和活动任务中断标记 |
+| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | 最后一次已验证的会话绑定, 恢复资格, 最后使用时间 metadata 和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
 | `history` | `bot,chat,thread,workspace,session,generation` | 旧绑定快照, 不是会话浏览器 |
 | `inbox` | 主键 `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | update 去重、处理状态和可选的实时进度身份 |
@@ -146,7 +146,7 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 7. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 6 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID 以及 inbox/outbox progress 关联的事务迁移后才推进 `user_version`. 已有 v3 消息在迁移时获得当前时间戳, 从而获得完整保留期而不是猜测历史年龄. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 8. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 7 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联以及 `bindings.last_used_at` 的事务迁移后才推进 `user_version`. v8 不猜测历史使用时间, 旧 binding 的 `last_used_at` 保持为 0. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -198,8 +198,23 @@ Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 wo
 ## 会话生命周期
 
 `/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
+由于其他 worker 可以删除 closed binding 而不更新当前 worker 的内存, bridge 会在 session-list 结果到达时以及真正执行 picker selection 前重新检查持久化 binding generation, 并把 picker 的 generation 带入 startup transaction. `PrepareStart` 在同一事务中确认预期的旧 row 仍存在 (generation 为 0 时确认当前没有 row), 然后才插入 `startup_intents`; `DeleteClosedBinding` 使用同一事务边界, 因此要么 intent 先成功使删除失败, 要么删除先成功使该 generation 的启动失败. binding 缺失或 generation 变化时清理旧菜单, 且不能重新创建该 binding. 如果显式启动发现当前 worker 的非零 generation binding 已被删除, 会先使内存中的 confirmation 全部失效, 再允许新 binding 从 generation 1 开始.
 
 无参数 `/new` 优先沿用对话保存的工作目录. 没有历史目录时解析并使用 `storage.workspace_root` 本身, 不另建按对话划分的子目录. 数据库读取失败仍报错, 不回退默认目录. 选择同一目录的对话共享文件, 不共享原生 session 身份.
+
+### Binding viewer
+
+`/bindings` 只读取当前 Bot 和 Telegram chat 的已提交 binding 以及未完成的 `startup_intents`. Bridge 按 `(bot,chat,thread)` 合并为一条展示记录; 存在 pending intent 时优先显示 pending, 不使用旧 binding 的 `running` 值判断状态. 展示状态为 `Pending new`、`Pending resume`、`Open` 和 `Closed`. Pending 使用 intent 的 workspace 和 resume 目标; `Last used` 仍来自旧的 committed binding. 第一次 `/new` 没有旧 binding 时显示 `Session: pending` 和 `Last used: unknown`.
+
+原生 session name 会按每个保存的 workspace, 通过短生命周期 `omp acp` `session/list` 查询尽力解析. name 只是 viewer 的临时 metadata, 不复制到 SQLite; 不可用或未命名的 session 显示 `unknown`, pending new session 显示 `pending`.
+
+消息正文只保留 viewer header. 所有 binding 详情都渲染为 disabled inline-keyboard button: 每条记录占四行, 带编号的标题按钮与 `Del` 操作并列, 后面依次是 disabled 的状态/last-used、workspace 和合并后的 `Name`/短 session 行. 只有 `Del` 操作可以携带 callback data.
+
+列表每页六条. Pending、open 和当前对话的删除按钮使用不带 callback data 的 Telegram disabled button. 只有其他对话的 closed binding 可以打开 danger 样式的删除确认. 每个列表和删除 callback 都校验授权用户、当前对话 generation、过期时间、来源消息 ID、action token、目标 binding generation 以及 Bridge 级内存 binding mutation epoch. `DeleteClosedBinding` 成功后会推进所有 worker 共享的 epoch, 即使被删除的 generation 随后复用, 旧 `/bindings` 菜单和删除确认仍会失效. 重新执行 `/bindings` 也会使旧 viewer token 失效; 旧 callback 不能翻页或清除新页面.
+
+`last_used_at` 是 Unix time, 迁移旧数据时为 0. 显式 `/new` 或 `/resume` 成功, root/review/attachment prompt 被接受, 以及 name、model、thinking、fast mode、compact、handoff 和 abort 等原生 session-changing command 成功后 touch. startup restore、lazy restore 本身、`/status`、`/bindings`、`/help` 和 viewer 翻页不会 touch. touch 失败只记录 metadata persistence error, 不会改变已经接受的任务结果. startup restore 会把旧值复制到新 generation, 不会刷新时间.
+
+`DeleteClosedBinding` 和 `PrepareStart` 都针对同一组 binding 与 intent row 使用 generation-fenced transaction. 删除只有在目标已关闭且没有 startup intent 时成功; closed binding 的启动必须先确认预期 row 仍存在, 并在同一事务中插入 intent. 因此 intent 先提交会使删除失败, 删除先提交会使 stale start 失败. 成功删除还会同时删除 bridge history snapshot, 并推进不持久化的 Bridge 级 binding mutation epoch, 使其他 worker 持有的菜单立即成为 stale. 它绝不删除 workspace、原生 session 文件或 omp 原生 history. 如果删除目标意外是当前 worker, worker 会清理内存中的 binding identity; UI 正常情况下会禁用该操作.
 
 合法的最终选择或取消会先消费 confirmation token, 再尽力通过 `editMessageReplyMarkup` 移除 inline keyboard, 不修改消息正文. 清理失败不阻止实际操作. 翻页直接更新原菜单. 已知的过期菜单也会清理; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启持久化.
 
@@ -239,6 +254,7 @@ Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 wo
 ### 空闲运行期释放
 
 `worker.idle_timeout` 默认值为 `30m`; 设置为 `0` 或 `disabled` 可关闭. 设置为其他正时长后, worker 只有在已连接进程完整空闲达到该时长, 且没有活动任务、队列项(包括附件准备)、compact 或 handoff operation、结束预览、host request、会话列表请求、启动意图或 runtime-bound confirmation 时才释放进程. model、thinking、fast、compact、new 和原生 UI 选择的 runtime-bound confirmation 会阻止空闲释放, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 满足条件后, worker 关闭 client 并归还全局进程 slot. 不修改 binding、generation、已验证 session 文件身份、session claim、工作目录或原生历史.
+idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且已存在并指向 regular file. 新建 native session 可能已经返回 ID 并提交 binding, 但 OMP 尚未写入 history file; 这种状态保持 connected, 避免 bridge 销毁唯一可恢复的副本. 这是内存中的 release guard, 不增加数据库 durability flag.
 
 下一条普通 prompt、附件、`/review` 或需要 OMP 状态的原生控制命令会在入队或 RPC 调用前, 通过正常原生身份和工作目录校验懒恢复已保存的 session. 懒恢复失败不会提交或重放根任务. `/status`、`/help`、`/stop` 和 `/close` 不会唤醒已释放运行期; `/stop` 只清 bridge 延后 prompt, `/close` 直接清除恢复资格. 显式 `/resume ID` 替换逻辑 binding 并启动指定原生 session. actor 会先移除 client 并标记运行期 released, 再关闭它, 所以迟到的关闭事件不会进入 failure handling; 仍连接时 OMP 真正退出继续走既有 uncertain/failure 路径. 原生事件、confirmation 展示和成功的原生调用会刷新空闲计时.
 
