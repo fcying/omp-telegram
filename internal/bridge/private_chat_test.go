@@ -153,14 +153,14 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 	// A running private instance must survive /new until its button is confirmed.
 	command(7, 0, "private", "/new")
 	waitFor(t, func() bool { return has(7, 0, "Start a new omp session in: "+after.Workspace) })
-	if got := binding(7, 0); got != after {
+	if got := binding(7, 0); !sameBindingIdentity(got, after) {
 		t.Fatalf("private /new replaced the instance before confirmation: %+v", got)
 	}
 	buttons = resumeButtons(t, d.fake)
 	token = buttons[0]["callback_data"].(string)
 	denied = callback(99)
 	waitFor(t, func() bool { return state(denied) == "ignored" })
-	if got := binding(7, 0); got != after {
+	if got := binding(7, 0); !sameBindingIdentity(got, after) {
 		t.Fatal("unauthorized confirmation replaced the private instance")
 	}
 	waitInputDone(t, d.db, callback(7))
@@ -171,7 +171,7 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 	command(7, 0, "private", "private-replaced")
 	waitFor(t, func() bool { return has(7, 0, "answer: private-replaced") })
 	waitInputDone(t, d.db, callback(7))
-	if got := binding(7, 0); got != replaced {
+	if got := binding(7, 0); !sameBindingIdentity(got, replaced) {
 		t.Fatal("replayed private confirmation replaced the session again")
 	}
 	if !binding(7, 11).Running {
