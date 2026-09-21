@@ -420,3 +420,23 @@ func TestExplicitTeardownInvalidatesRuntimeConfirmation(t *testing.T) {
 		t.Fatal("invalidated confirmation became actionable after teardown")
 	}
 }
+
+func TestLogicalEvictionKeepsRunningLogicalSession(t *testing.T) {
+	w, _, _, _ := releasedIdleWorker(t)
+	oldTimeout := logicalWorkerIdleTimeout
+	logicalWorkerIdleTimeout = time.Millisecond
+	t.Cleanup(func() { logicalWorkerIdleTimeout = oldTimeout })
+	w.lastLogicalActivity = time.Now().Add(-time.Minute)
+	if w.evictIfIdle(time.Now()) {
+		t.Fatal("logical eviction released a running logical session")
+	}
+	if !w.binding.Running {
+		t.Fatal("running binding changed during logical eviction")
+	}
+	if w.exitRequestedState() {
+		t.Fatal("running logical session requested worker exit")
+	}
+	if !w.b.sessionInUse(w.sessionID) {
+		t.Fatal("running logical session claim was lost")
+	}
+}
