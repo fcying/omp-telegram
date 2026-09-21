@@ -188,9 +188,12 @@ type worker struct {
 }
 
 type terminalAssistant struct {
-	StopReason   string
-	ErrorMessage string
+	StopReason                 string
+	ErrorMessage               string
+	ErrorClassificationMessage string
+	ErrorStatus                int
 }
+
 type previewResult struct {
 	id         int64
 	taskID     int64
@@ -259,10 +262,12 @@ type rpcEvent struct {
 }
 
 type message struct {
-	Role         string          `json:"role"`
-	Content      json.RawMessage `json:"content"`
-	StopReason   string          `json:"stopReason"`
-	ErrorMessage string          `json:"errorMessage"`
+	Role                       string          `json:"role"`
+	Content                    json.RawMessage `json:"content"`
+	StopReason                 string          `json:"stopReason"`
+	ErrorMessage               string          `json:"errorMessage"`
+	ErrorClassificationMessage string          `json:"errorClassificationMessage"`
+	ErrorStatus                int             `json:"errorStatus"`
 }
 
 type terminalResult int
@@ -1937,7 +1942,7 @@ func assistantTerminalState(m message) terminalResult {
 	case "error":
 		return terminalUncertain
 	}
-	if m.ErrorMessage != "" {
+	if m.ErrorMessage != "" || m.ErrorClassificationMessage != "" || m.ErrorStatus != 0 {
 		return terminalUncertain
 	}
 	return terminalDone
@@ -1948,15 +1953,59 @@ func (w *worker) terminalState(e rpcEvent) terminalResult {
 		return assistantTerminalState(m)
 	}
 	if w.lastAssistant != nil {
-		return assistantTerminalState(message{Role: "assistant", StopReason: w.lastAssistant.StopReason, ErrorMessage: w.lastAssistant.ErrorMessage})
+		return assistantTerminalState(message{
+			Role:                       "assistant",
+			StopReason:                 w.lastAssistant.StopReason,
+			ErrorMessage:               w.lastAssistant.ErrorMessage,
+			ErrorClassificationMessage: w.lastAssistant.ErrorClassificationMessage,
+			ErrorStatus:                w.lastAssistant.ErrorStatus,
+		})
 	}
 	return terminalDone
+}
+
+func isRateLimitedError(errorMessage string) bool {
+	normalized := strings.ToLower(strings.NewReplacer("_", " ", "-", " ").Replace(errorMessage))
+	if strings.Contains(normalized, "rate limit") || strings.Contains(normalized, "too many request") {
+		return true
+	}
+	for _, token := range strings.FieldsFunc(normalized, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'z'))
+	}) {
+		if token == "429" {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *worker) terminalFailureNotice(e rpcEvent) string {
+	m := message{}
+	if assistant, ok := lastAssistant(e.Messages); ok {
+		m = assistant
+	} else if w.lastAssistant != nil {
+		m = message{
+			Role:                       "assistant",
+			StopReason:                 w.lastAssistant.StopReason,
+			ErrorMessage:               w.lastAssistant.ErrorMessage,
+			ErrorClassificationMessage: w.lastAssistant.ErrorClassificationMessage,
+			ErrorStatus:                w.lastAssistant.ErrorStatus,
+		}
+	}
+	classification := m.ErrorClassificationMessage
+	if classification == "" {
+		classification = m.ErrorMessage
+	}
+	if m.ErrorStatus == http.StatusTooManyRequests || isRateLimitedError(classification) {
+		return "omp reported that the task was rate-limited by the model provider. The task outcome is uncertain and will not be replayed automatically."
+	}
+	return "omp reported that the task failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically."
 }
 
 func (w *worker) finishTerminal(e rpcEvent) {
 	switch w.terminalState(e) {
 	case terminalUncertain:
-		w.finishUncertain("omp reported that the task failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically.")
+		w.finishUncertain(w.terminalFailureNotice(e))
 	case terminalCancelled:
 		w.finishCancelled("Task was cancelled before completion.")
 	case terminalDone:
@@ -2017,7 +2066,12 @@ func (w *worker) event(raw []byte) {
 	case "message_end":
 		var m message
 		if json.Unmarshal(e.Message, &m) == nil && m.Role == "assistant" {
-			w.lastAssistant = &terminalAssistant{StopReason: m.StopReason, ErrorMessage: m.ErrorMessage}
+			w.lastAssistant = &terminalAssistant{
+				StopReason:                 m.StopReason,
+				ErrorMessage:               m.ErrorMessage,
+				ErrorClassificationMessage: m.ErrorClassificationMessage,
+				ErrorStatus:                m.ErrorStatus,
+			}
 			if text := assistantText(m); text != "" {
 				w.finalAssistantTexts = append(w.finalAssistantTexts, text)
 			}
