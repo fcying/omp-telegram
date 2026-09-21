@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSnapshotConfinesSource(t *testing.T) {
@@ -64,6 +65,34 @@ func TestSnapshotRetainsImmutableCopy(t *testing.T) {
 	info, err := os.Stat(file.Path)
 	if err != nil || info.Mode().Perm()&0222 != 0 {
 		t.Fatalf("snapshot is writable: %v, %v", info, err)
+	}
+}
+
+func TestSnapshotRejectsSourceChangedDuringCopy(t *testing.T) {
+	workspace, spool := t.TempDir(), t.TempDir()
+	path := filepath.Join(workspace, "large.txt")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(MaxDocumentBytes); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mutatorErr := make(chan error, 1)
+	go func() {
+		time.Sleep(time.Millisecond)
+		mutatorErr <- os.Truncate(path, MaxDocumentBytes-1)
+	}()
+	_, snapshotErr := Snapshot(context.Background(), workspace, spool, path, "document", "")
+	if err := <-mutatorErr; err != nil {
+		t.Fatal(err)
+	}
+	if snapshotErr == nil || !strings.Contains(snapshotErr.Error(), "changed during snapshot") {
+		t.Fatalf("changed source was accepted: %v", snapshotErr)
 	}
 }
 

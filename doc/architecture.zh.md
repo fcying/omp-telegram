@@ -122,6 +122,8 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 
 成功的新建/恢复实例会增加持久化 generation. 后台结果按对应的 generation, turn, 请求 token 或 client 身份校验. 会话 claim 防止同一 daemon 内两个 worker 同时打开同一个原生会话, 但不锁住工作目录供其他程序使用.
 
+closed binding 删除与 startup intent 准备共享事务 fence: start 只能为精确匹配的持久化 binding generation, 或确实没有 binding 的对话, 预留启动; deletion 只有在不存在 startup intent 时才成功. worker 发现自己的 binding row 已被删除后, 会在创建新 binding 前使旧 picker confirmation 失效.
+
 **关键是接受边界:** 旧运行时的迟到工作不能影响新实例, 但已经提交的 outbox 结果在 `/new` 或 `/close` 后仍可交付. generation 变化不能撤销已经接受的业务结果.
 
 ## SQLite

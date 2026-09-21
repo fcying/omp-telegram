@@ -364,6 +364,10 @@ func Snapshot(ctx context.Context, workspace, spoolRoot, path, kind, caption str
 	if n > limit {
 		return File{}, errors.New("attachment exceeds the upload size limit")
 	}
+	finalInfo, statErr := source.Stat()
+	if statErr != nil || !finalInfo.Mode().IsRegular() || finalInfo.Size() != info.Size() || !finalInfo.ModTime().Equal(info.ModTime()) || n != info.Size() {
+		return File{}, errors.New("attachment changed during snapshot")
+	}
 	if kind == "photo" {
 		if _, err = target.Seek(0, io.SeekStart); err != nil {
 			return File{}, errors.New("cannot inspect photo snapshot")

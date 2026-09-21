@@ -47,6 +47,8 @@ type Bridge struct {
 	sessionClaims map[string]sessionClaim
 	exportClaims  map[*worker]string
 	bindingsEpoch atomic.Uint64
+	ctx           context.Context
+	workerExits   chan workerExit
 }
 type incoming struct {
 	id       int64
@@ -54,6 +56,11 @@ type incoming struct {
 	callback *telegram.CallbackQuery
 }
 type target struct{ chat, thread int64 }
+
+type workerExit struct {
+	key    target
+	worker *worker
+}
 
 func supportedConversation(m *telegram.Message) bool {
 	return m != nil && (m.MessageThreadID != 0 || m.Chat.Type == "private")
@@ -156,39 +163,43 @@ type worker struct {
 	runtime               runtimeState
 	runtimeResuming       bool
 	lastActivity          time.Time
-	lastTyping            time.Time
-	typingCancel          context.CancelFunc
-	idleProbe             idleProbeState
-	preview               string
-	lastAssistant         *terminalAssistant
-	finalAssistantTexts   []string
-	lastPreview           string
-	previewID             int64
-	previewStopToken      string
-	previewBusy           bool
-	progressSuppressed    bool
-	previewResult         chan previewResult
-	confirms              map[string]confirmation
-	keyboardCleanup       chan int64
-	mediaResults          chan mediaResult
-	sendResults           chan sendResult
-	hostRequests          map[string]context.CancelFunc
-	resumeResults         chan resumeListResult
-	resumeCancel          context.CancelFunc
-	resumeRequest         uint64
-	exportResults         chan exportResult
-	exportCancel          context.CancelFunc
-	exportRequest         uint64
-	exportingSession      string
-	bindingNameResults    chan bindingNamesResult
-	bindingNameCancel     context.CancelFunc
-	bindingNameRequest    uint64
-	doctorResults         chan doctorResult
-	doctorCancel          context.CancelFunc
-	doctorRequest         uint64
+	lastLogicalActivity   time.Time
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	lastTyping          time.Time
+	typingCancel        context.CancelFunc
+	idleProbe           idleProbeState
+	preview             string
+	lastAssistant       *terminalAssistant
+	finalAssistantTexts []string
+	lastPreview         string
+	previewID           int64
+	previewStopToken    string
+	previewBusy         bool
+	progressSuppressed  bool
+	previewResult       chan previewResult
+	confirms            map[string]confirmation
+	keyboardCleanup     chan int64
+	mediaResults        chan mediaResult
+	sendResults         chan sendResult
+	hostRequests        map[string]context.CancelFunc
+	resumeResults       chan resumeListResult
+	resumeCancel        context.CancelFunc
+	resumeRequest       uint64
+	exportResults       chan exportResult
+	exportCancel        context.CancelFunc
+	exportRequest       uint64
+	exportingSession    string
+	bindingNameResults  chan bindingNamesResult
+	bindingNameCancel   context.CancelFunc
+	bindingNameRequest  uint64
+	doctorResults       chan doctorResult
+	doctorCancel        context.CancelFunc
+	doctorRequest       uint64
+
+	ctx           context.Context
+	cancel        context.CancelFunc
+	exitMu        sync.Mutex
+	exitRequested bool
 }
 
 type terminalAssistant struct {
@@ -217,6 +228,8 @@ const (
 	maxProgressUnits     = 3500
 	progressInitialDelay = 3 * time.Second
 )
+
+var logicalWorkerIdleTimeout = 5 * time.Minute
 
 type progressState struct {
 	StartedAt   time.Time
@@ -363,8 +376,8 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		}
 	}
 	telegramLog.Info("telegram command menu registered", "event", "command_menu_registered")
-	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2)}
 	ctx, cancel := context.WithCancel(ctx)
+	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit)}
 	defer func() { cancel(); b.wg.Wait() }()
 	b.reconcileProgressCleanup(ctx)
 	b.cleanupDatabase(ctx)
@@ -372,6 +385,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 	if err := b.restoreWorkers(ctx, workers); err != nil {
 		return err
 	}
+
 	b.wg.Add(2)
 	if cfg.DatabaseRetentionDays > 0 {
 		b.wg.Add(1)
@@ -489,18 +503,29 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 				continue
 			}
 			w := workers[key]
+			if w != nil && w.exitRequestedState() {
+				blocked[key] = true
+				continue
+			}
 			if w == nil {
-				w = b.launchWorker(ctx, key, store.Binding{}, false, nil)
+				binding, bindingErr := b.bindingForWorker(key)
+				if bindingErr != nil {
+					b.storeLog.Error("session binding read failed", "event", "binding_read_failed", "reason", "worker", "error_kind", "persistence")
+					return bindingErr
+				}
+				w = b.launchWorker(ctx, key, binding, false, nil)
 				workers[key] = w
 			}
-			select {
-			case w.input <- incoming{in.ID, m, u.CallbackQuery}:
-				delivered[in.ID] = true
-			default:
+			if !w.tryInput(incoming{in.ID, m, u.CallbackQuery}) {
 				blocked[key] = true
+				continue
 			}
+			delivered[in.ID] = true
+
 		}
 		select {
+		case exit := <-b.workerExits:
+			removeExitedWorker(workers, exit)
 		case <-ctx.Done():
 			return nil
 		case err := <-b.fatal:
@@ -756,10 +781,41 @@ func (w *worker) mark(id int64, state string) bool {
 	return true
 }
 
+func (w *worker) touchLogicalActivity() {
+	w.lastLogicalActivity = time.Now()
+}
+
 func (w *worker) touchActivity() {
+	w.touchLogicalActivity()
 	w.resetIdleProbe()
 	if w.runtime == runtimeConnected && w.client != nil {
 		w.lastActivity = time.Now()
+	}
+}
+
+func (w *worker) markExitRequested() {
+	w.exitMu.Lock()
+	w.exitRequested = true
+	w.exitMu.Unlock()
+}
+
+func (w *worker) exitRequestedState() bool {
+	w.exitMu.Lock()
+	defer w.exitMu.Unlock()
+	return w.exitRequested
+}
+
+func (w *worker) tryInput(in incoming) bool {
+	w.exitMu.Lock()
+	defer w.exitMu.Unlock()
+	if w.exitRequested {
+		return false
+	}
+	select {
+	case w.input <- in:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -795,6 +851,24 @@ func (w *worker) releaseIdleRuntime(now time.Time) {
 		return
 	}
 	w.releaseRuntimeWithReason(true, "idle")
+}
+
+func (w *worker) logicalIdleEligibleLocked() bool {
+	return w.runtime == runtimeReleased && w.client == nil && !w.restoring && !w.runtimeResuming && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && !w.awaitingContinuation && len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 && len(w.albumSuppressed) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.exportingSession == "" && w.bindingNameCancel == nil && w.doctorCancel == nil && w.startIntent == nil && len(w.confirms) == 0 && w.idleProbe.cancel == nil && w.typingCancel == nil && len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 && len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 && len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 && len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
+}
+
+func (w *worker) evictIfIdle(now time.Time) bool {
+	if logicalWorkerIdleTimeout <= 0 || w.lastLogicalActivity.IsZero() || now.Sub(w.lastLogicalActivity) < logicalWorkerIdleTimeout {
+		return false
+	}
+	w.exitMu.Lock()
+	defer w.exitMu.Unlock()
+	if w.exitRequested || !w.logicalIdleEligibleLocked() {
+		return false
+	}
+	w.exitRequested = true
+	w.cancel()
+	return true
 }
 
 func (w *worker) runtimeClient() (*omp.Client, bool) {
@@ -899,6 +973,7 @@ func (w *worker) logTaskSubmit(inboxID int64) {
 	w.log.LogAttrs(context.Background(), slog.LevelInfo, "task submitted", attrs...)
 }
 func (w *worker) run() {
+	w.touchLogicalActivity()
 	w.log.Info("worker started", "event", "worker_start")
 	w.initMedia()
 	w.initResumePicker()
@@ -993,11 +1068,15 @@ func (w *worker) run() {
 		case result := <-w.idleProbe.results:
 			w.idleProbeFinished(result, time.Now())
 		case <-tick.C:
+			now := time.Now()
 			w.typing()
 			w.flushPreview()
 			w.expire()
-			w.probeStuckTask(time.Now())
-			w.releaseIdleRuntime(time.Now())
+			w.probeStuckTask(now)
+			w.releaseIdleRuntime(now)
+			if w.evictIfIdle(now) {
+				return
+			}
 		}
 		w.dispatch()
 	}
@@ -1434,6 +1513,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	w.say(ready)
 }
 func (w *worker) handle(in incoming) {
+	w.touchLogicalActivity()
 	if in.callback != nil {
 		if !w.mark(in.id, "submitted") {
 			return
@@ -1984,7 +2064,7 @@ func (w *worker) terminalState(e rpcEvent) terminalResult {
 
 func isRateLimitedError(errorMessage string) bool {
 	normalized := strings.ToLower(strings.NewReplacer("_", " ", "-", " ").Replace(errorMessage))
-	if strings.Contains(normalized, "rate limit") || strings.Contains(normalized, "too many request") {
+	if strings.Contains(normalized, "rate limit") || strings.Contains(normalized, "too many requests") {
 		return true
 	}
 	for _, token := range strings.FieldsFunc(normalized, func(r rune) bool {

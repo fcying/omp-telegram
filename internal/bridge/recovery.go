@@ -29,6 +29,14 @@ func (b *Bridge) runWorker(w *worker) {
 	go func() {
 		defer b.wg.Done()
 		w.run()
+		w.markExitRequested()
+		if b.workerExits == nil || b.ctx == nil {
+			return
+		}
+		select {
+		case b.workerExits <- workerExit{key: w.key, worker: w}:
+		case <-b.ctx.Done():
+		}
 	}()
 }
 
@@ -36,6 +44,20 @@ func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Bin
 	w := b.newWorker(ctx, key, binding, restoring, intent)
 	b.runWorker(w)
 	return w
+}
+
+func removeExitedWorker(workers map[target]*worker, exit workerExit) {
+	if workers[exit.key] == exit.worker {
+		delete(workers, exit.key)
+	}
+}
+
+func (b *Bridge) bindingForWorker(key target) (store.Binding, error) {
+	binding, err := b.db.Binding(b.bot.ID, key.chat, key.thread)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.Binding{Bot: b.bot.ID, Chat: key.chat, Thread: key.thread}, nil
+	}
+	return binding, err
 }
 
 func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker) error {

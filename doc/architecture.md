@@ -122,6 +122,8 @@ Ordinary private chats use the existing `(chat, 0)` target and worker/session li
 
 A successful new/resumed instance increments the persisted generation. Background results are checked against the appropriate generation, turn, request token, or client identity. Session claims prevent two workers in this daemon from opening the same native conversation concurrently. Claims do not lock a workspace against other programs.
 
+Closed-binding deletion and startup-intent preparation share a transaction fence: a start may reserve only the exact persisted binding generation, or an actually unbound conversation, while deletion succeeds only when no startup intent exists. When a worker observes that its binding row was deleted, it invalidates its old picker confirmations before creating a fresh binding.
+
 **The acceptance boundary matters:** stale runtime work must not affect a replacement instance, but already committed outbox results remain deliverable after `/new` or `/close`. A later generation is not permission to discard accepted results.
 
 ## SQLite

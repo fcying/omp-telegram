@@ -133,17 +133,40 @@ func sameDoctorBinding(left, right doctorBindingSnapshot) bool {
 
 func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client, db *store.Store, binding doctorBindingSnapshot, runtime runtimeState) []doctorCheck {
 	checks := make([]doctorCheck, 0, 11)
-	checks = append(checks, checkDoctorConfig(cfg))
-	checks = append(checks, checkDoctorTelegram(ctx, tg))
-	checks = append(checks, checkDoctorDatabase(ctx, db))
-	checks = append(checks, checkDoctorStorage(cfg.DataDir))
-	checks = append(checks, checkDoctorOMPWithTimeout(ctx, cfg.OMP))
+	appendChecks := func(items ...doctorCheck) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		checks = append(checks, items...)
+		return ctx.Err() == nil
+	}
+	if !appendChecks(checkDoctorConfig(cfg)) {
+		return checks
+	}
+	if !appendChecks(checkDoctorTelegram(ctx, tg)) {
+		return checks
+	}
+	if !appendChecks(checkDoctorDatabase(ctx, db)) {
+		return checks
+	}
+	if !appendChecks(checkDoctorStorage(cfg.DataDir)) {
+		return checks
+	}
+	if !appendChecks(checkDoctorOMPWithTimeout(ctx, cfg.OMP)) {
+		return checks
+	}
 	workspace, session := checkDoctorWorkspaceSession(binding, runtime)
-	checks = append(checks, workspace, session)
-	checks = append(checks, checkDoctorRuntime(runtime, binding))
+	if !appendChecks(workspace, session) {
+		return checks
+	}
+	if !appendChecks(checkDoctorRuntime(runtime, binding)) {
+		return checks
+	}
 	inbox, outbox := checkDoctorUncertain(ctx, db)
-	checks = append(checks, inbox, outbox)
-	checks = append(checks, checkDoctorDisk(cfg.DataDir))
+	if !appendChecks(inbox, outbox) {
+		return checks
+	}
+	appendChecks(checkDoctorDisk(cfg.DataDir))
 	return checks
 }
 

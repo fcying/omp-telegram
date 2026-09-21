@@ -1870,3 +1870,54 @@ func TestInvalidNewPreservesRunningSession(t *testing.T) {
 		t.Fatal("new modified conflicting directory file")
 	}
 }
+
+func TestWorkerExitIdentityDoesNotDeleteReplacement(t *testing.T) {
+	key := target{chat: -10, thread: 11}
+	oldWorker := &worker{}
+	newWorker := &worker{}
+	workers := map[target]*worker{key: newWorker}
+	removeExitedWorker(workers, workerExit{key: key, worker: oldWorker})
+	if workers[key] != newWorker {
+		t.Fatal("stale worker exit removed replacement worker")
+	}
+	removeExitedWorker(workers, workerExit{key: key, worker: newWorker})
+	if _, ok := workers[key]; ok {
+		t.Fatal("matching worker exit did not remove worker")
+	}
+}
+
+func TestIdleWorkerRequestsExit(t *testing.T) {
+	oldTimeout := logicalWorkerIdleTimeout
+	logicalWorkerIdleTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { logicalWorkerIdleTimeout = oldTimeout })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := testBridge(t, &Bridge{cfg: config.Config{QueueCapacity: 1}, ctx: ctx, workerExits: make(chan workerExit, 1)})
+	w := b.newWorker(ctx, target{chat: -10, thread: 11}, store.Binding{}, false, nil)
+	b.runWorker(w)
+	var exit workerExit
+	select {
+	case exit = <-b.workerExits:
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle worker did not request exit")
+	}
+	if exit.key != w.key || exit.worker != w || !w.exitRequestedState() {
+		t.Fatalf("worker exit = %+v, worker=%p, requested=%t", exit, w, w.exitRequestedState())
+	}
+	b.wg.Wait()
+}
+
+func TestRateLimitTextFallbackRequiresRequestsPhrase(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{text: "Too Many Requests", want: true},
+		{text: "rate_limit_error", want: true},
+		{text: "too many request IDs", want: false},
+	} {
+		if got := isRateLimitedError(tc.text); got != tc.want {
+			t.Fatalf("isRateLimitedError(%q) = %t, want %t", tc.text, got, tc.want)
+		}
+	}
+}

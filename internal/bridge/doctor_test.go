@@ -362,3 +362,33 @@ func TestStoreQuickCheckHonorsCanceledContext(t *testing.T) {
 		t.Fatalf("QuickCheck canceled error = %v", err)
 	}
 }
+
+func TestDoctorStopsChecksAfterCancellation(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	oldGetMe, oldRunOMP, oldStatfs := doctorGetMe, doctorRunOMP, doctorStatfs
+	t.Cleanup(func() {
+		doctorGetMe, doctorRunOMP, doctorStatfs = oldGetMe, oldRunOMP, oldStatfs
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	doctorGetMe = func(context.Context, *telegram.Client) error {
+		cancel()
+		return nil
+	}
+	doctorRunOMP = func(context.Context, string) error {
+		t.Fatal("doctor continued after cancellation")
+		return nil
+	}
+	doctorStatfs = func(string) (uint64, error) {
+		t.Fatal("doctor reached filesystem checks after cancellation")
+		return 0, nil
+	}
+	checks := runDoctorChecks(ctx, config.Config{OMP: "fixture", DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 1, ProgressMode: "summary"}, newTestTelegram(t), db, doctorBindingSnapshot{}, runtimeReleased)
+	if len(checks) != 1 || checks[0].Name != "Config" {
+		t.Fatalf("checks after cancellation = %#v", checks)
+	}
+}

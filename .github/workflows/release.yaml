@@ -115,6 +115,8 @@ jobs:
           path: dist/omp-telegram-linux-${{ matrix.arch }}.txz
           if-no-files-found: error
 
+  # Same-repository pull requests intentionally publish the moving "nightly" prerelease
+  # so contributors can test the exact PR build; fork pull requests remain build-only below.
   release:
     needs: [prepare, build]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
