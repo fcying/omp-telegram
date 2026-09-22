@@ -340,6 +340,7 @@ func TestMain(m *testing.M) {
 type fakeHTTP struct {
 	mu                   sync.Mutex
 	messages             []map[string]any
+	forumTopicEdits      []map[string]any
 	callbacks            []string
 	updates              chan telegram.Update
 	rejectCommands       bool
@@ -405,6 +406,10 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		id := len(f.messages)
 		f.mu.Unlock()
 		result = map[string]any{"message_id": id}
+	case "editForumTopic":
+		f.mu.Lock()
+		f.forumTopicEdits = append(f.forumTopicEdits, req)
+		f.mu.Unlock()
 	case "deleteMessage":
 		f.mu.Lock()
 		f.deletedMessages = append(f.deletedMessages, req)
@@ -628,6 +633,37 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 	waitFor(t, func() bool { return f.has(11, "answer: "+first.Workspace) })
 	if data, err := os.ReadFile(marker); err != nil || string(data) != "keep" {
 		t.Fatal("close/resume lost workspace files")
+	}
+}
+
+func TestNewNamesPreviouslyUnboundTopicFromWorkspace(t *testing.T) {
+	f, db, send := setupBridge(t)
+	workspace := filepath.Join(t.TempDir(), "project")
+	send(update(1, 11, "/new "+workspace))
+	waitBinding(t, db, 11)
+	waitFor(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return len(f.forumTopicEdits) == 1
+	})
+	f.mu.Lock()
+	edits := append([]map[string]any(nil), f.forumTopicEdits...)
+	f.mu.Unlock()
+	if len(edits) != 1 || edits[0]["chat_id"] != float64(-10) || edits[0]["message_thread_id"] != float64(11) || edits[0]["name"] != "project" {
+		t.Fatalf("topic edits = %+v", edits)
+	}
+	send(update(2, 11, "/close"))
+	waitInputDone(t, db, 2)
+	send(update(3, 11, "/new "+filepath.Join(t.TempDir(), "replacement")))
+	waitFor(t, func() bool {
+		binding, err := db.Binding(99, -10, 11)
+		return err == nil && binding.Generation > 1
+	})
+	f.mu.Lock()
+	editCount := len(f.forumTopicEdits)
+	f.mu.Unlock()
+	if editCount != 1 {
+		t.Fatalf("existing topic was renamed during replacement: %d edits", editCount)
 	}
 }
 func TestUnauthorizedUpdateCannotSpawn(t *testing.T) {

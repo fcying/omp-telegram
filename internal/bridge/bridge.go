@@ -1281,6 +1281,23 @@ func (w *worker) startFenced(resume bool, target, expectedCWD string, replace bo
 	w.startInternal(resume, target, expectedCWD, replace, generation, true)
 }
 
+func (w *worker) renameNewTopic(workspace string) {
+	if w.key.thread == 0 || w.b.tg == nil {
+		return
+	}
+	name := clipUTF16(menuText(filepath.Base(filepath.Clean(workspace)), 128), 128)
+	if name == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+	if err := w.b.tg.EditForumTopic(ctx, w.key.chat, w.key.thread, name); err != nil {
+		info := telegram.ClassifyError(err)
+		w.log.Warn("new topic rename failed", "event", "topic_rename_failed", "error_kind", info.Reason)
+		w.say("The session started, but the Telegram topic title could not be updated.")
+	}
+}
+
 func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool) {
 	if _, connected := w.runtimeClient(); connected && !replace {
 		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
@@ -1304,6 +1321,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		return
 	}
 	oldMissing := errors.Is(e, sql.ErrNoRows)
+	renameTopic := !resume && !w.restoring && w.key.thread != 0 && oldMissing
 	if oldMissing && !w.restoring {
 		w.cancelResumeList()
 		w.clearConfirmations()
@@ -1503,6 +1521,9 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		runtimeReason = "lazy"
 	}
 	w.logRuntimeEvent(slog.LevelInfo, "runtime_connected", runtimeReason, "runtime connected", info.ID)
+	if renameTopic {
+		w.renameNewTopic(info.CWD)
+	}
 	if w.runtimeResuming {
 		return
 	}

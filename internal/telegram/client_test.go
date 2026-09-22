@@ -142,6 +142,26 @@ func TestDeleteMessage(t *testing.T) {
 	}
 }
 
+func TestEditForumTopic(t *testing.T) {
+	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/editForumTopic" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+			t.Error(err)
+			return
+		}
+		if string(fields["chat_id"]) != "-10" || string(fields["message_thread_id"]) != "8" || string(fields["name"]) != `"project"` {
+			t.Errorf("wrong topic edit fields: %s", fields)
+		}
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	})
+	if err := client.EditForumTopic(context.Background(), -10, 8, "project"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClearKeyboardPreservesText(t *testing.T) {
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/editMessageReplyMarkup" {

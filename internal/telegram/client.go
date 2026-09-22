@@ -391,6 +391,21 @@ func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string,
 	return err
 }
 
+// EditForumTopic changes a forum topic's display name.
+func (c *Client) EditForumTopic(ctx context.Context, chatID, threadID int64, name string) error {
+	err := c.call(ctx, "editForumTopic", map[string]any{
+		"chat_id": chatID, "message_thread_id": threadID, "name": name,
+	}, nil, true)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == 400 {
+		description := strings.ToLower(apiErr.Description)
+		if strings.Contains(description, "topic") && strings.Contains(description, "not modified") {
+			return nil
+		}
+	}
+	return err
+}
+
 // Delete removes a Telegram message without changing durable task state.
 func (c *Client) Delete(ctx context.Context, chatID, messageID int64) error {
 	return c.call(ctx, "deleteMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil, false)

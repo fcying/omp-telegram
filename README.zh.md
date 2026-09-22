@@ -37,7 +37,7 @@ tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 
 arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE, omp 需要单独安装. 每个发布版都附带 `SHA256SUMS`.
 
-开发构建发布在 [Development build](https://github.com/fcying/omp-telegram/releases/tag/nightly). 这是 prerelease, 可能不稳定.
+开发构建发布在 [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev). 这是 prerelease, 可能不稳定.
 
 ### 从源码构建
 
@@ -169,7 +169,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 | 命令 | 用途 |
 | --- | --- |
-| `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. |
+| `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. 对于没有 binding 的 Telegram topic, Telegram topic 标题会同步为解析后 workspace 的最后一级目录名; 后续替换 session 不会重命名 topic. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session. released session 只清空排队任务. |
 | `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |

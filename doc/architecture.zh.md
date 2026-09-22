@@ -92,7 +92,7 @@ RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单�
 | 组件 | 主要事件 |
 | --- | --- |
 | `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
-| `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `restore_runtime_skipped`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
+| `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `restore_runtime_skipped`, `topic_rename_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
 | `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
 | `telegram` | `command_menu_registered`, `poll_failed`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
 | `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed`, `progress_message_write_failed`, `progress_cleanup_state_failed` |
@@ -211,6 +211,7 @@ Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 wo
 ## 会话生命周期
 
 `/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录. Resume pin 只保存 `(bot,chat,thread,workspace,session_id)` identity metadata; pinned session 排在前面, stale pin 在 native listing 返回同一 identity 前保持隐藏. Pin 和 Unpin 是 picker 控件, 不修改原生 session 或 binding lifecycle. 显式删除 closed binding 时也会删除其 pinned metadata, 但不会触碰原生 session history.
+在没有 binding 的 forum topic 中首次执行 `/new` 时, bridge 会同步把 Telegram topic 标题设为解析后 workspace 的最后一级目录名. 后续替换 session 不会重命名 topic; `/name` 只修改 OMP 原生 session title.
 
 `/export` 使用 generation 和 binding identity 双重 fence 的 picker, 默认导出原生 session JSONL; `/export html` 使用同一个 picker 进行原生 HTML 渲染. `/export <session ID>` 和 `/export html <session ID>` 不列出 session, 会先校验原生 identity 和 workspace, 再直接导出指定 session. 因为列举是只读操作, 当前 worker 忙碌时仍可打开 picker. 选择当前 session 前必须等待 active task、compaction/finalization 和 queued prompt 结束; 其他 inactive 且未被 claim 的 session 可以并行导出. 每个进行中的 export 都会 reservation 选中的 session identity, 因此其他 conversation 在操作结束前不能 claim 或 export 同一 session. 导出文件作为 document 排入当前 conversation; 成功 export 只代表 durable outbox item 已创建, Telegram delivery 状态单独确认.`
 
@@ -380,6 +381,6 @@ just deploy
 
 应用版本由 [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go) 中的 `Version` 定义. `--version`/`-v` 在构建元数据可用时显示 Git revision/dirty 标记, 可通过 `-ldflags "-X main.Version=..."` 覆盖基础版本.
 
-[发布工作流](../.github/workflows/release.yaml) 在 `main` push, PR 及手动触发时运行. 所有非 `main` 分支变更必须通过 PR 进入 workflow. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 本仓库的每个 workflow 都会发布: `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag; 其他内部 workflow 均更新 `nightly` GitHub prerelease. 内部 PR 发布真实 head commit. 外部 PR 只构建, 不发布. workflow 只能更新 `nightly` tag 或创建新的正式版本 tag, 不会覆盖已发布的正式版本 tag.
+[发布工作流](../.github/workflows/release.yaml) 在 `main` push, PR 及手动触发时运行. 所有非 `main` 分支变更必须通过 PR 进入 workflow. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 本仓库的每个 workflow 都会发布: `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag; 其他内部 workflow 均更新 `dev` GitHub prerelease. 内部 PR 发布真实 head commit. 外部 PR 只构建, 不发布. workflow 只能更新 `dev` prerelease tag 和新源码版本 tag, 不会修改无关 tag.
 
 发布包包含二进制和 LICENSE, 并提供 `SHA256SUMS`. 只有发布 job 为 `GITHUB_TOKEN` 申请写权限. 发布新应用版本时, 将 `Version` 改为 `vMAJOR.MINOR.PATCH` 并合并/push 到 `main`, 不会自动改变数据库 schema 版本.

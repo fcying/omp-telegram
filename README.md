@@ -37,7 +37,7 @@ tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 
 For arm64, use `omp-telegram-linux-arm64.txz`. Archives contain the binary and LICENSE; omp itself is installed separately. Each release includes `SHA256SUMS`.
 
-Development builds are published as the [Development build](https://github.com/fcying/omp-telegram/releases/tag/nightly). They are prereleases and may be unstable.
+Development builds are published as the [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev). They are prereleases and may be unstable.
 
 ### Build from source
 
@@ -169,7 +169,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 
 | Command | What it does |
 | --- | --- |
-| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. |
+| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On an unbound Telegram topic, the Telegram topic title is set to the resolved workspace basename; later replacements do not rename it. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session open. A released session only clears queued tasks. |
 | `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |

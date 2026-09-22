@@ -43,7 +43,7 @@ jobs:
             target="${{ github.event.pull_request.head.sha }}"
           fi
           prerelease=true
-          version="nightly"
+          version="dev"
           if [[ "$GITHUB_REF" == "refs/heads/main" ]] && ! git show-ref --verify --quiet "refs/tags/${source_version}"; then
             version="$source_version"
             prerelease=false
@@ -115,7 +115,7 @@ jobs:
           path: dist/omp-telegram-linux-${{ matrix.arch }}.txz
           if-no-files-found: error
 
-  # Same-repository pull requests intentionally publish the moving "nightly" prerelease
+  # Same-repository pull requests intentionally publish the moving "dev" prerelease
   # so contributors can test the exact PR build; fork pull requests remain build-only below.
   release:
     needs: [prepare, build]
@@ -152,7 +152,7 @@ jobs:
           if [[ "$PRERELEASE" == true ]]; then
             while IFS= read -r release_id; do
               gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"
-            done < <(gh api --paginate --jq '.[] | select(.draft and .name == "nightly") | .id' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            done < <(gh api --paginate --jq '.[] | select(.draft and .name == "dev") | .id' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
             if gh release view "$VERSION" >/dev/null 2>&1; then
               gh release delete "$VERSION" --yes
             fi
