@@ -74,6 +74,9 @@ func TestDoctorReportsUncertainRecords(t *testing.T) {
 	if err := db.Accept(1, []byte(`{"update_id":1}`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Mark(1, "submitted"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Mark(1, "uncertain"); err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +85,9 @@ func TestDoctorReportsUncertainRecords(t *testing.T) {
 	}
 	output, err := db.NextOutput()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkOutput(output.ID, "sending"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.MarkOutput(output.ID, "uncertain"); err != nil {
@@ -148,6 +154,9 @@ func TestDoctorRunsAsyncRejectsDuplicateAndFencesRuntime(t *testing.T) {
 	}
 	if duplicate.Text != "Diagnostics are already running." {
 		t.Fatalf("duplicate response = %q", duplicate.Text)
+	}
+	if err := db.MarkOutput(duplicate.ID, "sending"); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.MarkOutput(duplicate.ID, "done"); err != nil {
 		t.Fatal(err)
@@ -323,6 +332,9 @@ func TestDoctorTimeoutCanRetry(t *testing.T) {
 	}
 	if timeoutOutput.Text != "Diagnostics timed out. Run /doctor again." {
 		t.Fatalf("timeout response = %q", timeoutOutput.Text)
+	}
+	if err := db.MarkOutput(timeoutOutput.ID, "sending"); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.MarkOutput(timeoutOutput.ID, "done"); err != nil {
 		t.Fatal(err)

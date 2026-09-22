@@ -37,6 +37,11 @@ type Config struct {
 	LogComponentLevels    map[string]string
 }
 
+const (
+	MaxWorkersLimit       = 64
+	MaxQueueCapacityLimit = 1024
+)
+
 // fileConfig accepts quoted environment references in otherwise numeric fields.
 type fileConfig struct {
 	Telegram telegramFileConfig `toml:"telegram"`
@@ -229,6 +234,9 @@ func load(path, baseDir string) (Config, error) {
 	}
 	if int64(int(workers)) != workers || int64(int(capacity)) != capacity || int64(int(retentionDays)) != retentionDays {
 		return c, errors.New("worker.max_workers, worker.queue_capacity, or storage.database_retention_days exceeds platform integer range")
+	}
+	if workers > MaxWorkersLimit || capacity > MaxQueueCapacityLimit {
+		return c, errors.New("worker.max_workers or worker.queue_capacity exceeds the configured safety limit")
 	}
 	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
 	switch progressMode {

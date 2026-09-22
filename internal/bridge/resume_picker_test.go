@@ -475,6 +475,36 @@ func TestResumePickerInvalidatedBeforeGenerationReuse(t *testing.T) {
 	}
 }
 
+func TestResumePickerEpochRejectsReusedGeneration(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	command("/close")
+	generation := w.binding.Generation
+	setResumeFixtures(t, w.binding.Workspace, 1)
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	data := resumeButtons(t, f)[0]["callback_data"].(string)
+	token, _, _ := strings.Cut(data, ":")
+	deleted, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, generation)
+	if err != nil || !deleted {
+		t.Fatalf("test binding deletion = %t, error %v", deleted, err)
+	}
+	replacement := w.binding
+	replacement.Session = filepath.Join(replacement.Workspace, "replacement.jsonl")
+	replacement.Running = false
+	requireStoreOK(t, w.b.db.Save(replacement))
+	w.b.bindingsEpoch.Add(1)
+	clickResume(w, 7, data)
+	if _, exists := w.confirms[token]; exists {
+		t.Fatal("deleted-binding picker confirmation survived the epoch change")
+	}
+	stored, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
+	requireStoreOK(t, err)
+	if stored != replacement {
+		t.Fatalf("stale picker changed generation-reused binding: %+v", stored)
+	}
+}
+
 func TestResumePickerDoesNotPublishAfterPersistedBindingDeletion(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new test")

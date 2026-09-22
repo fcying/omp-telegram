@@ -344,6 +344,11 @@ func Snapshot(ctx context.Context, workspace, spoolRoot, path, kind, caption str
 	if err = os.MkdirAll(spoolRoot, 0700); err != nil {
 		return File{}, errors.New("cannot create attachment spool")
 	}
+	spoolDir, err := os.Open(spoolRoot)
+	if err != nil {
+		return File{}, errors.New("cannot open attachment spool")
+	}
+	defer spoolDir.Close()
 	target, err := os.CreateTemp(spoolRoot, "attachment-*")
 	if err != nil {
 		return File{}, errors.New("cannot create attachment snapshot")
@@ -394,6 +399,9 @@ func Snapshot(ctx context.Context, workspace, spoolRoot, path, kind, caption str
 	}
 	if err = target.Close(); err != nil {
 		return File{}, errors.New("cannot finish attachment snapshot")
+	}
+	if err = spoolDir.Sync(); err != nil {
+		return File{}, errors.New("cannot persist attachment snapshot directory")
 	}
 	if err = ctx.Err(); err != nil {
 		return File{}, err

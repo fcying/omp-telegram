@@ -220,17 +220,18 @@ func TestFailedFinalCommitDoesNotLogSuccessfulCompletion(t *testing.T) {
 }
 
 type startupLogTransport struct {
-	target   string
-	reject   bool
-	entered  chan struct{}
-	fallback fakeHTTP
+	target      string
+	reject      bool
+	entered     chan struct{}
+	enteredOnce sync.Once
+	fallback    fakeHTTP
 }
 
 func (f *startupLogTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if filepath.Base(r.URL.Path) != f.target {
 		return f.fallback.RoundTrip(r)
 	}
-	close(f.entered)
+	f.enteredOnce.Do(func() { close(f.entered) })
 	if f.reject {
 		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Request: r, Body: io.NopCloser(strings.NewReader(`{"ok":false,"error_code":403,"description":"SECRET_STARTUP_DIAGNOSTIC"}`))}, nil
 	}
@@ -279,24 +280,45 @@ func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("startup did not reach Telegram request")
 				}
-				if !reject {
-					cancel()
-				}
-				select {
-				case err := <-done:
-					if err == nil || (!reject && !errors.Is(err, context.Canceled)) {
-						t.Fatalf("startup error contract changed: %v", err)
-					}
-				case <-time.After(5 * time.Second):
-					t.Fatal("startup did not return")
-				}
 				event := "telegram_identity_failed"
 				if endpoint == "setMyCommands" {
 					event = "telegram_commands_failed"
 				}
+				if reject && endpoint == "setMyCommands" {
+					deadline := time.NewTimer(5 * time.Second)
+					ticker := time.NewTicker(time.Millisecond)
+					for capturedEvent(t, capture, event) == nil {
+						select {
+						case <-deadline.C:
+							t.Fatal("startup rejection was not logged")
+						case <-ticker.C:
+						}
+					}
+					deadline.Stop()
+					ticker.Stop()
+				}
+				if !reject || endpoint == "setMyCommands" {
+					cancel()
+				}
+				select {
+				case err := <-done:
+					if endpoint == "getMe" {
+						if err == nil || (!reject && !errors.Is(err, context.Canceled)) {
+							t.Fatalf("startup error contract changed: %v", err)
+						}
+					} else if err != nil {
+						t.Fatalf("command menu failure stopped startup: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("startup did not return")
+				}
 				record := capturedEvent(t, capture, event)
 				if reject {
-					if record["level"] != "ERROR" || record["api_code"] != float64(403) {
+					wantLevel := "ERROR"
+					if endpoint == "setMyCommands" {
+						wantLevel = "WARN"
+					}
+					if record["level"] != wantLevel || record["api_code"] != float64(403) {
 						t.Fatalf("genuine startup failure was not reported: %+v", record)
 					}
 				} else if record != nil {

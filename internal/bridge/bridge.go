@@ -315,36 +315,6 @@ var botCommands = []telegram.BotCommand{
 	{Command: "help", Description: "Show usage help"},
 }
 
-func commandHelp() string {
-	var help strings.Builder
-	for i, command := range botCommands {
-		if i > 0 {
-			help.WriteByte('\n')
-		}
-		help.WriteByte('/')
-		help.WriteString(command.Command)
-		help.WriteString(" - ")
-		help.WriteString(command.Description)
-	}
-	return help.String()
-}
-func logTelegramFailure(logger *slog.Logger, level slog.Level, event, message string, err error, extra ...slog.Attr) {
-	info := telegram.ClassifyError(err)
-	attrs := []slog.Attr{
-		slog.String("event", event),
-		slog.String("reason", info.Reason),
-		slog.Bool("uncertain", info.Uncertain),
-	}
-	if info.Code != 0 {
-		attrs = append(attrs, slog.Int("api_code", info.Code))
-	}
-	if info.RetryAfter > 0 {
-		attrs = append(attrs, slog.Int("retry_after_s", info.RetryAfter))
-	}
-	attrs = append(attrs, extra...)
-	logger.LogAttrs(context.Background(), level, message, attrs...)
-}
-
 func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry) error {
 	if logs == nil {
 		return errors.New("logging registry required")
@@ -366,16 +336,21 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		storeLog.Error("bot consistency check failed", "event", "bot_check_failed", "error_kind", "persistence")
 		return err
 	}
-	// Replace both previously registered lists so all clients receive English descriptions.
+	// Command menus improve discoverability but are not required for polling.
+	registered := 0
 	for _, language := range []string{"", "zh"} {
 		if err = tg.SetCommands(ctx, botCommands, language); err != nil {
 			if ctx.Err() == nil {
-				logTelegramFailure(telegramLog, slog.LevelError, "telegram_commands_failed", "telegram command registration failed", err)
+				logTelegramFailure(telegramLog, slog.LevelWarn, "telegram_commands_failed", "telegram command registration failed", err, slog.String("language_code", language))
 			}
-			return fmt.Errorf("register Telegram commands: %w", err)
+			continue
 		}
+		registered++
 	}
-	telegramLog.Info("telegram command menu registered", "event", "command_menu_registered")
+	if registered > 0 {
+		telegramLog.Info("telegram command menu registered", "event", "command_menu_registered", "languages", registered)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit)}
 	defer func() { cancel(); b.wg.Wait() }()
@@ -401,6 +376,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		}
 	}()
 	wake := make(chan struct{}, 1)
+	var pollBackoff time.Duration
 	go func() {
 		defer b.wg.Done()
 		for ctx.Err() == nil {
@@ -416,13 +392,13 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 					return
 				}
 				logTelegramFailure(b.telegramLog, slog.LevelWarn, "poll_failed", "telegram polling failed", err)
-				select {
-				case <-ctx.Done():
+				pollBackoff = nextPollDelay(pollBackoff, telegram.ClassifyError(err).RetryAfter)
+				if !waitPollBackoff(ctx, pollBackoff) {
 					return
-				case <-time.After(2 * time.Second):
 				}
 				continue
 			}
+			pollBackoff = 0
 			for _, u := range updates {
 				raw, err := json.Marshal(u)
 				if err == nil {
@@ -665,33 +641,33 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			b.storeLog.Error("unsupported outbox content kind", "event", "outbox_read_failed", "reason", "invalid_kind")
 			return errors.New("unsupported outbox content kind")
 		}
-		state := "done"
+		state := store.OutboxDone
 		if e != nil {
 			info := telegram.ClassifyError(e)
-			state = "failed"
+			state = store.OutboxFailed
 			if info.Uncertain {
-				state = "uncertain"
+				state = store.OutboxUncertain
 			}
 			if ctx.Err() == nil && info.Reason != "cancelled" {
 				logTelegramFailure(b.telegramLog, slog.LevelWarn, "delivery_failed", "telegram delivery failed", e,
 					slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
-					slog.String("kind", o.Kind), slog.String("state", state), slog.Bool("replay", false))
+					slog.String("kind", o.Kind), slog.String("state", string(state)), slog.Bool("replay", false))
 			}
 		}
 		if e = b.db.MarkOutput(o.ID, state); e != nil {
 			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", state)
 			return e
 		}
-		if state == "done" && o.InboxID != 0 {
+		if state == store.OutboxDone && o.InboxID != 0 {
 			b.cleanupDeliveredProgress(ctx, o.InboxID)
 		}
 		if o.Kind != "text" {
-			if state == "done" {
+			if state == store.OutboxDone {
 				if removeErr := os.Remove(o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 					b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
 				}
 			} else {
-				if e = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+state+". It will not be replayed automatically."); e != nil {
+				if e = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+string(state)+". It will not be replayed automatically."); e != nil {
 					b.storeLog.Error("delivery failure notice persistence failed", "event", "outbox_write_failed")
 					return e
 				}
@@ -768,7 +744,7 @@ func (w *worker) say(s string) {
 		}
 	}
 }
-func (w *worker) mark(id int64, state string) bool {
+func (w *worker) mark(id int64, state store.InboxState) bool {
 	if id == 0 {
 		return true
 	}
@@ -1819,7 +1795,6 @@ func (w *worker) dispatch() {
 	raw, err := w.call("prompt", fields)
 	if err != nil {
 		w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
-		w.mark(q.id, "uncertain")
 		w.closeLogicalSession()
 		return
 	}
@@ -2215,7 +2190,6 @@ func (w *worker) event(raw []byte) {
 	case "response":
 		if !e.Success {
 			w.say("The omp request failed. Use /status to check the session state.")
-			w.mark(w.active, "uncertain")
 			w.closeLogicalSession()
 		}
 	case "extension_ui_request":

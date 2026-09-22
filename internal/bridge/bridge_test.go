@@ -344,7 +344,9 @@ type fakeHTTP struct {
 	callbacks            []string
 	updates              chan telegram.Update
 	rejectCommands       bool
+	rejectAllCommands    bool
 	rejectLanguage       string
+	rejectGetMe          bool
 	files                map[string][]byte
 	failProgress         bool
 	progressCalls        int
@@ -386,9 +388,12 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 			return nil, r.Context().Err()
 		}
 	case "getMe":
+		if f.rejectGetMe {
+			return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader(`{"ok":false,"error_code":401,"description":"identity lookup rejected"}`)), Header: make(http.Header), Request: r}, nil
+		}
 		result = telegram.User{ID: 99, Username: "fixture_bot", IsBot: true}
 	case "setMyCommands":
-		if f.rejectCommands && req["language_code"] == f.rejectLanguage {
+		if f.rejectCommands && (f.rejectAllCommands || req["language_code"] == f.rejectLanguage) {
 			return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"ok":false,"error_code":400,"description":"command registration rejected"}`)), Header: make(http.Header), Request: r}, nil
 		}
 	case "getUpdates":
@@ -494,26 +499,46 @@ func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) 
 	})
 	return fake, db, func(u telegram.Update) { fake.updates <- u }
 }
-
-func TestCommandRegistrationFailureStopsStartup(t *testing.T) {
-	for _, language := range []string{"", "zh"} {
-		t.Run("language="+language, func(t *testing.T) {
+func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
+	cases := []struct {
+		name         string
+		rejectAll    bool
+		rejectLocale string
+	}{
+		{name: "default", rejectLocale: ""},
+		{name: "zh", rejectLocale: "zh"},
+		{name: "all", rejectAll: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			db, err := store.Open(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer db.Close()
 			previous := http.DefaultTransport
-			http.DefaultTransport = &fakeHTTP{rejectCommands: true, rejectLanguage: language}
+			http.DefaultTransport = &fakeHTTP{rejectCommands: true, rejectAllCommands: tc.rejectAll, rejectLanguage: tc.rejectLocale}
 			defer func() { http.DefaultTransport = previous }()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			err = Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t))
-			var apiErr *telegram.APIError
-			if !errors.As(err, &apiErr) || apiErr.Code != 400 {
-				t.Fatalf("registration failure did not stop startup: %v", err)
+			if err := Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t)); err != nil {
+				t.Fatalf("command registration failure stopped startup: %v", err)
 			}
 		})
+	}
+}
+
+func TestGetMeFailureStopsStartup(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	previous := http.DefaultTransport
+	http.DefaultTransport = &fakeHTTP{rejectGetMe: true}
+	defer func() { http.DefaultTransport = previous }()
+	if err := Run(context.Background(), config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t)); err == nil {
+		t.Fatal("GetMe failure did not stop startup")
 	}
 }
 
@@ -992,6 +1017,7 @@ func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
 	requireStoreOK(t, db.SetProgressMessage(10, 77))
 	out, err := db.NextOutput()
 	requireStoreOK(t, err)
+	requireStoreOK(t, db.MarkOutput(out.ID, "sending"))
 	requireStoreOK(t, db.MarkOutput(out.ID, "done"))
 	fake := &fakeHTTP{progressDeleteStatus: http.StatusInternalServerError}
 	previous := http.DefaultTransport
@@ -1024,6 +1050,7 @@ func TestProgressDeletionPermanentFailureClearsAssociation(t *testing.T) {
 	requireStoreOK(t, db.SetProgressMessage(10, 77))
 	out, err := db.NextOutput()
 	requireStoreOK(t, err)
+	requireStoreOK(t, db.MarkOutput(out.ID, "sending"))
 	requireStoreOK(t, db.MarkOutput(out.ID, "done"))
 	fake := &fakeHTTP{progressDeleteStatus: http.StatusBadRequest}
 	previous := http.DefaultTransport
@@ -1725,6 +1752,7 @@ func TestUnsupportedFollowupDoesNotStartTask(t *testing.T) {
 
 func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
+	w.b.fatal = make(chan error, 1)
 	w.b.cfg.QueueCapacity = 4
 	command("/new " + t.TempDir())
 	if w.client == nil {
@@ -1751,6 +1779,40 @@ func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 	binding, err := w.b.db.Binding(99, -10, 11)
 	if err != nil || binding.Running {
 		t.Fatalf("uncertain process remains recoverable: %+v, %v", binding, err)
+	}
+	select {
+	case err := <-w.b.fatal:
+		t.Fatalf("duplicate uncertain transition reported fatal error: %v", err)
+	default:
+	}
+}
+
+func TestFailedResponseMarksTaskUncertainOnce(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := testBridge(t, &Bridge{db: db, fatal: make(chan error, 1)})
+	w := testWorker(t, &worker{
+		b: b, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel,
+		binding: store.Binding{Bot: 99, Chat: -10, Thread: 11}, active: 10,
+		confirms: make(map[string]confirmation),
+	})
+	w.event([]byte(`{"type":"response","success":false}`))
+	var state string
+	requireStoreOK(t, db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "uncertain" {
+		t.Fatalf("failed response state = %q, want uncertain", state)
+	}
+	select {
+	case err := <-b.fatal:
+		t.Fatalf("duplicate uncertain response transition reported fatal error: %v", err)
+	default:
 	}
 }
 

@@ -119,8 +119,8 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `storage.data_dir` | Database, lock, and outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
 | `storage.database_retention_days` | How long terminal bridge message metadata is retained. Default: `90`; `0` disables automatic cleanup. |
-| `worker.max_workers` | Maximum number of connected OMP processes. Default: `4`. |
-| `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`. |
+| `worker.max_workers` | Maximum number of connected OMP processes. Default: `4`; maximum: `64`. |
+| `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`; maximum: `1024`. |
 | `worker.idle_timeout` | Time before releasing an otherwise idle OMP process while keeping its session available. Default: `30m`; `0` or `disabled` turns this off. |
 | `logging.level` | Global log level: `debug`, `info`, `warn`, or `error`. Default: `info`. |
 | `logging.format` | Log format: `text` or `json`. Default: `text`. |

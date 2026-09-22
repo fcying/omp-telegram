@@ -32,7 +32,9 @@ workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 database_retention_days = 90
 
 [worker]
+# max_workers maximum: 64 connected OMP processes.
 max_workers = 4
+# queue_capacity maximum: 1024 waiting tasks per conversation.
 queue_capacity = 16
 # Release an unused OMP runtime after this duration while retaining the logical session.
 # Set 0 or disabled to turn automatic release off.

@@ -87,6 +87,9 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - name: Vet
         run: go vet ./...
 

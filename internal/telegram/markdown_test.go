@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestConvertMarkdownTableAligned(t *testing.T) {
@@ -88,6 +89,36 @@ func TestConvertMarkdownPlainTextUnchanged(t *testing.T) {
 	if got := ConvertMarkdown(in); got != in {
 		t.Fatalf("plain text changed: %s", got)
 	}
+}
+
+func FuzzConvertMarkdown(f *testing.F) {
+	for _, seed := range []string{"plain", "```go\nvalue < 1\n```", "| a | b |\n|---|---|\n| 1 | 2 |", "> quote\n> text"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, input string) {
+		if output := ConvertMarkdown(input); !utf8.ValidString(output) {
+			t.Fatal("markdown conversion produced invalid UTF-8")
+		}
+	})
+}
+
+func FuzzSplitForTelegram(f *testing.F) {
+	for _, seed := range []string{
+		"plain",
+		"emoji 😀😀😀",
+		"```go\nvalue < 1\n```",
+		"| a | b |\n|---|---|\n| 1 | 2 |",
+		"> quote\n> text",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, input string) {
+		for index, part := range SplitForTelegram(input, MaxMessageUTF16) {
+			if got := renderedUTF16Len(ConvertMarkdown(part)); got > MaxMessageUTF16 {
+				t.Fatalf("part %d rendered length = %d, limit %d", index, got, MaxMessageUTF16)
+			}
+		}
+	})
 }
 
 func TestSendAddsHTMLParseMode(t *testing.T) {

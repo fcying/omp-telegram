@@ -23,6 +23,9 @@ func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +58,9 @@ func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	if got := f.deletedMessageIDs(); len(got) != 0 {
 		t.Fatalf("progress was deleted before final delivery: %v", got)
 	}
+	if err := w.b.db.MarkOutput(output.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.b.db.MarkOutput(output.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +78,9 @@ func TestShortTaskCompletesWithoutProgressMessage(t *testing.T) {
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
 		t.Fatal(err)
 	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
@@ -131,6 +140,9 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
 		t.Fatal(err)
 	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
@@ -208,6 +220,9 @@ func TestTerminalCompletionDeletesProgressMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +243,9 @@ func TestTerminalCompletionDeletesProgressMessage(t *testing.T) {
 	}
 	if got := f.deletedMessageIDs(); len(got) != 0 {
 		t.Fatalf("progress was deleted before final delivery: %v", got)
+	}
+	if err := w.b.db.MarkOutput(out.ID, "sending"); err != nil {
+		t.Fatal(err)
 	}
 	if err := w.b.db.MarkOutput(out.ID, "done"); err != nil {
 		t.Fatal(err)
@@ -284,6 +302,9 @@ func TestRootCompletionPersistsReplyToOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +325,9 @@ func TestQueuedRootRepliesRetainTheirOwnOrigins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -322,6 +346,9 @@ func TestQueuedRootRepliesRetainTheirOwnOrigins(t *testing.T) {
 		out, err := w.b.db.NextOutput()
 		if err != nil || out.Text != want.text || out.ReplyTo != want.replyTo {
 			t.Fatalf("queued root output = %+v, error %v", out, err)
+		}
+		if err = w.b.db.MarkOutput(out.ID, "sending"); err != nil {
+			t.Fatal(err)
 		}
 		if err = w.b.db.MarkOutput(out.ID, "done"); err != nil {
 			t.Fatal(err)
@@ -349,6 +376,9 @@ func activeProgressStop(t *testing.T) (*worker, *fakeHTTP, string, int) {
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
 		t.Fatal(err)
 	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
@@ -472,6 +502,9 @@ func TestReviewFinalReplyRetainsCommandOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -491,6 +524,9 @@ func TestAttachmentFinalReplyRetainsAttachmentOrigin(t *testing.T) {
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
 		t.Fatal(err)
 	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
@@ -534,6 +570,9 @@ func TestProgressStopAcceptsCallbackBeforeInitialResult(t *testing.T) {
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
 		t.Fatal(err)
 	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {

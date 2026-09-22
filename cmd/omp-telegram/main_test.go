@@ -193,3 +193,19 @@ func TestDaemonStructuredLogFormats(t *testing.T) {
 		})
 	}
 }
+func TestDaemonLockRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.lock")
+	link := filepath.Join(dir, "daemon.lock")
+	if err := os.WriteFile(target, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := openDaemonLock(link)
+	if err == nil {
+		lock.Close()
+		t.Fatal("daemon lock followed a symlink")
+	}
+}

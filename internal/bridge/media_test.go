@@ -428,6 +428,9 @@ func TestAlbumQueueFullRejectsOnce(t *testing.T) {
 	if err != nil || out.Text != "The queue is full. This album was not submitted." {
 		t.Fatalf("album queue-full notice = %+v, error %v", out, err)
 	}
+	if err := w.b.db.MarkOutput(out.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.b.db.MarkOutput(out.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -968,6 +971,9 @@ func TestDatabaseCleanupRemovesOnlyOwnedSnapshots(t *testing.T) {
 		}
 	}
 	for _, id := range []int64{1, 2, 3} {
+		if err = db.MarkOutput(id, "sending"); err != nil {
+			t.Fatal(err)
+		}
 		if err = db.MarkOutput(id, "done"); err != nil {
 			t.Fatal(err)
 		}

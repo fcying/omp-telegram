@@ -20,6 +20,9 @@ func releasedIdleWorker(t *testing.T) (*worker, *fakeHTTP, func(string), store.B
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = w.b.db.MarkOutput(ready.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err = w.b.db.MarkOutput(ready.ID, "done"); err != nil {
 		t.Fatal(err)
 	}

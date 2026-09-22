@@ -360,6 +360,35 @@ func TestNumericEnvironmentValues(t *testing.T) {
 	}
 }
 
+func TestWorkerLimits(t *testing.T) {
+	path, source := configFixture(t)
+	for _, tc := range []struct {
+		table, key, value string
+		limit             int
+	}{
+		{"worker", "max_workers", strconv.Itoa(MaxWorkersLimit), MaxWorkersLimit},
+		{"worker", "queue_capacity", strconv.Itoa(MaxQueueCapacityLimit), MaxQueueCapacityLimit},
+	} {
+		c, err := loadSource(t, path, setTOMLField(source, tc.table, tc.key, tc.value))
+		if err != nil {
+			t.Fatalf("rejected safe %s: %v", tc.key, err)
+		}
+		if got := map[string]int{"max_workers": c.MaxWorkers, "queue_capacity": c.QueueCapacity}[tc.key]; got != tc.limit {
+			t.Fatalf("%s = %d, want %d", tc.key, got, tc.limit)
+		}
+	}
+	for _, tc := range []struct {
+		table, key, value string
+	}{
+		{"worker", "max_workers", strconv.Itoa(MaxWorkersLimit + 1)},
+		{"worker", "queue_capacity", strconv.Itoa(MaxQueueCapacityLimit + 1)},
+	} {
+		if _, err := loadSource(t, path, setTOMLField(source, tc.table, tc.key, tc.value)); err == nil {
+			t.Fatalf("accepted unsafe %s", tc.key)
+		}
+	}
+}
+
 func TestDatabaseRetentionDays(t *testing.T) {
 	path, source := configFixture(t)
 	c, err := loadSource(t, path, source)

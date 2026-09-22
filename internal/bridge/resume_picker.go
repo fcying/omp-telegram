@@ -25,6 +25,7 @@ const resumePageSize = 8
 type resumeListResult struct {
 	request                   uint64
 	generation, user          int64
+	epoch                     uint64
 	cwd, action, exportFormat string
 	sessions                  []omp.SessionSummary
 	err                       error
@@ -38,6 +39,7 @@ type resumePickerOption struct {
 type exportResult struct {
 	request                          uint64
 	generation                       int64
+	epoch                            uint64
 	format                           string
 	sessionID                        string
 	workspace                        string
@@ -205,6 +207,7 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
 	w.resumeCancel = cancel
 	request, generation := w.resumeRequest, binding.Generation
+	epoch := w.b.bindingsEpoch.Load()
 	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: w.b.cfg.OMPArgs}
 	w.background.Add(1)
 	go func() {
@@ -218,7 +221,7 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := resumeListResult{request: request, generation: generation, user: user, cwd: cwd, action: action, exportFormat: format, sessions: sessions, err: err}
+		result := resumeListResult{request: request, generation: generation, epoch: epoch, user: user, cwd: cwd, action: action, exportFormat: format, sessions: sessions, err: err}
 		select {
 		case w.resumeResults <- result:
 		case <-w.ctx.Done():
@@ -232,6 +235,10 @@ func (w *worker) acceptSessionList(result resumeListResult) bool {
 	}
 	w.resumeCancel()
 	w.resumeCancel = nil
+	if result.epoch != w.b.bindingsEpoch.Load() {
+		w.say("The saved binding changed. Use /resume again.")
+		return false
+	}
 	if result.generation != w.binding.Generation {
 		return false
 	}
@@ -288,7 +295,7 @@ func (w *worker) resumeListed(result resumeListResult) {
 	nativeSessions := append([]omp.SessionSummary(nil), result.sessions...)
 	sessions := append([]omp.SessionSummary(nil), nativeSessions...)
 	sortPinnedSessions(sessions, pinned)
-	w.showResumePage(confirmation{action: "resume", method: "select", workspace: result.cwd, user: result.user, generation: result.generation, sessions: sessions, nativeSessions: nativeSessions, pinnedSessions: pinned}, 0, 0)
+	w.showResumePage(confirmation{action: "resume", method: "select", workspace: result.cwd, user: result.user, generation: result.generation, epoch: result.epoch, sessions: sessions, nativeSessions: nativeSessions, pinnedSessions: pinned}, 0, 0)
 }
 
 func (w *worker) exportListed(result resumeListResult) {
@@ -296,7 +303,7 @@ func (w *worker) exportListed(result resumeListResult) {
 		w.say("omp has no saved sessions in this working directory.")
 		return
 	}
-	w.showResumePage(confirmation{action: "export", method: "select", workspace: result.cwd, exportFormat: result.exportFormat, user: result.user, generation: result.generation, sessions: result.sessions}, 0, 0)
+	w.showResumePage(confirmation{action: "export", method: "select", workspace: result.cwd, exportFormat: result.exportFormat, user: result.user, generation: result.generation, epoch: result.epoch, sessions: result.sessions}, 0, 0)
 }
 
 func menuText(text string, limit int) string {
@@ -367,6 +374,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 	w.exportCancel = cancel
 	w.exportRequest++
 	request := w.exportRequest
+	epoch := w.b.bindingsEpoch.Load()
 	if currentCandidate {
 		w.exportingSession = session.ID
 	}
@@ -435,7 +443,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := exportResult{request: request, generation: generation, format: exportFormatName(format), sessionID: session.ID, workspace: committed.Workspace, bindingSession: bindingSession, bindingSessionID: bindingSessionID, file: file, err: err}
+		result := exportResult{request: request, generation: generation, epoch: epoch, format: exportFormatName(format), sessionID: session.ID, workspace: committed.Workspace, bindingSession: bindingSession, bindingSessionID: bindingSessionID, file: file, err: err}
 		select {
 		case w.exportResults <- result:
 		case <-w.ctx.Done():
@@ -453,7 +461,7 @@ func (w *worker) cleanupExportResult(result exportResult) {
 
 func (w *worker) exportFinished(result exportResult) {
 	defer w.b.releaseExport(w)
-	if result.request != w.exportRequest || result.generation != w.binding.Generation || w.exportCancel == nil {
+	if result.request != w.exportRequest || result.generation != w.binding.Generation || result.epoch != w.b.bindingsEpoch.Load() || w.exportCancel == nil {
 		w.cleanupExportResult(result)
 		if w.exportCancel != nil {
 			w.exportCancel()
@@ -596,6 +604,11 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		return
 	}
 	option := c.pickerOptions[index]
+	if c.epoch != w.b.bindingsEpoch.Load() {
+		w.clearKeyboard(messageID)
+		w.say("The saved binding changed. Use " + command + " again.")
+		return
+	}
 	switch option.action {
 	case "previous":
 		w.showResumePage(c, c.page-1, messageID)
@@ -620,11 +633,6 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		return
 	}
 	if !w.persistedBindingGenerationMatches(c.generation) {
-		w.clearKeyboard(messageID)
-		w.say("The saved binding changed. Use " + command + " again.")
-		return
-	}
-	if option.session < 0 || option.session >= len(c.sessions) {
 		w.clearKeyboard(messageID)
 		return
 	}
@@ -654,7 +662,7 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 }
 
 func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID int64) {
-	if !w.persistedBindingGenerationMatches(c.generation) {
+	if c.epoch != w.b.bindingsEpoch.Load() || !w.persistedBindingGenerationMatches(c.generation) {
 		w.clearKeyboard(messageID)
 		w.say("The saved binding changed. Use /resume again.")
 		return

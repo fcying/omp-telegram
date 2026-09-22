@@ -77,7 +77,7 @@ func run() int {
 	}
 	logger := logs.Logger(logging.Daemon)
 	syscall.Umask(0077)
-	lock, e := os.OpenFile(filepath.Join(c.DataDir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lock, e := openDaemonLock(filepath.Join(c.DataDir, "daemon.lock"))
 	if e != nil {
 		logger.Error("daemon lock unavailable", "event", "lock_failed", "reason", "lock_unavailable")
 		return 1

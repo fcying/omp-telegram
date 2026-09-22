@@ -19,6 +19,38 @@ import (
 const schemaVersion = 9
 const messageCleanupBatchSize = 1000
 
+// InboxState identifies the durable lifecycle state of an incoming update.
+type InboxState string
+
+const (
+	InboxPending   InboxState = "pending"
+	InboxSubmitted InboxState = "submitted"
+	InboxDone      InboxState = "done"
+	InboxCancelled InboxState = "cancelled"
+	InboxFailed    InboxState = "failed"
+	InboxIgnored   InboxState = "ignored"
+	InboxUncertain InboxState = "uncertain"
+)
+
+// OutboxState identifies the durable lifecycle state of a Telegram delivery.
+type OutboxState string
+
+const (
+	OutboxPending   OutboxState = "pending"
+	OutboxSending   OutboxState = "sending"
+	OutboxDone      OutboxState = "done"
+	OutboxFailed    OutboxState = "failed"
+	OutboxUncertain OutboxState = "uncertain"
+	OutboxCancelled OutboxState = "cancelled"
+	OutboxSent      OutboxState = "sent"
+)
+
+var (
+	ErrInboxStateTransition  = errors.New("inbox state transition rejected")
+	ErrOutboxStateTransition = errors.New("outbox state transition rejected")
+	ErrStaleBinding          = errors.New("stale binding")
+)
+
 type Store struct{ DB *sql.DB }
 type Binding struct {
 	Bot, Chat, Thread             int64
@@ -339,9 +371,36 @@ func (s *Store) Pending() ([]Input, error) {
 	}
 	return out, rows.Err()
 }
-func (s *Store) Mark(id int64, state string) error {
-	_, e := s.DB.Exec("UPDATE inbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
-	return e
+func (s *Store) Mark(id int64, state InboxState) error {
+	var expected string
+	switch state {
+	case InboxSubmitted:
+		expected = "'pending'"
+	case InboxDone:
+		expected = "'pending','submitted'"
+	case InboxCancelled:
+		expected = "'pending','submitted'"
+	case InboxFailed:
+		expected = "'pending'"
+	case InboxIgnored:
+		expected = "'pending'"
+	case InboxUncertain:
+		expected = "'submitted'"
+	default:
+		return fmt.Errorf("%w: %s", ErrInboxStateTransition, state)
+	}
+	result, err := s.DB.Exec("UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state IN ("+expected+")", string(state), time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: %s", ErrInboxStateTransition, state)
+	}
+	return nil
 }
 
 // Submit records a root task's originating Telegram message before OMP accepts it.
@@ -349,8 +408,18 @@ func (s *Store) Submit(id, replyTo int64) error {
 	if replyTo < 0 {
 		return errors.New("invalid reply target")
 	}
-	_, e := s.DB.Exec("UPDATE inbox SET state='submitted',reply_to=?,updated_at=? WHERE id=?", replyTo, time.Now().Unix(), id)
-	return e
+	result, err := s.DB.Exec("UPDATE inbox SET state='submitted',reply_to=?,updated_at=? WHERE id=? AND state='pending'", replyTo, time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrInboxStateTransition
+	}
+	return nil
 }
 func (s *Store) Binding(bot, chat, thread int64) (Binding, error) {
 	b := Binding{Bot: bot, Chat: chat, Thread: thread}
@@ -618,13 +687,33 @@ func validSessionID(id string) string {
 }
 
 func (s *Store) SetRunning(b Binding, running bool) error {
-	_, e := s.DB.Exec("UPDATE bindings SET running=? WHERE bot=? AND chat=? AND thread=? AND generation=?", running, b.Bot, b.Chat, b.Thread, b.Generation)
-	return e
+	result, err := s.DB.Exec("UPDATE bindings SET running=? WHERE bot=? AND chat=? AND thread=? AND generation=?", running, b.Bot, b.Chat, b.Thread, b.Generation)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleBinding
+	}
+	return nil
 }
 
 func (s *Store) SetInterrupted(b Binding, interrupted bool) error {
-	_, err := s.DB.Exec("UPDATE bindings SET interrupted=? WHERE bot=? AND chat=? AND thread=? AND generation=?", interrupted, b.Bot, b.Chat, b.Thread, b.Generation)
-	return err
+	result, err := s.DB.Exec("UPDATE bindings SET interrupted=? WHERE bot=? AND chat=? AND thread=? AND generation=?", interrupted, b.Bot, b.Chat, b.Thread, b.Generation)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleBinding
+	}
+	return nil
 }
 
 func (s *Store) CleanupMessages(ctx context.Context, cutoff int64) (CleanupResult, error) {
@@ -741,7 +830,7 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 	return count, paths, nil
 }
 func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
-	if previous.Generation < 0 || (intent.Kind != "new" && intent.Kind != "resume") || intent.Generation != previous.Generation+1 {
+	if previous.Generation < 0 || (intent.Kind != "new" && intent.Kind != "resume") || intent.Generation != previous.Generation+1 || intent.Bot != previous.Bot || intent.Chat != previous.Chat || intent.Thread != previous.Thread {
 		return errors.New("invalid startup intent")
 	}
 	tx, err := s.DB.Begin()
@@ -749,24 +838,6 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 		return err
 	}
 	defer tx.Rollback()
-	var generation int64
-	err = tx.QueryRow("SELECT generation FROM bindings WHERE bot=? AND chat=? AND thread=?", previous.Bot, previous.Chat, previous.Thread).Scan(&generation)
-	switch {
-	case previous.Generation == 0:
-		if err == nil {
-			return errors.New("startup binding changed")
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-	case err != nil:
-		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("startup binding changed")
-		}
-		return err
-	case generation != previous.Generation:
-		return errors.New("startup binding changed")
-	}
 	if previous.Running {
 		result, err := tx.Exec("UPDATE bindings SET running=0 WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=1", previous.Bot, previous.Chat, previous.Thread, previous.Generation)
 		if err != nil {
@@ -780,13 +851,26 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 			return errors.New("startup binding changed")
 		}
 	}
-	_, err = tx.Exec("INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation) VALUES(?,?,?,?,?,?,?)", intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation)
+	where := "NOT EXISTS (SELECT 1 FROM bindings WHERE bot=? AND chat=? AND thread=?)"
+	args := []any{intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation, previous.Bot, previous.Chat, previous.Thread}
+	if previous.Generation > 0 {
+		where = "EXISTS (SELECT 1 FROM bindings WHERE bot=? AND chat=? AND thread=? AND generation=?)"
+		args = append(args, previous.Generation)
+	}
+	query := "INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation) SELECT ?,?,?,?,?,?,? WHERE " + where
+	result, err := tx.Exec(query, args...)
 	if err != nil {
 		return err
 	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errors.New("startup binding changed")
+	}
 	return tx.Commit()
 }
-
 func (s *Store) CommitStart(b Binding) error {
 	tx, err := s.DB.Begin()
 	if err != nil {
@@ -847,22 +931,22 @@ func (s *Store) Enqueue(chat, thread int64, text string) error {
 // CompleteInboxWithReplies commits the complete final result and input completion together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, "done", replies)
+	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies)
 }
 
 // CompleteInboxUncertainWithReplies commits a terminal result that cannot be confirmed.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxUncertainWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, "uncertain", replies)
+	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies)
 }
 
 // CompleteInboxCancelledWithReplies commits an aborted terminal result and its replies together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxCancelledWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, "cancelled", replies)
+	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies)
 }
 
-func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state string, replies []string) error {
+func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -876,7 +960,7 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 		}
 		return err
 	}
-	result, err := tx.ExecContext(ctx, "UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state='submitted'", state, now, id)
+	result, err := tx.ExecContext(ctx, "UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state='submitted'", string(state), now, id)
 	if err != nil {
 		return err
 	}
@@ -910,9 +994,28 @@ func (s *Store) NextOutput() (Output, error) {
 	return o, err
 }
 
-func (s *Store) MarkOutput(id int64, state string) error {
-	_, err := s.DB.Exec("UPDATE outbox SET state=?,updated_at=? WHERE id=?", state, time.Now().Unix(), id)
-	return err
+func (s *Store) MarkOutput(id int64, state OutboxState) error {
+	var expected string
+	switch state {
+	case OutboxSending:
+		expected = "'pending'"
+	case OutboxDone, OutboxFailed, OutboxUncertain, OutboxCancelled, OutboxSent:
+		expected = "'sending'"
+	default:
+		return fmt.Errorf("%w: %s", ErrOutboxStateTransition, state)
+	}
+	result, err := s.DB.Exec("UPDATE outbox SET state=?,updated_at=? WHERE id=? AND state IN ("+expected+")", string(state), time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: %s", ErrOutboxStateTransition, state)
+	}
+	return nil
 }
 
 func (s *Store) SetProgressMessage(inboxID, messageID int64) error {
@@ -939,7 +1042,7 @@ func (s *Store) CompletedProgressMessage(inboxID int64) (ProgressMessage, bool, 
 SELECT i.id,MIN(o.chat),i.progress_message_id
 FROM inbox i
 JOIN outbox o ON o.inbox_id=i.id
-WHERE i.id=? AND i.state='done' AND i.progress_message_id>0
+WHERE i.id=? AND i.state IN ('done','cancelled','failed','ignored','uncertain') AND i.progress_message_id>0
   AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state<>'done')
 GROUP BY i.id,i.progress_message_id`, inboxID).Scan(&message.InboxID, &message.Chat, &message.MessageID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -953,7 +1056,7 @@ func (s *Store) CompletedProgressMessages() ([]ProgressMessage, error) {
 SELECT i.id,MIN(o.chat),i.progress_message_id
 FROM inbox i
 JOIN outbox o ON o.inbox_id=i.id
-WHERE i.state='done' AND i.progress_message_id>0
+WHERE i.state IN ('done','cancelled','failed','ignored','uncertain') AND i.progress_message_id>0
   AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state<>'done')
 GROUP BY i.id,i.progress_message_id ORDER BY i.id`)
 	if err != nil {

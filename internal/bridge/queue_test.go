@@ -23,6 +23,9 @@ func queueReady(t *testing.T, w *worker, command func(string)) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := w.b.db.MarkOutput(output.ID, "sending"); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.b.db.MarkOutput(output.ID, "done"); err != nil {
 		t.Fatal(err)
 	}

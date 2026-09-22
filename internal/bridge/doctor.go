@@ -171,7 +171,7 @@ func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client
 }
 
 func checkDoctorConfig(cfg config.Config) doctorCheck {
-	if cfg.OMP == "" || cfg.DataDir == "" || cfg.MaxWorkers <= 0 || cfg.QueueCapacity <= 0 {
+	if cfg.OMP == "" || cfg.DataDir == "" || cfg.MaxWorkers < 1 || cfg.MaxWorkers > config.MaxWorkersLimit || cfg.QueueCapacity < 1 || cfg.QueueCapacity > config.MaxQueueCapacityLimit {
 		return doctorCheck{Name: "Config", Level: doctorFail, Message: "invalid runtime configuration"}
 	}
 	switch cfg.ProgressMode {

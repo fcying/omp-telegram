@@ -119,8 +119,8 @@ format = "text"
 | `storage.data_dir` | 数据库, lock 和待发送附件的存储目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
 | `storage.database_retention_days` | 终态 bridge 消息 metadata 的保留天数. 默认 `90`; `0` 关闭自动清理. |
-| `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `4`. |
-| `worker.queue_capacity` | 每个对话最多等待的任务数. 默认 `16`. |
+| `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `4`; 配置最大值 `64`. |
+| `worker.queue_capacity` | 每个对话最多等待的任务数. 默认 `16`; 配置最大值 `1024`. |
 | `worker.idle_timeout` | 保留 session 的同时释放持续空闲 OMP 进程前的时长. 默认 `30m`; `0` 或 `disabled` 关闭. |
 | `logging.level` | 全局日志级别: `debug`, `info`, `warn` 或 `error`. 默认 `info`. |
 | `logging.format` | 日志格式: `text` 或 `json`. 默认 `text`. |

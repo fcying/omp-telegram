@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,58 @@ func TestChunksRejectInvalidEncodingAndLength(t *testing.T) {
 	if _, err := d.push(chunkFrame("one", 1, 2, 4, []byte{'}'})); err == nil {
 		t.Fatal("short reassembly accepted")
 	}
+}
+
+func FuzzFrameDecoder(f *testing.F) {
+	for _, seed := range []struct {
+		data, splits []byte
+	}{
+		{data: []byte(`{"type":"agent_start"}`), splits: []byte{1, 4}},
+		{data: []byte(`{"type":"rpc_chunk","chunkId":"x","index":0,"count":2,"byteLength":4,"data":"ew=="}`), splits: []byte{0, 1}},
+		{data: []byte{0, 1, 2, 3, 255}, splits: []byte{2, 3}},
+	} {
+		f.Add(seed.data, seed.splits)
+	}
+	f.Fuzz(func(t *testing.T, data, splits []byte) {
+		d := frameDecoder{physical: 1024, logical: maxLogical}
+		_, _ = d.push(data)
+		if len(data) > 1<<20 {
+			data = data[:1<<20]
+		}
+		payload, err := json.Marshal(map[string]string{"type": "agent_end", "text": string(data)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		positions := []int{0, len(payload)}
+		for _, raw := range splits {
+			if len(positions) >= 34 {
+				break
+			}
+			positions = append(positions, 1+int(raw)%(len(payload)-1))
+		}
+		sort.Ints(positions)
+		unique := positions[:0]
+		for _, position := range positions {
+			if len(unique) == 0 || unique[len(unique)-1] != position {
+				unique = append(unique, position)
+			}
+		}
+		positions = unique
+		if len(positions) < 3 {
+			positions = []int{0, len(payload) / 2, len(payload)}
+		}
+		d = frameDecoder{physical: 1, logical: maxLogical}
+		count := len(positions) - 1
+		for i := 0; i < count; i++ {
+			got, err := d.push(chunkFrame("fuzz", i, count, len(payload), payload[positions[i]:positions[i+1]]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i+1 == count && !bytes.Equal(got, payload) {
+				t.Fatalf("reassembled payload differs: got %q want %q", got, payload)
+			}
+		}
+	})
 }
 
 func fixtureClient(t *testing.T) *Client {

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -168,6 +169,7 @@ func TestCompletionSurvivesRestartWithOrderedReplies(t *testing.T) {
 		if out.Text != expected {
 			t.Fatalf("next reply = %q, want %q", out.Text, expected)
 		}
+		requireStoreOK(t, s.MarkOutput(out.ID, "sending"))
 		requireStoreOK(t, s.MarkOutput(out.ID, "done"))
 	}
 	if _, err := s.NextOutput(); err != sql.ErrNoRows {
@@ -189,8 +191,21 @@ func TestRootReplyTargetSurvivesCompletionAndRestart(t *testing.T) {
 		if out.Text != want || out.ReplyTo != 42 {
 			t.Fatalf("durable reply target = %+v, want text %q replying to 42", out, want)
 		}
+		requireStoreOK(t, s.MarkOutput(out.ID, "sending"))
 		requireStoreOK(t, s.MarkOutput(out.ID, "done"))
 	}
+}
+
+func TestMarkOutputRequiresSendingState(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Enqueue(1, 2, "reply"))
+	out, err := s.NextOutput()
+	requireStoreOK(t, err)
+	if err = s.MarkOutput(out.ID, OutboxDone); !errors.Is(err, ErrOutboxStateTransition) {
+		t.Fatalf("pending to done error = %v, want %v", err, ErrOutboxStateTransition)
+	}
+	requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
+	requireStoreOK(t, s.MarkOutput(out.ID, OutboxDone))
 }
 
 func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
@@ -207,12 +222,14 @@ func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
 	if first.InboxID != 10 {
 		t.Fatalf("first output inbox = %d, want 10", first.InboxID)
 	}
+	requireStoreOK(t, s.MarkOutput(first.ID, "sending"))
 	requireStoreOK(t, s.MarkOutput(first.ID, "done"))
 	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
 		t.Fatalf("partial progress cleanup became ready=%t, err=%v", ready, err)
 	}
 	second, err := s.NextOutput()
 	requireStoreOK(t, err)
+	requireStoreOK(t, s.MarkOutput(second.ID, "sending"))
 	requireStoreOK(t, s.MarkOutput(second.ID, "done"))
 	target, ready, err := s.CompletedProgressMessage(10)
 	requireStoreOK(t, err)
@@ -229,7 +246,7 @@ func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
 		t.Fatalf("cleared progress cleanup remained ready=%t, err=%v", ready, err)
 	}
 }
-func TestTerminalNonDoneProgressIsNotCleanupEligible(t *testing.T) {
+func TestTerminalProgressWaitsForFinalReplyDelivery(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	for _, tc := range []struct {
 		id    int64
@@ -249,12 +266,16 @@ func TestTerminalNonDoneProgressIsNotCleanupEligible(t *testing.T) {
 		requireStoreOK(t, err)
 		requireStoreOK(t, s.SetProgressMessage(tc.id, tc.id+100))
 		if _, ready, err := s.CompletedProgressMessage(tc.id); err != nil || ready {
-			t.Fatalf("%s progress became cleanup eligible: ready=%t, err=%v", tc.state, ready, err)
+			t.Fatalf("%s progress became ready before delivery: ready=%t, err=%v", tc.state, ready, err)
 		}
-		var messageID int64
-		requireStoreOK(t, s.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=?", tc.id).Scan(&messageID))
-		if messageID != tc.id+100 {
-			t.Fatalf("%s progress association = %d", tc.state, messageID)
+		out, err := s.NextOutput()
+		requireStoreOK(t, err)
+		requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
+		requireStoreOK(t, s.MarkOutput(out.ID, OutboxDone))
+		target, ready, err := s.CompletedProgressMessage(tc.id)
+		requireStoreOK(t, err)
+		if !ready || target.InboxID != tc.id || target.MessageID != tc.id+100 {
+			t.Fatalf("%s progress after delivery = %+v, ready=%t", tc.state, target, ready)
 		}
 	}
 }
@@ -288,6 +309,7 @@ func TestRestartRecovery(t *testing.T) {
 	if out.Text != "not sent" || out.Chat != 1 || out.Thread != 2 {
 		t.Fatalf("replayed uncertain output: %+v", out)
 	}
+	requireStoreOK(t, s.MarkOutput(out.ID, "sending"))
 	requireStoreOK(t, s.MarkOutput(out.ID, "sent"))
 	if _, err = s.NextOutput(); err != sql.ErrNoRows {
 		t.Fatalf("uncertain output became deliverable: %v", err)
@@ -327,6 +349,7 @@ func TestAttachmentRestartRecovery(t *testing.T) {
 	if state != "uncertain" {
 		t.Fatalf("in-flight attachment state = %q", state)
 	}
+	requireStoreOK(t, s.MarkOutput(out.ID, "sending"))
 	requireStoreOK(t, s.MarkOutput(out.ID, "sent"))
 	if _, err = s.NextOutput(); err != sql.ErrNoRows {
 		t.Fatalf("ambiguous attachment was replayed: %v", err)
@@ -558,7 +581,9 @@ func TestRunningBindingsSurviveRestartAndStayScoped(t *testing.T) {
 			t.Fatalf("running binding %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	requireStoreOK(t, s.SetRunning(first, false))
+	if err := s.SetRunning(first, false); err != nil {
+		t.Fatalf("current binding close failed: %v", err)
+	}
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
 	got, err = s.RunningBindings(first.Bot)
@@ -580,7 +605,9 @@ func TestSetRunningCannotDisableReplacementGeneration(t *testing.T) {
 	next := old
 	next.Session, next.Generation = "/sessions/new.jsonl", 2
 	requireStoreOK(t, s.Save(next))
-	requireStoreOK(t, s.SetRunning(old, false))
+	if err := s.SetRunning(old, false); err != ErrStaleBinding {
+		t.Fatalf("stale binding error = %v, want %v", err, ErrStaleBinding)
+	}
 	got, err := s.RunningBindings(1)
 	requireStoreOK(t, err)
 	if len(got) != 1 || got[0] != next {
@@ -592,7 +619,9 @@ func TestSetRunningCannotDisableReplacementGeneration(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("current exit left running binding: %+v", got)
 	}
-	requireStoreOK(t, s.SetRunning(old, true))
+	if err := s.SetRunning(old, true); err != ErrStaleBinding {
+		t.Fatalf("stale binding error = %v, want %v", err, ErrStaleBinding)
+	}
 	got, err = s.RunningBindings(1)
 	requireStoreOK(t, err)
 	if len(got) != 0 {
@@ -673,13 +702,19 @@ func TestCleanupMessagesProtectsNonterminalAndRecentRows(t *testing.T) {
 	for _, id := range []int64{1, 2, 3, 4, 5, 6, 7, 8} {
 		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
 	}
-	for id, state := range map[int64]string{1: "done", 2: "failed", 3: "uncertain", 4: "ignored", 5: "cancelled", 6: "pending", 7: "submitted", 8: "done"} {
+	for _, id := range []int64{2, 3} {
+		requireStoreOK(t, s.Mark(id, InboxSubmitted))
+	}
+	for id, state := range map[int64]InboxState{1: InboxDone, 2: InboxUncertain, 3: InboxUncertain, 4: InboxIgnored, 5: InboxCancelled, 7: InboxSubmitted, 8: InboxDone} {
 		requireStoreOK(t, s.Mark(id, state))
 	}
 	for range 7 {
 		requireStoreOK(t, s.Enqueue(2, 3, "message"))
 	}
-	for id, state := range map[int64]string{1: "done", 2: "failed", 3: "uncertain", 4: "cancelled", 5: "pending", 6: "sending", 7: "done"} {
+	for id, state := range map[int64]OutboxState{1: OutboxDone, 2: OutboxFailed, 3: OutboxUncertain, 4: OutboxCancelled, 6: OutboxSending, 7: OutboxDone} {
+		if state != OutboxSending {
+			requireStoreOK(t, s.MarkOutput(id, OutboxSending))
+		}
 		requireStoreOK(t, s.MarkOutput(id, state))
 	}
 	old := time.Now().AddDate(0, 0, -91).Unix()
@@ -717,6 +752,7 @@ func TestCleanupMessagesRetainsProgressAssociationWithActiveOutbox(t *testing.T)
 	if result.Inbox != 0 || result.Outbox != 0 {
 		t.Fatalf("cleanup removed active progress association: %+v", result)
 	}
+	requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
 	requireStoreOK(t, s.MarkOutput(out.ID, "uncertain"))
 	requireStoreOK(t, setMessageTimes(s, old, old, nil, []int64{out.ID}))
 	result, err = s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
@@ -731,12 +767,12 @@ func TestCleanupMessagesReleasesExpiredTerminalProgressAssociations(t *testing.T
 	cases := []struct {
 		id          int64
 		state       string
-		outboxState string
+		outboxState OutboxState
 	}{
-		{id: 1, state: "cancelled", outboxState: "cancelled"},
-		{id: 2, state: "uncertain", outboxState: "uncertain"},
-		{id: 3, state: "done", outboxState: "failed"},
-		{id: 4, state: "done", outboxState: "uncertain"},
+		{id: 1, state: "cancelled", outboxState: OutboxCancelled},
+		{id: 2, state: "uncertain", outboxState: OutboxUncertain},
+		{id: 3, state: "done", outboxState: OutboxFailed},
+		{id: 4, state: "done", outboxState: OutboxUncertain},
 	}
 	old := time.Now().AddDate(0, 0, -91).Unix()
 	for _, tc := range cases {
@@ -754,6 +790,7 @@ func TestCleanupMessagesReleasesExpiredTerminalProgressAssociations(t *testing.T
 		requireStoreOK(t, err)
 		out, err := s.NextOutput()
 		requireStoreOK(t, err)
+		requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
 		requireStoreOK(t, s.MarkOutput(out.ID, tc.outboxState))
 		requireStoreOK(t, s.SetProgressMessage(tc.id, tc.id+100))
 		requireStoreOK(t, setMessageTimes(s, old, old, []int64{tc.id}, []int64{out.ID}))
