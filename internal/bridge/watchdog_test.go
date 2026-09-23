@@ -52,7 +52,8 @@ func TestRejectedNativeCallInvalidatesIdleEvidence(t *testing.T) {
 
 func drainWatchdogEvents(t *testing.T, w *worker) {
 	t.Helper()
-	// The acknowledgment barrier ensures all earlier fixture events are queued.
+	// Consume the prompt acknowledgment before using a later RPC as the event barrier.
+	w.operationReturned(waitOperation(t, w))
 	if _, err := w.client.Call(w.ctx, "get_state", nil); err != nil {
 		t.Fatal(err)
 	}

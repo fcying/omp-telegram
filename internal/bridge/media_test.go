@@ -34,8 +34,10 @@ func (f *fakeHTTP) mediaRequest(r *http.Request) (*http.Response, bool, error) {
 	if strings.Contains(r.URL.Path, "/file/bot") {
 		id := filepath.Base(r.URL.Path)
 		f.mu.Lock()
+		f.downloadRequests++
 		data := append([]byte(nil), f.files[id]...)
 		gate := f.downloadGate
+		downloadErr := f.downloadErr
 		f.mu.Unlock()
 		if gate != nil {
 			select {
@@ -43,6 +45,9 @@ func (f *fakeHTTP) mediaRequest(r *http.Request) (*http.Response, bool, error) {
 			case <-r.Context().Done():
 				return nil, true, r.Context().Err()
 			}
+		}
+		if downloadErr != nil {
+			return nil, true, downloadErr
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(data)), ContentLength: int64(len(data)), Request: r}, true, nil
 	}

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func localClient(t *testing.T, handler http.HandlerFunc) *Client {
@@ -212,7 +211,7 @@ func TestClearKeyboardSurfacesFailureWithoutRetry(t *testing.T) {
 	}
 }
 
-func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
+func TestRateLimitedSendReturnsExplicitRejectionForDurableRetry(t *testing.T) {
 	var attempts atomic.Int32
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
 		var fields map[string]json.RawMessage
@@ -232,19 +231,17 @@ func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
 		if string(fields["reply_to_message_id"]) != "42" {
 			t.Errorf("reply target = %s, want 42", fields["reply_to_message_id"])
 		}
-		if attempts.Add(1) == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":0}}`)
-			return
-		}
-		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42,"chat":{"id":-10,"type":"supergroup"},"message_thread_id":8}}`)
+		attempts.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":7}}`)
 	})
 	message, err := client.Send(context.Background(), -10, 8, "<b>literal</b> _literal_", SendOptions{ReplyToMessageID: 42})
-	if err != nil || message.MessageID != 42 {
-		t.Fatalf("send = %+v, %v", message, err)
+	if err == nil || message.MessageID != 0 || attempts.Load() != 1 {
+		t.Fatalf("send = %+v, %v, attempts=%d", message, err, attempts.Load())
 	}
-	if attempts.Load() != 2 {
-		t.Fatalf("attempts = %d", attempts.Load())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.RetryAfter != 7 || DeliveryUncertain(err) {
+		t.Fatalf("rate limit = %v, want explicit durable retry", err)
 	}
 }
 
@@ -275,7 +272,7 @@ func TestSendFallsBackWhenReplyTargetIsUnavailable(t *testing.T) {
 	}
 }
 
-func TestRetryAfterCancellationAndBounds(t *testing.T) {
+func TestRetryAfterIsReturnedWithoutClientRetry(t *testing.T) {
 	for _, seconds := range []int{60, 61} {
 		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
 			var attempts atomic.Int32
@@ -284,24 +281,10 @@ func TestRetryAfterCancellationAndBounds(t *testing.T) {
 				w.WriteHeader(http.StatusTooManyRequests)
 				fmt.Fprintf(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":%d}}`, seconds)
 			})
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			_, err := client.Send(ctx, 1, 0, "hello", SendOptions{})
-			if seconds == 60 {
-				if !errors.Is(err, context.DeadlineExceeded) {
-					t.Fatalf("expected cancellation, got %v", err)
-				}
-			} else {
-				var apiErr *APIError
-				if !errors.As(err, &apiErr) || apiErr.RetryAfter != 61 {
-					t.Fatalf("expected bounded rate limit, got %v", err)
-				}
-			}
-			if DeliveryUncertain(err) {
-				t.Fatalf("explicit rejection became uncertain: %v", err)
-			}
-			if attempts.Load() != 1 {
-				t.Fatalf("retried before server delay: %d", attempts.Load())
+			_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.RetryAfter != seconds || DeliveryUncertain(err) || attempts.Load() != 1 {
+				t.Fatalf("attempts=%d error=%v", attempts.Load(), err)
 			}
 		})
 	}
@@ -316,7 +299,7 @@ func TestRateLimitAttemptLimit(t *testing.T) {
 	})
 	_, err := client.Send(context.Background(), 1, 0, "hello", SendOptions{})
 	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != 429 || attempts.Load() != 3 || DeliveryUncertain(err) {
+	if !errors.As(err, &apiErr) || apiErr.Code != 429 || apiErr.RetryAfter != 1 || attempts.Load() != 1 || DeliveryUncertain(err) {
 		t.Fatalf("attempts=%d error=%v", attempts.Load(), err)
 	}
 }
@@ -420,6 +403,9 @@ func TestSendResponseDeliveryCertainty(t *testing.T) {
 		{"invalid result", 200, `{"ok":true,"result":{"message_id":"invalid"}}`, true},
 		{"missing result", 200, `{"ok":true}`, true},
 		{"contradictory status", 500, `{"ok":true,"result":{"message_id":42}}`, true},
+		{"server status alone", 503, `{}`, true},
+		{"transient server rejection", 503, `{"ok":false,"error_code":503,"description":"Service unavailable"}`, false},
+		{"malformed server rejection", 503, `{"ok":false,"error_code":503,"description":"Service unavailable"`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var attempts atomic.Int32

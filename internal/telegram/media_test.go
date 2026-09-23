@@ -3,6 +3,7 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -64,7 +65,7 @@ func TestDownloadPreservesExistingDestination(t *testing.T) {
 	}
 }
 
-func TestSendFileMultipartRetriesExplicitRateLimit(t *testing.T) {
+func TestSendFileReturnsExplicitRateLimitForDurableRetry(t *testing.T) {
 	var attempts atomic.Int32
 	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/bot123:secret-token/sendDocument" {
@@ -88,19 +89,17 @@ func TestSendFileMultipartRetriesExplicitRateLimit(t *testing.T) {
 		if r.FormValue("caption") != "caption" || r.FormValue("chat_id") != "-10" || r.FormValue("message_thread_id") != "8" {
 			t.Error("lost multipart fields")
 		}
-		if attempts.Add(1) == 1 {
-			w.WriteHeader(429)
-			fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":0}}`)
-			return
-		}
-		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42}}`)
+		attempts.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":7}}`)
 	})
 	path := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	message, err := client.SendFile(context.Background(), -10, 8, "document", path, `quoted "file".txt`, "caption", SendOptions{})
-	if err != nil || message.MessageID != 42 || attempts.Load() != 2 {
+	var apiErr *APIError
+	if err == nil || message.MessageID != 0 || attempts.Load() != 1 || !errors.As(err, &apiErr) || apiErr.RetryAfter != 7 || DeliveryUncertain(err) {
 		t.Fatalf("send = %+v %v attempts=%d", message, err, attempts.Load())
 	}
 }

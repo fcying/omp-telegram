@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 9
+const schemaVersion = 10
 const messageCleanupBatchSize = 1000
 
 // InboxState identifies the durable lifecycle state of an incoming update.
@@ -80,6 +80,7 @@ type Output struct {
 	ID, InboxID, Chat, Thread, ReplyTo int64
 	Text                               string
 	Kind, Path, Name                   string
+	NextAttemptAt, AttemptCount        int64
 }
 
 type ProgressMessage struct {
@@ -149,6 +150,14 @@ func Open(dir string) (*Store, error) {
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return nil, e
 	}
+	if info, e := os.Stat(dir); e != nil || !info.IsDir() {
+		if e != nil {
+			return nil, e
+		}
+		return nil, fmt.Errorf("data directory must be a directory")
+	} else if info.Mode().Perm()&0o022 != 0 {
+		return nil, fmt.Errorf("data directory must not be group- or world-writable")
+	}
 	// Existing directories may be the user's project root; preserve their permissions.
 	path := filepath.Join(dir, "omp-telegram.db")
 	if info, e := os.Lstat(path); e == nil && !info.Mode().IsRegular() {
@@ -217,10 +226,12 @@ func initialize(db *sql.DB) error {
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
  CREATE TABLE session_favorites(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(bot,chat,thread,workspace,session_id));
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL DEFAULT 0,attempt_count INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX idx_inbox_state ON inbox(state,id);
  CREATE INDEX idx_outbox_state ON outbox(state,id);
- CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state);`)
+ CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state);
+ CREATE INDEX idx_outbox_delivery ON outbox(state,next_attempt_at,id);
+ CREATE INDEX idx_outbox_conversation ON outbox(chat,thread,state,id);`)
 		if e != nil {
 			return e
 		}
@@ -303,6 +314,19 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 9
+	}
+	if version == 9 {
+		for _, query := range []string{
+			"ALTER TABLE outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
+			"ALTER TABLE outbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+			"CREATE INDEX idx_outbox_delivery ON outbox(state,next_attempt_at,id)",
+			"CREATE INDEX idx_outbox_conversation ON outbox(chat,thread,state,id)",
+		} {
+			if _, e = tx.Exec(query); e != nil {
+				return e
+			}
+		}
+		version = 10
 	}
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
@@ -924,7 +948,7 @@ func (s *Store) PendingStarts(bot int64) ([]StartIntent, error) {
 
 func (s *Store) Enqueue(chat, thread int64, text string) error {
 	now := time.Now().Unix()
-	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,created_at,updated_at) VALUES(?,?,?,'pending',?,?)", chat, thread, text, now, now)
+	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,'pending',?,?,?,0)", chat, thread, text, now, now, now)
 	return e
 }
 
@@ -972,7 +996,7 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 		return fmt.Errorf("input is not submitted")
 	}
 	for _, reply := range replies {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,state,reply_to,created_at,updated_at) VALUES(?,?,?,?,'pending',?,?,?)", id, chat, thread, reply, replyTo, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, replyTo, now, now, now); err != nil {
 			return err
 		}
 	}
@@ -984,14 +1008,83 @@ func (s *Store) EnqueueAttachment(chat, thread int64, kind, path, name, caption 
 		return fmt.Errorf("unsupported attachment kind %q", kind)
 	}
 	now := time.Now().Unix()
-	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,kind,path,name,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?,?,?)", chat, thread, caption, kind, path, name, now, now)
+	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,kind,path,name,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,'pending',?,?,?,?,?,?,0)", chat, thread, caption, kind, path, name, now, now, now)
 	return e
 }
 
-func (s *Store) NextOutput() (Output, error) {
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanOutput(row rowScanner) (Output, error) {
 	var o Output
-	err := s.DB.QueryRow("SELECT id,inbox_id,chat,thread,text,reply_to,kind,path,name FROM outbox WHERE state='pending' ORDER BY id LIMIT 1").Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name)
+	err := row.Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name, &o.NextAttemptAt, &o.AttemptCount)
 	return o, err
+}
+
+const outputColumns = "id,inbox_id,chat,thread,text,reply_to,kind,path,name,next_attempt_at,attempt_count"
+
+func (s *Store) NextOutput() (Output, error) {
+	return scanOutput(s.DB.QueryRow("SELECT " + outputColumns + " FROM outbox WHERE state='pending' ORDER BY id LIMIT 1"))
+}
+
+// ClaimNextOutput atomically reserves the oldest ready output whose conversation has no active or older pending work.
+func (s *Store) ClaimNextOutput(ctx context.Context, now int64) (Output, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Output{}, err
+	}
+	defer tx.Rollback()
+	query := `SELECT ` + outputColumns + `
+FROM outbox AS candidate
+WHERE candidate.state='pending' AND candidate.next_attempt_at<=?
+  AND NOT EXISTS (
+		SELECT 1 FROM outbox AS active
+		WHERE active.chat IS candidate.chat AND active.thread IS candidate.thread
+		  AND active.state='sending'
+	)
+  AND NOT EXISTS (
+		SELECT 1 FROM outbox AS earlier
+		WHERE earlier.chat IS candidate.chat AND earlier.thread IS candidate.thread
+		  AND earlier.id<candidate.id AND earlier.state IN ('pending','sending')
+	)
+ORDER BY candidate.id LIMIT 1`
+	o, err := scanOutput(tx.QueryRowContext(ctx, query, now))
+	if err != nil {
+		return Output{}, err
+	}
+	result, err := tx.ExecContext(ctx, "UPDATE outbox SET state='sending',attempt_count=attempt_count+1,updated_at=? WHERE id=? AND state='pending'", time.Now().Unix(), o.ID)
+	if err != nil {
+		return o, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return o, err
+	}
+	if changed != 1 {
+		return o, fmt.Errorf("%w: claim", ErrOutboxStateTransition)
+	}
+	if err := tx.Commit(); err != nil {
+		return o, err
+	}
+	o.AttemptCount++
+	return o, nil
+}
+
+// RetryOutput returns a sending output to the durable pending queue with a retry deadline.
+func (s *Store) RetryOutput(id, nextAttemptAt int64) error {
+	result, err := s.DB.Exec("UPDATE outbox SET state='pending',next_attempt_at=?,updated_at=? WHERE id=? AND state='sending'", nextAttemptAt, time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: retry", ErrOutboxStateTransition)
+	}
+	return nil
 }
 
 func (s *Store) MarkOutput(id int64, state OutboxState) error {
@@ -1004,7 +1097,7 @@ func (s *Store) MarkOutput(id int64, state OutboxState) error {
 	default:
 		return fmt.Errorf("%w: %s", ErrOutboxStateTransition, state)
 	}
-	result, err := s.DB.Exec("UPDATE outbox SET state=?,updated_at=? WHERE id=? AND state IN ("+expected+")", string(state), time.Now().Unix(), id)
+	result, err := s.DB.Exec("UPDATE outbox SET state=?,next_attempt_at=0,updated_at=? WHERE id=? AND state IN ("+expected+")", string(state), time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}

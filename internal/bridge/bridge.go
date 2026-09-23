@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,6 +62,8 @@ type workerExit struct {
 	key    target
 	worker *worker
 }
+
+const deliveryWorkerCount = 4
 
 func supportedConversation(m *telegram.Message) bool {
 	return m != nil && (m.MessageThreadID != 0 || m.Chat.Type == "private")
@@ -154,11 +157,15 @@ type worker struct {
 	progress              progressState
 	operations            chan operationResult
 	albums                map[albumKey]*pendingAlbum
+	rpcOperations         []rpcOperation
+	rpcOperationActive    bool
+	topicRenameResults    chan topicRenameResult
 	albumEvents           chan albumEvent
 	albumVersion          uint64
 	albumSuppressed       map[albumKey]time.Time
 	background            sync.WaitGroup
 	busy                  bool
+	controlBusy           bool
 	awaitingContinuation  bool
 	runtime               runtimeState
 	runtimeResuming       bool
@@ -247,10 +254,32 @@ type progressTool struct {
 
 type operationResult struct {
 	generation int64
+	active     int64
+	turn       uint64
+	clientID   uint64
 	kind       string
+	data       json.RawMessage
+	message    string
+	meta       any
 	cancelled  bool
 	err        error
 }
+
+type rpcOperation struct {
+	generation int64
+	active     int64
+	turn       uint64
+	clientID   uint64
+	kind       string
+	call       func(context.Context) (json.RawMessage, error)
+	message    string
+	meta       any
+}
+type topicRenameResult struct {
+	generation int64
+	err        error
+}
+
 type callbackResult bool
 
 const (
@@ -315,7 +344,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "help", Description: "Show usage help"},
 }
 
-func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry) error {
+func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry) (runErr error) {
 	if logs == nil {
 		return errors.New("logging registry required")
 	}
@@ -353,7 +382,13 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 
 	ctx, cancel := context.WithCancel(ctx)
 	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit)}
-	defer func() { cancel(); b.wg.Wait() }()
+	defer func() {
+		cancel()
+		b.wg.Wait()
+		if err := b.cancelPendingPrompts("shutdown"); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
 	b.reconcileProgressCleanup(ctx)
 	b.cleanupDatabase(ctx)
 	workers := map[target]*worker{}
@@ -361,7 +396,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		return err
 	}
 
-	b.wg.Add(2)
+	b.wg.Add(deliveryWorkerCount + 1)
 	if cfg.DatabaseRetentionDays > 0 {
 		b.wg.Add(1)
 		go func() {
@@ -369,12 +404,14 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 			b.runDatabaseJanitor(ctx)
 		}()
 	}
-	go func() {
-		defer b.wg.Done()
-		if err := b.deliver(ctx); err != nil {
-			b.fail(err)
-		}
-	}()
+	for range deliveryWorkerCount {
+		go func() {
+			defer b.wg.Done()
+			if err := b.deliver(ctx); err != nil {
+				b.fail(err)
+			}
+		}()
+	}
 	wake := make(chan struct{}, 1)
 	var pollBackoff time.Duration
 	go func() {
@@ -614,49 +651,113 @@ func (b *Bridge) reconcileOutboxSnapshots(ctx context.Context, cutoff time.Time)
 	}
 }
 
+const maxServerRetryDelaySeconds int64 = 5 * 60
+
+func retryableServerRejection(info telegram.ErrorInfo) bool {
+	if info.Uncertain {
+		return false
+	}
+	switch info.Code {
+	case http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func deliveryRetryDelaySeconds(output store.Output, info telegram.ErrorInfo) int64 {
+	if info.Reason == "rate_limited" {
+		if info.RetryAfter > 0 {
+			return int64(info.RetryAfter)
+		}
+		return 1
+	}
+	delay := int64(1)
+	for attempt := int64(1); attempt < output.AttemptCount && delay < maxServerRetryDelaySeconds; attempt++ {
+		delay *= 2
+	}
+	if delay > maxServerRetryDelaySeconds {
+		return maxServerRetryDelaySeconds
+	}
+	return delay
+}
+
 func (b *Bridge) deliver(ctx context.Context) error {
 	for ctx.Err() == nil {
-		o, e := b.db.NextOutput()
-		if errors.Is(e, sql.ErrNoRows) {
+		o, err := b.db.ClaimNextOutput(ctx, time.Now().Unix())
+		if errors.Is(err, sql.ErrNoRows) {
+			timer := time.NewTimer(200 * time.Millisecond)
 			select {
 			case <-ctx.Done():
-			case <-time.After(200 * time.Millisecond):
+				timer.Stop()
+			case <-timer.C:
 			}
 			continue
 		}
-		if e != nil {
-			b.storeLog.Error("outbox read failed", "event", "outbox_read_failed")
-			return e
-		}
-		if e = b.db.MarkOutput(o.ID, "sending"); e != nil {
-			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", "sending")
-			return e
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if o.ID != 0 {
+				b.storeLog.Error("outbox claim state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", string(store.OutboxSending))
+			} else {
+				b.storeLog.Error("outbox claim failed", "event", "outbox_read_failed")
+			}
+			return err
 		}
 		switch o.Kind {
 		case "text":
-			_, e = b.tg.Send(ctx, o.Chat, o.Thread, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
+			_, err = b.tg.Send(ctx, o.Chat, o.Thread, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		case "photo", "document":
-			_, e = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
+			_, err = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		default:
 			b.storeLog.Error("unsupported outbox content kind", "event", "outbox_read_failed", "reason", "invalid_kind")
 			return errors.New("unsupported outbox content kind")
 		}
 		state := store.OutboxDone
-		if e != nil {
-			info := telegram.ClassifyError(e)
+		if err != nil {
+			info := telegram.ClassifyError(err)
+			rateLimited := info.Reason == "rate_limited" && !info.Uncertain
+			if rateLimited || retryableServerRejection(info) {
+				delay := deliveryRetryDelaySeconds(o, info)
+				nextAttempt := time.Now().Unix()
+				maxInt64 := int64(^uint64(0) >> 1)
+				if delay > maxInt64-nextAttempt {
+					nextAttempt = maxInt64
+				} else {
+					nextAttempt += delay
+				}
+				if retryErr := b.db.RetryOutput(o.ID, nextAttempt); retryErr != nil {
+					b.storeLog.Error("outbox retry state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", "pending")
+					return retryErr
+				}
+				if ctx.Err() == nil {
+					event, message := "delivery_retry_scheduled", "telegram delivery deferred for retry"
+					if rateLimited {
+						event, message = "delivery_rate_limited", "telegram delivery deferred by rate limit"
+					}
+					logTelegramFailure(b.telegramLog, slog.LevelWarn, event, message, err,
+						slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
+						slog.String("kind", o.Kind), slog.String("state", string(store.OutboxPending)), slog.Bool("replay", true))
+				}
+				continue
+			}
 			state = store.OutboxFailed
 			if info.Uncertain {
 				state = store.OutboxUncertain
 			}
 			if ctx.Err() == nil && info.Reason != "cancelled" {
-				logTelegramFailure(b.telegramLog, slog.LevelWarn, "delivery_failed", "telegram delivery failed", e,
+				logTelegramFailure(b.telegramLog, slog.LevelWarn, "delivery_failed", "telegram delivery failed", err,
 					slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
 					slog.String("kind", o.Kind), slog.String("state", string(state)), slog.Bool("replay", false))
 			}
 		}
-		if e = b.db.MarkOutput(o.ID, state); e != nil {
-			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", state)
-			return e
+		if err = b.db.MarkOutput(o.ID, state); err != nil {
+			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", string(state))
+			return err
 		}
 		if state == store.OutboxDone && o.InboxID != 0 {
 			b.cleanupDeliveredProgress(ctx, o.InboxID)
@@ -667,9 +768,9 @@ func (b *Bridge) deliver(ctx context.Context) error {
 					b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
 				}
 			} else {
-				if e = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+string(state)+". It will not be replayed automatically."); e != nil {
+				if err = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+string(state)+". It will not be replayed automatically."); err != nil {
 					b.storeLog.Error("delivery failure notice persistence failed", "event", "outbox_write_failed")
-					return e
+					return err
 				}
 			}
 		}
@@ -796,7 +897,7 @@ func (w *worker) tryInput(in incoming) bool {
 }
 
 func (w *worker) sessionControlBusy() bool {
-	return w.busy || w.compacting || w.finishing || w.exportingSession != ""
+	return w.busy || w.controlBusy || w.compacting || w.finishing || w.exportingSession != ""
 }
 
 func (w *worker) hasRuntimeConfirmation() bool {
@@ -810,7 +911,7 @@ func (w *worker) hasRuntimeConfirmation() bool {
 }
 
 func (w *worker) idleEligible() bool {
-	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
+	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.controlBusy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
 }
 
 func (w *worker) sessionDurable() bool {
@@ -830,7 +931,7 @@ func (w *worker) releaseIdleRuntime(now time.Time) {
 }
 
 func (w *worker) logicalIdleEligibleLocked() bool {
-	return !w.binding.Running && w.runtime == runtimeReleased && w.client == nil && !w.restoring && !w.runtimeResuming && w.active == 0 && !w.busy && !w.compacting && !w.finishing && !w.previewBusy && !w.awaitingContinuation && len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 && len(w.albumSuppressed) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.exportingSession == "" && w.bindingNameCancel == nil && w.doctorCancel == nil && w.startIntent == nil && len(w.confirms) == 0 && w.idleProbe.cancel == nil && w.typingCancel == nil && len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 && len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 && len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 && len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
+	return !w.binding.Running && w.runtime == runtimeReleased && w.client == nil && !w.restoring && !w.runtimeResuming && w.active == 0 && !w.busy && !w.controlBusy && !w.compacting && !w.finishing && !w.previewBusy && !w.awaitingContinuation && len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 && len(w.albumSuppressed) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.exportingSession == "" && w.bindingNameCancel == nil && w.doctorCancel == nil && w.startIntent == nil && len(w.confirms) == 0 && w.idleProbe.cancel == nil && w.typingCancel == nil && len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 && len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 && len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 && len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
 }
 
 func (w *worker) evictIfIdle(now time.Time) bool {
@@ -855,6 +956,8 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.awaitingContinuation = false
+	// Drop old-client calls, but keep the active lane fenced until its result returns.
+	w.rpcOperations = nil
 	sessionID := w.sessionID
 	generation := w.binding.Generation
 	// Disable the old client's event and Done channels before closing it, so an
@@ -969,12 +1072,85 @@ func (w *worker) run() {
 	}
 	tick := time.NewTicker(1500 * time.Millisecond)
 	defer tick.Stop()
+	onTick := func() bool {
+		now := time.Now()
+		w.typing()
+		w.flushPreview()
+		w.expire()
+		w.probeStuckTask(now)
+		w.releaseIdleRuntime(now)
+		return w.evictIfIdle(now)
+	}
 	for {
 		var events <-chan json.RawMessage
 		var done <-chan struct{}
 		if client, ok := w.runtimeClient(); ok {
 			events = client.Events()
 			done = client.Done()
+		}
+		// Prefer actor inputs and operation results over a continuously ready RPC event queue.
+		select {
+		case <-w.ctx.Done():
+			return
+		case in := <-w.input:
+			w.handle(in)
+			w.dispatch()
+			continue
+		case <-done:
+			w.failed()
+			w.dispatch()
+			continue
+		case result := <-w.previewResult:
+			w.previewFinished(result)
+			w.dispatch()
+			continue
+		case result := <-w.operations:
+			w.operationReturned(result)
+			w.dispatch()
+			continue
+		case result := <-w.topicRenameResults:
+			w.topicRenameFinished(result)
+			w.dispatch()
+			continue
+		case event := <-w.albumEvents:
+			w.sealAlbum(event)
+			w.dispatch()
+			continue
+		case result := <-w.mediaResults:
+			w.preparedMedia(result)
+			w.dispatch()
+			continue
+		case result := <-w.sendResults:
+			w.preparedSend(result)
+			w.dispatch()
+			continue
+		case result := <-w.resumeResults:
+			w.resumeListed(result)
+			w.dispatch()
+			continue
+		case result := <-w.exportResults:
+			w.exportFinished(result)
+			w.dispatch()
+			continue
+		case result := <-w.bindingNameResults:
+			w.bindingNamesLoaded(result)
+			w.dispatch()
+			continue
+		case result := <-w.doctorResults:
+			w.doctorFinished(result)
+			w.dispatch()
+			continue
+		case result := <-w.idleProbe.results:
+			w.idleProbeFinished(result, time.Now())
+			w.dispatch()
+			continue
+		case <-tick.C:
+			if onTick() {
+				return
+			}
+			w.dispatch()
+			continue
+		default:
 		}
 		if events != nil {
 			select {
@@ -984,6 +1160,7 @@ func (w *worker) run() {
 				} else {
 					w.event(raw)
 				}
+				w.dispatch()
 				continue
 			default:
 			}
@@ -1004,29 +1181,9 @@ func (w *worker) run() {
 		case result := <-w.previewResult:
 			w.previewFinished(result)
 		case result := <-w.operations:
-			if result.generation == w.binding.Generation {
-				if _, ok := w.runtimeClient(); ok {
-					w.touchActivity()
-					w.compacting = false
-					w.busy = false
-					if result.kind == "handoff" {
-						switch {
-						case result.err != nil:
-							w.say("Handoff failed or its outcome is uncertain. It will not be replayed automatically.")
-						case result.cancelled:
-							w.say("Handoff canceled without a result.")
-						default:
-							w.touchBinding()
-							w.say("Handoff completed.")
-						}
-					} else if result.err != nil {
-						w.say("Compaction failed.")
-					} else {
-						w.touchBinding()
-						w.say("Compaction completed.")
-					}
-				}
-			}
+			w.operationReturned(result)
+		case result := <-w.topicRenameResults:
+			w.topicRenameFinished(result)
 		case event := <-w.albumEvents:
 			w.sealAlbum(event)
 		case result := <-w.mediaResults:
@@ -1044,17 +1201,113 @@ func (w *worker) run() {
 		case result := <-w.idleProbe.results:
 			w.idleProbeFinished(result, time.Now())
 		case <-tick.C:
-			now := time.Now()
-			w.typing()
-			w.flushPreview()
-			w.expire()
-			w.probeStuckTask(now)
-			w.releaseIdleRuntime(now)
-			if w.evictIfIdle(now) {
+			if onTick() {
 				return
 			}
 		}
 		w.dispatch()
+	}
+}
+
+func (w *worker) operationFinished(result operationResult) {
+	if result.generation != w.binding.Generation || result.active != 0 && result.active != w.active || result.turn != 0 && result.turn != w.turn {
+		return
+	}
+	if result.clientID != 0 && (w.client == nil || w.client.ID() != result.clientID) {
+		return
+	}
+	if result.err != nil && w.log.Enabled(context.Background(), slog.LevelDebug) {
+		attrs := []slog.Attr{
+			slog.String("event", "request_failed"),
+			slog.String("phase", "handled"),
+			slog.Uint64("client_id", result.clientID),
+			slog.Int64("generation", result.generation),
+			slog.Uint64("turn", result.turn),
+			slog.String("error_kind", omp.ClassifyError(result.err)),
+		}
+		if result.active != 0 {
+			attrs = append(attrs, slog.Int64("inbox_id", result.active))
+		}
+		w.log.LogAttrs(context.Background(), slog.LevelDebug, "rpc request failed", attrs...)
+	}
+	if result.kind == "prompt" {
+		if result.err != nil {
+			w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
+			w.closeLogicalSession()
+			return
+		}
+		w.touchBinding()
+		var response struct {
+			AgentInvoked *bool `json:"agentInvoked"`
+		}
+		if json.Unmarshal(result.data, &response) == nil && response.AgentInvoked != nil && !*response.AgentInvoked {
+			w.finishTerminal(rpcEvent{})
+		}
+		return
+	}
+	if strings.HasPrefix(result.kind, "model_") {
+		w.modelOperationFinished(result)
+		return
+	}
+	switch result.kind {
+	case "handoff":
+		w.compacting = false
+		w.busy = false
+		cancelled := result.cancelled
+		if !cancelled && result.err == nil {
+			var response *struct {
+				SavedPath string `json:"savedPath"`
+			}
+			cancelled = json.Unmarshal(result.data, &response) == nil && response == nil
+		}
+		if result.err != nil {
+			w.say("Handoff failed or its outcome is uncertain. It will not be replayed automatically.")
+		} else if cancelled {
+			w.say("Handoff canceled without a result.")
+		} else {
+			w.touchBinding()
+			w.say("Handoff completed.")
+		}
+	case "compact", "":
+		w.compacting = false
+		w.busy = false
+		if result.err != nil {
+			w.say("Compaction failed.")
+		} else {
+			w.touchBinding()
+			w.say("Compaction completed.")
+		}
+	case "abort":
+		w.controlBusy = false
+		if result.err != nil {
+			w.say("The abort request failed.")
+		} else {
+			w.touchBinding()
+			w.say(result.message)
+		}
+	case "status":
+		w.controlBusy = false
+		if result.err != nil {
+			w.say("Failed to read the session state.")
+			return
+		}
+		var state statusState
+		if json.Unmarshal(result.data, &state) != nil {
+			w.say("Failed to read the session state.")
+			return
+		}
+		home, _ := os.UserHomeDir()
+		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)))
+	case "name":
+		w.controlBusy = false
+		if result.err != nil {
+			w.say("The session name change could not be confirmed. Use /status to check before retrying.")
+			return
+		}
+		w.touchBinding()
+		w.say(result.message)
+	default:
+		w.controlBusy = false
 	}
 }
 
@@ -1080,6 +1333,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.turn++
 	w.finishing = false
 	w.compacting = false
+	w.controlBusy = false
 	w.preview = ""
 	w.activeReplyTo = 0
 	w.finalAssistantTexts = nil
@@ -1193,12 +1447,95 @@ func (w *worker) requestAbort(notice string) {
 		w.say("No active task. Queued prompts cleared.")
 		return
 	}
-	if _, err := w.call("abort", nil); err != nil {
+	if w.controlBusy {
+		w.say("The session operation is still loading.")
+		return
+	}
+	client, err := w.ensureRuntime()
+	if err != nil {
 		w.say("The abort request failed.")
 		return
 	}
-	w.touchBinding()
-	w.say(notice)
+	w.controlBusy = true
+	w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
+		return client.Call(ctx, "abort", nil)
+	}, 0, notice)
+}
+
+func (w *worker) startOperation(kind string, client *omp.Client, call func(context.Context) (json.RawMessage, error), active int64, message string, metadata ...any) {
+	request := rpcOperation{
+		generation: w.binding.Generation,
+		active:     active,
+		turn:       w.turn,
+		clientID:   client.ID(),
+		kind:       kind,
+		call:       call,
+		message:    message,
+	}
+	if len(metadata) > 0 {
+		request.meta = metadata[0]
+	}
+	w.touchActivity()
+	w.rpcOperations = append(w.rpcOperations, request)
+	w.dispatchRPCOperation()
+}
+
+func (w *worker) dispatchRPCOperation() {
+	if w.rpcOperationActive || len(w.rpcOperations) == 0 || w.ctx.Err() != nil {
+		return
+	}
+	request := w.rpcOperations[0]
+	w.rpcOperations[0] = rpcOperation{}
+	w.rpcOperations = w.rpcOperations[1:]
+	if len(w.rpcOperations) == 0 {
+		w.rpcOperations = nil
+	}
+	w.rpcOperationActive = true
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+		defer cancel()
+		data, err := request.call(ctx)
+		result := operationResult{
+			generation: request.generation,
+			active:     request.active,
+			turn:       request.turn,
+			clientID:   request.clientID,
+			kind:       request.kind,
+			data:       data,
+			message:    request.message,
+			meta:       request.meta,
+			err:        err,
+		}
+		select {
+		case w.operations <- result:
+		case <-w.ctx.Done():
+		}
+	}()
+}
+
+func (w *worker) operationReturned(result operationResult) {
+	w.rpcOperationActive = false
+	w.operationFinished(result)
+	w.dispatchRPCOperation()
+}
+
+func (w *worker) beginControl(kind string, call func(*omp.Client, context.Context) (json.RawMessage, error), message string) bool {
+	if w.controlBusy {
+		w.say("The session operation is still loading.")
+		return false
+	}
+	client, err := w.ensureRuntime()
+	if err != nil {
+		w.say(err.Error())
+		return false
+	}
+	w.controlBusy = true
+	w.startOperation(kind, client, func(ctx context.Context) (json.RawMessage, error) {
+		return call(client, ctx)
+	}, 0, message)
+	return true
 }
 
 func (w *worker) call(kind string, fields map[string]any) (json.RawMessage, error) {
@@ -1265,13 +1602,31 @@ func (w *worker) renameNewTopic(workspace string) {
 	if name == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
-	defer cancel()
-	if err := w.b.tg.EditForumTopic(ctx, w.key.chat, w.key.thread, name); err != nil {
-		info := telegram.ClassifyError(err)
-		w.log.Warn("new topic rename failed", "event", "topic_rename_failed", "error_kind", info.Reason)
-		w.say("The session started, but the Telegram topic title could not be updated.")
+	if w.topicRenameResults == nil {
+		w.topicRenameResults = make(chan topicRenameResult, 1)
 	}
+	generation, chat, thread := w.binding.Generation, w.key.chat, w.key.thread
+	tg, results, workerCtx := w.b.tg, w.topicRenameResults, w.ctx
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		ctx, cancel := context.WithTimeout(workerCtx, 10*time.Second)
+		defer cancel()
+		err := tg.EditForumTopic(ctx, chat, thread, name)
+		select {
+		case results <- topicRenameResult{generation: generation, err: err}:
+		case <-workerCtx.Done():
+		}
+	}()
+}
+
+func (w *worker) topicRenameFinished(result topicRenameResult) {
+	if result.generation != w.binding.Generation || result.err == nil {
+		return
+	}
+	info := telegram.ClassifyError(result.err)
+	w.log.Warn("new topic rename failed", "event", "topic_rename_failed", "error_kind", info.Reason)
+	w.say("The session started, but the Telegram topic title could not be updated.")
 }
 
 func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool) {
@@ -1644,16 +1999,10 @@ func (w *worker) handle(in incoming) {
 			w.say("Wait for the current session export to finish before changing its name.")
 			return
 		}
-		if _, err := w.ensureRuntime(); err != nil {
-			w.say(err.Error())
-			return
-		}
-		if _, err := w.call("set_session_name", map[string]any{"name": arg}); err != nil {
-			w.say("The session name change could not be confirmed. Use /status to check before retrying.")
-			return
-		}
-		w.touchBinding()
-		w.say("Session named: " + menuText(arg, 160))
+		name := menuText(arg, 160)
+		w.beginControl("name", func(client *omp.Client, ctx context.Context) (json.RawMessage, error) {
+			return client.Call(ctx, "set_session_name", map[string]any{"name": arg})
+		}, "Session named: "+name)
 	case "/model":
 		if arg == "" {
 			w.showModelPicker(in.msg.From.ID)
@@ -1714,25 +2063,11 @@ func (w *worker) handoff(instructions string) {
 	}
 	w.busy, w.compacting = true, true
 	w.touchActivity()
-	generation := w.binding.Generation
-	w.background.Add(1)
-	go func() {
-		defer w.background.Done()
-		raw, err := client.Call(w.ctx, "handoff", fields)
-		var result *struct {
-			SavedPath string `json:"savedPath"`
-		}
-		if err == nil {
-			err = json.Unmarshal(raw, &result)
-		}
-		select {
-		case w.operations <- operationResult{generation: generation, kind: "handoff", cancelled: result == nil, err: err}:
-		case <-w.ctx.Done():
-		}
-	}()
+	w.startOperation("handoff", client, func(ctx context.Context) (json.RawMessage, error) {
+		return client.Call(ctx, "handoff", fields)
+	}, 0, "")
 	w.say("Handoff requested.")
 }
-
 func (w *worker) status() {
 	home, _ := os.UserHomeDir()
 	if w.runtime == runtimeReleased && w.binding.Running {
@@ -1748,23 +2083,16 @@ func (w *worker) status() {
 		w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
 		return
 	}
-	raw, e := w.call("get_state", nil)
-	if e != nil {
-		w.say("Failed to read the session state.")
-		return
-	}
-	var s statusState
-	if json.Unmarshal(raw, &s) != nil {
-		w.say("Failed to read the session state.")
-		return
-	}
-	w.say(formatRuntimeStatus(s, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)))
+	w.beginControl("status", func(client *omp.Client, ctx context.Context) (json.RawMessage, error) {
+		return client.Call(ctx, "get_state", nil)
+	}, "")
 }
 func (w *worker) dispatch() {
-	if w.busy || w.compacting || w.finishing || w.exportingSession != "" || len(w.queue) == 0 {
+	if w.busy || w.controlBusy || w.compacting || w.finishing || w.exportingSession != "" || len(w.queue) == 0 {
 		return
 	}
-	if _, err := w.ensureRuntime(); err != nil || w.queue[0].preparing {
+	client, err := w.ensureRuntime()
+	if err != nil || w.queue[0].preparing {
 		return
 	}
 	q := w.queue[0]
@@ -1792,19 +2120,9 @@ func (w *worker) dispatch() {
 	if len(q.images) > 0 {
 		fields["images"] = q.images
 	}
-	raw, err := w.call("prompt", fields)
-	if err != nil {
-		w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
-		w.closeLogicalSession()
-		return
-	}
-	w.touchBinding()
-	var response struct {
-		AgentInvoked *bool `json:"agentInvoked"`
-	}
-	if json.Unmarshal(raw, &response) == nil && response.AgentInvoked != nil && !*response.AgentInvoked {
-		w.finishTerminal(rpcEvent{})
-	}
+	w.startOperation("prompt", client, func(ctx context.Context) (json.RawMessage, error) {
+		return client.Call(ctx, "prompt", fields)
+	}, q.id, "")
 }
 
 func (w *worker) enqueuePrompt(in incoming, text string) {
@@ -2073,6 +2391,48 @@ func isRateLimitedError(errorMessage string) bool {
 	return false
 }
 
+const terminalFailureCredentialKeyPattern = `(?:authorization|api[_ -]?(?:key|token)|access[_ -]?token|refresh[_ -]?token|token|password|secret|client[_ -]?secret)`
+
+var (
+	terminalFailureDoubleQuotedCredentialPattern = regexp.MustCompile(`(?i)(["']?` + terminalFailureCredentialKeyPattern + `["']?\s*[:=]\s*")((?:\\.|[^"\\])*)(")`)
+	terminalFailureSingleQuotedCredentialPattern = regexp.MustCompile(`(?i)(["']?` + terminalFailureCredentialKeyPattern + `["']?\s*[:=]\s*')((?:\\.|[^'\\])*)(')`)
+	terminalFailureCredentialPattern             = regexp.MustCompile(`(?i)(["']?` + terminalFailureCredentialKeyPattern + `["']?\s*[:=]\s*)((?:Bearer|Basic|Token|ApiKey)\s+)?([^\s,;}\]"']+)`)
+	terminalFailureIDPattern                     = regexp.MustCompile(`(?i)\b((?:request|trace|correlation)[_-]?id)\b\s*[:=]\s*[^\s,;]+`)
+	terminalFailureURLPattern                    = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s]+`)
+	terminalFailureUnixPathPattern               = regexp.MustCompile(`(^|[\s(:])/(?:[^\s/,;]+/)+[^\s/,;]+`)
+	terminalFailureWindowsPathPattern            = regexp.MustCompile(`(?i)\b[A-Z]:\\(?:[^\s\\]+\\)*[^\s,;]+`)
+	terminalFailureSecretMarkerPattern           = regexp.MustCompile(`(?i)\bsecret\b`)
+)
+
+func containsUnkeyedSecretMarker(detail string) bool {
+	for _, match := range terminalFailureSecretMarkerPattern.FindAllStringIndex(detail, -1) {
+		suffix := strings.TrimLeft(detail[match[1]:], "\"' \t\r\n")
+		if len(suffix) > 0 && (suffix[0] == ':' || suffix[0] == '=') {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func terminalFailureDetail(raw string) string {
+	detail := menuText(raw, 512)
+	if detail == "" {
+		return ""
+	}
+	detail = terminalFailureDoubleQuotedCredentialPattern.ReplaceAllString(detail, "$1[redacted]$3")
+	detail = terminalFailureSingleQuotedCredentialPattern.ReplaceAllString(detail, "$1[redacted]$3")
+	detail = terminalFailureCredentialPattern.ReplaceAllString(detail, "$1$2[redacted]")
+	if containsUnkeyedSecretMarker(detail) {
+		return ""
+	}
+	detail = terminalFailureIDPattern.ReplaceAllString(detail, "$1=[redacted]")
+	detail = terminalFailureURLPattern.ReplaceAllString(detail, "[redacted URL]")
+	detail = terminalFailureUnixPathPattern.ReplaceAllString(detail, "$1[redacted path]")
+	detail = terminalFailureWindowsPathPattern.ReplaceAllString(detail, "[redacted path]")
+	return menuText(detail, 512)
+}
+
 func (w *worker) terminalFailureNotice(e rpcEvent) string {
 	m := message{}
 	if assistant, ok := lastAssistant(e.Messages); ok {
@@ -2093,7 +2453,11 @@ func (w *worker) terminalFailureNotice(e rpcEvent) string {
 	if m.ErrorStatus == http.StatusTooManyRequests || isRateLimitedError(classification) {
 		return "omp reported that the task was rate-limited by the model provider. The task outcome is uncertain and will not be replayed automatically."
 	}
-	return "omp reported that the task failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically."
+	notice := "omp reported that the task failed before producing a confirmed result."
+	if detail := terminalFailureDetail(m.ErrorMessage); detail != "" {
+		notice += " Reason: " + detail
+	}
+	return notice + " The task outcome is uncertain and will not be replayed automatically."
 }
 
 func (w *worker) finishTerminal(e rpcEvent) {
@@ -2786,16 +3150,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		w.busy = true
 		w.compacting = true
 		w.touchActivity()
-		generation := w.binding.Generation
-		w.background.Add(1)
-		go func() {
-			defer w.background.Done()
-			_, err := client.Call(w.ctx, "compact", nil)
-			select {
-			case w.operations <- operationResult{generation: generation, err: err}:
-			case <-w.ctx.Done():
-			}
-		}()
+		w.startOperation("compact", client, func(ctx context.Context) (json.RawMessage, error) {
+			return client.Call(ctx, "compact", nil)
+		}, 0, "")
 	}
 	return callbackDone
 }

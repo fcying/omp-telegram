@@ -524,14 +524,11 @@ func (c *Client) decodeResponse(ctx context.Context, resp *http.Response, result
 		rejection := deliveryFailure(apiErr, uncertain)
 		if code == 429 && !uncertain {
 			apiErr.RetryAfter = 1
-			if envelope.Parameters.RetryAfter != nil {
+			if envelope.Parameters.RetryAfter != nil && *envelope.Parameters.RetryAfter > 0 {
 				apiErr.RetryAfter = *envelope.Parameters.RetryAfter
 			}
-			// Respect the server's minimum delay; never clamp it and retry early.
-			if apiErr.RetryAfter < 0 || apiErr.RetryAfter > 60 {
-				return false, 0, rejection
-			}
-			return true, time.Duration(apiErr.RetryAfter) * time.Second, rejection
+			// Explicit rate limits prove non-delivery; the durable outbox owns the retry.
+			return false, 0, rejection
 		}
 		return safe && code >= 500 && code <= 599, -1, rejection
 	}

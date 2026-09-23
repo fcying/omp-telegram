@@ -20,7 +20,7 @@ func (b *Bridge) newWorker(ctx context.Context, key target, binding store.Bindin
 		b: b, log: workerLog, key: key, binding: binding, restoring: restoring, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
-		operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
+		topicRenameResults: make(chan topicRenameResult, 1), operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
 	}
 }
 
@@ -72,23 +72,8 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		return err
 	}
 	// Snapshot before polling starts: restoring an instance must not restart old prompts.
-	pending, err := b.db.Pending()
-	if err != nil {
-		b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", "restore", "error_kind", "persistence")
+	if err := b.cancelPendingPrompts("restore"); err != nil {
 		return err
-	}
-	for _, in := range pending {
-		var update telegram.Update
-		if json.Unmarshal(in.Raw, &update) != nil || update.Message == nil {
-			continue
-		}
-		message := update.Message
-		if deferredPrompt(message) {
-			if err := b.db.Mark(in.ID, "cancelled"); err != nil {
-				b.storeLog.Error("input cancellation persistence failed", "event", "inbox_state_write_failed", "reason", "restore", "inbox_id", in.ID, "error_kind", "persistence")
-				return err
-			}
-		}
 	}
 	restored := make([]*worker, 0, len(bindings))
 	for _, binding := range bindings {
@@ -131,6 +116,25 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			return err
 		}
 		workers[key] = b.launchWorker(ctx, key, binding, false, intent)
+	}
+	return nil
+}
+
+func (b *Bridge) cancelPendingPrompts(reason string) error {
+	pending, err := b.db.Pending()
+	if err != nil {
+		b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", reason, "error_kind", "persistence")
+		return err
+	}
+	for _, in := range pending {
+		var update telegram.Update
+		if json.Unmarshal(in.Raw, &update) != nil || update.Message == nil || !deferredPrompt(update.Message) {
+			continue
+		}
+		if err := b.db.Mark(in.ID, "cancelled"); err != nil {
+			b.storeLog.Error("input cancellation persistence failed", "event", "inbox_state_write_failed", "reason", reason, "inbox_id", in.ID, "error_kind", "persistence")
+			return err
+		}
 	}
 	return nil
 }

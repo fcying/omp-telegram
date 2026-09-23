@@ -478,30 +478,85 @@ func TestDaemonRecoveryHonorsReducedWorkerLimit(t *testing.T) {
 
 func TestDaemonShutdownCancelsPendingQueue(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+	orderPath := filepath.Join(t.TempDir(), "rpc-order")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_ORDER", orderPath)
 	d := newRecoveryDaemon(t, 1)
+	gate := make(chan struct{})
+	photoData, documentData := []byte("fake image"), []byte("document")
+	d.fake.mu.Lock()
+	d.fake.files = map[string][]byte{"shutdown-photo": photoData, "shutdown-document": documentData}
+	d.fake.downloadGate = gate
+	d.fake.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+		d.fake.mu.Lock()
+		d.fake.downloadGate = nil
+		d.fake.mu.Unlock()
+	})
 	d.command(11, "/new "+t.TempDir())
 	active := d.send(11, "wait")
 	waitFor(t, func() bool {
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", active).Scan(&state) == nil && state == "submitted"
 	})
-	queued := d.send(11, "/review queued-before-shutdown")
+	queuedText := d.send(11, "queued text before shutdown")
+	queuedReview := d.send(11, "/review queued-before-shutdown")
+	sendAttachment := func(fileID string, photo bool) int64 {
+		d.nextID++
+		u := update(d.nextID, 11, "")
+		if photo {
+			u.Message.Photo = []telegram.PhotoSize{{FileID: fileID, Width: 1, Height: 1, FileSize: int64(len(photoData))}}
+		} else {
+			u.Message.Document = &telegram.Document{FileID: fileID, FileName: "queued.txt", MimeType: "text/plain", FileSize: int64(len(documentData))}
+		}
+		d.fake.updates <- u
+		return d.nextID
+	}
+	queuedPhoto := sendAttachment("shutdown-photo", true)
+	queuedDocument := sendAttachment("shutdown-document", false)
+	queued := []int64{queuedText, queuedReview, queuedPhoto, queuedDocument}
 	waitFor(t, func() bool {
-		var state string
-		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
+		for _, id := range queued {
+			var state string
+			if err := d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&state); err != nil || state != "pending" {
+				return false
+			}
+		}
+		d.fake.mu.Lock()
+		defer d.fake.mu.Unlock()
+		return d.fake.fileRequests == 2 && d.fake.downloadRequests == 2
 	})
 	d.stop()
-	reopened, err := store.Open(d.root)
+	close(gate)
+	d.fake.mu.Lock()
+	d.fake.downloadGate = nil
+	d.fake.mu.Unlock()
+	d.start()
+	if state := d.state(active); state != "uncertain" {
+		t.Fatalf("active input after restart = %q, want uncertain", state)
+	}
+	for _, id := range queued {
+		if state := d.state(id); state != "cancelled" {
+			t.Errorf("queued input %d after restart = %q, want cancelled", id, state)
+		}
+	}
+	d.command(11, "/status")
+	rpcOrder, err := os.ReadFile(orderPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.DB.Close()
-	var state string
-	if err := reopened.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state); err != nil {
-		t.Fatal(err)
+	if string(rpcOrder) != "prompt\n" {
+		t.Fatalf("prompt RPCs after shutdown and restart = %q, want only the original active prompt", rpcOrder)
 	}
-	if state != "cancelled" {
-		t.Fatalf("pending task after daemon shutdown = %q", state)
+	d.fake.mu.Lock()
+	fileRequests, downloadRequests := d.fake.fileRequests, d.fake.downloadRequests
+	d.fake.mu.Unlock()
+	if fileRequests != 2 || downloadRequests != 2 {
+		t.Fatalf("attachment downloads after restart = metadata:%d download:%d, want no replay after the two original downloads", fileRequests, downloadRequests)
 	}
 }
 

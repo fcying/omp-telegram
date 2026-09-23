@@ -27,6 +27,14 @@ func assertKeyboardClears(t *testing.T, f *fakeHTTP, messageIDs ...int) {
 // Omit the callback message to exercise the identity saved when the menu was sent.
 func clickKeyboard(w *worker, user int64, data string) {
 	w.callback(&telegram.CallbackQuery{ID: "keyboard-callback", From: telegram.User{ID: user}, Data: data})
+	for w.controlBusy {
+		select {
+		case result := <-w.operations:
+			w.operationReturned(result)
+		case <-time.After(5 * time.Second):
+			panic("control operation did not complete")
+		}
+	}
 }
 
 func TestNewConfirmationClearsKeyboardOnce(t *testing.T) {

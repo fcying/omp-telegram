@@ -69,7 +69,24 @@ func testWorker(t *testing.T, w *worker) *worker {
 	if w.log == nil {
 		w.log = w.b.log.With("chat_id", w.key.chat, "thread_id", w.key.thread)
 	}
+	if w.operations == nil {
+		w.operations = make(chan operationResult, 1)
+	}
+	if w.topicRenameResults == nil {
+		w.topicRenameResults = make(chan topicRenameResult, 1)
+	}
 	return w
+}
+
+func waitOperation(t *testing.T, w *worker) operationResult {
+	t.Helper()
+	select {
+	case result := <-w.operations:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("operation did not complete")
+		return operationResult{}
+	}
 }
 
 func newTestTelegram(t *testing.T) *telegram.Client {
@@ -77,6 +94,35 @@ func newTestTelegram(t *testing.T) *telegram.Client {
 }
 
 // This subprocess speaks RPC to exercise the real pipe and actor boundaries.
+func recordFixtureRPCOrder(command string) {
+	path := os.Getenv("OMP_TELEGRAM_FIXTURE_RPC_ORDER")
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		os.Exit(2)
+	}
+	_, writeErr := fmt.Fprintln(file, command)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		os.Exit(2)
+	}
+}
+
+func waitForFixtureFile(path string) {
+	for {
+		_, err := os.Stat(path)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			os.Exit(2)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestMain(m *testing.M) {
 	if len(os.Args) == 5 && os.Args[1] == "config" && os.Args[2] == "get" && os.Args[4] == "--json" {
 		var value any
@@ -103,7 +149,10 @@ func TestMain(m *testing.M) {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
 		out := json.NewEncoder(os.Stdout)
+		var emitMu sync.Mutex
 		emit := func(v any) {
+			emitMu.Lock()
+			defer emitMu.Unlock()
 			if out.Encode(v) != nil {
 				os.Exit(2)
 			}
@@ -259,6 +308,10 @@ func TestMain(m *testing.M) {
 					text = "native review: " + text
 				}
 				rootPrompts++
+				recordFixtureRPCOrder("prompt")
+				if text == "delayed-prompt-ack" {
+					waitForFixtureFile(os.Getenv("OMP_TELEGRAM_FIXTURE_PROMPT_ACK_GATE"))
+				}
 				if text == "failed-prompt-ack" {
 					emit(map[string]any{"type": "agent_start"})
 					resp["success"] = false
@@ -276,6 +329,15 @@ func TestMain(m *testing.M) {
 						emit(map[string]any{"type": "agent_end", "isTerminal": false})
 					}
 					streaming = false
+					continue
+				}
+				if text == "event-flood" {
+					go func() {
+						for i := 0; i < 100000; i++ {
+							emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "flood"}})
+							time.Sleep(time.Millisecond)
+						}
+					}()
 					continue
 				}
 				if text == "wait" {
@@ -313,6 +375,7 @@ func TestMain(m *testing.M) {
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}}})
 				continue
 			case "abort":
+				recordFixtureRPCOrder("abort")
 				if _, ok := cmd["clearQueuedMessages"]; ok {
 					os.Exit(2)
 				}
@@ -337,28 +400,38 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+type fakeHTTPResponse struct {
+	status int
+	body   string
+}
+
 type fakeHTTP struct {
-	mu                   sync.Mutex
-	messages             []map[string]any
-	forumTopicEdits      []map[string]any
-	callbacks            []string
-	updates              chan telegram.Update
-	rejectCommands       bool
-	rejectAllCommands    bool
-	rejectLanguage       string
-	rejectGetMe          bool
-	files                map[string][]byte
-	failProgress         bool
-	progressCalls        int
-	downloadGate         <-chan struct{}
-	fileRequests         int
-	uploads              []mediaUpload
-	keyboardClears       []map[string]any
-	deletedMessages      []map[string]any
-	progressDeleteStatus int
-	failKeyboardClear    bool
-	keyboardClearGate    <-chan struct{}
-	typingRequests       chan context.Context
+	mu                    sync.Mutex
+	messages              []map[string]any
+	forumTopicEdits       []map[string]any
+	callbacks             []string
+	updates               chan telegram.Update
+	rejectCommands        bool
+	rejectAllCommands     bool
+	rejectLanguage        string
+	rejectGetMe           bool
+	files                 map[string][]byte
+	failProgress          bool
+	progressCalls         int
+	downloadGate          <-chan struct{}
+	downloadErr           error
+	fileRequests          int
+	downloadRequests      int
+	uploads               []mediaUpload
+	keyboardClears        []map[string]any
+	deletedMessages       []map[string]any
+	progressDeleteStatus  int
+	failKeyboardClear     bool
+	keyboardClearGate     <-chan struct{}
+	typingRequests        chan context.Context
+	sendResponses         map[int64][]fakeHTTPResponse
+	forumTopicEditGate    <-chan struct{}
+	forumTopicEditStarted chan struct{}
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -409,12 +482,38 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		f.mu.Lock()
 		f.messages = append(f.messages, req)
 		id := len(f.messages)
+		var response *fakeHTTPResponse
+		if filepath.Base(r.URL.Path) == "sendMessage" {
+			chat, _ := req["chat_id"].(float64)
+			if queued := f.sendResponses[int64(chat)]; len(queued) > 0 {
+				next := queued[0]
+				response = &next
+				f.sendResponses[int64(chat)] = queued[1:]
+			}
+		}
 		f.mu.Unlock()
 		result = map[string]any{"message_id": id}
+		if response != nil {
+			return &http.Response{StatusCode: response.status, Body: io.NopCloser(strings.NewReader(response.body)), Header: make(http.Header), Request: r}, nil
+		}
 	case "editForumTopic":
 		f.mu.Lock()
 		f.forumTopicEdits = append(f.forumTopicEdits, req)
+		gate, started := f.forumTopicEditGate, f.forumTopicEditStarted
 		f.mu.Unlock()
+		if started != nil {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+		}
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}
 	case "deleteMessage":
 		f.mu.Lock()
 		f.deletedMessages = append(f.deletedMessages, req)
@@ -469,6 +568,22 @@ func waitFor(t *testing.T, fn func() bool) {
 	}
 	t.Fatal("observable condition not reached")
 }
+
+func drainControlOperations(t *testing.T, w *worker) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for w.controlBusy {
+		select {
+		case result := <-w.operations:
+			w.operationReturned(result)
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("control operation did not complete")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
 func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) {
 	t.Helper()
 	db, err := store.Open(t.TempDir())
@@ -499,6 +614,209 @@ func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) 
 	})
 	return fake, db, func(u telegram.Update) { fake.updates <- u }
 }
+func TestRateLimitedDeliveryDoesNotBlockOtherConversation(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
+		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":60}}`}},
+	}}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	requireStoreOK(t, db.Enqueue(-10, 11, "rate-limited conversation"))
+	requireStoreOK(t, db.Enqueue(-11, 22, "independent conversation"))
+	var limitedID, independentID int64
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "rate-limited conversation").Scan(&limitedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "independent conversation").Scan(&independentID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	waitFor(t, func() bool {
+		var stateA, stateB string
+		var attempts int
+		return db.DB.QueryRow("SELECT state,attempt_count FROM outbox WHERE id=?", limitedID).Scan(&stateA, &attempts) == nil && stateA == "pending" && attempts >= 1 &&
+			db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", independentID).Scan(&stateB) == nil && stateB == "done"
+	})
+	var nextAttempt, updatedAt int64
+	if err := db.DB.QueryRow("SELECT next_attempt_at,updated_at FROM outbox WHERE id=?", limitedID).Scan(&nextAttempt, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if delay := nextAttempt - updatedAt; delay < 50 || delay > 60 {
+		t.Fatalf("rate-limited retry delay = %d seconds, want about 60", delay)
+	}
+}
+
+func TestRateLimitedDeliverySurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
+		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`}},
+	}}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	requireStoreOK(t, db.Enqueue(-10, 11, "retry after restart"))
+	var outputID int64
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "retry after restart").Scan(&outputID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancelFirst := context.WithCancel(context.Background())
+	doneFirst := make(chan error, 1)
+	go func() { doneFirst <- b.deliver(ctx) }()
+	firstFinished := false
+	t.Cleanup(func() {
+		if firstFinished {
+			return
+		}
+		cancelFirst()
+		if err := <-doneFirst; err != nil {
+			t.Error(err)
+		}
+	})
+	waitFor(t, func() bool {
+		var state string
+		var nextAttempt int64
+		var attempts int
+		return db.DB.QueryRow("SELECT state,next_attempt_at,attempt_count FROM outbox WHERE id=?", outputID).Scan(&state, &nextAttempt, &attempts) == nil && state == "pending" && nextAttempt > 0 && attempts >= 1
+	})
+	var retryAt int64
+	if err := db.DB.QueryRow("SELECT next_attempt_at FROM outbox WHERE id=?", outputID).Scan(&retryAt); err != nil {
+		t.Fatal(err)
+	}
+	cancelFirst()
+	if err := <-doneFirst; err != nil {
+		t.Fatal(err)
+	}
+	firstFinished = true
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var restoredRetryAt int64
+	if err := db.DB.QueryRow("SELECT state,next_attempt_at FROM outbox WHERE id=?", outputID).Scan(&state, &restoredRetryAt); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" || restoredRetryAt != retryAt {
+		t.Fatalf("reopened retry state = %q at %d, want pending at %d", state, restoredRetryAt, retryAt)
+	}
+	if delay := time.Until(time.Unix(retryAt, 0)); delay > 0 {
+		time.Sleep(delay)
+	}
+	b = testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	ctxSecond, cancelSecond := context.WithCancel(context.Background())
+	doneSecond := make(chan error, 1)
+	go func() { doneSecond <- b.deliver(ctxSecond) }()
+	secondFinished := false
+	t.Cleanup(func() {
+		if secondFinished {
+			return
+		}
+		cancelSecond()
+		if err := <-doneSecond; err != nil {
+			t.Error(err)
+		}
+	})
+	waitFor(t, func() bool {
+		return db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", outputID).Scan(&state) == nil && state == "done"
+	})
+	cancelSecond()
+	if err := <-doneSecond; err != nil {
+		t.Fatal(err)
+	}
+	secondFinished = true
+	fake.mu.Lock()
+	attempts := 0
+	for _, message := range fake.messages {
+		if message["chat_id"] == float64(-10) {
+			attempts++
+		}
+	}
+	fake.mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("delivery attempts after restart = %d, want 2", attempts)
+	}
+}
+
+func testServerRejectionUsesDurableBackoff(t *testing.T, status int) {
+	t.Helper()
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	body := fmt.Sprintf(`{"ok":false,"error_code":%d,"description":%q}`, status, http.StatusText(status))
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
+		-10: {{status: status, body: body}},
+	}}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	requireStoreOK(t, db.Enqueue(-10, 11, "retry transient rejection"))
+	var outputID int64
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "retry transient rejection").Scan(&outputID); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().Unix()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	waitFor(t, func() bool {
+		var state string
+		var nextAttempt, updatedAt int64
+		var attempts int
+		return db.DB.QueryRow("SELECT state,next_attempt_at,updated_at,attempt_count FROM outbox WHERE id=?", outputID).Scan(&state, &nextAttempt, &updatedAt, &attempts) == nil && state == "pending" && attempts == 1 && nextAttempt-updatedAt >= 0 && nextAttempt-updatedAt <= 1
+	})
+	var nextAttempt int64
+	if err := db.DB.QueryRow("SELECT next_attempt_at FROM outbox WHERE id=?", outputID).Scan(&nextAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if nextAttempt < startedAt+1 {
+		t.Fatalf("first server retry deadline = %d, started at %d", nextAttempt, startedAt)
+	}
+	waitFor(t, func() bool {
+		var state string
+		return db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", outputID).Scan(&state) == nil && state == "done"
+	})
+}
+
+func TestTransientServerRejectionUsesDurableBackoff(t *testing.T) {
+	testServerRejectionUsesDurableBackoff(t, http.StatusServiceUnavailable)
+}
+
+func TestGatewayTimeoutUsesDurableBackoff(t *testing.T) {
+	testServerRejectionUsesDurableBackoff(t, http.StatusGatewayTimeout)
+}
+
 func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -659,6 +977,142 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 	if data, err := os.ReadFile(marker); err != nil || string(data) != "keep" {
 		t.Fatal("close/resume lost workspace files")
 	}
+}
+
+func TestRPCEventFloodDoesNotStarveControlInput(t *testing.T) {
+	f, db, send := setupBridge(t)
+	send(update(1, 11, "/new "+t.TempDir()))
+	waitBinding(t, db, 11)
+	send(update(2, 11, "event-flood"))
+	time.Sleep(50 * time.Millisecond)
+	send(update(3, 11, "/status"))
+	waitFor(t, func() bool { return f.has(11, "fixture/safe") })
+}
+
+func TestPromptStopRPCOrderUnderDelayedAcknowledgement(t *testing.T) {
+	root := t.TempDir()
+	orderPath := filepath.Join(root, "rpc-order")
+	releasePath := filepath.Join(root, "release-prompt-ack")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_ORDER", orderPath)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_PROMPT_ACK_GATE", releasePath)
+	_, db, send := setupBridge(t)
+	t.Cleanup(func() { _ = os.WriteFile(releasePath, nil, 0600) })
+	send(update(1, 11, "/new "+t.TempDir()))
+	waitBinding(t, db, 11)
+	send(update(2, 11, "delayed-prompt-ack"))
+	waitFor(t, func() bool {
+		var state string
+		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state) == nil && state == "submitted"
+	})
+	send(update(3, 11, "/stop"))
+	waitInputDone(t, db, 3)
+	time.Sleep(25 * time.Millisecond)
+	if err := os.WriteFile(releasePath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		data, err := os.ReadFile(orderPath)
+		return err == nil && strings.Count(string(data), "\n") == 2
+	})
+	data, err := os.ReadFile(orderPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != "prompt\nabort" {
+		t.Fatalf("OMP RPC command order = %q, want prompt then abort", data)
+	}
+}
+
+func TestRuntimeReplacementDropsQueuedStaleRPC(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	staleAbortStarted := make(chan struct{}, 1)
+	newRuntimeStarted := make(chan struct{}, 1)
+	w := testWorker(t, &worker{
+		ctx:                ctx,
+		cancel:             cancel,
+		binding:            store.Binding{Generation: 1},
+		active:             2,
+		turn:               1,
+		rpcOperationActive: true,
+		rpcOperations: []rpcOperation{{
+			generation: 1,
+			active:     2,
+			turn:       1,
+			kind:       "abort",
+			call: func(context.Context) (json.RawMessage, error) {
+				staleAbortStarted <- struct{}{}
+				return nil, nil
+			},
+		}},
+	})
+	promptRelease := make(chan struct{})
+	promptReturned := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePrompt := func() { releaseOnce.Do(func() { close(promptRelease) }) }
+	go func() {
+		<-promptRelease
+		w.operationReturned(operationResult{generation: 1, active: 2, turn: 1, kind: "prompt"})
+		close(promptReturned)
+	}()
+	t.Cleanup(func() {
+		releasePrompt()
+		<-promptReturned
+		cancel()
+		w.background.Wait()
+	})
+	w.releaseRuntimeWithReason(false, "explicit")
+	if !w.rpcOperationActive {
+		t.Fatal("runtime teardown released the active prompt lane before its result returned")
+	}
+	w.binding.Generation = 2
+	w.turn = 2
+	w.rpcOperations = append(w.rpcOperations, rpcOperation{
+		generation: 2,
+		turn:       2,
+		kind:       "new_runtime_probe",
+		call: func(context.Context) (json.RawMessage, error) {
+			newRuntimeStarted <- struct{}{}
+			return nil, nil
+		},
+	})
+	releasePrompt()
+	select {
+	case <-promptReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old prompt result did not release the RPC lane")
+	}
+	select {
+	case <-staleAbortStarted:
+		t.Fatal("queued abort from the released runtime was dispatched")
+	case <-newRuntimeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("new runtime operation did not dispatch after the old prompt returned")
+	}
+	result := waitOperation(t, w)
+	if result.kind != "new_runtime_probe" || result.generation != 2 {
+		t.Fatalf("dispatched operation = %+v, want new runtime probe", result)
+	}
+}
+
+func TestTopicRenameDoesNotBlockWorker(t *testing.T) {
+	f, db, send := setupBridge(t)
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	f.mu.Lock()
+	f.forumTopicEditGate = gate
+	f.forumTopicEditStarted = started
+	f.mu.Unlock()
+	defer close(gate)
+	send(update(1, 11, "/new "+t.TempDir()))
+	waitBinding(t, db, 11)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("topic rename did not reach Telegram")
+	}
+	send(update(2, 11, "/status"))
+	waitFor(t, func() bool { return f.has(11, "fixture/safe") })
+	waitInputDone(t, db, 2)
 }
 
 func TestNewNamesPreviouslyUnboundTopicFromWorkspace(t *testing.T) {
@@ -1208,6 +1662,13 @@ func TestCompactedTerminalEventsUseMessageEndMetadata(t *testing.T) {
 			hidden:  "SECRET diagnostics",
 		},
 		{
+			name:    "upstream model not found",
+			preview: "partial answer",
+			message: `{"role":"assistant","stopReason":"error","errorMessage":"The upstream could not find the corresponding model."}`,
+			state:   "uncertain",
+			want:    "Reason: The upstream could not find the corresponding model.",
+		},
+		{
 			name:    "structured rate limit status",
 			preview: "partial answer",
 			message: `{"role":"assistant","stopReason":"error","errorStatus":429,"errorMessage":"Resource exhausted"}`,
@@ -1281,6 +1742,56 @@ func TestCompactedTerminalEventsUseMessageEndMetadata(t *testing.T) {
 				t.Fatalf("compacted terminal output = %q, error %v", o.Text, err)
 			}
 		})
+	}
+}
+
+func TestTerminalFailureNoticeRedactsSensitiveDetails(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Mark(10, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"Upstream could not find model. API_KEY=hidden-value request-id=trace-123 https://provider.example/models /home/worker/model.json"}]}`))
+	output, err := db.NextOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.Text, "Upstream could not find model") {
+		t.Fatalf("terminal failure reason missing: %q", output.Text)
+	}
+	for _, sensitive := range []string{"hidden-value", "trace-123", "provider.example", "/home/worker/model.json"} {
+		if strings.Contains(output.Text, sensitive) {
+			t.Errorf("terminal failure exposed %q: %q", sensitive, output.Text)
+		}
+	}
+}
+
+func TestTerminalFailureNoticeRedactsJSONCredentials(t *testing.T) {
+	detail := `Model not found; quota exceeded; capacity unavailable; invalid parameters; API_KEY=key0; API_KEY: key1; api-token=key2; api_token=key3; token=key4; access_token=key5; refresh_token=key6; Authorization: Bearer key7; Authorization: Basic dXNlcjpwYXNz; Authorization: Token token0; Authorization: ApiKey api-key0; password=key8; secret=key9; client_secret=key10; JSON {"api_key":"json0","Authorization":"Bearer json1","access_token":"json2","refresh_token":"json3","password":"json4","client_secret":"json5"}; 'api_key':'single0'`
+	notice := (&worker{}).terminalFailureNotice(rpcEvent{Messages: []message{{Role: "assistant", StopReason: "error", ErrorMessage: detail}}})
+	for _, useful := range []string{"Model not found", "quota exceeded", "capacity unavailable", "invalid parameters"} {
+		if !strings.Contains(notice, useful) {
+			t.Errorf("terminal failure detail lost %q: %q", useful, notice)
+		}
+	}
+	for _, authorization := range []string{"Authorization: Basic [redacted]", "Authorization: Token [redacted]", "Authorization: ApiKey [redacted]"} {
+		if !strings.Contains(notice, authorization) {
+			t.Errorf("terminal failure did not preserve redacted authorization %q: %q", authorization, notice)
+		}
+	}
+	for _, credential := range []string{"key0", "key1", "key2", "key3", "key4", "key5", "key6", "key7", "key8", "key9", "key10", "dXNlcjpwYXNz", "token0", "api-key0", "json0", "json1", "json2", "json3", "json4", "json5", "single0"} {
+		if strings.Contains(notice, credential) {
+			t.Errorf("terminal failure exposed credential %q: %q", credential, notice)
+		}
 	}
 }
 
@@ -1403,6 +1914,14 @@ func TestDispatchWaitsForPreviewCleanup(t *testing.T) {
 	w.dispatch()
 	if len(w.queue) != 1 {
 		t.Fatal("next prompt dispatched before prior preview cleanup")
+	}
+}
+
+func TestDispatchWaitsForControlOperation(t *testing.T) {
+	w := testWorker(t, &worker{client: &omp.Client{}, controlBusy: true, queue: []queued{{id: 1}}})
+	w.dispatch()
+	if len(w.queue) != 1 {
+		t.Fatal("next prompt dispatched while a control operation was pending")
 	}
 }
 
@@ -1721,6 +2240,49 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 			t.Fatal(err)
 		}
 		w.handle(incoming{id: id, msg: u.Message})
+		drainControlOperations(t, w)
+	}
+}
+
+func TestStartOperationWaitsForPreviousAcknowledgement(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	w.startOperation("first", w.client, func(ctx context.Context) (json.RawMessage, error) {
+		close(firstStarted)
+		select {
+		case <-releaseFirst:
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}, 0, "")
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first RPC did not start")
+	}
+	w.startOperation("second", w.client, func(context.Context) (json.RawMessage, error) {
+		close(secondStarted)
+		return nil, nil
+	}, 0, "")
+	select {
+	case <-secondStarted:
+		t.Fatal("second RPC started before the first acknowledgement")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if result := waitOperation(t, w); result.kind != "first" {
+		t.Fatalf("first RPC result kind = %q", result.kind)
+	} else {
+		w.operationReturned(result)
+	}
+	if result := waitOperation(t, w); result.kind != "second" {
+		t.Fatalf("second RPC result kind = %q", result.kind)
+	} else {
+		w.operationReturned(result)
 	}
 }
 
@@ -1762,6 +2324,8 @@ func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 	command("failed-prompt-ack")
 	command("/review must not run")
 	w.dispatch()
+	result := waitOperation(t, w)
+	w.operationReturned(result)
 	for id, want := range map[int64]string{2: "uncertain", 3: "cancelled"} {
 		var state string
 		if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&state); err != nil || state != want {

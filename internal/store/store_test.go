@@ -322,6 +322,32 @@ func TestRestartRecovery(t *testing.T) {
 	}
 }
 
+func TestClaimNextOutputDoesNotBlockOtherConversations(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Enqueue(-10, 11, "rate limited"))
+	requireStoreOK(t, s.Enqueue(-10, 11, "same conversation"))
+	requireStoreOK(t, s.Enqueue(-10, 22, "independent conversation"))
+	now := time.Now().Unix()
+	first, err := s.ClaimNextOutput(context.Background(), now)
+	requireStoreOK(t, err)
+	if first.Chat != -10 || first.Thread != 11 || first.AttemptCount != 1 {
+		t.Fatalf("first claim = %+v", first)
+	}
+	requireStoreOK(t, s.RetryOutput(first.ID, now+60))
+	other, err := s.ClaimNextOutput(context.Background(), now)
+	requireStoreOK(t, err)
+	if other.Chat != -10 || other.Thread != 22 || other.Text != "independent conversation" {
+		t.Fatalf("independent claim = %+v", other)
+	}
+	requireStoreOK(t, s.MarkOutput(other.ID, OutboxDone))
+	if _, err = s.ClaimNextOutput(context.Background(), now); err != sql.ErrNoRows {
+		t.Fatalf("same conversation bypassed retry deadline: %v", err)
+	}
+	if _, err = s.ClaimNextOutput(context.Background(), now+60); err != nil {
+		t.Fatalf("rate-limited output did not become claimable: %v", err)
+	}
+}
+
 func TestAttachmentRestartRecovery(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
@@ -336,8 +362,8 @@ func TestAttachmentRestartRecovery(t *testing.T) {
 	s = openTestStore(t, dir)
 	out, err := s.NextOutput()
 	requireStoreOK(t, err)
-	if out != want {
-		t.Fatalf("staged attachment after restart = %+v, want %+v", out, want)
+	if out.ID != want.ID || out.Chat != want.Chat || out.Thread != want.Thread || out.Kind != want.Kind || out.Path != want.Path || out.Name != want.Name || out.Text != want.Text || out.NextAttemptAt <= 0 || out.AttemptCount != 0 {
+		t.Fatalf("staged attachment after restart = %+v, want durable fields %+v", out, want)
 	}
 	n, err := s.Uncertain()
 	requireStoreOK(t, err)

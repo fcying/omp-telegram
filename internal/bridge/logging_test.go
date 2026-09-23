@@ -524,18 +524,15 @@ func (mediaDownloadTimeout) Timeout() bool { return true }
 func TestMediaPreparationLogsWrappedTelegramTimeout(t *testing.T) {
 	capture := &logCapture{}
 	w, command := setupLoggingWorker(t, capture, "json")
+	fake, ok := http.DefaultTransport.(*fakeHTTP)
+	if !ok {
+		t.Fatal("workspace fixture did not install fake HTTP transport")
+	}
+	fake.mu.Lock()
+	fake.downloadErr = mediaDownloadTimeout{}
+	fake.mu.Unlock()
 	command("/new " + t.TempDir())
-	previous := http.DefaultTransport
-	http.DefaultTransport = logTestTransport(func(r *http.Request) (*http.Response, error) {
-		if strings.Contains(r.URL.Path, "/file/bot") {
-			return nil, mediaDownloadTimeout{}
-		}
-		return previous.RoundTrip(r)
-	})
-	defer func() {
-		w.background.Wait()
-		http.DefaultTransport = previous
-	}()
+	defer w.background.Wait()
 	u := update(100, 11, "")
 	u.Message.Document = &telegram.Document{FileID: "download-timeout", FileName: "input.txt", MimeType: "text/plain", FileSize: 4}
 	raw, err := json.Marshal(u)
