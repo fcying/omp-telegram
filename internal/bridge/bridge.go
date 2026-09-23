@@ -835,7 +835,7 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			b.cleanupDeliveredProgress(ctx, o.InboxID)
 		}
 		if o.Kind != "text" {
-			if removeErr := os.Remove(o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			if removeErr := removeOutboxSnapshot(filepath.Join(b.cfg.DataDir, "attachments", "outbox"), o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
 			}
 			if state != store.OutboxDone {

@@ -1322,3 +1322,43 @@ func TestFailedAttachmentDeliveryRemovesSnapshot(t *testing.T) {
 		})
 	}
 }
+
+func TestAttachmentDeliveryDoesNotDeleteOutsideSpool(t *testing.T) {
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	source := filepath.Join(t.TempDir(), "source.txt")
+	content := []byte("outside the private spool")
+	if err = os.WriteFile(source, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.EnqueueAttachment(-10, 11, "document", source, filepath.Base(source), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := http.DefaultTransport
+	http.DefaultTransport = &fakeHTTP{}
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dataDir}, db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+
+	var state string
+	waitFor(t, func() bool {
+		return db.DB.QueryRow("SELECT state FROM outbox WHERE path=?", source).Scan(&state) == nil && state == string(store.OutboxDone)
+	})
+	if got, err := os.ReadFile(source); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("out-of-spool source changed or disappeared: data=%q, error=%v", got, err)
+	}
+}

@@ -788,7 +788,7 @@ func TestRateLimitedDeliverySurvivesRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
-		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":60}}`}},
+		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":3600}}`}},
 	}}
 	oldTransport := http.DefaultTransport
 	http.DefaultTransport = fake
