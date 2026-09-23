@@ -951,6 +951,43 @@ func TestObsoleteHostAttachmentCannotReachNewGeneration(t *testing.T) {
 	}
 }
 
+func TestHostResultWriteFailureMarksTaskUncertainAndReleasesRuntime(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	client := w.client
+	const taskID int64 = 99
+	if err := w.b.db.Accept(taskID, []byte(`{"update_id":99}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.b.db.Mark(taskID, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	w.active, w.busy, w.preview = taskID, true, "partial answer"
+	cancelled := false
+	w.hostRequests = map[string]context.CancelFunc{"pending": func() { cancelled = true }}
+	_ = client.Close()
+
+	w.hostSend(rpcEvent{ID: "failed-result", ToolName: "unsupported"})
+	if w.client != nil || w.runtime != runtimeReleased || !w.binding.Running || w.active != 0 || w.busy {
+		t.Fatal("failed host result left its runtime or task active")
+	}
+	if !cancelled || len(w.hostRequests) != 0 {
+		t.Fatal("failed host result retained pending host tool work")
+	}
+	var state, text string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", taskID).Scan(&state); err != nil || state != "uncertain" {
+		t.Fatalf("host result failure task state = %q, error %v", state, err)
+	}
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=? ORDER BY id DESC LIMIT 1", taskID).Scan(&text); err != nil || !strings.Contains(text, "outcome is uncertain") {
+		t.Fatalf("host result failure notice = %q, error %v", text, err)
+	}
+
+	command("/name lazy resumed")
+	if w.client == nil || w.client.ID() == client.ID() || w.runtime != runtimeConnected {
+		t.Fatal("next operation did not lazily resume after the failed host result")
+	}
+}
+
 func TestDatabaseCleanupRemovesOnlyOwnedSnapshots(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(dir)

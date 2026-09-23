@@ -249,6 +249,7 @@ func TestMain(m *testing.M) {
 				if streaming {
 					resp["success"] = false
 				} else if cmd["customInstructions"] == "hold" {
+					recordFixtureRPCOrder("handoff")
 					continue
 				} else if cmd["customInstructions"] == "cancel" {
 					resp["data"] = nil

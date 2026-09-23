@@ -265,6 +265,13 @@ type operationResult struct {
 	err        error
 }
 
+func uncertainOperationOutcome(err error, cancelled bool) bool {
+	if err != nil {
+		return omp.ClassifyError(err) != "rejected"
+	}
+	return cancelled
+}
+
 type rpcOperation struct {
 	generation int64
 	active     int64
@@ -1285,16 +1292,31 @@ func (w *worker) operationFinished(result operationResult) {
 		w.compacting = false
 		w.busy = false
 		cancelled := result.cancelled
-		if !cancelled && result.err == nil {
+		uncertain := uncertainOperationOutcome(result.err, cancelled)
+		if result.err == nil && !cancelled {
 			var response *struct {
 				SavedPath string `json:"savedPath"`
 			}
-			cancelled = json.Unmarshal(result.data, &response) == nil && response == nil
+			if err := json.Unmarshal(result.data, &response); err != nil {
+				uncertain = true
+			} else {
+				cancelled = response == nil
+				uncertain = cancelled
+			}
+		}
+		if uncertain {
+			w.releaseRuntimeWithReason(true, "failure")
 		}
 		if result.err != nil {
-			w.say("Handoff failed or its outcome is uncertain. It will not be replayed automatically.")
+			if uncertain {
+				w.say("Handoff failed or its outcome is uncertain. The instance was closed and will resume on the next request.")
+			} else {
+				w.say("omp rejected the handoff.")
+			}
 		} else if cancelled {
-			w.say("Handoff canceled without a result.")
+			w.say("Handoff canceled without a result. The instance was closed and will resume on the next request.")
+		} else if uncertain {
+			w.say("Handoff result could not be confirmed. The instance was closed and will resume on the next request.")
 		} else {
 			w.touchBinding()
 			w.say("Handoff completed.")
@@ -1302,8 +1324,18 @@ func (w *worker) operationFinished(result operationResult) {
 	case "compact", "":
 		w.compacting = false
 		w.busy = false
+		uncertain := uncertainOperationOutcome(result.err, result.cancelled)
+		if uncertain {
+			w.releaseRuntimeWithReason(true, "failure")
+		}
 		if result.err != nil {
-			w.say("Compaction failed.")
+			if uncertain {
+				w.say("Compaction failed or its outcome is uncertain. The instance was closed and will resume on the next request.")
+			} else {
+				w.say("omp rejected compaction.")
+			}
+		} else if result.cancelled {
+			w.say("Compaction was canceled. The instance was closed and will resume on the next request.")
 		} else {
 			w.touchBinding()
 			w.say("Compaction completed.")

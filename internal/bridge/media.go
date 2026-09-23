@@ -488,23 +488,56 @@ func (w *worker) preparedMedia(result mediaResult) {
 	}
 }
 
-func (w *worker) hostResult(client *omp.Client, id, text string, failed bool) {
+func (w *worker) hostResult(client *omp.Client, id, text string, failed bool) error {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
-	_ = client.Send(ctx, map[string]any{"type": "host_tool_result", "id": id, "isError": failed, "result": map[string]any{"content": []map[string]string{{"type": "text", "text": text}}}})
+	return client.Send(ctx, map[string]any{"type": "host_tool_result", "id": id, "isError": failed, "result": map[string]any{"content": []map[string]string{{"type": "text", "text": text}}}})
 }
 
+func (w *worker) sendHostResult(client *omp.Client, id, text string, failed bool) {
+	if err := w.hostResult(client, id, text, failed); err != nil {
+		w.hostResultFailed(client, err)
+	}
+}
+
+func (w *worker) hostResultFailed(client *omp.Client, err error) {
+	if client != w.client {
+		return
+	}
+	attrs := []slog.Attr{
+		slog.String("event", "host_tool_result_failed"),
+		slog.String("error_kind", omp.ClassifyError(err)),
+		slog.Uint64("client_id", client.ID()),
+		slog.Int64("generation", w.binding.Generation),
+	}
+	if w.active != 0 {
+		attrs = append(attrs, slog.Int64("inbox_id", w.active))
+	}
+	w.log.LogAttrs(context.Background(), slog.LevelWarn, "host tool result delivery failed", attrs...)
+	for id, cancel := range w.hostRequests {
+		cancel()
+		delete(w.hostRequests, id)
+	}
+	if w.active != 0 {
+		w.finishUncertain("A host tool result could not be delivered to omp. The instance was closed; the task outcome is uncertain and will not be replayed automatically.")
+	} else {
+		w.say("A host tool result could not be delivered to omp. The instance was closed.")
+	}
+	w.busy = false
+	w.compacting = false
+	w.releaseRuntimeWithReason(true, "failure")
+}
 func (w *worker) hostSend(event rpcEvent) {
 	client, connected := w.runtimeClient()
 	if !connected {
 		return
 	}
 	if event.ToolName != "telegram_send" {
-		w.hostResult(client, event.ID, "Unsupported host tool.", true)
+		w.sendHostResult(client, event.ID, "Unsupported host tool.", true)
 		return
 	}
 	if !w.busy || w.active == 0 {
-		w.hostResult(client, event.ID, "Attachments can only be sent during an active Telegram request.", true)
+		w.sendHostResult(client, event.ID, "Attachments can only be sent during an active Telegram request.", true)
 		return
 	}
 	w.initMedia()
@@ -512,7 +545,7 @@ func (w *worker) hostSend(event rpcEvent) {
 		return
 	}
 	if len(w.hostRequests) >= 16 {
-		w.hostResult(client, event.ID, "Too many pending attachment requests.", true)
+		w.sendHostResult(client, event.ID, "Too many pending attachment requests.", true)
 		return
 	}
 	var request struct {
@@ -523,14 +556,14 @@ func (w *worker) hostSend(event rpcEvent) {
 	decoder := json.NewDecoder(strings.NewReader(string(event.Arguments)))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&request) != nil || request.Path == "" {
-		w.hostResult(client, event.ID, "Invalid attachment request.", true)
+		w.sendHostResult(client, event.ID, "Invalid attachment request.", true)
 		return
 	}
 	if request.Kind == "" {
 		request.Kind = "document"
 	}
 	if request.Kind != "document" && request.Kind != "photo" {
-		w.hostResult(client, event.ID, "Attachment kind must be photo or document.", true)
+		w.sendHostResult(client, event.ID, "Attachment kind must be photo or document.", true)
 		return
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
@@ -572,18 +605,18 @@ func (w *worker) preparedSend(result sendResult) {
 		if !mediaCancellation(result.err) {
 			result.logger.Warn("attachment snapshot failed", "event", "snapshot_failed", "error_kind", mediaErrorKind(result.err))
 		}
-		w.hostResult(result.client, result.id, result.err.Error(), true)
+		w.sendHostResult(result.client, result.id, result.err.Error(), true)
 		return
 	}
 	file := result.file
 	if err := w.b.db.EnqueueAttachment(w.key.chat, w.key.thread, file.Kind, file.Path, file.Name, file.Caption); err != nil {
 		result.logger.Error("attachment persistence failed", "event", "attachment_persist_failed", "error_kind", "persistence")
 		removeMediaSnapshot(file.Path, result.logger)
-		w.hostResult(result.client, result.id, "Cannot persist attachment delivery.", true)
+		w.sendHostResult(result.client, result.id, "Cannot persist attachment delivery.", true)
 		w.b.fail(err)
 		return
 	}
-	w.hostResult(result.client, result.id, "Attachment queued for this Telegram conversation. Delivery is not yet confirmed.", false)
+	w.sendHostResult(result.client, result.id, "Attachment queued for this Telegram conversation. Delivery is not yet confirmed.", false)
 }
 
 func (w *worker) drainMediaResults() {
