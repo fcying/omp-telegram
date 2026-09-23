@@ -147,6 +147,38 @@ func TestSnapshotSessionBoundsAndProtectsSource(t *testing.T) {
 	}
 }
 
+func TestSnapshotSessionRequiresSpoolDirectorySync(t *testing.T) {
+	root, spool := t.TempDir(), t.TempDir()
+	source := filepath.Join(root, "session.jsonl")
+	if err := os.WriteFile(source, []byte("native\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("directory sync failed")
+	oldSync := exportDirectorySync
+	t.Cleanup(func() { exportDirectorySync = oldSync })
+	calls := 0
+	exportDirectorySync = func(path string) error {
+		calls++
+		if path != spool {
+			t.Errorf("directory sync path = %q, want %q", path, spool)
+		}
+		return syncErr
+	}
+	if _, err := SnapshotSession(context.Background(), spool, source); !errors.Is(err, syncErr) {
+		t.Fatalf("snapshot sync failure = %v, want %v", err, syncErr)
+	}
+	if calls != 1 {
+		t.Fatalf("directory sync calls = %d, want 1", calls)
+	}
+	entries, err := os.ReadDir(spool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed snapshot left unowned spool entries: %v", entries)
+	}
+}
+
 func TestSnapshotSessionRejectsNonRegularFiles(t *testing.T) {
 	root, spool := t.TempDir(), t.TempDir()
 	directory := filepath.Join(root, "directory")
@@ -539,6 +571,45 @@ func TestHTMLSnapshotTimeoutRemovesTarget(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("HTML failure left spool entries: %v", entries)
+	}
+}
+
+func TestHTMLSnapshotRequiresFinalSpoolDirectorySync(t *testing.T) {
+	root, spool := t.TempDir(), t.TempDir()
+	source := filepath.Join(root, "session.jsonl")
+	if err := os.WriteFile(source, []byte("native\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "omp-export")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf '%s' '<html>native</html>' > \"$3\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("final directory sync failed")
+	oldSync := exportDirectorySync
+	t.Cleanup(func() { exportDirectorySync = oldSync })
+	calls := 0
+	exportDirectorySync = func(path string) error {
+		calls++
+		if path != spool {
+			t.Errorf("directory sync path = %q, want %q", path, spool)
+		}
+		if calls == 1 {
+			return oldSync(path)
+		}
+		return syncErr
+	}
+	if _, err := snapshotHTML(context.Background(), binary, source, spool, "omp-session-test.html"); !errors.Is(err, syncErr) {
+		t.Fatalf("HTML snapshot sync failure = %v, want %v", err, syncErr)
+	}
+	if calls != 2 {
+		t.Fatalf("directory sync calls = %d, want source and final snapshots", calls)
+	}
+	entries, err := os.ReadDir(spool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed HTML snapshot left unowned spool entries: %v", entries)
 	}
 }
 

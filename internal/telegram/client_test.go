@@ -68,6 +68,10 @@ func TestConversationMessages(t *testing.T) {
 					w.WriteHeader(http.StatusBadRequest)
 					fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"invalid conversation request"}`)
 				}
+				if _, exists := fields["reply_to_message_id"]; exists {
+					reject("legacy reply field is present")
+					return
+				}
 				if string(fields["chat_id"]) != fmt.Sprint(conversation.chatID) {
 					reject("wrong destination chat")
 					return
@@ -85,12 +89,24 @@ func TestConversationMessages(t *testing.T) {
 				}
 				switch r.URL.Path {
 				case "/bot123:secret-token/sendMessage", "/bot123:secret-token/editMessageText":
+					if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+						var replyParameters struct {
+							MessageID int64 `json:"message_id"`
+						}
+						if err := json.Unmarshal(fields["reply_parameters"], &replyParameters); err != nil || replyParameters.MessageID != 42 {
+							reject("missing or invalid reply parameters")
+							return
+						}
+					} else if _, exists := fields["reply_parameters"]; exists {
+						reject("edit unexpectedly contains reply parameters")
+						return
+					}
 					var keyboard Keyboard
 					if err := json.Unmarshal(fields["reply_markup"], &keyboard); err != nil || len(keyboard.InlineKeyboard) != 1 || len(keyboard.InlineKeyboard[0]) != 1 || keyboard.InlineKeyboard[0][0].CallbackData != "stop" {
 						reject("missing stop button")
 						return
 					}
-					if editing && (string(fields["message_id"]) != "42" || string(fields["text"]) != `"Working"`) {
+					if strings.HasSuffix(r.URL.Path, "/editMessageText") && (string(fields["message_id"]) != "42" || string(fields["text"]) != `"Working"`) {
 						reject("invalid progress edit")
 						return
 					}
@@ -107,7 +123,7 @@ func TestConversationMessages(t *testing.T) {
 			})
 			ctx := context.Background()
 			keyboard := &Keyboard{InlineKeyboard: [][]Button{{{Text: "Stop", CallbackData: "stop"}}}}
-			message, err := client.Send(ctx, conversation.chatID, conversation.threadID, "Starting", SendOptions{Keyboard: keyboard})
+			message, err := client.Send(ctx, conversation.chatID, conversation.threadID, "Starting", SendOptions{Keyboard: keyboard, ReplyToMessageID: 42})
 			if err != nil || message.MessageID != 42 {
 				t.Fatalf("send = %+v, %v", message, err)
 			}
@@ -228,8 +244,14 @@ func TestRateLimitedSendReturnsExplicitRejectionForDurableRetry(t *testing.T) {
 		if text != "&lt;b&gt;literal&lt;/b&gt; <i>literal</i>" {
 			t.Errorf("text not converted: %q", text)
 		}
-		if string(fields["reply_to_message_id"]) != "42" {
-			t.Errorf("reply target = %s, want 42", fields["reply_to_message_id"])
+		var replyParameters struct {
+			MessageID int64 `json:"message_id"`
+		}
+		if err := json.Unmarshal(fields["reply_parameters"], &replyParameters); err != nil || replyParameters.MessageID != 42 {
+			t.Errorf("reply parameters = %s, want message_id 42", fields["reply_parameters"])
+		}
+		if _, exists := fields["reply_to_message_id"]; exists {
+			t.Error("legacy reply field is present")
 		}
 		attempts.Add(1)
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -254,15 +276,24 @@ func TestSendFallsBackWhenReplyTargetIsUnavailable(t *testing.T) {
 			return
 		}
 		if attempts.Add(1) == 1 {
-			if string(fields["reply_to_message_id"]) != "42" {
-				t.Errorf("initial reply target = %s, want 42", fields["reply_to_message_id"])
+			var replyParameters struct {
+				MessageID int64 `json:"message_id"`
+			}
+			if err := json.Unmarshal(fields["reply_parameters"], &replyParameters); err != nil || replyParameters.MessageID != 42 {
+				t.Errorf("initial reply parameters = %s, want message_id 42", fields["reply_parameters"])
+			}
+			if _, exists := fields["reply_to_message_id"]; exists {
+				t.Error("legacy reply field is present")
 			}
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}`)
 			return
 		}
+		if _, exists := fields["reply_parameters"]; exists {
+			t.Error("fallback retained rejected reply parameters")
+		}
 		if _, exists := fields["reply_to_message_id"]; exists {
-			t.Error("fallback retained rejected reply target")
+			t.Error("fallback emitted legacy reply field")
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":43}}`)
 	})
@@ -515,23 +546,32 @@ func TestReplyFallbackLogsSafeEventInTextAndJSON(t *testing.T) {
 			} else {
 				handler = slog.NewTextHandler(&logs, nil)
 			}
+			var attempts atomic.Int32
 			client := localClientWithLogger(t, func(w http.ResponseWriter, r *http.Request) {
-				if r.Header.Get("Content-Type") == "application/json" {
-					var fields map[string]json.RawMessage
-					if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
-						t.Error(err)
-						return
+				attempts.Add(1)
+				var fields map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, exists := fields["reply_to_message_id"]; exists {
+					t.Error("request emitted legacy reply field")
+				}
+				if _, exists := fields["reply_parameters"]; exists {
+					var parameters struct {
+						MessageID int64 `json:"message_id"`
 					}
-					if _, exists := fields["reply_to_message_id"]; exists {
-						w.WriteHeader(http.StatusBadRequest)
-						fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}`)
-						return
+					if err := json.Unmarshal(fields["reply_parameters"], &parameters); err != nil || parameters.MessageID != 42 {
+						t.Errorf("reply parameters = %s, want message_id 42", fields["reply_parameters"])
 					}
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message to be replied not found"}`)
+					return
 				}
 				fmt.Fprint(w, `{"ok":true,"result":{"message_id":43}}`)
 			}, slog.New(handler))
-			_, err := client.Send(context.Background(), 1, 0, "answer", SendOptions{ReplyToMessageID: 42})
-			if err != nil || !strings.Contains(logs.String(), "reply_fallback") || strings.Contains(logs.String(), "secret-token") || strings.Contains(logs.String(), "private.invalid") {
+			message, err := client.Send(context.Background(), 1, 0, "answer", SendOptions{ReplyToMessageID: 42})
+			if err != nil || message.MessageID != 43 || attempts.Load() != 2 || !strings.Contains(logs.String(), "reply_fallback") || strings.Contains(logs.String(), "secret-token") || strings.Contains(logs.String(), "private.invalid") {
 				t.Fatalf("fallback log or result unsafe: err=%v logs=%s", err, logs.String())
 			}
 		})

@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -205,7 +206,11 @@ func (c *Client) upload(ctx context.Context, file *os.File, chatID, threadID int
 			writeErr = multipartWriter.WriteField("message_thread_id", strconv.FormatInt(threadID, 10))
 		}
 		if writeErr == nil && replyTo != 0 {
-			writeErr = multipartWriter.WriteField("reply_to_message_id", strconv.FormatInt(replyTo, 10))
+			var parameters []byte
+			parameters, writeErr = json.Marshal(map[string]int64{"message_id": replyTo})
+			if writeErr == nil {
+				writeErr = multipartWriter.WriteField("reply_parameters", string(parameters))
+			}
 		}
 		if writeErr == nil && caption != "" {
 			writeErr = multipartWriter.WriteField("caption", caption)

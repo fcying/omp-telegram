@@ -3,6 +3,7 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -113,15 +114,24 @@ func TestSendFileFallsBackWhenReplyTargetIsUnavailable(t *testing.T) {
 		}
 		defer r.MultipartForm.RemoveAll()
 		if attempts.Add(1) == 1 {
-			if r.FormValue("reply_to_message_id") != "42" {
-				t.Errorf("initial reply target = %q", r.FormValue("reply_to_message_id"))
+			var replyParameters struct {
+				MessageID int64 `json:"message_id"`
+			}
+			if err := json.Unmarshal([]byte(r.FormValue("reply_parameters")), &replyParameters); err != nil || replyParameters.MessageID != 42 {
+				t.Errorf("initial reply parameters = %q, want message_id 42", r.FormValue("reply_parameters"))
+			}
+			if _, exists := r.MultipartForm.Value["reply_to_message_id"]; exists {
+				t.Error("initial request emitted legacy reply field")
 			}
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: reply message not found"}`)
 			return
 		}
-		if r.FormValue("reply_to_message_id") != "" {
-			t.Error("fallback retained rejected reply target")
+		if _, exists := r.MultipartForm.Value["reply_parameters"]; exists {
+			t.Error("fallback retained rejected reply parameters")
+		}
+		if _, exists := r.MultipartForm.Value["reply_to_message_id"]; exists {
+			t.Error("fallback emitted legacy reply field")
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":43}}`)
 	})
@@ -184,6 +194,17 @@ func TestConversationAttachments(t *testing.T) {
 						reject("wrong attachment topic")
 						return
 					}
+					var replyParameters struct {
+						MessageID int64 `json:"message_id"`
+					}
+					if err := json.Unmarshal([]byte(r.FormValue("reply_parameters")), &replyParameters); err != nil || replyParameters.MessageID != 42 {
+						reject("missing or invalid reply parameters")
+						return
+					}
+					if _, exists := r.MultipartForm.Value["reply_to_message_id"]; exists {
+						reject("legacy reply field is present")
+						return
+					}
 					file, header, err := r.FormFile(attachment.kind)
 					if err != nil {
 						reject(err.Error())
@@ -201,7 +222,7 @@ func TestConversationAttachments(t *testing.T) {
 				if err := os.WriteFile(path, attachment.payload, 0600); err != nil {
 					t.Fatal(err)
 				}
-				message, err := client.SendFile(context.Background(), conversation.chatID, conversation.threadID, attachment.kind, path, "attachment", "Result", SendOptions{})
+				message, err := client.SendFile(context.Background(), conversation.chatID, conversation.threadID, attachment.kind, path, "attachment", "Result", SendOptions{ReplyToMessageID: 42})
 				if err != nil || message.MessageID != 42 {
 					t.Fatalf("send attachment = %+v, %v", message, err)
 				}

@@ -54,13 +54,17 @@ func TestInvalidResumeIDPreservesSavedSession(t *testing.T) {
 	}
 	command("/close")
 	before := w.binding
+	savedBefore, err := w.b.db.Binding(99, -10, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, id := range []string{"--print", "../../session.jsonl", "deadbeef-0000-4000-8000-000000000000"} {
 		command("/resume " + id)
 		if w.client != nil {
 			t.Fatal("invalid ID started an instance")
 		}
 		saved, err := w.b.db.Binding(99, -10, 11)
-		if err != nil || saved != before {
+		if err != nil || saved != savedBefore || w.binding != before {
 			t.Fatal("failed ID resume changed the saved binding")
 		}
 	}

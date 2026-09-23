@@ -94,7 +94,7 @@ Both formats write to stderr. File storage and rotation belong to supervisor/jou
 | `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
 | `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `restore_runtime_skipped`, `topic_rename_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
 | `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
-| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_rate_limited`, `delivery_retry_scheduled`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
+| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_rate_limited`, `delivery_retry_scheduled`, `delivery_retry_exhausted`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
 | `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed`, `progress_message_write_failed`, `progress_cleanup_state_failed` |
 | `media` | `prepare_failed`, `snapshot_failed`, `attachment_persist_failed`, `cleanup_failed` |
 
@@ -138,7 +138,7 @@ The database is `omp-telegram.db` under `storage.data_dir`. It uses WAL, a busy 
 | `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots created on replacement; deleting a closed binding removes this conversation's snapshots. It is not a session browser. |
 | `session_favorites` | PK `(bot,chat,thread,workspace,session_id)` | Pinned native session identities for the `/resume` picker; no session content |
 | `inbox` | PK `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | Update deduplication, processing state, and optional live-progress identity |
-| `outbox` | Autoincrement `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,next_attempt_at,attempt_count,created_at,updated_at` | Ordered Telegram delivery; definite rate limits and retryable server rejections return to the durable pending queue with a retry deadline |
+| `outbox` | Autoincrement `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count,created_at,updated_at` | Ordered Telegram delivery; definite rate limits are uncapped, while the separate server-rejection count bounds retryable 5xx failures |
 
 ### Database Message Retention
 
@@ -151,7 +151,7 @@ Retention never deletes bindings, history, startup intents, session favorites, w
 
 ### Schema version
 
-`PRAGMA user_version` is the schema version, currently 10. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 9 migrate transactionally through `startup_intents`, the binding interruption marker, message timestamps, reply targets, native session IDs, inbox/outbox progress associations, `bindings.last_used_at`, per-conversation `/resume` favorites, and durable outbox retry metadata before advancing `user_version`. The v8 migration leaves existing `last_used_at` values at zero; it never guesses historical use time. Application versions and database versions evolve independently.
+`PRAGMA user_version` is the schema version, currently 11. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 10 migrate transactionally through `startup_intents`, the binding interruption marker, message timestamps, reply targets, native session IDs, inbox/outbox progress associations, `bindings.last_used_at`, per-conversation `/resume` favorites, durable outbox retry metadata, and separate server-rejection retry counts before advancing `user_version`. The v8 migration leaves existing `last_used_at` values at zero; the v10-to-v11 migration initializes `server_retry_count` to zero because legacy `attempt_count` mixed rate limits and server rejections. Application versions and database versions evolve independently.
 
 ### Input and completion transactions
 
@@ -179,8 +179,8 @@ A database completion failure stops the worker rather than pretending the task c
 
 ```text
 pending -> sending -> done
-                   -> pending (429 / definite 5xx)
-                   -> failed
+                   -> pending (429 uncapped / definite 5xx before the 12th server rejection)
+                   -> failed (12th definite 5xx rejection, or other failure)
                    -> uncertain
 
 restart: sending -> uncertain
@@ -192,7 +192,7 @@ The Telegram client classifies failures at the transport boundary:
 - Transport interruption, incomplete responses, or otherwise unconfirmed delivery remain uncertain.
 - HTTP status alone is insufficient. Prior uncertainty must not be erased by a later local failure.
 
-Definite 429 rejections return to the durable pending queue at Telegram's `retry_after` deadline, or after one second when it is absent. Complete, definite 500, 502, 503, and 504 rejections use exponential retry delay starting at one second and capped at five minutes. Uncertain outcomes and other failures are not automatically retried. A database transaction cannot atomically commit a Telegram network side effect, so exactly-once delivery is not promised.
+Complete, definite 500, 502, 503, and 504 rejections use exponential retry delay starting at one second and capped at five minutes. A durable `server_retry_count` records only these definite rejections; the 12th marks the output `failed` rather than scheduling another retry, allowing later outputs in that conversation to proceed. `attempt_count` tracks total claims and does not consume this server-rejection budget. Definite 429 responses return to the durable pending queue at Telegram's `retry_after` deadline, or after one second when it is absent; 429 retries are uncapped. Uncertain outcomes and other failures are not automatically retried. A database transaction cannot atomically commit a Telegram network side effect, so exactly-once delivery is not promised.
 
 For progress deletion, a confirmed non-retryable Telegram 4xx other than 429 clears only the local progress association. A 429, 5xx, transport failure, or uncertain response retains that association for a later cleanup attempt. Cleanup state never changes the task or outbox result.
 
@@ -381,6 +381,6 @@ Current evidence includes transactional failure injection, index query plans, re
 
 Application version comes from `Version` in [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go). `--version`/`-v` includes Git revision/dirty metadata when available; `-ldflags "-X main.Version=..."` can override the base version.
 
-The [release workflow](../.github/workflows/release.yaml) runs on `main` pushes, pull requests, and manual dispatch. All non-`main` branch changes must enter through a pull request. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. Every workflow from the repository publishes: a new source version on `main` creates a formal release without rewriting an existing version tag, while all other internal workflows update the `dev` GitHub prerelease. Internal PRs publish the true head commit. External PRs only build and do not publish. The workflow can only update the `dev` prerelease tag and a new source version tag; it never changes unrelated tags.
+The [release workflow](../.github/workflows/release.yaml) runs on `main` pushes, pull requests, and manual dispatch. All non-`main` branch changes must enter through a pull request. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. Every workflow from the repository publishes: a new source version on `main` creates a formal release without rewriting an existing version tag, while all other internal workflows update the `dev-latest` GitHub prerelease. Internal PRs publish the true head commit. External PRs only build and do not publish. The workflow can only update the `dev-latest` prerelease tag and a new source version tag; it never changes unrelated tags.
 
 Release archives contain the binary and LICENSE, with `SHA256SUMS` alongside them. Publishing uses `GITHUB_TOKEN` with write permission only in the release job. To release a new application version, update `Version` to `vMAJOR.MINOR.PATCH` and merge/push to `main`. This does not automatically change the database schema version.

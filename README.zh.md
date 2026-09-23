@@ -37,7 +37,7 @@ tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 
 arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE, omp 需要单独安装. 每个发布版都附带 `SHA256SUMS`.
 
-开发构建发布在 [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev). 这是 prerelease, 可能不稳定.
+开发构建发布在 [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev-latest). 这是 prerelease, 可能不稳定.
 
 ### 从源码构建
 

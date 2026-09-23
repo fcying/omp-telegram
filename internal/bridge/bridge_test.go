@@ -817,6 +817,302 @@ func TestGatewayTimeoutUsesDurableBackoff(t *testing.T) {
 	testServerRejectionUsesDurableBackoff(t, http.StatusGatewayTimeout)
 }
 
+func TestInternalServerErrorUsesDurableBackoff(t *testing.T) {
+	testServerRejectionUsesDurableBackoff(t, http.StatusInternalServerError)
+}
+
+func TestBadGatewayUsesDurableBackoff(t *testing.T) {
+	testServerRejectionUsesDurableBackoff(t, http.StatusBadGateway)
+}
+
+func TestRetryableServerRejectionRequiresDefiniteListedCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info telegram.ErrorInfo
+	}{
+		{name: "unlisted 501", info: telegram.ErrorInfo{Code: http.StatusNotImplemented}},
+		{name: "uncertain 503", info: telegram.ErrorInfo{Code: http.StatusServiceUnavailable, Uncertain: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if retryableServerRejection(tc.info) {
+				t.Fatal("non-retryable failure was classified for server retry")
+			}
+		})
+	}
+}
+
+func TestServerRejectionExhaustionUnblocksConversationAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	})
+	body := `{"ok":false,"error_code":503,"description":"Service Unavailable"}`
+	responses := make([]fakeHTTPResponse, 0, maxServerDeliveryAttempts)
+	for attempt := int64(0); attempt < maxServerDeliveryAttempts; attempt++ {
+		responses = append(responses, fakeHTTPResponse{status: http.StatusServiceUnavailable, body: body})
+	}
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{-10: responses}}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	capture := &logCapture{}
+	logs, err := logging.New(capture, logging.Options{Level: "info", Format: "json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBridge := func() *Bridge {
+		b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+		b.telegramLog = logs.Logger(logging.Telegram)
+		return b
+	}
+	requireStoreOK(t, db.Enqueue(-10, 11, "exhausted output"))
+	requireStoreOK(t, db.Enqueue(-10, 11, "later output"))
+	var outputID, laterID int64
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "exhausted output").Scan(&outputID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "later output").Scan(&laterID); err != nil {
+		t.Fatal(err)
+	}
+	bFirst := newBridge()
+	ctxFirst, cancelFirst := context.WithCancel(context.Background())
+	doneFirst := make(chan error, 1)
+	go func() { doneFirst <- bFirst.deliver(ctxFirst) }()
+	firstFinished := false
+	t.Cleanup(func() {
+		if firstFinished {
+			return
+		}
+		cancelFirst()
+		if err := <-doneFirst; err != nil {
+			t.Error(err)
+		}
+	})
+	for attempt := int64(1); attempt <= 6; attempt++ {
+		wantAttempt := int(attempt)
+		waitFor(t, func() bool {
+			var state string
+			var attempts, serverRetries int
+			return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "pending" && attempts == wantAttempt && serverRetries == wantAttempt
+		})
+		if attempt < 6 {
+			if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=0 WHERE id=?", outputID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cancelFirst()
+	err = <-doneFirst
+	firstFinished = true
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var attemptCount, serverRetryCount int
+	if err := db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attemptCount, &serverRetryCount); err != nil || state != "pending" || attemptCount != 6 || serverRetryCount != 6 {
+		t.Fatalf("restored retry state = %q after %d attempts and %d server rejections, error %v", state, attemptCount, serverRetryCount, err)
+	}
+	if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=0 WHERE id=?", outputID); err != nil {
+		t.Fatal(err)
+	}
+	bSecond := newBridge()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- bSecond.deliver(ctx) }()
+	secondFinished := false
+	t.Cleanup(func() {
+		if secondFinished {
+			return
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	for attempt := int64(7); attempt < maxServerDeliveryAttempts; attempt++ {
+		wantAttempt := int(attempt)
+		waitFor(t, func() bool {
+			var state string
+			var attempts, serverRetries int
+			return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "pending" && attempts == wantAttempt && serverRetries == wantAttempt
+		})
+		if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=0 WHERE id=?", outputID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		var attempts, serverRetries int
+		return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "failed" && attempts == int(maxServerDeliveryAttempts) && serverRetries == int(maxServerDeliveryAttempts)
+	})
+	waitFor(t, func() bool {
+		return db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", laterID).Scan(&state) == nil && state == "done"
+	})
+	cancel()
+	err = <-done
+	secondFinished = true
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sends int
+	fake.mu.Lock()
+	for _, message := range fake.messages {
+		if message["chat_id"] == float64(-10) {
+			sends++
+		}
+	}
+	fake.mu.Unlock()
+	if sends != int(maxServerDeliveryAttempts)+1 {
+		t.Fatalf("delivery sends = %d, want %d", sends, maxServerDeliveryAttempts+1)
+	}
+	record := capturedEvent(t, capture, "delivery_retry_exhausted")
+	if record == nil || record["outbox_id"] != float64(outputID) || record["chat_id"] != float64(-10) || record["thread_id"] != float64(11) || record["kind"] != "text" || record["attempt_count"] != float64(maxServerDeliveryAttempts) || record["server_retry_count"] != float64(maxServerDeliveryAttempts) || record["api_code"] != float64(http.StatusServiceUnavailable) {
+		t.Fatalf("retry exhaustion log = %+v", record)
+	}
+	allowed := map[string]bool{"time": true, "level": true, "msg": true, "component": true, "event": true, "outbox_id": true, "chat_id": true, "thread_id": true, "kind": true, "attempt_count": true, "server_retry_count": true, "api_code": true}
+	for key := range record {
+		if !allowed[key] {
+			t.Errorf("retry exhaustion log contains unexpected field %q", key)
+		}
+	}
+}
+
+func TestRateLimitDoesNotConsumeServerRetryBudget(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	})
+	requireStoreOK(t, db.Enqueue(-10, 11, "rate limit after many attempts"))
+	var outputID int64
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "rate limit after many attempts").Scan(&outputID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE outbox SET attempt_count=? WHERE id=?", maxServerDeliveryAttempts-1, outputID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
+		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":60}}`}},
+	}}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	finished := false
+	t.Cleanup(func() {
+		if finished {
+			return
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	waitFor(t, func() bool {
+		var state string
+		var attempts, serverRetries int
+		return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "pending" && attempts == int(maxServerDeliveryAttempts) && serverRetries == 0
+	})
+	if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=0 WHERE id=?", outputID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		var state string
+		var attempts, serverRetries int
+		return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "done" && attempts == int(maxServerDeliveryAttempts+1) && serverRetries == 0
+	})
+	cancel()
+	err = <-done
+	finished = true
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerRetryBudgetIgnoresRateLimitAttempts(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	requireStoreOK(t, db.Enqueue(-10, 11, "mixed retry history"))
+	var outputID int64
+	if err := db.DB.QueryRow("SELECT id FROM outbox WHERE text=?", "mixed retry history").Scan(&outputID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE outbox SET attempt_count=? WHERE id=?", maxServerDeliveryAttempts-2, outputID); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
+		-10: {
+			{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":60}}`},
+			{status: http.StatusServiceUnavailable, body: `{"ok":false,"error_code":503,"description":"Service Unavailable"}`},
+		},
+	}}
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	finished := false
+	t.Cleanup(func() {
+		if finished {
+			return
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	waitFor(t, func() bool {
+		var state string
+		var attempts int
+		var serverRetries int
+		return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "pending" && attempts == int(maxServerDeliveryAttempts-1) && serverRetries == 0
+	})
+	if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=0 WHERE id=?", outputID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		var state string
+		var attempts, serverRetries int
+		return db.DB.QueryRow("SELECT state,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &attempts, &serverRetries) == nil && state == "pending" && attempts == int(maxServerDeliveryAttempts) && serverRetries == 1
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	finished = true
+}
 func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -939,12 +1235,13 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 	if f.has(11, "independent") {
 		t.Fatal("cross-topic output")
 	}
+	// Telegram update IDs are monotonic; out-of-order IDs make pending routing nondeterministic.
 	send(update(13, 11, "/review"))
 	waitFor(t, func() bool {
 		var state string
 		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=13").Scan(&state) == nil && state == "pending"
 	})
-	send(update(6, 11, "/stop"))
+	send(update(14, 11, "/stop"))
 	waitFor(t, func() bool {
 		var state string
 		_ = db.DB.QueryRow("SELECT state FROM inbox WHERE id=4").Scan(&state)
@@ -954,25 +1251,25 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 		var state string
 		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=13").Scan(&state) == nil && state == "cancelled"
 	})
-	send(update(7, 11, "after stop"))
+	send(update(15, 11, "after stop"))
 	waitFor(t, func() bool { return f.has(11, "answer: after stop") })
 	if f.has(11, "must not run") {
 		t.Fatal("cancelled prompt executed")
 	}
-	send(update(8, 11, "/status"))
+	send(update(16, 11, "/status"))
 	waitFor(t, func() bool { return f.has(11, "fixture/safe") })
 	if f.has(11, "SECRET") || f.has(11, "PRIVATE") {
 		t.Fatal("sensitive state exposed")
 	}
-	send(update(9, 11, "/close"))
-	waitInputDone(t, db, 9)
-	send(update(10, 11, "/resume "+strings.TrimSuffix(filepath.Base(first.Session), ".jsonl")))
+	send(update(17, 11, "/close"))
+	waitInputDone(t, db, 17)
+	send(update(18, 11, "/resume "+strings.TrimSuffix(filepath.Base(first.Session), ".jsonl")))
 	waitFor(t, func() bool { b, e := db.Binding(99, -10, 11); return e == nil && b.Generation > first.Generation })
 	restored, _ := db.Binding(99, -10, 11)
 	if restored.Session != first.Session || restored.Workspace != first.Workspace {
 		t.Fatal("resume selected another session or working directory")
 	}
-	send(update(11, 11, "cwd"))
+	send(update(19, 11, "cwd"))
 	waitFor(t, func() bool { return f.has(11, "answer: "+first.Workspace) })
 	if data, err := os.ReadFile(marker); err != nil || string(data) != "keep" {
 		t.Fatal("close/resume lost workspace files")

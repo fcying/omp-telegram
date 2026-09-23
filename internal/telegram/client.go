@@ -309,7 +309,7 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 			fields["message_thread_id"] = threadID
 		}
 		if options.ReplyToMessageID != 0 {
-			fields["reply_to_message_id"] = options.ReplyToMessageID
+			fields["reply_parameters"] = map[string]int64{"message_id": options.ReplyToMessageID}
 		}
 		if options.Keyboard != nil {
 			fields["reply_markup"] = options.Keyboard

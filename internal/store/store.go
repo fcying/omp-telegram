@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 10
+const schemaVersion = 11
 const messageCleanupBatchSize = 1000
 
 // InboxState identifies the durable lifecycle state of an incoming update.
@@ -81,6 +81,7 @@ type Output struct {
 	Text                               string
 	Kind, Path, Name                   string
 	NextAttemptAt, AttemptCount        int64
+	ServerRetryCount                   int64
 }
 
 type ProgressMessage struct {
@@ -226,7 +227,7 @@ func initialize(db *sql.DB) error {
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
  CREATE TABLE session_favorites(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(bot,chat,thread,workspace,session_id));
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL DEFAULT 0,attempt_count INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL DEFAULT 0,attempt_count INTEGER NOT NULL DEFAULT 0,server_retry_count INTEGER NOT NULL DEFAULT 0);
  CREATE INDEX idx_inbox_state ON inbox(state,id);
  CREATE INDEX idx_outbox_state ON outbox(state,id);
  CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state);
@@ -328,6 +329,13 @@ func initialize(db *sql.DB) error {
 		}
 		version = 10
 	}
+	if version == 10 {
+		if _, e = tx.Exec("ALTER TABLE outbox ADD COLUMN server_retry_count INTEGER NOT NULL DEFAULT 0"); e != nil {
+			return e
+		}
+		version = 11
+	}
+
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
 	}
@@ -1018,11 +1026,11 @@ type rowScanner interface {
 
 func scanOutput(row rowScanner) (Output, error) {
 	var o Output
-	err := row.Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name, &o.NextAttemptAt, &o.AttemptCount)
+	err := row.Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name, &o.NextAttemptAt, &o.AttemptCount, &o.ServerRetryCount)
 	return o, err
 }
 
-const outputColumns = "id,inbox_id,chat,thread,text,reply_to,kind,path,name,next_attempt_at,attempt_count"
+const outputColumns = "id,inbox_id,chat,thread,text,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count"
 
 func (s *Store) NextOutput() (Output, error) {
 	return scanOutput(s.DB.QueryRow("SELECT " + outputColumns + " FROM outbox WHERE state='pending' ORDER BY id LIMIT 1"))
@@ -1085,6 +1093,48 @@ func (s *Store) RetryOutput(id, nextAttemptAt int64) error {
 		return fmt.Errorf("%w: retry", ErrOutboxStateTransition)
 	}
 	return nil
+}
+
+// RetryServerOutput increments the durable count of definite server rejections and atomically retries or fails the output.
+func (s *Store) RetryServerOutput(id, nextAttemptAt, maxAttempts int64) (int64, bool, error) {
+	if maxAttempts < 1 {
+		return 0, false, errors.New("server retry limit must be positive")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback()
+
+	var retryCount int64
+	if err = tx.QueryRow("SELECT server_retry_count FROM outbox WHERE id=? AND state='sending'", id).Scan(&retryCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, fmt.Errorf("%w: retry", ErrOutboxStateTransition)
+		}
+		return 0, false, err
+	}
+	retryCount++
+	exhausted := retryCount >= maxAttempts
+	state := OutboxPending
+	if exhausted {
+		state = OutboxFailed
+		nextAttemptAt = 0
+	}
+	result, err := tx.Exec("UPDATE outbox SET state=?,server_retry_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state='sending'", string(state), retryCount, nextAttemptAt, time.Now().Unix(), id)
+	if err != nil {
+		return 0, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
+	if changed != 1 {
+		return 0, false, fmt.Errorf("%w: retry", ErrOutboxStateTransition)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return retryCount, exhausted, nil
 }
 
 func (s *Store) MarkOutput(id int64, state OutboxState) error {

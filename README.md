@@ -37,7 +37,7 @@ tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 
 For arm64, use `omp-telegram-linux-arm64.txz`. Archives contain the binary and LICENSE; omp itself is installed separately. Each release includes `SHA256SUMS`.
 
-Development builds are published as the [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev). They are prereleases and may be unstable.
+Development builds are published as the [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev-latest). They are prereleases and may be unstable.
 
 ### Build from source
 

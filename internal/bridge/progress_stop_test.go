@@ -9,6 +9,14 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
+func sentReplyTarget(fields map[string]any) any {
+	parameters, ok := fields["reply_parameters"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return parameters["message_id"]
+}
+
 func allowInitialProgress(w *worker) {
 	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 }
@@ -169,7 +177,7 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 		t.Fatalf("progress stop callback = %q", data)
 	}
 	f.mu.Lock()
-	replyTo := f.messages[0]["reply_to_message_id"]
+	replyTo := sentReplyTarget(f.messages[0])
 	f.mu.Unlock()
 	if replyTo != float64(2) {
 		t.Fatalf("progress reply target = %v, want original root message 2", replyTo)
@@ -548,7 +556,7 @@ func TestAttachmentFinalReplyRetainsAttachmentOrigin(t *testing.T) {
 func TestProgressAndFinalReplyShareRootOrigin(t *testing.T) {
 	w, f, _, messageID := activeProgressStop(t)
 	f.mu.Lock()
-	progressReplyTo := f.messages[0]["reply_to_message_id"]
+	progressReplyTo := sentReplyTarget(f.messages[0])
 	f.mu.Unlock()
 	if progressReplyTo != float64(2) {
 		t.Fatalf("progress reply target = %v, want 2", progressReplyTo)

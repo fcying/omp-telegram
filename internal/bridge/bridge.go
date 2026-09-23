@@ -652,6 +652,7 @@ func (b *Bridge) reconcileOutboxSnapshots(ctx context.Context, cutoff time.Time)
 }
 
 const maxServerRetryDelaySeconds int64 = 5 * 60
+const maxServerDeliveryAttempts int64 = 12
 
 func retryableServerRejection(info telegram.ErrorInfo) bool {
 	if info.Uncertain {
@@ -675,8 +676,12 @@ func deliveryRetryDelaySeconds(output store.Output, info telegram.ErrorInfo) int
 		}
 		return 1
 	}
+	attemptCount := output.AttemptCount
+	if retryableServerRejection(info) {
+		attemptCount = output.ServerRetryCount + 1
+	}
 	delay := int64(1)
-	for attempt := int64(1); attempt < output.AttemptCount && delay < maxServerRetryDelaySeconds; attempt++ {
+	for attempt := int64(1); attempt < attemptCount && delay < maxServerRetryDelaySeconds; attempt++ {
 		delay *= 2
 	}
 	if delay > maxServerRetryDelaySeconds {
@@ -718,10 +723,14 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			return errors.New("unsupported outbox content kind")
 		}
 		state := store.OutboxDone
+		retryExhausted := false
+		apiCode := 0
 		if err != nil {
 			info := telegram.ClassifyError(err)
+			apiCode = info.Code
 			rateLimited := info.Reason == "rate_limited" && !info.Uncertain
-			if rateLimited || retryableServerRejection(info) {
+			serverRejection := retryableServerRejection(info)
+			if rateLimited || serverRejection {
 				delay := deliveryRetryDelaySeconds(o, info)
 				nextAttempt := time.Now().Unix()
 				maxInt64 := int64(^uint64(0) >> 1)
@@ -730,34 +739,56 @@ func (b *Bridge) deliver(ctx context.Context) error {
 				} else {
 					nextAttempt += delay
 				}
-				if retryErr := b.db.RetryOutput(o.ID, nextAttempt); retryErr != nil {
-					b.storeLog.Error("outbox retry state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", "pending")
+				if serverRejection {
+					serverRetryCount, exhausted, retryErr := b.db.RetryServerOutput(o.ID, nextAttempt, maxServerDeliveryAttempts)
+					if retryErr != nil {
+						b.storeLog.Error("outbox retry state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread)
+						return retryErr
+					}
+					o.ServerRetryCount = serverRetryCount
+					retryExhausted = exhausted
+					if retryExhausted {
+						state = store.OutboxFailed
+					}
+				} else if retryErr := b.db.RetryOutput(o.ID, nextAttempt); retryErr != nil {
+					b.storeLog.Error("outbox retry state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", string(store.OutboxPending))
 					return retryErr
 				}
-				if ctx.Err() == nil {
-					event, message := "delivery_retry_scheduled", "telegram delivery deferred for retry"
-					if rateLimited {
-						event, message = "delivery_rate_limited", "telegram delivery deferred by rate limit"
+				if !retryExhausted {
+					if ctx.Err() == nil {
+						event, message := "delivery_retry_scheduled", "telegram delivery deferred for retry"
+						if rateLimited {
+							event, message = "delivery_rate_limited", "telegram delivery deferred by rate limit"
+						}
+						logTelegramFailure(b.telegramLog, slog.LevelWarn, event, message, err,
+							slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
+							slog.String("kind", o.Kind), slog.String("state", string(store.OutboxPending)), slog.Bool("replay", true))
 					}
-					logTelegramFailure(b.telegramLog, slog.LevelWarn, event, message, err,
-						slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
-						slog.String("kind", o.Kind), slog.String("state", string(store.OutboxPending)), slog.Bool("replay", true))
+					continue
 				}
-				continue
-			}
-			state = store.OutboxFailed
-			if info.Uncertain {
-				state = store.OutboxUncertain
-			}
-			if ctx.Err() == nil && info.Reason != "cancelled" {
-				logTelegramFailure(b.telegramLog, slog.LevelWarn, "delivery_failed", "telegram delivery failed", err,
-					slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
-					slog.String("kind", o.Kind), slog.String("state", string(state)), slog.Bool("replay", false))
+			} else {
+				state = store.OutboxFailed
+				if info.Uncertain {
+					state = store.OutboxUncertain
+				}
+				if ctx.Err() == nil && info.Reason != "cancelled" {
+					logTelegramFailure(b.telegramLog, slog.LevelWarn, "delivery_failed", "telegram delivery failed", err,
+						slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
+						slog.String("kind", o.Kind), slog.String("state", string(state)), slog.Bool("replay", false))
+				}
 			}
 		}
-		if err = b.db.MarkOutput(o.ID, state); err != nil {
-			b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", string(state))
-			return err
+		if !retryExhausted {
+			if err = b.db.MarkOutput(o.ID, state); err != nil {
+				b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", string(state))
+				return err
+			}
+		}
+		if retryExhausted {
+			b.telegramLog.LogAttrs(context.Background(), slog.LevelWarn, "telegram delivery retries exhausted",
+				slog.String("event", "delivery_retry_exhausted"),
+				slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
+				slog.String("kind", o.Kind), slog.Int64("attempt_count", o.AttemptCount), slog.Int64("server_retry_count", o.ServerRetryCount), slog.Int("api_code", apiCode))
 		}
 		if state == store.OutboxDone && o.InboxID != 0 {
 			b.cleanupDeliveredProgress(ctx, o.InboxID)

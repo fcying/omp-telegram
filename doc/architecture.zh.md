@@ -94,7 +94,7 @@ RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单�
 | `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
 | `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `restore_runtime_skipped`, `topic_rename_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
 | `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
-| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_rate_limited`, `delivery_retry_scheduled`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
+| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_rate_limited`, `delivery_retry_scheduled`, `delivery_retry_exhausted`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
 | `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed`, `progress_message_write_failed`, `progress_cleanup_state_failed` |
 | `media` | `prepare_failed`, `snapshot_failed`, `attachment_persist_failed`, `cleanup_failed` |
 
@@ -138,7 +138,7 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 | `history` | `bot,chat,thread,workspace,session,generation` | 替换 binding 时创建的旧快照; 删除 closed binding 时清理该对话的快照. 不是会话浏览器. |
 | `session_favorites` | 主键 `(bot,chat,thread,workspace,session_id)` | `/resume` picker 的 pinned 原生 session identity, 不保存 session 内容 |
 | `inbox` | 主键 `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | update 去重、处理状态和可选的实时进度身份 |
-| `outbox` | 自增 `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,next_attempt_at,attempt_count,created_at,updated_at` | 与根输入关联的 Telegram 有序投递; 明确限流和可重试的服务端拒绝会回到带重试截止时间的持久 pending 队列 |
+| `outbox` | 自增 `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count,created_at,updated_at` | 与根输入关联的 Telegram 有序投递; 明确限流重试不设上限, 独立的服务端拒绝计数限制可重试的 5xx 失败 |
 
 ### Database Message Retention
 
@@ -151,7 +151,7 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 10. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 9 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites 以及持久化 outbox 重试元数据的事务迁移后才推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 11. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites、持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -179,8 +179,8 @@ Reply context 只来自当前 Update 解码出的 `ReplyToMessage` 和 `Quote`; 
 
 ```text
 pending -> sending -> done
-                   -> pending (429 / definite 5xx)
-                   -> failed
+                   -> pending (429 不限次数 / 第 12 次服务端拒绝之前的明确 5xx)
+                   -> failed (第 12 次明确的 5xx 拒绝, 或其他失败)
                    -> uncertain
 
 restart: sending -> uncertain
@@ -192,7 +192,7 @@ Telegram client 在传输边界区分错误:
 - 传输中断, 响应不完整或其他无法确认的交付, 保持不确定状态.
 - 不能只看 HTTP 状态码分类. 之前发生的不确定性不能被后来的本地失败抹掉.
 
-明确的 429 拒绝会按 Telegram 的 `retry_after` 截止时间回到持久 pending 队列; 缺少该值时等待一秒. 完整且明确的 500, 502, 503 和 504 拒绝使用指数退避, 从一秒开始, 最长五分钟. 不确定结果和其他失败不会自动重试. 数据库事务无法与 Telegram 网络副作用原子提交, 因此不承诺 exactly-once 交付.
+完整且明确的 500, 502, 503 和 504 拒绝使用指数退避, 从一秒开始, 最长五分钟. 持久化的 `server_retry_count` 只记录这些明确拒绝; 第 12 次拒绝会将输出标记为 `failed`, 不再安排重试, 使同一对话中的后续输出可以继续. `attempt_count` 只记录总认领次数, 不消耗该服务端拒绝预算. 明确的 429 拒绝会按 Telegram 的 `retry_after` 截止时间回到持久 pending 队列; 缺少该值时等待一秒, 429 重试不设次数上限. 不确定结果和其他失败不会自动重试. 数据库事务无法与 Telegram 网络副作用原子提交, 因此不承诺 exactly-once 交付.
 
 对于 progress 删除, 已确认且不可重试的 Telegram 4xx (429 除外) 只清除本地 progress 关联. 429, 5xx, 传输失败或不确定响应会保留该关联, 等待之后的清理尝试. 清理状态不会改变任务或 outbox 结果.
 
@@ -382,6 +382,6 @@ just deploy
 
 应用版本由 [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go) 中的 `Version` 定义. `--version`/`-v` 在构建元数据可用时显示 Git revision/dirty 标记, 可通过 `-ldflags "-X main.Version=..."` 覆盖基础版本.
 
-[发布工作流](../.github/workflows/release.yaml) 在 `main` push, PR 及手动触发时运行. 所有非 `main` 分支变更必须通过 PR 进入 workflow. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 本仓库的每个 workflow 都会发布: `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag; 其他内部 workflow 均更新 `dev` GitHub prerelease. 内部 PR 发布真实 head commit. 外部 PR 只构建, 不发布. workflow 只能更新 `dev` prerelease tag 和新源码版本 tag, 不会修改无关 tag.
+[发布工作流](../.github/workflows/release.yaml) 在 `main` push, PR 及手动触发时运行. 所有非 `main` 分支变更必须通过 PR 进入 workflow. Linux amd64/arm64 分别原生构建和测试, amd64 额外执行 race. 本仓库的每个 workflow 都会发布: `main` 上的新源码版本创建正式 release, 不覆盖已有正式 tag; 其他内部 workflow 均更新 `dev-latest` GitHub prerelease. 内部 PR 发布真实 head commit. 外部 PR 只构建, 不发布. workflow 只能更新 `dev-latest` prerelease tag 和新源码版本 tag, 不会修改无关 tag.
 
 发布包包含二进制和 LICENSE, 并提供 `SHA256SUMS`. 只有发布 job 为 `GITHUB_TOKEN` 申请写权限. 发布新应用版本时, 将 `Version` 改为 `vMAJOR.MINOR.PATCH` 并合并/push 到 `main`, 不会自动改变数据库 schema 版本.

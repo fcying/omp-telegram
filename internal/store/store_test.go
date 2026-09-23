@@ -896,6 +896,27 @@ PRAGMA user_version=7;`)
 	}
 }
 
+func TestVersionTenMigratesServerRetryCountIndependently(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+	requireStoreOK(t, err)
+	_, err = db.Exec(`CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,last_used_at INTEGER NOT NULL DEFAULT 0,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL DEFAULT 0,attempt_count INTEGER NOT NULL DEFAULT 0);
+INSERT INTO outbox(id,chat,thread,text,state,next_attempt_at,attempt_count) VALUES(1,-10,11,'legacy retry','pending',123,11);
+PRAGMA user_version=10;`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, db.Close())
+	s := openTestStore(t, dir)
+	var version int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	out, err := s.NextOutput()
+	requireStoreOK(t, err)
+	if version != schemaVersion || out.ID != 1 || out.AttemptCount != 11 || out.ServerRetryCount != 0 || out.NextAttemptAt != 123 {
+		t.Fatalf("v10 retry migration = version %d, output %+v, want separate retry count initialized to zero", version, out)
+	}
+}
+
 func TestBindingsForChatMergesPendingIntents(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	old := Binding{Bot: 1, Chat: 2, Thread: 10, Workspace: "/old", Session: "/sessions/old.jsonl", SessionID: "old-session", Generation: 3, LastUsedAt: time.Now().Add(-12 * 24 * time.Hour).Unix(), Running: true}

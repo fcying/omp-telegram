@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
@@ -15,7 +16,20 @@ import (
 var (
 	errSessionExportTooLarge = errors.New("session export is too large to send through Telegram")
 	errSessionHTMLTimeout    = errors.New("session HTML export timed out")
+	exportDirectorySync      = syncExportSpoolDirectory
 )
+
+func syncExportSpoolDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err = directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
+}
 
 // SnapshotSession copies an absolute OMP session file into the private outbox spool.
 // The source is opened read-only and is never returned to the outbox.
@@ -81,6 +95,9 @@ func SnapshotSession(ctx context.Context, spoolRoot, sessionFile string) (result
 	}
 	if err = target.Close(); err != nil {
 		return media.File{}, errors.New("cannot finish session snapshot")
+	}
+	if err = exportDirectorySync(spoolRoot); err != nil {
+		return media.File{}, fmt.Errorf("cannot persist session snapshot directory: %w", err)
 	}
 	if err = ctx.Err(); err != nil {
 		return media.File{}, err
@@ -156,6 +173,9 @@ func snapshotHTMLWithLimit(ctx context.Context, binary, sessionFile, spoolRoot, 
 	}
 	if err = output.Close(); err != nil {
 		return media.File{}, errors.New("cannot finish HTML snapshot")
+	}
+	if err = exportDirectorySync(spoolRoot); err != nil {
+		return media.File{}, fmt.Errorf("cannot persist HTML snapshot directory: %w", err)
 	}
 	if err = ctx.Err(); err != nil {
 		return media.File{}, err
