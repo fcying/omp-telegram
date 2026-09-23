@@ -788,7 +788,7 @@ func TestRateLimitedDeliverySurvivesRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
-		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`}},
+		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":60}}`}},
 	}}
 	oldTransport := http.DefaultTransport
 	http.DefaultTransport = fake
@@ -842,8 +842,9 @@ func TestRateLimitedDeliverySurvivesRestart(t *testing.T) {
 	if state != "pending" || restoredRetryAt != retryAt {
 		t.Fatalf("reopened retry state = %q at %d, want pending at %d", state, restoredRetryAt, retryAt)
 	}
-	if delay := time.Until(time.Unix(retryAt, 0)); delay > 0 {
-		time.Sleep(delay)
+	// Simulate the persisted retry deadline elapsing without a wall-clock sleep.
+	if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=? WHERE id=? AND state='pending'", time.Now().Unix(), outputID); err != nil {
+		t.Fatal(err)
 	}
 	b = testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
 	ctxSecond, cancelSecond := context.WithCancel(context.Background())
