@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"omp-telegram/internal/config"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
@@ -1051,7 +1052,7 @@ func TestExportSnapshotDeliveryRemovesSnapshotAfterSuccess(t *testing.T) {
 	if err := os.WriteFile(source, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := SnapshotSession(context.Background(), filepath.Join(root, "spool"), source)
+	snapshot, err := SnapshotSession(context.Background(), filepath.Join(root, "attachments", "outbox"), source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1061,7 +1062,7 @@ func TestExportSnapshotDeliveryRemovesSnapshotAfterSuccess(t *testing.T) {
 	previous := http.DefaultTransport
 	http.DefaultTransport = &fakeHTTP{}
 	defer func() { http.DefaultTransport = previous }()
-	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: root}, db: db, tg: newTestTelegram(t)})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- b.deliver(ctx) }()
@@ -1081,7 +1082,7 @@ func TestExportSnapshotDeliveryRemovesSnapshotAfterSuccess(t *testing.T) {
 	}
 }
 
-func TestExportSnapshotDeliveryFailureRetainsSnapshotAndSource(t *testing.T) {
+func TestExportSnapshotDeliveryFailureRemovesSnapshotAndPreservesSource(t *testing.T) {
 	root := t.TempDir()
 	db, err := store.Open(root)
 	if err != nil {
@@ -1093,7 +1094,7 @@ func TestExportSnapshotDeliveryFailureRetainsSnapshotAndSource(t *testing.T) {
 	if err := os.WriteFile(source, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := SnapshotSession(context.Background(), filepath.Join(root, "spool"), source)
+	snapshot, err := SnapshotSession(context.Background(), filepath.Join(root, "attachments", "outbox"), source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1103,7 +1104,7 @@ func TestExportSnapshotDeliveryFailureRetainsSnapshotAndSource(t *testing.T) {
 	previous := http.DefaultTransport
 	http.DefaultTransport = exportDeliveryFailureTransport{}
 	defer func() { http.DefaultTransport = previous }()
-	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: root}, db: db, tg: newTestTelegram(t)})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- b.deliver(ctx) }()
@@ -1111,8 +1112,12 @@ func TestExportSnapshotDeliveryFailureRetainsSnapshotAndSource(t *testing.T) {
 		var state string
 		return db.DB.QueryRow("SELECT state FROM outbox WHERE path=?", snapshot.Path).Scan(&state) == nil && state == "failed"
 	})
-	if _, err := os.Stat(snapshot.Path); err != nil {
-		t.Fatalf("failed export snapshot was removed: %v", err)
+	waitFor(t, func() bool {
+		_, err := os.Stat(snapshot.Path)
+		return errors.Is(err, os.ErrNotExist)
+	})
+	if _, err := os.Stat(snapshot.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed export snapshot was not removed: %v", err)
 	}
 	if data, err := os.ReadFile(source); err != nil || string(data) != string(raw) {
 		t.Fatalf("failed delivery changed source, data=%q, error=%v", data, err)

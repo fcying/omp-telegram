@@ -537,6 +537,8 @@ type fakeHTTP struct {
 	fileRequests          int
 	downloadRequests      int
 	uploads               []mediaUpload
+	attachmentResponse    *fakeHTTPResponse
+	attachmentError       error
 	keyboardClears        []map[string]any
 	deletedMessages       []map[string]any
 	progressDeleteStatus  int
@@ -786,7 +788,7 @@ func TestRateLimitedDeliverySurvivesRestart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
-		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`}},
+		-10: {{status: http.StatusTooManyRequests, body: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":3600}}`}},
 	}}
 	oldTransport := http.DefaultTransport
 	http.DefaultTransport = fake
@@ -840,8 +842,9 @@ func TestRateLimitedDeliverySurvivesRestart(t *testing.T) {
 	if state != "pending" || restoredRetryAt != retryAt {
 		t.Fatalf("reopened retry state = %q at %d, want pending at %d", state, restoredRetryAt, retryAt)
 	}
-	if delay := time.Until(time.Unix(retryAt, 0)); delay > 0 {
-		time.Sleep(delay)
+	// Simulate the persisted retry deadline elapsing without a wall-clock sleep.
+	if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=? WHERE id=? AND state='pending'", time.Now().Unix(), outputID); err != nil {
+		t.Fatal(err)
 	}
 	b = testBridge(t, &Bridge{db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
 	ctxSecond, cancelSecond := context.WithCancel(context.Background())
@@ -1873,6 +1876,43 @@ func TestDeliveryCleansDoneProgressAfterAllReplies(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("delivery loop returned error: %v", err)
+	}
+}
+
+func TestDeliveryFailureCleansTerminalProgress(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, db.Submit(10, 42))
+	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
+	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
+		7: {{status: http.StatusBadRequest, body: `{"ok":false,"error_code":400,"description":"reply rejected"}`}},
+	}}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.deliver(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("delivery loop returned error: %v", err)
+		}
+	}()
+	waitFor(t, func() bool {
+		var state string
+		var progressID int64
+		err := db.DB.QueryRow("SELECT outbox.state,inbox.progress_message_id FROM outbox JOIN inbox ON inbox.id=outbox.inbox_id WHERE inbox.id=10").Scan(&state, &progressID)
+		return err == nil && state == "failed" && progressID == 0 && len(fake.deletedMessageIDs()) == 1
+	})
+	if got := fake.deletedMessageIDs(); len(got) != 1 || got[0] != 77 {
+		t.Fatalf("deleted progress messages = %v, want [77]", got)
 	}
 }
 func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
@@ -2997,5 +3037,78 @@ func TestRateLimitTextFallbackRequiresRequestsPhrase(t *testing.T) {
 		if got := isRateLimitedError(tc.text); got != tc.want {
 			t.Fatalf("isRateLimitedError(%q) = %t, want %t", tc.text, got, tc.want)
 		}
+	}
+}
+
+func TestPollerDrainsPendingInputsAcrossBatches(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := int64(1); id <= int64(pendingInputBatchSize+1); id++ {
+		if err := db.Accept(id, []byte("invalid update")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeHTTP{updates: make(chan telegram.Update, 1)}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: binary, DataDir: dir, MaxWorkers: 2, QueueCapacity: 4}
+	logs := testLogs(t)
+	go func() { done <- Run(ctx, cfg, db, logs) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("pending batch poller did not stop")
+		}
+		http.DefaultTransport = previous
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	waitFor(t, func() bool {
+		var ignored int
+		return db.DB.QueryRow("SELECT COUNT(*) FROM inbox WHERE state='ignored'").Scan(&ignored) == nil && ignored == pendingInputBatchSize+1
+	})
+}
+
+func TestCancelPendingPromptsAcrossBatches(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	b := testBridge(t, &Bridge{db: db})
+	for id := int64(1); id <= int64(pendingInputBatchSize+1); id++ {
+		raw, err := json.Marshal(update(id, 11, "ordinary prompt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Accept(id, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.cancelPendingPrompts("test"); err != nil {
+		t.Fatal(err)
+	}
+	var cancelled int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM inbox WHERE state='cancelled'").Scan(&cancelled); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled != pendingInputBatchSize+1 {
+		t.Fatalf("cancelled prompts = %d, want %d", cancelled, pendingInputBatchSize+1)
 	}
 }

@@ -160,7 +160,7 @@ func TestForeignBotCommandsRemainIgnoredAfterRestart(t *testing.T) {
 			t.Fatalf("foreign command %d changed after restart: %s", id, got)
 		}
 	}
-	pending, err := d.db.Pending()
+	pending, err := d.db.Pending(256)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("foreign commands remain eligible for replay: %v, %v", pending, err)
 	}

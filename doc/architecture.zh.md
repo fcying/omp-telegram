@@ -106,7 +106,7 @@ Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务
 
 实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 增加有界的最近工具列表. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 只修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 只对该活跃根任务发送原生 `abort`; 不同于 `/stop`, 保留 bridge 延后 prompt, 在取消完成后按顺序调度; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
 
-Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.5 秒 worker tick 中检查. 已有消息更新、typing 和持久化最终回复保持独立行为. 每条 progress preview 都关联其根 inbox. 对于任意终态 inbox (`done`, `cancelled`, `ignored`, `failed` 或 `uncertain`), 只有全部关联 outbox 分段在 Telegram 确认送达并标记为 `done` 后, bridge 才删除该 progress. 失败或不确定的 outbox 分段会保留关联以便后续清理. 这个关联只是本地清理辅助信息, 不是永久 retention pin: 当终态数据达到 retention cutoff 且没有关联的 `pending` 或 `sending` outbox 工作时, cleanup 只清除本地关联, 保留 Telegram 消息. 已确认的不可重试 Telegram 删除拒绝也会释放持久化关联. 传输失败、429、5xx 和不确定响应会保留关联以便后续重试. 启动时会重试上次运行留下的已完成关联.
+Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.5 秒 worker tick 中检查. 已有消息更新、typing 和持久化最终回复保持独立行为. 每条 progress preview 都关联其根 inbox. 对于任意终态 inbox (`done`, `cancelled`, `ignored`, `failed` 或 `uncertain`), 所有关联 outbox 分段进入终态交付状态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后, bridge 就会尝试删除该 progress; `pending` 和 `sending` 分段会推迟清理. 因此终态回复交付失败不会继续保留 progress 关联. 这个关联只是本地清理辅助信息, 不是永久 retention pin: 当终态数据达到 retention cutoff 且没有关联的 `pending` 或 `sending` outbox 工作时, cleanup 只清除本地关联, 保留 Telegram 消息. 已确认的不可重试 Telegram 删除拒绝也会释放持久化关联. 传输失败、429、5xx 和不确定响应会保留关联以便后续重试. 启动时会重试上次运行留下的已完成关联.
 
 ## 身份与过期工作
 
@@ -149,7 +149,7 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
 
 带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
-保留策略绝不删除 binding, history, startup intent, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 附件 snapshot 在对应数据库删除提交后才解除所有权, 仅当其位于 `storage.data_dir/attachments/outbox/` 时 best-effort 删除. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+保留策略绝不删除 binding, history, startup intent, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 ### Schema 版本
 
@@ -200,12 +200,12 @@ Telegram client 在传输边界区分错误:
 
 outbox replay 为每个最终文本分段保留持久化的 reply target. Telegram 因原始消息不可用而拒绝该 target 时, client 对同一文本仅再发送一次普通消息; 该 UX fallback 不改变 inbox/outbox ownership 或任务结算.
 
-每条 progress preview 都关联其根 inbox, 每个最终 outbox 分段都携带该 inbox ID. 对于任意终态 inbox (`done`, `cancelled`, `ignored`, `failed` 或 `uncertain`), 只有全部关联 outbox 分段在 Telegram 确认送达并标记为 `done` 后才删除 progress. 启动时会重试上次运行留下的已完成关联. 已确认的不可重试 Telegram 删除拒绝会清除尽力而为的 progress 关联; 当终态数据达到 retention cutoff 且没有 pending 或 sending outbox 工作时, retention 会清除本地关联但不删除 Telegram 消息. 传输失败、429、5xx 和不确定响应会保留关联以便重试, 不改变任务交付状态.
+每条 progress preview 都关联其根 inbox, 每个最终 outbox 分段都携带该 inbox ID. 对于任意终态 inbox (`done`, `cancelled`, `ignored`, `failed` 或 `uncertain`), 所有关联 outbox 分段进入终态交付状态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后就会开始 progress 清理; `pending` 和 `sending` 分段会推迟清理, 但终态交付失败不会阻止清理. 启动时会重试上次运行留下的终态关联. 已确认的不可重试 Telegram 删除拒绝会清除尽力而为的 progress 关联; 当终态数据达到 retention cutoff 且没有 pending 或 sending outbox 工作时, retention 会清除本地关联但不删除 Telegram 消息. 传输失败、429、5xx 和不确定响应会保留关联以便重试, 不改变任务交付状态.
 
 ### 附件生命周期
 
-Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 workspace 的 `.telegram/incoming/` 下. 它们属于 workspace 文件, 不会被 bridge 消息 retention 删除. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. 确认送达后删除 snapshot; 失败或不确定交付会在 outbox 持有该文件, 直到终态 retention 清理. retention 只会在对应 outbox 行删除后删除 snapshot, janitor 也只会在这个私有 spool 内删除过期且无引用的 `attachment-*` 文件. 该清理不会删除 workspace 源文件.
-确认送达后的 snapshot 删除是 best-effort; 暂时无法删除的 snapshot 由 retention 和 spool janitor 后续处理.
+Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 workspace 的 `.telegram/incoming/` 下. 它们属于 workspace 文件, 不会被 bridge 消息 retention 删除. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. outbox state 持久化为任意终态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后, bridge 无论交付成功或失败都会 best-effort 删除 snapshot; workspace 源文件保持不变. 如果立即删除失败, retention 和 spool janitor 可以后续清除剩余 snapshot. retention 只会在对应 outbox 行删除后删除 snapshot, janitor 也只会在这个私有 spool 内删除过期且无引用的 `attachment-*` 文件.
+任意终态 outbox state 后的 snapshot 删除都是 best-effort; 无法立即删除的 snapshot 由 retention 和 spool janitor 后续处理.
 
 `/export` 只使用已提交 binding 的 workspace 和原生 session identity. 它不会调用 `ensureRuntime`, 修改 binding 状态, claim session, touch `last_used_at`, 或占用普通 runtime slot. 如果 selected ID 等于 committed binding 的 `session_id`, 即使 idle release 或 `/close` 之后也直接使用已保存的 `session` path; 其他 ID 通过 OMP 原生 `omp <omp.args...> render <session-id> -q -t` 命令, 使用 configured working directory 解析, 再严格校验返回的第一条 `session  <absolute-path>` diagnostic line 及持久化 session header. 如果 `omp.args` 或 `PI_CODING_AGENT_SESSION_DIR` 指定 custom session directory, inactive session export 会直接拒绝, 因为 native render 不会接收这个 launch-global store override. bridge 不发现或模拟 OMP session storage 规则. raw 导出以只读且禁止跟随 symlink 的方式打开 absolute source, 再通过 `Fstat` 检查打开的文件, 使用有界的 `MaxDocumentBytes` 读取复制到私有 attachment outbox spool, fsync 后设置 `0400`, 并保留经过安全处理的 OMP basename 作为 Telegram filename. HTML 导出也先以相同的 no-follow 规则, 只把选中的 main session JSONL snapshot 到 bridge-owned 私有 spool, 再把这个稳定 snapshot 交给 OMP 原生 exporter; 不复制 companion 或 subagent transcript. HTML 生成期间监控 output 增长, 超过 `MaxDocumentBytes` 就终止并清理. 只导出 main session JSONL, 不创建 zip 或 subagent bundle.
 
@@ -274,7 +274,7 @@ Export 不会:
 - 创建 `startup_intents` row;
 - 修改 session claim.
 
-Outbox 永远不指向原生 session 文件. Confirmed delivery 只删除 private snapshot; failed 或 uncertain delivery 遵循现有 attachment outbox 语义.
+Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后, 无论交付成功或失败, bridge 都只 best-effort 删除 private snapshot; source session file 保持不变.
 
 `/export` 返回的原生 JSONL 可以在另一台电脑上使用: 准备对应的源码目录, 下载文件, 然后在目标项目目录执行 `omp --resume /path/to/exported-session.jsonl`. 如果记录的旧工作目录不可用, OMP 可能要求将 session re-root 到当前目录. 该导出不是项目归档, 不包含源码文件, Git 状态, 未提交文件, OMP 配置, API credentials 或 shell environment; 这些内容需要单独同步. JSONL 和 HTML 导出可能包含敏感的 conversation 和 tool 数据, 包括 prompts, responses, tool calls 和 results, 本地路径, 命令输出, 源码片段以及意外捕获的 secrets. 只应将它们发送到可信的 Telegram 对话; 用户输入 `/export` 就是明确确认.
 
@@ -354,7 +354,7 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 - 正常关闭先关闭 stdin 并继续读取输出, 必要时升级到进程组终止. 每个子进程只有一个 `Wait` 所有者.
 - Linux RPC/ACP 启动使用父死亡 SIGTERM. Linux 将此信号关联到创建子进程的 OS 线程, 因此线程锁定到 `Wait` 完成, 每个存活原生子进程占一个锁定线程.
 - 父死亡信号不是整个进程树 containment. 忽略信号, 后代残留, 脱离进程组或清除父死亡设置的程序, 仍需要部署层边界. 项目不强制 systemd/supervisor 配置.
-- 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `storage.data_dir/attachments/outbox/` 私有快照后入队, 交付确认后删除快照, 失败则保留.
+- 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `storage.data_dir/attachments/outbox/` 私有快照后入队. outbox state 持久化为任意终态后 best-effort 删除快照, 包括交付失败; workspace 源文件保持不变.
 - Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
 
 ## 配置与路径契约

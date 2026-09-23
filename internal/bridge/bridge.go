@@ -353,6 +353,8 @@ var botCommands = []telegram.BotCommand{
 	{Command: "help", Description: "Show usage help"},
 }
 
+const pendingInputBatchSize = 256
+
 func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry) (runErr error) {
 	if logs == nil {
 		return errors.New("logging registry required")
@@ -463,21 +465,51 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		}
 	}()
 	delivered := map[int64]bool{}
+	pendingCursor := int64(-1)
+	var pendingHighWater int64
+	pendingCycleActive := false
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		inputs, err := db.Pending()
+		if len(delivered) > 0 {
+			ids := make([]int64, 0, len(delivered))
+			for id := range delivered {
+				ids = append(ids, id)
+			}
+			pendingIDs, err := db.PendingIDs(ids)
+			if err != nil {
+				b.storeLog.Error("pending input state read failed", "event", "inbox_read_failed", "reason", "pending_ids", "error_kind", "persistence")
+				return err
+			}
+			for id := range delivered {
+				if _, ok := pendingIDs[id]; !ok {
+					delete(delivered, id)
+				}
+			}
+		}
+		if !pendingCycleActive {
+			offset, err := db.Offset()
+			if err != nil {
+				b.storeLog.Error("database offset failed", "event", "inbox_read_failed", "reason", "offset", "error_kind", "persistence")
+				return err
+			}
+			pendingCursor = -1
+			pendingHighWater = offset - 1
+			pendingCycleActive = true
+		}
+		inputs, err := db.PendingAfter(pendingCursor, pendingHighWater, pendingInputBatchSize)
 		if err != nil {
 			b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", "pending", "error_kind", "persistence")
 			return err
 		}
-		pendingIDs := make(map[int64]bool, len(inputs))
-		for _, in := range inputs {
-			pendingIDs[in.ID] = true
-		}
-		for id := range delivered {
-			if !pendingIDs[id] {
-				delete(delivered, id)
+		if len(inputs) == 0 {
+			pendingCursor = -1
+			pendingHighWater = 0
+			pendingCycleActive = false
+		} else {
+			pendingCursor = inputs[len(inputs)-1].ID
+			if pendingCursor >= pendingHighWater {
+				pendingCycleActive = false
 			}
 		}
 		blocked := make(map[target]bool)
@@ -799,15 +831,14 @@ func (b *Bridge) deliver(ctx context.Context) error {
 				slog.Int64("outbox_id", o.ID), slog.Int64("chat_id", o.Chat), slog.Int64("thread_id", o.Thread),
 				slog.String("kind", o.Kind), slog.Int64("attempt_count", o.AttemptCount), slog.Int64("server_retry_count", o.ServerRetryCount), slog.Int("api_code", apiCode))
 		}
-		if state == store.OutboxDone && o.InboxID != 0 {
+		if o.InboxID != 0 {
 			b.cleanupDeliveredProgress(ctx, o.InboxID)
 		}
 		if o.Kind != "text" {
-			if state == store.OutboxDone {
-				if removeErr := os.Remove(o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-					b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
-				}
-			} else {
+			if removeErr := removeOutboxSnapshot(filepath.Join(b.cfg.DataDir, "attachments", "outbox"), o.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
+			}
+			if state != store.OutboxDone {
 				if err = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+string(state)+". It will not be replayed automatically."); err != nil {
 					b.storeLog.Error("delivery failure notice persistence failed", "event", "outbox_write_failed")
 					return err
