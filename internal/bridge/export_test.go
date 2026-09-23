@@ -1081,7 +1081,7 @@ func TestExportSnapshotDeliveryRemovesSnapshotAfterSuccess(t *testing.T) {
 	}
 }
 
-func TestExportSnapshotDeliveryFailureRetainsSnapshotAndSource(t *testing.T) {
+func TestExportSnapshotDeliveryFailureRemovesSnapshotAndPreservesSource(t *testing.T) {
 	root := t.TempDir()
 	db, err := store.Open(root)
 	if err != nil {
@@ -1111,8 +1111,12 @@ func TestExportSnapshotDeliveryFailureRetainsSnapshotAndSource(t *testing.T) {
 		var state string
 		return db.DB.QueryRow("SELECT state FROM outbox WHERE path=?", snapshot.Path).Scan(&state) == nil && state == "failed"
 	})
-	if _, err := os.Stat(snapshot.Path); err != nil {
-		t.Fatalf("failed export snapshot was removed: %v", err)
+	waitFor(t, func() bool {
+		_, err := os.Stat(snapshot.Path)
+		return errors.Is(err, os.ErrNotExist)
+	})
+	if _, err := os.Stat(snapshot.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed export snapshot was not removed: %v", err)
 	}
 	if data, err := os.ReadFile(source); err != nil || string(data) != string(raw) {
 		t.Fatalf("failed delivery changed source, data=%q, error=%v", data, err)

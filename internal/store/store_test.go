@@ -49,7 +49,7 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
-	pending, err := s.Pending()
+	pending, err := s.Pending(256)
 	requireStoreOK(t, err)
 	if len(pending) != 1 || pending[0].ID != 10 {
 		t.Fatal("reopening the current schema lost existing input")
@@ -280,6 +280,31 @@ func TestTerminalProgressWaitsForFinalReplyDelivery(t *testing.T) {
 	}
 }
 
+func TestFailedReplyMakesProgressCleanupReady(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
+	requireStoreOK(t, s.SetProgressMessage(10, 99))
+	out, err := s.NextOutput()
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
+	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
+		t.Fatalf("in-flight reply progress became ready=%t, err=%v", ready, err)
+	}
+	requireStoreOK(t, s.MarkOutput(out.ID, OutboxFailed))
+	target, ready, err := s.CompletedProgressMessage(10)
+	requireStoreOK(t, err)
+	if !ready || target != (ProgressMessage{InboxID: 10, Chat: 7, MessageID: 99}) {
+		t.Fatalf("failed reply progress = %+v, ready=%t", target, ready)
+	}
+	messages, err := s.CompletedProgressMessages()
+	requireStoreOK(t, err)
+	if len(messages) != 1 || messages[0] != target {
+		t.Fatalf("startup failed-reply progress = %+v, want [%+v]", messages, target)
+	}
+}
+
 func TestRestartRecovery(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
@@ -294,7 +319,7 @@ func TestRestartRecovery(t *testing.T) {
 	requireStoreOK(t, s.Close())
 
 	s = openTestStore(t, dir)
-	pending, err := s.Pending()
+	pending, err := s.Pending(256)
 	requireStoreOK(t, err)
 	if len(pending) != 1 || pending[0].ID != 10 || string(pending[0].Raw) != `{"update_id":10}` {
 		t.Fatalf("pending after restart: %+v", pending)
@@ -315,7 +340,7 @@ func TestRestartRecovery(t *testing.T) {
 		t.Fatalf("uncertain output became deliverable: %v", err)
 	}
 	requireStoreOK(t, s.Accept(11, []byte(`{"duplicate":true}`)))
-	pending, err = s.Pending()
+	pending, err = s.Pending(256)
 	requireStoreOK(t, err)
 	if len(pending) != 1 || pending[0].ID != 10 {
 		t.Fatalf("duplicate revived uncertain input: %+v", pending)
@@ -399,7 +424,7 @@ func TestAcceptAtomicDedupAndOffset(t *testing.T) {
 	requireStoreOK(t, s.Accept(20, []byte(`{"original":true}`)))
 	requireStoreOK(t, s.Accept(20, []byte(`{"replacement":true}`)))
 	requireStoreOK(t, s.Accept(19, []byte(`{}`)))
-	pending, err := s.Pending()
+	pending, err := s.Pending(256)
 	requireStoreOK(t, err)
 	if len(pending) != 2 || pending[1].ID != 20 || string(pending[1].Raw) != `{"original":true}` {
 		t.Fatalf("dedup changed original input: %+v", pending)
@@ -422,10 +447,49 @@ func TestAcceptAtomicDedupAndOffset(t *testing.T) {
 	if err = s.Accept(40, []byte(`{}`)); err == nil {
 		t.Fatal("accepted input despite offset write failure")
 	}
-	pending, err = s.Pending()
+	pending, err = s.Pending(256)
 	requireStoreOK(t, err)
 	if len(pending) != 2 {
 		t.Fatalf("offset failure left partially committed input: %+v", pending)
+	}
+}
+
+func TestPendingBatchesAreBoundedAndOrdered(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	for id := int64(10); id <= 14; id++ {
+		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
+	}
+	if _, err := s.Pending(0); err == nil {
+		t.Fatal("accepted a non-positive pending page size")
+	}
+	first, err := s.Pending(2)
+	requireStoreOK(t, err)
+	if len(first) != 2 || first[0].ID != 10 || first[1].ID != 11 {
+		t.Fatalf("first pending page = %+v", first)
+	}
+	second, err := s.PendingAfter(first[len(first)-1].ID, 14, 2)
+	requireStoreOK(t, err)
+	if len(second) != 2 || second[0].ID != 12 || second[1].ID != 13 {
+		t.Fatalf("second pending page = %+v", second)
+	}
+	last, err := s.PendingAfter(second[len(second)-1].ID, 14, 2)
+	requireStoreOK(t, err)
+	if len(last) != 1 || last[0].ID != 14 {
+		t.Fatalf("last pending page = %+v", last)
+	}
+	if empty, err := s.PendingAfter(14, 14, 2); err != nil || len(empty) != 0 {
+		t.Fatalf("pending page past high-water = %+v, error %v", empty, err)
+	}
+	pendingIDs, err := s.PendingIDs([]int64{10, 12, 14, 99})
+	requireStoreOK(t, err)
+	if len(pendingIDs) != 3 {
+		t.Fatalf("still-pending IDs = %v", pendingIDs)
+	}
+	requireStoreOK(t, s.Mark(12, InboxIgnored))
+	pendingIDs, err = s.PendingIDs([]int64{10, 12, 14, 99})
+	requireStoreOK(t, err)
+	if _, ok := pendingIDs[12]; ok || len(pendingIDs) != 2 {
+		t.Fatalf("terminal input remained pending: %v", pendingIDs)
 	}
 }
 

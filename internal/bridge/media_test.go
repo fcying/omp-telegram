@@ -65,6 +65,15 @@ func (f *fakeHTTP) mediaRequest(r *http.Request) (*http.Response, bool, error) {
 		f.mu.Unlock()
 		return mediaResponse(r, map[string]any{"file_path": "files/" + req.ID, "file_size": size}), true, nil
 	case "sendDocument", "sendPhoto":
+		f.mu.Lock()
+		attachmentResponse, attachmentError := f.attachmentResponse, f.attachmentError
+		f.mu.Unlock()
+		if attachmentError != nil {
+			return nil, true, attachmentError
+		}
+		if attachmentResponse != nil {
+			return &http.Response{StatusCode: attachmentResponse.status, Body: io.NopCloser(strings.NewReader(attachmentResponse.body)), Header: make(http.Header), Request: r}, true, nil
+		}
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			return nil, true, err
 		}
@@ -1244,4 +1253,72 @@ func TestUncertainAbortDoesNotLeakHostRequest(t *testing.T) {
 		t.Fatalf("uncertain task state = %q, error %v", state, err)
 	}
 	assertLateHostAttachmentIgnored(t, w, result)
+}
+
+func TestFailedAttachmentDeliveryRemovesSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response *fakeHTTPResponse
+		err      error
+		state    store.OutboxState
+	}{
+		{
+			name:     "definite",
+			response: &fakeHTTPResponse{status: http.StatusBadRequest, body: `{"ok":false,"error_code":400,"description":"Bad Request: rejected"}`},
+			state:    store.OutboxFailed,
+		},
+		{
+			name:  "uncertain",
+			err:   errors.New("attachment transport failed"),
+			state: store.OutboxUncertain,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db, err := store.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			spool := filepath.Join(dir, "attachments", "outbox")
+			if err = os.MkdirAll(spool, 0700); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := filepath.Join(spool, "attachment-test")
+			if err = os.WriteFile(snapshot, []byte("sensitive attachment"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.EnqueueAttachment(-10, 11, "document", snapshot, "artifact.txt", ""); err != nil {
+				t.Fatal(err)
+			}
+			var outputID int64
+			if err = db.DB.QueryRow("SELECT id FROM outbox WHERE path=?", snapshot).Scan(&outputID); err != nil {
+				t.Fatal(err)
+			}
+
+			fake := &fakeHTTP{attachmentResponse: tc.response, attachmentError: tc.err}
+			previous := http.DefaultTransport
+			http.DefaultTransport = fake
+			t.Cleanup(func() { http.DefaultTransport = previous })
+			b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dir, DatabaseRetentionDays: 0}, db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}})
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- b.deliver(ctx) }()
+			defer func() {
+				cancel()
+				if err := <-done; err != nil {
+					t.Error(err)
+				}
+			}()
+
+			waitFor(t, func() bool {
+				var state string
+				if err := db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", outputID).Scan(&state); err != nil || state != string(tc.state) {
+					return false
+				}
+				_, err := os.Stat(snapshot)
+				return errors.Is(err, os.ErrNotExist)
+			})
+		})
+	}
 }

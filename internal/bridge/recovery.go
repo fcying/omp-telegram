@@ -121,22 +121,34 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 }
 
 func (b *Bridge) cancelPendingPrompts(reason string) error {
-	pending, err := b.db.Pending()
+	offset, err := b.db.Offset()
 	if err != nil {
-		b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", reason, "error_kind", "persistence")
+		b.storeLog.Error("pending input offset read failed", "event", "inbox_read_failed", "reason", reason, "error_kind", "persistence")
 		return err
 	}
-	for _, in := range pending {
-		var update telegram.Update
-		if json.Unmarshal(in.Raw, &update) != nil || update.Message == nil || !deferredPrompt(update.Message) {
-			continue
-		}
-		if err := b.db.Mark(in.ID, "cancelled"); err != nil {
-			b.storeLog.Error("input cancellation persistence failed", "event", "inbox_state_write_failed", "reason", reason, "inbox_id", in.ID, "error_kind", "persistence")
+	cursor := int64(-1)
+	throughID := offset - 1
+	for {
+		pending, err := b.db.PendingAfter(cursor, throughID, pendingInputBatchSize)
+		if err != nil {
+			b.storeLog.Error("pending input read failed", "event", "inbox_read_failed", "reason", reason, "error_kind", "persistence")
 			return err
 		}
+		if len(pending) == 0 {
+			return nil
+		}
+		cursor = pending[len(pending)-1].ID
+		for _, in := range pending {
+			var update telegram.Update
+			if json.Unmarshal(in.Raw, &update) != nil || update.Message == nil || !deferredPrompt(update.Message) {
+				continue
+			}
+			if err := b.db.Mark(in.ID, "cancelled"); err != nil {
+				b.storeLog.Error("input cancellation persistence failed", "event", "inbox_state_write_failed", "reason", reason, "inbox_id", in.ID, "error_kind", "persistence")
+				return err
+			}
+		}
 	}
-	return nil
 }
 
 func deferredPrompt(message *telegram.Message) bool {

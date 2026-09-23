@@ -18,6 +18,7 @@ import (
 
 const schemaVersion = 11
 const messageCleanupBatchSize = 1000
+const pendingIDQueryBatchSize = 500
 
 // InboxState identifies the durable lifecycle state of an incoming update.
 type InboxState string
@@ -387,21 +388,68 @@ func (s *Store) Accept(id int64, raw []byte) error {
 	}
 	return tx.Commit()
 }
-func (s *Store) Pending() ([]Input, error) {
-	rows, e := s.DB.Query("SELECT id,raw FROM inbox WHERE state='pending' ORDER BY id")
-	if e != nil {
-		return nil, e
+
+// Pending returns at most limit pending inputs from the beginning of the inbox.
+func (s *Store) Pending(limit int) ([]Input, error) {
+	return s.PendingAfter(-1, int64(^uint64(0)>>1), limit)
+}
+
+// PendingAfter returns a bounded page of pending inputs within a stable ID window.
+func (s *Store) PendingAfter(afterID, throughID int64, limit int) ([]Input, error) {
+	if limit <= 0 {
+		return nil, errors.New("pending input limit must be positive")
+	}
+	rows, err := s.DB.Query("SELECT id,raw FROM inbox WHERE state='pending' AND id>? AND id<=? ORDER BY id LIMIT ?", afterID, throughID, limit)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	var out []Input
 	for rows.Next() {
-		var v Input
-		if e = rows.Scan(&v.ID, &v.Raw); e != nil {
-			return nil, e
+		var input Input
+		if err = rows.Scan(&input.ID, &input.Raw); err != nil {
+			return nil, err
 		}
-		out = append(out, v)
+		out = append(out, input)
 	}
 	return out, rows.Err()
+}
+
+// PendingIDs returns the supplied IDs whose inbox state is still pending.
+func (s *Store) PendingIDs(ids []int64) (map[int64]struct{}, error) {
+	pending := make(map[int64]struct{}, len(ids))
+	for start := 0; start < len(ids); start += pendingIDQueryBatchSize {
+		end := start + pendingIDQueryBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+		rows, err := s.DB.Query("SELECT id FROM inbox WHERE state='pending' AND id IN ("+placeholders+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			pending[id] = struct{}{}
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err = rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return pending, nil
 }
 func (s *Store) Mark(id int64, state InboxState) error {
 	var expected string
@@ -1186,7 +1234,7 @@ SELECT i.id,MIN(o.chat),i.progress_message_id
 FROM inbox i
 JOIN outbox o ON o.inbox_id=i.id
 WHERE i.id=? AND i.state IN ('done','cancelled','failed','ignored','uncertain') AND i.progress_message_id>0
-  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state<>'done')
+	  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state NOT IN ('done','failed','uncertain','cancelled','sent'))
 GROUP BY i.id,i.progress_message_id`, inboxID).Scan(&message.InboxID, &message.Chat, &message.MessageID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ProgressMessage{}, false, nil
@@ -1200,7 +1248,7 @@ SELECT i.id,MIN(o.chat),i.progress_message_id
 FROM inbox i
 JOIN outbox o ON o.inbox_id=i.id
 WHERE i.state IN ('done','cancelled','failed','ignored','uncertain') AND i.progress_message_id>0
-  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state<>'done')
+	  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state NOT IN ('done','failed','uncertain','cancelled','sent'))
 GROUP BY i.id,i.progress_message_id ORDER BY i.id`)
 	if err != nil {
 		return nil, err
