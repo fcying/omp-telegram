@@ -1119,3 +1119,129 @@ func TestFullQueueRejectsAttachmentBeforePreparation(t *testing.T) {
 		t.Fatalf("accepted task did not complete: state=%q err=%v", state, err)
 	}
 }
+
+func setupActiveHostAttachment(t *testing.T) (*worker, sendResult) {
+	t.Helper()
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.DataDir = t.TempDir()
+	command("/new " + t.TempDir())
+	const taskID int64 = 99
+	if err := w.b.db.Accept(taskID, []byte(`{"update_id":99}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.b.db.Mark(taskID, "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	w.active, w.busy, w.owner = taskID, true, 7
+	w.turn++
+	if err := os.WriteFile(filepath.Join(w.binding.Workspace, "artifact.txt"), []byte("attachment"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	event, err := json.Marshal(rpcEvent{
+		Type:      "host_tool_call",
+		ID:        "pending-attachment",
+		ToolName:  "telegram_send",
+		Arguments: json.RawMessage(`{"path":"artifact.txt","kind":"document","caption":"late"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.event(event)
+	if _, ok := w.hostRequests["pending-attachment"]; !ok {
+		t.Fatal("host tool request was not registered")
+	}
+	select {
+	case result := <-w.sendResults:
+		if result.err != nil || result.file.Path == "" {
+			t.Fatalf("attachment snapshot failed: %+v", result)
+		}
+		return w, result
+	case <-time.After(5 * time.Second):
+		t.Fatal("attachment snapshot did not complete")
+		return nil, sendResult{}
+	}
+}
+
+func observeHostRequestCancel(t *testing.T, w *worker, id string) *bool {
+	t.Helper()
+	cancel, ok := w.hostRequests[id]
+	if !ok {
+		t.Fatalf("host request %q is not pending", id)
+	}
+	cancelled := false
+	w.hostRequests[id] = func() {
+		cancelled = true
+		cancel()
+	}
+	return &cancelled
+}
+
+func assertLateHostAttachmentIgnored(t *testing.T, w *worker, result sendResult) {
+	t.Helper()
+	w.preparedSend(result)
+	var count int
+	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind != 'text'").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("late host result queued %d attachments, error %v", count, err)
+	}
+	if _, err := os.Stat(result.file.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ignored host snapshot remains: %v", err)
+	}
+}
+
+func TestAbortCancelsPendingHostAttachment(t *testing.T) {
+	w, result := setupActiveHostAttachment(t)
+	taskID := w.active
+	cancelled := observeHostRequestCancel(t, w, result.id)
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted","errorMessage":"Request was aborted"}]}`))
+	if !*cancelled || len(w.hostRequests) != 0 {
+		t.Fatal("normal abort retained pending host tool work")
+	}
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", taskID).Scan(&state); err != nil || state != "cancelled" {
+		t.Fatalf("aborted task state = %q, error %v", state, err)
+	}
+	assertLateHostAttachmentIgnored(t, w, result)
+}
+
+func TestCompletedTaskCancelsPendingHostAttachment(t *testing.T) {
+	w, result := setupActiveHostAttachment(t)
+	taskID := w.active
+	cancelled := observeHostRequestCancel(t, w, result.id)
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"completed"}]}]}`))
+	if !*cancelled || len(w.hostRequests) != 0 {
+		t.Fatal("completed task retained pending host tool work")
+	}
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", taskID).Scan(&state); err != nil || state != "done" {
+		t.Fatalf("completed task state = %q, error %v", state, err)
+	}
+	assertLateHostAttachmentIgnored(t, w, result)
+}
+
+func TestUncertainAbortDoesNotLeakHostRequest(t *testing.T) {
+	order, _ := fixtureRPCControlFiles(t, "abort")
+	w, result := setupActiveHostAttachment(t)
+	taskID := w.active
+	cancelled := observeHostRequestCancel(t, w, result.id)
+	client := w.client
+	w.controlBusy = true
+	w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
+		callCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		return client.Call(callCtx, "abort", nil)
+	}, 0, "Abort requested.")
+	waitFixtureRPCOrder(t, order, "abort")
+	abort := waitOperation(t, w)
+	if !errors.Is(abort.err, context.DeadlineExceeded) {
+		t.Fatalf("held abort error = %v, want deadline exceeded", abort.err)
+	}
+	w.operationReturned(abort)
+	if !*cancelled || len(w.hostRequests) != 0 {
+		t.Fatal("uncertain abort retained pending host tool work")
+	}
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", taskID).Scan(&state); err != nil || state != "uncertain" {
+		t.Fatalf("uncertain task state = %q, error %v", state, err)
+	}
+	assertLateHostAttachmentIgnored(t, w, result)
+}

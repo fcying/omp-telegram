@@ -111,6 +111,13 @@ func (w *worker) initMedia() {
 		w.b.mediaSlots = make(chan struct{}, 2)
 	}
 }
+
+func (w *worker) cancelHostRequests() {
+	for id, cancel := range w.hostRequests {
+		cancel()
+		delete(w.hostRequests, id)
+	}
+}
 func (w *worker) queueMedia(in incoming) {
 	w.initMedia()
 	message := *in.msg
@@ -514,10 +521,7 @@ func (w *worker) hostResultFailed(client *omp.Client, err error) {
 		attrs = append(attrs, slog.Int64("inbox_id", w.active))
 	}
 	w.log.LogAttrs(context.Background(), slog.LevelWarn, "host tool result delivery failed", attrs...)
-	for id, cancel := range w.hostRequests {
-		cancel()
-		delete(w.hostRequests, id)
-	}
+	w.cancelHostRequests()
 	if w.active != 0 {
 		w.finishUncertain("A host tool result could not be delivered to omp. The instance was closed; the task outcome is uncertain and will not be replayed automatically.")
 	} else {

@@ -75,7 +75,18 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		w.controlBusy = false
 		return
 	}
-	if result.err != nil {
+	if result.err != nil || result.cancelled {
+		switch result.kind {
+		case "model_set_role":
+			// SetModelRole fails closed when any native selection step is unconfirmed.
+			w.releaseRuntimeWithReason(true, "failure")
+		case "model_verify_thinking":
+			w.releaseRuntimeWithReason(true, "failure")
+		case "model_set_model", "model_set_thinking", "model_set_fast":
+			if uncertainOperationOutcome(result.err, result.cancelled) {
+				w.releaseRuntimeWithReason(true, "failure")
+			}
+		}
 		w.controlBusy = false
 		w.say(modelOperationFailure(request.action))
 		return
@@ -152,6 +163,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		var model omp.Model
 		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
 			w.controlBusy = false
+			w.releaseRuntimeWithReason(true, "failure")
 			w.say(modelOperationFailure("model_switch"))
 			return
 		}
@@ -166,6 +178,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		var state modelSettings
 		if json.Unmarshal(result.data, &state) != nil || state.ThinkingLevel == "" {
 			w.controlBusy = false
+			w.releaseRuntimeWithReason(true, "failure")
 			w.say("OMP did not report the resulting thinking level. The change could not be confirmed.")
 			return
 		}
@@ -180,6 +193,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		var fast modelFastResult
 		if json.Unmarshal(result.data, &fast) != nil || fast.Enabled == nil || fast.Active == nil {
 			w.controlBusy = false
+			w.releaseRuntimeWithReason(true, "failure")
 			w.say(modelOperationFailure("fast_select"))
 			return
 		}

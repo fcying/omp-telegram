@@ -110,6 +110,84 @@ func recordFixtureRPCOrder(command string) {
 	}
 }
 
+func fixtureHoldsRPC(kind string) bool {
+	return os.Getenv("OMP_TELEGRAM_FIXTURE_HOLD_RPC") == kind
+}
+
+func fixtureRejectsRPC(kind string) bool {
+	return os.Getenv("OMP_TELEGRAM_FIXTURE_REJECT_RPC") == kind
+}
+
+type fixtureRPCTraceEntry struct {
+	pid, kind, payload string
+}
+
+func recordFixtureRPCTrace(kind, payload string) {
+	path := os.Getenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE")
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		os.Exit(2)
+	}
+	_, writeErr := fmt.Fprintf(file, "%d\t%s\t%s\n", os.Getpid(), kind, payload)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		os.Exit(2)
+	}
+}
+
+func fixtureRPCTrace(path string) []fixtureRPCTraceEntry {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	text := strings.TrimSuffix(string(data), "\n")
+	if text == "" {
+		return nil
+	}
+	var entries []fixtureRPCTraceEntry
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) == 3 {
+			entries = append(entries, fixtureRPCTraceEntry{pid: fields[0], kind: fields[1], payload: fields[2]})
+		}
+	}
+	return entries
+}
+
+func waitFixtureRPCOrder(t *testing.T, path, command string) {
+	t.Helper()
+	waitFor(t, func() bool {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if line == command {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func waitFixtureRPCTrace(t *testing.T, path, kind, payload string) fixtureRPCTraceEntry {
+	t.Helper()
+	var match fixtureRPCTraceEntry
+	waitFor(t, func() bool {
+		for _, entry := range fixtureRPCTrace(path) {
+			if entry.kind == kind && entry.payload == payload {
+				match = entry
+				return true
+			}
+		}
+		return false
+	})
+	return match
+}
+
 func waitForFixtureFile(path string) {
 	for {
 		_, err := os.Stat(path)
@@ -260,31 +338,75 @@ func TestMain(m *testing.M) {
 				}
 			case "set_fast_mode":
 				enabled, ok := cmd["enabled"].(bool)
-				if !ok || (enabled && modelID == "no-fast") {
+				if !ok || (enabled && modelID == "no-fast") || fixtureRejectsRPC(typ) {
 					resp["success"] = false
 				} else {
 					fastEnabled = enabled
 					fastActive = enabled && modelID != "fast-fallback"
+					recordFixtureRPCTrace(typ, "")
+					if fixtureHoldsRPC(typ) {
+						recordFixtureRPCOrder(typ)
+						continue
+					}
 					resp["data"] = map[string]bool{"enabled": fastEnabled, "active": fastActive}
 				}
 			case "set_model":
-				modelProvider, _ = cmd["provider"].(string)
-				modelID, _ = cmd["modelId"].(string)
-				resp["data"] = map[string]string{"provider": modelProvider, "id": modelID}
+				if fixtureRejectsRPC(typ) {
+					resp["success"] = false
+				} else {
+					modelProvider, _ = cmd["provider"].(string)
+					modelID, _ = cmd["modelId"].(string)
+					recordFixtureRPCTrace(typ, "")
+					if fixtureHoldsRPC(typ) {
+						recordFixtureRPCOrder(typ)
+						continue
+					}
+					resp["data"] = map[string]string{"provider": modelProvider, "id": modelID}
+				}
 			case "set_thinking_level":
 				level, _ := cmd["level"].(string)
-				if modelID == "reject-thinking" {
+				if fixtureRejectsRPC(typ) || modelID == "reject-thinking" {
 					resp["success"] = false
-				} else if level == "max" {
-					thinkingLevel = "high"
 				} else {
-					thinkingLevel = level
+					if level == "max" {
+						thinkingLevel = "high"
+					} else {
+						thinkingLevel = level
+					}
+					recordFixtureRPCTrace(typ, "")
+					if fixtureHoldsRPC(typ) {
+						recordFixtureRPCOrder(typ)
+						continue
+					}
 				}
+			case "abort":
+				recordFixtureRPCOrder("abort")
+				recordFixtureRPCTrace(typ, "")
+				if _, ok := cmd["clearQueuedMessages"]; ok {
+					os.Exit(2)
+				}
+				if fixtureRejectsRPC(typ) {
+					resp["success"] = false
+					break
+				}
+				if fixtureHoldsRPC(typ) {
+					streaming = false
+					continue
+				}
+				streaming = false
+				emit(resp)
+				emit(map[string]any{"type": "agent_end", "messages": []any{}})
+				continue
 			case "cycle_model":
 				os.Exit(2)
 			case "prompt":
 				text, _ := cmd["message"].(string)
+				recordFixtureRPCTrace(typ, text)
 				if strings.HasPrefix(text, "/model @") {
+					if fixtureRejectsRPC("model_role") {
+						resp["success"] = false
+						break
+					}
 					id, ok := map[string]string{"smol": "quick", "default": "safe", "slow": "deep", "free": "free"}[strings.TrimPrefix(text, "/model @")]
 					if !ok {
 						os.Exit(2)
@@ -374,15 +496,6 @@ func TestMain(m *testing.M) {
 				emit(map[string]any{"type": "agent_end", "isTerminal": false})
 				streaming = false
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}}})
-				continue
-			case "abort":
-				recordFixtureRPCOrder("abort")
-				if _, ok := cmd["clearQueuedMessages"]; ok {
-					os.Exit(2)
-				}
-				streaming = false
-				emit(resp)
-				emit(map[string]any{"type": "agent_end", "messages": []any{}})
 				continue
 			}
 			emit(resp)
@@ -559,8 +672,12 @@ func (f *fakeHTTP) has(thread int64, text string) bool {
 	return false
 }
 func waitFor(t *testing.T, fn func() bool) {
+	waitForTimeout(t, 5*time.Second, fn)
+}
+
+func waitForTimeout(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if fn() {
 			return
@@ -1284,7 +1401,8 @@ func TestRPCEventFloodDoesNotStarveControlInput(t *testing.T) {
 	send(update(2, 11, "event-flood"))
 	time.Sleep(50 * time.Millisecond)
 	send(update(3, 11, "/status"))
-	waitFor(t, func() bool { return f.has(11, "fixture/safe") })
+	// Race-instrumented child-process event handling can be delayed under CI load.
+	waitForTimeout(t, 15*time.Second, func() bool { return f.has(11, "fixture/safe") })
 }
 
 func TestPromptStopRPCOrderUnderDelayedAcknowledgement(t *testing.T) {

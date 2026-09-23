@@ -61,7 +61,7 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 
 bridge 使用公开 RPC v2, 不依赖协议扩展. 调用 `prompt` 前, 先将该输入设为 active terminal-result owner. 成功的 acknowledgement 不需要路由分类; `agentInvoked=false` 通过正常完成流程结束本地命令, 其他已接受的 prompt 则等待终结事件. prompt 请求失败或无法确认时, 该输入以 uncertain 结束, 同时关闭该 OMP client 并取消 bridge 队列, 不重试. 不能将该 client 当作 idle 后继续复用, 否则未确认的工作可能接管后续输入的结果归属. `/stop` 先清 bridge 延后 prompt, 再发送不带清队列选项的普通 `abort` 请求. Worker 提交的 task 和 control RPC 共用 FIFO 队列, 因此本地清队列立即生效, 但 `abort` 不会越过尚未确认的 `prompt`. 重启或执行结果不确定后, 包括 `/review` 在内的待执行任务都不会自动重放.
 
-`handoff` 或 `compact` 请求出错时会关闭该 client, 只有 omp 明确拒绝时才继续复用; timeout、取消或结果无法确认都会让后续请求 lazy resume. `host_tool_result` 写入失败时, bridge 将 active task 以 `uncertain` 结算并关闭 client.
+`handoff` 或 `compact` 请求出错时会关闭该 client, 只有 omp 明确拒绝时才继续复用; timeout、取消或结果无法确认都会让后续请求 lazy resume. `abort` 被明确拒绝时会保留 client; 结果无法确认时会关闭 client, 将 active task 以 `uncertain` 结算且不重放, 然后在新 runtime 上继续排队任务. `set_model`, `set_thinking_level` 和 `set_fast_mode` 仅在 RPC 明确拒绝时保留 client; 错误结果不确定或无法确认时, 会在排队 prompt 执行前关闭它. 原生 cycle-role 选择继续遵循 `SetModelRole` 的 fail-closed 行为. worker 在 RPC 进行中观察到 client 退出时, 会等待该 RPC 的结果再应用退出策略; 因此 model-role 失败只释放 runtime, 并保留供 lazy resume 使用的逻辑 binding. `host_tool_result` 写入失败时, bridge 将 active task 以 `uncertain` 结算并关闭该 client.
 
 Progress Stop 只中止 active task. `/queue` Cancel 只移除选中的 bridge pending task, `/stop` 才会中止 active task 并清空全部 bridge pending task.
 

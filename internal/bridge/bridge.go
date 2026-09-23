@@ -137,40 +137,42 @@ const (
 )
 
 type worker struct {
-	b                     *Bridge
-	log                   *slog.Logger
-	key                   target
-	input                 chan incoming
-	client                *omp.Client
-	binding               store.Binding
-	startIntent           *store.StartIntent
-	sessionID             string
-	claimedSession        string
-	restoring             bool
-	queue                 []queued
-	stream                strings.Builder
-	active, activeReplyTo int64
-	owner                 int64
-	turn                  uint64
-	finishing             bool
-	compacting            bool
-	progress              progressState
-	operations            chan operationResult
-	albums                map[albumKey]*pendingAlbum
-	rpcOperations         []rpcOperation
-	rpcOperationActive    bool
-	topicRenameResults    chan topicRenameResult
-	albumEvents           chan albumEvent
-	albumVersion          uint64
-	albumSuppressed       map[albumKey]time.Time
-	background            sync.WaitGroup
-	busy                  bool
-	controlBusy           bool
-	awaitingContinuation  bool
-	runtime               runtimeState
-	runtimeResuming       bool
-	lastActivity          time.Time
-	lastLogicalActivity   time.Time
+	b                      *Bridge
+	log                    *slog.Logger
+	key                    target
+	input                  chan incoming
+	client                 *omp.Client
+	binding                store.Binding
+	startIntent            *store.StartIntent
+	sessionID              string
+	claimedSession         string
+	restoring              bool
+	queue                  []queued
+	stream                 strings.Builder
+	active, activeReplyTo  int64
+	owner                  int64
+	turn                   uint64
+	finishing              bool
+	compacting             bool
+	progress               progressState
+	operations             chan operationResult
+	albums                 map[albumKey]*pendingAlbum
+	rpcOperations          []rpcOperation
+	rpcOperationActive     bool
+	rpcOperationClientID   uint64
+	rpcExitPendingClientID uint64
+	topicRenameResults     chan topicRenameResult
+	albumEvents            chan albumEvent
+	albumVersion           uint64
+	albumSuppressed        map[albumKey]time.Time
+	background             sync.WaitGroup
+	busy                   bool
+	controlBusy            bool
+	awaitingContinuation   bool
+	runtime                runtimeState
+	runtimeResuming        bool
+	lastActivity           time.Time
+	lastLogicalActivity    time.Time
 
 	lastTyping          time.Time
 	typingCancel        context.CancelFunc
@@ -1122,7 +1124,7 @@ func (w *worker) run() {
 	for {
 		var events <-chan json.RawMessage
 		var done <-chan struct{}
-		if client, ok := w.runtimeClient(); ok {
+		if client, ok := w.runtimeClient(); ok && w.rpcExitPendingClientID != client.ID() {
 			events = client.Events()
 			done = client.Done()
 		}
@@ -1341,10 +1343,17 @@ func (w *worker) operationFinished(result operationResult) {
 			w.say("Compaction completed.")
 		}
 	case "abort":
-		w.controlBusy = false
-		if result.err != nil {
+		if result.err != nil || result.cancelled {
+			if uncertainOperationOutcome(result.err, result.cancelled) {
+				w.releaseRuntimeWithReason(true, "failure")
+				if w.active != 0 {
+					w.finishUncertain("Abort outcome is uncertain. The active task will not be replayed automatically.")
+				}
+			}
+			w.controlBusy = false
 			w.say("The abort request failed.")
 		} else {
+			w.controlBusy = false
 			w.touchBinding()
 			w.say(result.message)
 		}
@@ -1387,10 +1396,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 
 	w.clearQueue()
 	w.clearAlbums()
-	for id, cancel := range w.hostRequests {
-		cancel()
-		delete(w.hostRequests, id)
-	}
+	w.cancelHostRequests()
 	w.progress = progressState{}
 	w.progressSuppressed = false
 	w.turn++
@@ -1454,9 +1460,21 @@ func (w *worker) failed() {
 	if w.runtime == runtimeReleased && w.client == nil {
 		return
 	}
+	clientID := uint64(0)
 	if w.client != nil {
+		clientID = w.client.ID()
+	}
+	if clientID != 0 && w.rpcOperationActive && w.rpcOperationClientID == clientID {
+		if w.rpcExitPendingClientID != clientID {
+			w.rpcExitPendingClientID = clientID
+			w.logRuntimeEvent(slog.LevelWarn, "runtime_exit", "failure", "runtime exited", w.sessionID)
+		}
+		return
+	}
+	if clientID != 0 && w.rpcExitPendingClientID != clientID {
 		w.logRuntimeEvent(slog.LevelWarn, "runtime_exit", "failure", "runtime exited", w.sessionID)
 	}
+	w.rpcExitPendingClientID = 0
 	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
 	w.closeLogicalSession()
 }
@@ -1544,7 +1562,7 @@ func (w *worker) startOperation(kind string, client *omp.Client, call func(conte
 }
 
 func (w *worker) dispatchRPCOperation() {
-	if w.rpcOperationActive || len(w.rpcOperations) == 0 || w.ctx.Err() != nil {
+	if w.rpcOperationActive || w.rpcExitPendingClientID != 0 || len(w.rpcOperations) == 0 || w.ctx.Err() != nil {
 		return
 	}
 	request := w.rpcOperations[0]
@@ -1554,6 +1572,7 @@ func (w *worker) dispatchRPCOperation() {
 		w.rpcOperations = nil
 	}
 	w.rpcOperationActive = true
+	w.rpcOperationClientID = request.clientID
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -1580,7 +1599,16 @@ func (w *worker) dispatchRPCOperation() {
 
 func (w *worker) operationReturned(result operationResult) {
 	w.rpcOperationActive = false
+	w.rpcOperationClientID = 0
+	pendingExit := result.clientID != 0 && w.rpcExitPendingClientID == result.clientID
 	w.operationFinished(result)
+	if pendingExit {
+		if client, connected := w.runtimeClient(); connected && client.ID() == result.clientID {
+			w.failed()
+		} else {
+			w.rpcExitPendingClientID = 0
+		}
+	}
 	w.dispatchRPCOperation()
 }
 
@@ -2299,6 +2327,7 @@ func (w *worker) finish() {
 			}
 			return
 		}
+		w.cancelHostRequests()
 		w.logTaskComplete(taskID, "done")
 		w.active = 0
 		w.activeReplyTo = 0
@@ -2358,6 +2387,7 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 		}
 		return false
 	}
+	w.cancelHostRequests()
 	w.logTaskComplete(taskID, state)
 	w.active = 0
 	w.activeReplyTo = 0
