@@ -2144,11 +2144,13 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	if w.runtimeResuming {
 		return
 	}
-	ready := "omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID
-	if interrupted {
-		ready += "\n\n⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted."
+	if w.restoring {
+		if interrupted {
+			w.say("⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted.")
+		}
+		return
 	}
-	w.say(ready)
+	w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
 }
 func (w *worker) handle(in incoming) {
 	w.touchLogicalActivity()

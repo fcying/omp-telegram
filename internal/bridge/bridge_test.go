@@ -486,7 +486,7 @@ func TestMain(m *testing.M) {
 									os.Exit(2)
 								}
 							}
-							time.Sleep(time.Millisecond)
+							time.Sleep(5 * time.Millisecond)
 						}
 						streaming.Store(false)
 						emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "answer: event-flood"}}}}})

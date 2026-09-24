@@ -234,6 +234,18 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 		waitFor(t, func() bool { return d.fake.has(before.Thread, "answer: "+before.Workspace) })
 		waitInputDone(t, d.db, id)
 	}
+	for _, thread := range []int64{11, 22} {
+		var ready int
+		err := d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE chat=? AND thread=? AND text LIKE 'omp is ready.%'", d.chat, thread).Scan(&ready)
+		if err != nil || ready != 1 {
+			t.Fatalf("topic %d ready messages after restart = %d, error = %v", thread, ready, err)
+		}
+	}
+	var warnings int
+	err := d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE chat=? AND thread=? AND text LIKE '%Gateway restarted while the previous task was active%'", d.chat, 11).Scan(&warnings)
+	if err != nil || warnings != 1 {
+		t.Fatalf("interrupted topic warnings after restart = %d, error = %v", warnings, err)
+	}
 	d.command(33, "closed-topic-probe")
 	if got := d.binding(33); got != closed || d.fake.has(33, "answer: closed-topic-probe") {
 		t.Fatalf("closed topic was revived: %+v", got)
