@@ -27,7 +27,7 @@ func assertKeyboardClears(t *testing.T, f *fakeHTTP, messageIDs ...int) {
 // Omit the callback message to exercise the identity saved when the menu was sent.
 func clickKeyboard(w *worker, user int64, data string) {
 	w.callback(&telegram.CallbackQuery{ID: "keyboard-callback", From: telegram.User{ID: user}, Data: data})
-	for w.controlBusy {
+	for w.controlInProgress() {
 		select {
 		case result := <-w.operations:
 			w.operationReturned(result)
@@ -224,7 +224,7 @@ func TestCompactConfirmationClearsBeforeCompletion(t *testing.T) {
 	messageID := f.messageCount()
 	clickKeyboard(w, 7, data)
 	assertKeyboardClears(t, f, messageID)
-	if !w.busy || !w.compacting || !sameBindingIdentity(w.binding, before) {
+	if w.sessionOp != sessionOperationCompact || w.taskActive() || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("compaction confirmation did not start compaction in the current session")
 	}
 	select {

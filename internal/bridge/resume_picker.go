@@ -101,7 +101,7 @@ func (w *worker) persistedExportBindingMatches(result exportResult) bool {
 }
 
 func (w *worker) resumeBusy() bool {
-	return w.busy || w.compacting || len(w.queue) != 0 || w.exportCancel != nil
+	return w.taskOrSessionBusy() || w.compacting || len(w.queue) != 0 || w.exportCancel != nil
 }
 
 func (w *worker) requestResumeList(user int64) {
@@ -331,7 +331,7 @@ func (w *worker) bindingSessionSelected(sessionID string) bool {
 }
 
 func (w *worker) exportCurrentBusy(sessionID string) bool {
-	return w.bindingSessionSelected(sessionID) && (w.active != 0 || w.busy || w.compacting || w.finishing || len(w.queue) != 0)
+	return w.bindingSessionSelected(sessionID) && (w.taskActive() || w.taskOrSessionBusy() || w.compacting || w.finishing || len(w.queue) != 0)
 }
 
 func (w *worker) beginExport(session omp.SessionSummary, format, workspace string, generation int64) {

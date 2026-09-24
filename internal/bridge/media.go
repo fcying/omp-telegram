@@ -517,18 +517,17 @@ func (w *worker) hostResultFailed(client *omp.Client, err error) {
 		slog.Uint64("client_id", client.ID()),
 		slog.Int64("generation", w.binding.Generation),
 	}
-	if w.active != 0 {
+	if w.taskActive() {
 		attrs = append(attrs, slog.Int64("inbox_id", w.active))
 	}
 	w.log.LogAttrs(context.Background(), slog.LevelWarn, "host tool result delivery failed", attrs...)
 	w.cancelHostRequests()
-	if w.active != 0 {
+	if w.taskActive() {
 		w.finishUncertain("A host tool result could not be delivered to omp. The instance was closed; the task outcome is uncertain and will not be replayed automatically.")
 	} else {
 		w.say("A host tool result could not be delivered to omp. The instance was closed.")
 	}
-	w.busy = false
-	w.compacting = false
+	w.clearFailedHostOperation()
 	w.releaseRuntimeWithReason(true, "failure")
 }
 func (w *worker) hostSend(event rpcEvent) {
@@ -540,7 +539,7 @@ func (w *worker) hostSend(event rpcEvent) {
 		w.sendHostResult(client, event.ID, "Unsupported host tool.", true)
 		return
 	}
-	if !w.busy || w.active == 0 {
+	if !w.taskRunning() {
 		w.sendHostResult(client, event.ID, "Attachments can only be sent during an active Telegram request.", true)
 		return
 	}

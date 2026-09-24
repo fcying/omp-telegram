@@ -72,7 +72,7 @@ func (w *worker) resetIdleProbeReason(reason string) {
 	}
 }
 func (w *worker) stuckTaskEligible() bool {
-	if w.runtime != runtimeConnected || w.client == nil || w.active == 0 || !w.busy || w.awaitingContinuation || w.compacting || w.finishing || w.progress.Retrying || len(w.progress.ActiveTools) != 0 || len(w.hostRequests) != 0 {
+	if w.runtime != runtimeConnected || w.client == nil || !w.taskRunning() || w.awaitingContinuation || w.compacting || w.finishing || w.progress.Retrying || len(w.progress.ActiveTools) != 0 || len(w.hostRequests) != 0 {
 		return false
 	}
 	for _, c := range w.confirms {

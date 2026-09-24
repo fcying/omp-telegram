@@ -136,10 +136,10 @@ func TestDoctorRunsAsyncRejectsDuplicateAndFencesRuntime(t *testing.T) {
 			tg:  newTestTelegram(t),
 			bot: telegram.User{ID: 99},
 		}),
-		key:     target{chat: 1, thread: 2},
-		ctx:     ctx,
-		cancel:  cancel,
-		runtime: runtimeReleased,
+		key:              target{chat: 1, thread: 2},
+		ctx:              ctx,
+		cancel:           cancel,
+		runtimeLifecycle: runtimeLifecycle{runtime: runtimeReleased},
 	})
 	w.runDoctor()
 	select {

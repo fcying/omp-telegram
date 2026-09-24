@@ -17,7 +17,7 @@ func (b *Bridge) newWorker(ctx context.Context, key target, binding store.Bindin
 	ctx, cancel := context.WithCancel(ctx)
 	workerLog := b.log.With("chat_id", key.chat, "thread_id", key.thread)
 	return &worker{
-		b: b, log: workerLog, key: key, binding: binding, restoring: restoring, startIntent: intent,
+		b: b, log: workerLog, key: key, binding: binding, runtimeLifecycle: runtimeLifecycle{restoring: restoring}, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
 		topicRenameResults: make(chan topicRenameResult, 1), operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,

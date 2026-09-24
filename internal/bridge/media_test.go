@@ -479,14 +479,14 @@ func TestAlbumKeysIsolateGroupsUsersAndWorkers(t *testing.T) {
 		t.Fatalf("album group or user keys merged: albums=%+v queue=%+v", w.albums, w.queue)
 	}
 	other := &worker{
-		b:       w.b,
-		log:     w.log,
-		key:     target{chat: -10, thread: 22},
-		binding: w.binding,
-		client:  w.client,
-		runtime: runtimeConnected,
-		ctx:     w.ctx,
-		cancel:  w.cancel,
+		b:                w.b,
+		log:              w.log,
+		key:              target{chat: -10, thread: 22},
+		binding:          w.binding,
+		client:           w.client,
+		runtimeLifecycle: runtimeLifecycle{runtime: runtimeConnected},
+		ctx:              w.ctx,
+		cancel:           w.cancel,
 	}
 	other.initAlbums()
 	otherMember := update(5, 22, "")
@@ -1233,7 +1233,7 @@ func TestUncertainAbortDoesNotLeakHostRequest(t *testing.T) {
 	taskID := w.active
 	cancelled := observeHostRequestCancel(t, w, result.id)
 	client := w.client
-	w.controlBusy = true
+	w.beginControlOperation(controlAbort)
 	w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
 		callCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()

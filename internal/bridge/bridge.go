@@ -136,23 +136,63 @@ const (
 	runtimeConnected
 )
 
+type taskState struct {
+	active, activeReplyTo int64
+	owner                 int64
+	awaitingContinuation  bool
+	busy                  bool
+}
+
+type controlOperation uint8
+
+const (
+	controlNone controlOperation = iota
+	controlAbort
+	controlStatus
+	controlName
+	controlModel
+)
+
+type sessionOperation uint8
+
+const (
+	sessionOperationNone sessionOperation = iota
+	sessionOperationCompact
+	sessionOperationHandoff
+)
+
+type progressTransport struct {
+	finishing          bool
+	previewBusy        bool
+	previewID          int64
+	previewStopToken   string
+	progressSuppressed bool
+	lastPreview        string
+}
+
+type runtimeLifecycle struct {
+	runtime         runtimeState
+	runtimeResuming bool
+	restoring       bool
+}
+
 type worker struct {
-	b                      *Bridge
-	log                    *slog.Logger
-	key                    target
-	input                  chan incoming
-	client                 *omp.Client
-	binding                store.Binding
-	startIntent            *store.StartIntent
-	sessionID              string
-	claimedSession         string
-	restoring              bool
-	queue                  []queued
-	stream                 strings.Builder
-	active, activeReplyTo  int64
-	owner                  int64
-	turn                   uint64
-	finishing              bool
+	b              *Bridge
+	log            *slog.Logger
+	key            target
+	input          chan incoming
+	client         *omp.Client
+	binding        store.Binding
+	startIntent    *store.StartIntent
+	sessionID      string
+	claimedSession string
+	runtimeLifecycle
+	queue   []queued
+	stream  strings.Builder
+	preview string
+	taskState
+	turn uint64
+	progressTransport
 	compacting             bool
 	progress               progressState
 	operations             chan operationResult
@@ -166,25 +206,16 @@ type worker struct {
 	albumVersion           uint64
 	albumSuppressed        map[albumKey]time.Time
 	background             sync.WaitGroup
-	busy                   bool
-	controlBusy            bool
-	awaitingContinuation   bool
-	runtime                runtimeState
-	runtimeResuming        bool
+	controlOp              controlOperation
+	sessionOp              sessionOperation
 	lastActivity           time.Time
 	lastLogicalActivity    time.Time
 
 	lastTyping          time.Time
 	typingCancel        context.CancelFunc
 	idleProbe           idleProbeState
-	preview             string
 	lastAssistant       *terminalAssistant
 	finalAssistantTexts []string
-	lastPreview         string
-	previewID           int64
-	previewStopToken    string
-	previewBusy         bool
-	progressSuppressed  bool
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
 	keyboardCleanup     chan int64
@@ -967,8 +998,88 @@ func (w *worker) tryInput(in incoming) bool {
 	}
 }
 
+func (w *worker) taskActive() bool { return w.active != 0 }
+
+func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
+
+func (w *worker) beginTask(q queued) {
+	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true}
+	w.turn++
+}
+
+func (w *worker) clearTask() {
+	w.active = 0
+	w.activeReplyTo = 0
+	w.awaitingContinuation = false
+	w.busy = false
+}
+
+func (w *worker) awaitTaskContinuation() { w.awaitingContinuation = true }
+
+func (w *worker) clearAwaitingContinuation() { w.awaitingContinuation = false }
+
+func (w *worker) controlInProgress() bool { return w.controlOp != controlNone }
+
+func (w *worker) beginControlOperation(kind controlOperation) { w.controlOp = kind }
+
+func (w *worker) endControlOperation() { w.controlOp = controlNone }
+
+func (w *worker) sessionOperationActive() bool { return w.sessionOp != sessionOperationNone }
+
+func (w *worker) beginSessionOperation(kind sessionOperation) { w.sessionOp = kind }
+
+func (w *worker) endSessionOperation() { w.sessionOp = sessionOperationNone }
+
+func (w *worker) completeSessionOperation() {
+	w.endSessionOperation()
+	w.compacting = false
+}
+
+func (w *worker) taskOrSessionBusy() bool { return w.busy || w.sessionOperationActive() }
+
+func (w *worker) clearFailedHostOperation() {
+	w.busy = false
+	w.compacting = false
+	w.endSessionOperation()
+}
+
 func (w *worker) sessionControlBusy() bool {
-	return w.busy || w.controlBusy || w.compacting || w.finishing || w.exportingSession != ""
+	return w.taskOrSessionBusy() || w.controlInProgress() || w.compacting || w.finishing || w.exportingSession != ""
+}
+
+func (w *worker) canDispatch() bool {
+	return !w.sessionControlBusy() && len(w.queue) != 0
+}
+
+func (w *worker) canReleaseRuntime() bool {
+	return w.runtime == runtimeConnected && w.client != nil &&
+		!w.taskActive() && !w.taskOrSessionBusy() && !w.controlInProgress() &&
+		!w.compacting && !w.finishing && !w.previewBusy &&
+		len(w.queue) == 0 && len(w.hostRequests) == 0 &&
+		w.resumeCancel == nil && w.exportCancel == nil && w.startIntent == nil &&
+		!w.hasRuntimeConfirmation()
+}
+
+func (w *worker) lifecycleIdle() bool {
+	return !w.binding.Running && w.runtime == runtimeReleased && w.client == nil &&
+		!w.restoring && !w.runtimeResuming && !w.taskActive() &&
+		!w.taskOrSessionBusy() && !w.controlInProgress() &&
+		!w.compacting && !w.finishing && !w.previewBusy &&
+		!w.awaitingContinuation && w.exportingSession == ""
+}
+
+func (w *worker) canEvict() bool {
+	if !w.lifecycleIdle() {
+		return false
+	}
+	return len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 && len(w.albumSuppressed) == 0 &&
+		len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil &&
+		w.bindingNameCancel == nil && w.doctorCancel == nil && w.startIntent == nil &&
+		len(w.confirms) == 0 && w.idleProbe.cancel == nil && w.typingCancel == nil &&
+		len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 &&
+		len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 &&
+		len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 &&
+		len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
 }
 
 func (w *worker) hasRuntimeConfirmation() bool {
@@ -981,10 +1092,6 @@ func (w *worker) hasRuntimeConfirmation() bool {
 	return false
 }
 
-func (w *worker) idleEligible() bool {
-	return w.runtime == runtimeConnected && w.client != nil && w.active == 0 && !w.busy && !w.controlBusy && !w.compacting && !w.finishing && !w.previewBusy && len(w.queue) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.startIntent == nil && !w.hasRuntimeConfirmation()
-}
-
 func (w *worker) sessionDurable() bool {
 	path := w.binding.Session
 	if path == "" || !filepath.IsAbs(path) {
@@ -995,14 +1102,10 @@ func (w *worker) sessionDurable() bool {
 }
 
 func (w *worker) releaseIdleRuntime(now time.Time) {
-	if w.b.cfg.IdleTimeout <= 0 || !w.idleEligible() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout || !w.sessionDurable() {
+	if w.b.cfg.IdleTimeout <= 0 || !w.canReleaseRuntime() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout || !w.sessionDurable() {
 		return
 	}
 	w.releaseRuntimeWithReason(true, "idle")
-}
-
-func (w *worker) logicalIdleEligibleLocked() bool {
-	return !w.binding.Running && w.runtime == runtimeReleased && w.client == nil && !w.restoring && !w.runtimeResuming && w.active == 0 && !w.busy && !w.controlBusy && !w.compacting && !w.finishing && !w.previewBusy && !w.awaitingContinuation && len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 && len(w.albumSuppressed) == 0 && len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.exportingSession == "" && w.bindingNameCancel == nil && w.doctorCancel == nil && w.startIntent == nil && len(w.confirms) == 0 && w.idleProbe.cancel == nil && w.typingCancel == nil && len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 && len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 && len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 && len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
 }
 
 func (w *worker) evictIfIdle(now time.Time) bool {
@@ -1011,7 +1114,7 @@ func (w *worker) evictIfIdle(now time.Time) bool {
 	}
 	w.exitMu.Lock()
 	defer w.exitMu.Unlock()
-	if w.exitRequested || !w.logicalIdleEligibleLocked() {
+	if w.exitRequested || !w.canEvict() {
 		return false
 	}
 	w.exitRequested = true
@@ -1023,20 +1126,40 @@ func (w *worker) runtimeClient() (*omp.Client, bool) {
 	return w.client, w.runtime == runtimeConnected && w.client != nil
 }
 
+func (w *worker) beginRuntimeStart() { w.runtime = runtimeStarting }
+
+func (w *worker) runtimeStarted(client *omp.Client) {
+	w.client = client
+	w.runtime = runtimeConnected
+}
+
+func (w *worker) runtimeStopped() {
+	w.client = nil
+	w.runtime = runtimeReleased
+}
+
+func (w *worker) beginRuntimeResume() {
+	w.restoring, w.runtimeResuming = true, true
+}
+
+func (w *worker) endRuntimeResume() {
+	w.restoring, w.runtimeResuming = false, false
+}
+
 func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.stopTyping()
 	w.resetIdleProbe()
-	w.awaitingContinuation = false
+	w.clearAwaitingContinuation()
 	// Drop old-client calls, but keep the active lane fenced until its result returns.
 	w.rpcOperations = nil
 	sessionID := w.sessionID
 	generation := w.binding.Generation
 	// Disable the old client's event and Done channels before closing it, so an
 	// intentional release cannot be mistaken for an unexpected exit.
-	if client := w.client; client != nil {
+	client := w.client
+	w.runtimeStopped()
+	if client != nil {
 		clientID := client.ID()
-		w.client = nil
-		w.runtime = runtimeReleased
 		client.Close()
 		if releaseSlot {
 			<-w.b.slots
@@ -1052,7 +1175,6 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 		}
 		w.log.LogAttrs(context.Background(), slog.LevelInfo, "runtime released", attrs...)
 	}
-	w.runtime = runtimeReleased
 	w.previewID = 0
 	w.previewStopToken = ""
 }
@@ -1081,9 +1203,9 @@ func (w *worker) ensureRuntime() (*omp.Client, error) {
 	if !w.binding.Running || w.binding.Session == "" || !filepath.IsAbs(w.binding.Session) || !filepath.IsAbs(w.binding.Workspace) {
 		return nil, errors.New("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
 	}
-	w.runtimeResuming, w.restoring = true, true
+	w.beginRuntimeResume()
 	w.start(true, w.binding.Session, w.binding.Workspace, false)
-	w.restoring, w.runtimeResuming = false, false
+	w.endRuntimeResume()
 	if client, ok := w.runtimeClient(); ok {
 		w.logRuntimeEvent(slog.LevelInfo, "runtime_resume", "lazy", "runtime resumed", w.sessionID)
 		return client, nil
@@ -1322,8 +1444,7 @@ func (w *worker) operationFinished(result operationResult) {
 	}
 	switch result.kind {
 	case "handoff":
-		w.compacting = false
-		w.busy = false
+		w.completeSessionOperation()
 		cancelled := result.cancelled
 		uncertain := uncertainOperationOutcome(result.err, cancelled)
 		if result.err == nil && !cancelled {
@@ -1355,8 +1476,7 @@ func (w *worker) operationFinished(result operationResult) {
 			w.say("Handoff completed.")
 		}
 	case "compact", "":
-		w.compacting = false
-		w.busy = false
+		w.completeSessionOperation()
 		uncertain := uncertainOperationOutcome(result.err, result.cancelled)
 		if uncertain {
 			w.releaseRuntimeWithReason(true, "failure")
@@ -1381,15 +1501,15 @@ func (w *worker) operationFinished(result operationResult) {
 					w.finishUncertain("Abort outcome is uncertain. The active task will not be replayed automatically.")
 				}
 			}
-			w.controlBusy = false
+			w.endControlOperation()
 			w.say("The abort request failed.")
 		} else {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.touchBinding()
 			w.say(result.message)
 		}
 	case "status":
-		w.controlBusy = false
+		w.endControlOperation()
 		if result.err != nil {
 			w.say("Failed to read the session state.")
 			return
@@ -1402,7 +1522,7 @@ func (w *worker) operationFinished(result operationResult) {
 		home, _ := os.UserHomeDir()
 		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)))
 	case "name":
-		w.controlBusy = false
+		w.endControlOperation()
 		if result.err != nil {
 			w.say("The session name change could not be confirmed. Use /status to check before retrying.")
 			return
@@ -1410,7 +1530,7 @@ func (w *worker) operationFinished(result operationResult) {
 		w.touchBinding()
 		w.say(result.message)
 	default:
-		w.controlBusy = false
+		w.endControlOperation()
 	}
 }
 
@@ -1433,7 +1553,8 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.turn++
 	w.finishing = false
 	w.compacting = false
-	w.controlBusy = false
+	w.endSessionOperation()
+	w.endControlOperation()
 	w.preview = ""
 	w.activeReplyTo = 0
 	w.finalAssistantTexts = nil
@@ -1469,9 +1590,7 @@ func (w *worker) closeLogicalSession() bool {
 	}
 	w.clearQueue()
 	w.teardownWorker(true)
-	w.active = 0
-	w.activeReplyTo = 0
-	w.busy = false
+	w.clearTask()
 	attrs := []slog.Attr{
 		slog.String("event", "session_close"),
 		slog.Int64("generation", generation),
@@ -1559,7 +1678,7 @@ func (w *worker) requestAbort(notice string) {
 		w.say("No active task. Queued prompts cleared.")
 		return
 	}
-	if w.controlBusy {
+	if w.controlInProgress() {
 		w.say("The session operation is still loading.")
 		return
 	}
@@ -1568,7 +1687,7 @@ func (w *worker) requestAbort(notice string) {
 		w.say("The abort request failed.")
 		return
 	}
-	w.controlBusy = true
+	w.beginControlOperation(controlAbort)
 	w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "abort", nil)
 	}, 0, notice)
@@ -1644,7 +1763,7 @@ func (w *worker) operationReturned(result operationResult) {
 }
 
 func (w *worker) beginControl(kind string, call func(*omp.Client, context.Context) (json.RawMessage, error), message string) bool {
-	if w.controlBusy {
+	if w.controlInProgress() {
 		w.say("The session operation is still loading.")
 		return false
 	}
@@ -1653,7 +1772,12 @@ func (w *worker) beginControl(kind string, call func(*omp.Client, context.Contex
 		w.say(err.Error())
 		return false
 	}
-	w.controlBusy = true
+	switch kind {
+	case "status":
+		w.beginControlOperation(controlStatus)
+	case "name":
+		w.beginControlOperation(controlName)
+	}
 	w.startOperation(kind, client, func(ctx context.Context) (json.RawMessage, error) {
 		return call(client, ctx)
 	}, 0, message)
@@ -1872,17 +1996,16 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 			if reuseSlot {
 				reserved = true
 			}
-			w.active = 0
-			w.busy = false
+			w.clearTask()
 		}
 	}
-	w.runtime = runtimeStarting
+	w.beginRuntimeStart()
 	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs}, w.b.rpcLog)
 	if e != nil {
 		if reserved {
 			<-w.b.slots
 		}
-		w.runtime = runtimeReleased
+		w.runtimeStopped()
 		if w.runtimeResuming {
 			w.say("Failed to resume the released OMP session. No prompt was submitted.")
 		} else if resume {
@@ -1892,8 +2015,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		}
 		return
 	}
-	w.client = c
-	w.runtime = runtimeConnected
+	w.runtimeStarted(c)
 	w.initMedia()
 	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Second)
 	info, e := c.SessionInfo(ctx)
@@ -1952,7 +2074,6 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	w.startIntent = nil
 	w.preview, w.lastPreview = "", ""
 	w.previewID = 0
-	w.runtime = runtimeConnected
 	w.touchActivity()
 	if !w.runtimeResuming && !w.restoring {
 		w.touchBinding()
@@ -2183,7 +2304,7 @@ func (w *worker) handoff(instructions string) {
 	if instructions != "" {
 		fields = map[string]any{"customInstructions": instructions}
 	}
-	w.busy, w.compacting = true, true
+	w.beginSessionOperation(sessionOperationHandoff)
 	w.touchActivity()
 	w.startOperation("handoff", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "handoff", fields)
@@ -2210,7 +2331,7 @@ func (w *worker) status() {
 	}, "")
 }
 func (w *worker) dispatch() {
-	if w.busy || w.controlBusy || w.compacting || w.finishing || w.exportingSession != "" || len(w.queue) == 0 {
+	if !w.canDispatch() {
 		return
 	}
 	client, err := w.ensureRuntime()
@@ -2222,14 +2343,10 @@ func (w *worker) dispatch() {
 	if !w.submit(q) {
 		return
 	}
-	w.active = q.id
-	w.activeReplyTo = q.replyTo
-	w.owner = q.user
+	w.beginTask(q)
 	w.stopTyping()
 	w.resetIdleProbe()
-	w.awaitingContinuation = false
-	w.turn++
-	w.busy = true
+	w.clearAwaitingContinuation()
 	w.progress = progressState{StartedAt: time.Now(), ActiveTools: make(map[string]progressTool)}
 	w.logTaskSubmit(q.id)
 	w.progressSuppressed = false
@@ -2345,7 +2462,7 @@ func (w *worker) logRuntimeEvent(level slog.Level, event, reason, message, sessi
 func (w *worker) finish() {
 	w.stopTyping()
 	w.resetIdleProbe()
-	w.awaitingContinuation = false
+	w.clearAwaitingContinuation()
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		taskID := w.active
@@ -2360,9 +2477,7 @@ func (w *worker) finish() {
 		}
 		w.cancelHostRequests()
 		w.logTaskComplete(taskID, "done")
-		w.active = 0
-		w.activeReplyTo = 0
-		w.busy = false
+		w.clearTask()
 		w.preview = ""
 		w.stream.Reset()
 		w.clearTaskConfirmations()
@@ -2371,11 +2486,7 @@ func (w *worker) finish() {
 	}
 	w.lastAssistant = nil
 	w.finalAssistantTexts = nil
-	if w.previewBusy {
-		w.finishing = true
-		return
-	}
-	w.finishPreview()
+	w.finishProgressWhenReady()
 }
 
 func (w *worker) finishUncertain(notice string) bool {
@@ -2389,7 +2500,7 @@ func (w *worker) finishCancelled(notice string) bool {
 func (w *worker) finishIncomplete(state, notice string) bool {
 	w.stopTyping()
 	w.resetIdleProbe()
-	w.awaitingContinuation = false
+	w.clearAwaitingContinuation()
 	if w.active == 0 {
 		w.lastAssistant = nil
 		w.finalAssistantTexts = nil
@@ -2420,19 +2531,13 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	}
 	w.cancelHostRequests()
 	w.logTaskComplete(taskID, state)
-	w.active = 0
-	w.activeReplyTo = 0
-	w.busy = false
+	w.clearTask()
 	w.preview = ""
 	w.lastAssistant = nil
 	w.finalAssistantTexts = nil
 	w.stream.Reset()
 	w.clearTaskConfirmations()
-	if w.previewBusy {
-		w.finishing = true
-		return true
-	}
-	w.finishPreview()
+	w.finishProgressWhenReady()
 	return true
 }
 
@@ -2598,6 +2703,14 @@ func (w *worker) finishTerminal(e rpcEvent) {
 		w.finish()
 	}
 }
+func (w *worker) finishProgressWhenReady() {
+	if w.previewBusy {
+		w.finishing = true
+		return
+	}
+	w.finishPreview()
+}
+
 func (w *worker) finishPreview() {
 	w.finishing = false
 	w.progress = progressState{}
@@ -2640,7 +2753,7 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
-		w.awaitingContinuation = false
+		w.clearAwaitingContinuation()
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)
 		w.lastAssistant = nil
@@ -2660,10 +2773,10 @@ func (w *worker) event(raw []byte) {
 		}
 	case "agent_end":
 		if e.IsTerminal != nil && !*e.IsTerminal {
-			w.awaitingContinuation = true
+			w.awaitTaskContinuation()
 			return
 		}
-		w.awaitingContinuation = false
+		w.clearAwaitingContinuation()
 		texts := assistantTexts(e.Messages)
 		if len(texts) > 0 {
 			w.preview = strings.Join(texts, "\n\n")
@@ -2689,7 +2802,7 @@ func (w *worker) typing() {
 		return
 	}
 	preparing := len(w.queue) > 0 && w.queue[0].preparing
-	if (!w.busy && !preparing) || time.Since(w.lastTyping) < 5*time.Second {
+	if (!w.taskOrSessionBusy() && !preparing) || time.Since(w.lastTyping) < 5*time.Second {
 		return
 	}
 	w.stopTyping()
@@ -2838,7 +2951,7 @@ func (w *worker) progressStatus() string {
 }
 
 func (w *worker) renderProgress() string {
-	if !w.busy || w.active == 0 {
+	if !w.taskRunning() {
 		return ""
 	}
 	sections := []string{"Processing..."}
@@ -2980,7 +3093,7 @@ func (w *worker) previewFinished(result previewResult) {
 			if w.previewStopToken == result.stopToken {
 				w.previewStopToken = ""
 			}
-		case w.active != 0 && w.busy && !w.finishing && c.active == w.active:
+		case w.taskRunning() && !w.finishing && c.active == w.active:
 			c.messageID = result.id
 			w.confirms[result.stopToken] = c
 		default:
@@ -3018,7 +3131,7 @@ func (w *worker) flushPreview() {
 	replyTo := w.activeReplyTo
 	taskID := w.active
 	stopToken := ""
-	if id == 0 && w.active != 0 && w.busy && !w.finishing {
+	if id == 0 && w.taskRunning() && !w.finishing {
 		stopToken = w.newProgressStopToken()
 		if stopToken != "" {
 			w.confirms[stopToken] = confirmation{action: "stop", generation: gen, active: w.active, turn: turn, user: w.owner}
@@ -3178,7 +3291,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	if c.action == "stop" {
-		if c.active != w.active || c.turn != w.turn || w.active == 0 || !w.busy {
+		if c.active != w.active || c.turn != w.turn || !w.taskRunning() {
 			delete(w.confirms, token)
 			if w.previewStopToken == token {
 				w.previewStopToken = ""
@@ -3271,8 +3384,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			w.say("The instance is not idle. Compaction was canceled.")
 			return callbackDone
 		}
-		w.busy = true
-		w.compacting = true
+		w.beginSessionOperation(sessionOperationCompact)
 		w.touchActivity()
 		w.startOperation("compact", client, func(ctx context.Context) (json.RawMessage, error) {
 			return client.Call(ctx, "compact", nil)
