@@ -542,6 +542,10 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", sessions); err != nil {
 		panic(err)
 	}
+	// Only child fixtures inherit this; the test process keeps its race exit window.
+	if err := os.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0")); err != nil {
+		panic(err)
+	}
 	code := m.Run()
 	_ = os.RemoveAll(sessions)
 	os.Exit(code)
@@ -1676,6 +1680,13 @@ func TestUnauthorizedUpdateCannotSpawn(t *testing.T) {
 		_ = db.DB.QueryRow("SELECT state FROM inbox WHERE id=1").Scan(&state)
 		return state == "ignored"
 	})
+	var raw []byte
+	var offset int64
+	requireStoreOK(t, db.DB.QueryRow("SELECT raw FROM inbox WHERE id=1").Scan(&raw))
+	requireStoreOK(t, db.DB.QueryRow("SELECT value FROM meta WHERE key='offset'").Scan(&offset))
+	if len(raw) != 0 || offset != 2 {
+		t.Fatalf("ignored update retained payload or lost offset: raw=%q offset=%d", raw, offset)
+	}
 	if _, e := db.Binding(99, -10, 11); e == nil {
 		t.Fatal("unauthorized binding")
 	}
@@ -2040,11 +2051,19 @@ func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
 		t.Fatalf("failed deletion cleared progress association: %d", progressID)
 	}
 	fake.progressDeleteStatus = 0
-	b.reconcileProgressCleanup(context.Background())
-	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
-	if progressID != 0 {
-		t.Fatalf("successful retry left progress association: %d", progressID)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		b.runProgressJanitor(ctx, 10*time.Millisecond)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitFor(t, func() bool {
+		return db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID) == nil && progressID == 0
+	})
 }
 
 func TestProgressDeletionPermanentFailureClearsAssociation(t *testing.T) {
@@ -2165,6 +2184,138 @@ func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
 	}
 	if !strings.Contains(o.Text, "omp reported that the task failed") || !strings.Contains(o.Text, "partial answer") || strings.Contains(o.Text, "SECRET") {
 		t.Fatalf("terminal failure output = %q", o.Text)
+	}
+}
+
+func TestAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
+	w.active, w.busy = 10, true
+	w.stream.WriteString(strings.Repeat("x", maxAssistantOutputBytes-2))
+	w.preview = "partial answer"
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"more"}}`))
+	var state string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "uncertain" || w.client != nil || w.binding.Running {
+		t.Fatalf("preterminal overflow state=%s runtime=%v binding=%+v", state, w.client, w.binding)
+	}
+	var reply string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=10").Scan(&reply))
+	if !strings.Contains(reply, "resource budget") || !strings.Contains(reply, "partial answer") {
+		t.Fatalf("missing partial answer and overflow notice: %q", reply)
+	}
+}
+
+func TestFinalizedAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
+	w.active, w.busy = 10, true
+	message, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": strings.Repeat("x", maxAssistantOutputBytes+1)}}}})
+	requireStoreOK(t, err)
+	w.event(message)
+	var state string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "uncertain" || w.client != nil || len(w.finalAssistantTexts) != 0 {
+		t.Fatalf("finalized preterminal overflow state=%s runtime=%v cached=%d", state, w.client, len(w.finalAssistantTexts))
+	}
+}
+
+func TestStreamedAssistantMessageEndReplacesPendingBudget(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
+	text := strings.Repeat("a", 21*(1<<20)/10)
+	for start := 0; start < len(text); start += 256 << 10 {
+		end := min(start+256<<10, len(text))
+		delta, err := json.Marshal(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text[start:end]}})
+		requireStoreOK(t, err)
+		w.event(delta)
+	}
+	messageEnd, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}})
+	requireStoreOK(t, err)
+	w.event(messageEnd)
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[]}`))
+	var state string
+	requireStoreOK(t, db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "done" {
+		t.Fatalf("streamed 2.1 MiB reply finished as %s, want done", state)
+	}
+	rows, err := db.DB.Query("SELECT text FROM outbox WHERE inbox_id=10 ORDER BY id")
+	requireStoreOK(t, err)
+	defer rows.Close()
+	count, bytes, last := 0, 0, ""
+	for rows.Next() {
+		requireStoreOK(t, rows.Scan(&last))
+		count++
+		bytes += len(last)
+	}
+	requireStoreOK(t, rows.Err())
+	if count == 0 || count > maxFinalReplyMessages || bytes > maxFinalReplyBytes || last != replyTruncatedNotice {
+		t.Fatalf("reply display budget: parts=%d bytes=%d last=%q", count, bytes, last)
+	}
+}
+
+func TestFinalizedAssistantAndNewStreamShareBudget(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
+	w.active, w.busy = 10, true
+	message, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2<<20)}}}})
+	requireStoreOK(t, err)
+	w.event(message)
+	delta, err := json.Marshal(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": strings.Repeat("y", (2<<20)+1)}})
+	requireStoreOK(t, err)
+	w.event(delta)
+	var state string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "uncertain" {
+		t.Fatalf("combined assistant output over budget finished as %s", state)
+	}
+}
+
+func TestTerminalDisplayOverflowStillCompletes(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
+	terminal, err := json.Marshal(map[string]any{"type": "agent_end", "isTerminal": true, "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": strings.Repeat("answer\n", maxFinalReplyBytes/7)}}}}})
+	requireStoreOK(t, err)
+	w.event(terminal)
+	var state string
+	requireStoreOK(t, db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "done" {
+		t.Fatalf("terminal display overflow state = %q", state)
+	}
+	rows, err := db.DB.Query("SELECT text FROM outbox WHERE inbox_id=10 ORDER BY id")
+	requireStoreOK(t, err)
+	defer rows.Close()
+	count, bytes := 0, 0
+	last := ""
+	for rows.Next() {
+		requireStoreOK(t, rows.Scan(&last))
+		count++
+		bytes += len(last)
+		if utf16Length(last) > telegram.MaxMessageUTF16 {
+			t.Fatalf("part %d exceeds Telegram limit", count)
+		}
+	}
+	requireStoreOK(t, rows.Err())
+	if count == 0 || count > maxFinalReplyMessages || bytes > maxFinalReplyBytes || last != replyTruncatedNotice {
+		t.Fatalf("display budget: parts=%d bytes=%d last=%q", count, bytes, last)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -88,6 +89,11 @@ func TestMain(m *testing.M) {
 				for range 200 {
 					fmt.Println(`{"type":"agent_start"}`)
 				}
+			case "byte_overflow":
+				frame := []byte(`{"type":"agent_start","padding":"` + strings.Repeat("x", maxFrame-64) + `"}` + "\n")
+				for range 66 {
+					_, _ = os.Stdout.Write(frame)
+				}
 			default:
 				reply := map[string]any{"type": "response", "id": command["id"], "command": command["type"], "success": true, "data": map[string]any{"accepted": true, "private": rpcSensitiveCanary}}
 				encoded, _ := json.Marshal(reply)
@@ -100,6 +106,10 @@ func TestMain(m *testing.M) {
 				}
 			}
 		}
+	}
+	// Only child fixtures inherit this; the test process keeps its race exit window.
+	if err := os.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0")); err != nil {
+		panic(err)
 	}
 	os.Exit(m.Run())
 }
@@ -346,7 +356,7 @@ func fixtureClient(t *testing.T) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	t.Cleanup(cancel)
 	client, err := Start(ctx, Config{Binary: binary}, testRPCLogger())
 	if err != nil {
@@ -400,6 +410,71 @@ func TestEventOverflowStopsProcess(t *testing.T) {
 	case <-time.After(6 * time.Second):
 		t.Fatal("overflow left process running")
 	}
+}
+
+func TestEventByteBudgetOverflowAndConsumption(t *testing.T) {
+	t.Run("overflow before queue slots", func(t *testing.T) {
+		client := fixtureClient(t)
+		if err := client.Send(context.Background(), map[string]any{"type": "byte_overflow"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-client.Done():
+			if err := client.failure(); ClassifyError(err) != "queue_overflow" || !errors.Is(err, errQueueOverflow) {
+				t.Fatalf("byte overflow did not fail closed: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("byte overflow left process running")
+		}
+	})
+
+	t.Run("receive restores byte credit", func(t *testing.T) {
+		c := &Client{events: make(chan json.RawMessage), queuedEvents: make(chan json.RawMessage, 128), stop: make(chan struct{})}
+		forwarded := make(chan struct{})
+		go func() {
+			c.forwardEvents()
+			close(forwarded)
+		}()
+		defer func() {
+			close(c.stop)
+			<-forwarded
+		}()
+		frame := json.RawMessage(make([]byte, 40<<20))
+		if !c.bytes.reserve(cap(frame)) {
+			t.Fatal("first event rejected")
+		}
+		c.queuedEvents <- frame
+		d := frameDecoder{physical: 1024, logical: maxLogical, budget: &c.bytes}
+		firstChunk := chunkFrame("budget", 0, 2, 30<<20, []byte("{"))
+		if _, err := d.push(firstChunk); err != errQueueOverflow {
+			t.Fatalf("decoder admitted a frame beyond the shared byte budget: %v", err)
+		}
+		select {
+		case <-c.Events():
+		case <-time.After(time.Second):
+			t.Fatal("forwarder did not deliver event")
+		}
+		deadline := time.After(time.Second)
+		for {
+			result, err := d.push(firstChunk)
+			if err == nil {
+				if result != nil || cap(d.data) != 30<<20 {
+					t.Fatal("decoder did not reserve the announced reassembly capacity")
+				}
+				c.bytes.release(cap(d.data))
+				break
+			}
+			if err != errQueueOverflow {
+				t.Fatalf("decoder rejected frame after consumption: %v", err)
+			}
+			select {
+			case <-deadline:
+				t.Fatal("receiving an event did not restore decoder byte credit")
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	})
 }
 
 func TestRejectedRPCExposesOnlySafeFailureKind(t *testing.T) {

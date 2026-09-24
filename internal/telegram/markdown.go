@@ -477,9 +477,33 @@ func renderedUTF16Len(html string) int {
 	return n
 }
 
+// plainASCIIText identifies input whose rendered UTF-16 length equals its byte length.
+func plainASCIIText(s string) bool {
+	text, spaces := false, false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			text = true
+		case c == ' ':
+			spaces = true
+		case c == '\n':
+			if spaces && !text {
+				return false
+			}
+			text, spaces = false, false
+		default:
+			return false
+		}
+	}
+	return !spaces || text
+}
+
 // convertLen is the length model for every split and clip decision: the
 // UTF-16 length of the text Telegram renders, not of the generated markup.
 func convertLen(md string) int {
+	if plainASCIIText(md) {
+		return len(md)
+	}
 	return renderedUTF16Len(ConvertMarkdown(md))
 }
 

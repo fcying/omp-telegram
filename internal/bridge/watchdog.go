@@ -152,6 +152,10 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		return
 	default:
 	}
+	if result.client.BufferedOutput() {
+		w.resetIdleProbeReason("queued_rpc_output")
+		return
+	}
 	if !w.stuckTaskEligible() || result.err != nil || !result.idle {
 		w.resetIdleProbeReason("probe_not_idle")
 		w.idleProbe.next = now.Add(stuckTaskQuietPeriod)

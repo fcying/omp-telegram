@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"omp-telegram/internal/config"
 	"omp-telegram/internal/logging"
@@ -65,8 +66,23 @@ type workerExit struct {
 
 const deliveryWorkerCount = 4
 
+const maxAssistantOutputBytes = 4 << 20
+const maxFinalReplyBytes = 1 << 20
+const maxFinalReplyMessages = 32
+const replyTruncatedNotice = "Reply truncated because it exceeded the Telegram display budget."
+
 func supportedConversation(m *telegram.Message) bool {
 	return m != nil && (m.MessageThreadID != 0 || m.Chat.Type == "private")
+}
+
+func updateSender(u telegram.Update) (*telegram.Message, int64) {
+	if u.CallbackQuery != nil {
+		return u.CallbackQuery.Message, u.CallbackQuery.From.ID
+	}
+	if u.Message != nil && u.Message.From != nil {
+		return u.Message, u.Message.From.ID
+	}
+	return u.Message, 0
 }
 
 type queued struct {
@@ -187,9 +203,12 @@ type worker struct {
 	sessionID      string
 	claimedSession string
 	runtimeLifecycle
-	queue   []queued
-	stream  strings.Builder
-	preview string
+	queue                []queued
+	stream               strings.Builder
+	preview              string
+	finalAssistantBytes  int
+	finalizedStreamBytes int
+	finalOutputTruncated bool
 	taskState
 	turn uint64
 	progressTransport
@@ -437,8 +456,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 	if err := b.restoreWorkers(ctx, workers); err != nil {
 		return err
 	}
-
-	b.wg.Add(deliveryWorkerCount + 1)
+	b.wg.Add(deliveryWorkerCount + 2)
 	if cfg.DatabaseRetentionDays > 0 {
 		b.wg.Add(1)
 		go func() {
@@ -446,6 +464,10 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 			b.runDatabaseJanitor(ctx)
 		}()
 	}
+	go func() {
+		defer b.wg.Done()
+		b.runProgressJanitor(ctx, progressCleanupInterval)
+	}()
 	for range deliveryWorkerCount {
 		go func() {
 			defer b.wg.Done()
@@ -479,9 +501,16 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 			}
 			pollBackoff = 0
 			for _, u := range updates {
-				raw, err := json.Marshal(u)
-				if err == nil {
-					err = db.Accept(u.UpdateID, raw)
+				var err error
+				m, user := updateSender(u)
+				if m == nil || !cfg.Authorized(user, m.Chat.ID) {
+					err = db.AcceptIgnored(u.UpdateID)
+				} else {
+					var raw []byte
+					raw, err = json.Marshal(u)
+					if err == nil {
+						err = db.Accept(u.UpdateID, raw)
+					}
 				}
 				if err != nil {
 					b.storeLog.Error("update persistence failed", "event", "inbox_state_write_failed", "reason", "accept", "error_kind", "persistence")
@@ -556,15 +585,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 				}
 				continue
 			}
-			m := u.Message
-			var user int64
-			if m != nil && m.From != nil {
-				user = m.From.ID
-			}
-			if u.CallbackQuery != nil {
-				m = u.CallbackQuery.Message
-				user = u.CallbackQuery.From.ID
-			}
+			m, user := updateSender(u)
 			if m == nil || !cfg.Authorized(user, m.Chat.ID) {
 				if err = db.Mark(in.ID, "ignored"); err != nil {
 					b.storeLog.Error("input state persistence failed", "event", "inbox_state_write_failed")
@@ -617,6 +638,21 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 			return err
 		case <-wake:
 		case <-tick.C:
+		}
+	}
+}
+
+const progressCleanupInterval = time.Minute
+
+func (b *Bridge) runProgressJanitor(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.reconcileProgressCleanup(ctx)
 		}
 	}
 }
@@ -1560,6 +1596,9 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.endSessionOperation()
 	w.endControlOperation()
 	w.preview = ""
+	w.finalAssistantBytes = 0
+	w.finalizedStreamBytes = 0
+	w.finalOutputTruncated = false
 	w.activeReplyTo = 0
 	w.finalAssistantTexts = nil
 	w.lastAssistant = nil
@@ -2399,6 +2438,9 @@ func (w *worker) dispatch() {
 	w.progressSuppressed = false
 	w.preview = ""
 	w.stream.Reset()
+	w.finalAssistantBytes = 0
+	w.finalizedStreamBytes = 0
+	w.finalOutputTruncated = false
 	w.lastPreview = ""
 	w.previewID = 0
 	w.previewStopToken = ""
@@ -2506,6 +2548,107 @@ func (w *worker) logRuntimeEvent(level slog.Level, event, reason, message, sessi
 	w.log.LogAttrs(context.Background(), level, message, w.lifecycleAttrs(event, reason, sessionID)...)
 }
 
+func truncateUTF8(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+	return text[:limit]
+}
+
+// Split only as much input as needed to fill the allowed Telegram pages.
+func splitTaskText(text string, maxParts int) ([]string, bool) {
+	size := min(len(text), 64<<10)
+	for {
+		parts := telegram.SplitForTelegram(truncateUTF8(text, size), telegram.MaxMessageUTF16)
+		if len(parts) > maxParts {
+			return parts[:maxParts+1], true
+		}
+		if size == len(text) {
+			return parts, false
+		}
+		size = min(len(text), size*2)
+	}
+}
+
+func fitTaskReplyBudget(parts []string, finalNotice string, truncated bool) []string {
+	totalBytes := len(finalNotice)
+	for _, part := range parts {
+		totalBytes += len(part)
+	}
+	if totalBytes > maxFinalReplyBytes {
+		truncated = true
+	}
+	maxTextParts := maxFinalReplyMessages
+	if finalNotice != "" {
+		maxTextParts--
+	}
+	if truncated {
+		maxTextParts--
+		totalBytes += len(replyTruncatedNotice)
+	}
+	for len(parts) > maxTextParts || totalBytes > maxFinalReplyBytes {
+		last := len(parts) - 1
+		totalBytes -= len(parts[last])
+		parts = parts[:last]
+	}
+	if truncated {
+		parts = append(parts, replyTruncatedNotice)
+	}
+	if finalNotice != "" {
+		parts = append(parts, finalNotice)
+	}
+	return parts
+}
+
+func taskReplies(text, finalNotice string, truncated bool) []string {
+	if finalNotice != "" && !truncated && len(text)+len(finalNotice)+2 <= maxFinalReplyBytes {
+		combined := finalNotice
+		if text != "" {
+			combined = text + "\n\n" + finalNotice
+		}
+		parts, overflow := splitTaskText(combined, maxFinalReplyMessages)
+		if !overflow {
+			var totalBytes int
+			for _, part := range parts {
+				totalBytes += len(part)
+			}
+			if totalBytes <= maxFinalReplyBytes {
+				return parts
+			}
+		}
+	}
+	budget := maxFinalReplyBytes - len(replyTruncatedNotice) - len(finalNotice)
+	if len(text) > maxFinalReplyBytes-len(finalNotice) || truncated && len(text) > budget {
+		text = truncateUTF8(text, budget)
+		truncated = true
+	}
+	maxTextParts := maxFinalReplyMessages
+	if finalNotice != "" {
+		maxTextParts--
+	}
+	if truncated {
+		maxTextParts--
+	}
+	parts, overflow := splitTaskText(text, maxTextParts)
+	if overflow && !truncated {
+		truncated = true
+		maxTextParts--
+	}
+	if len(parts) > maxTextParts {
+		parts = parts[:maxTextParts]
+	}
+	return fitTaskReplyBudget(parts, finalNotice, truncated)
+}
+
+func (w *worker) assistantBudgetExceeded() {
+	w.logRuntimeEvent(slog.LevelWarn, "assistant_output_overflow", "resource_limit", "assistant output exceeded bridge budget", w.sessionID)
+	w.finishUncertain("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
+	w.closeLogicalSession()
+}
+
 func (w *worker) finish() {
 	w.stopTyping()
 	w.resetIdleProbe()
@@ -2513,8 +2656,7 @@ func (w *worker) finish() {
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		taskID := w.active
-		text := w.preview
-		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, telegram.SplitForTelegram(text, telegram.MaxMessageUTF16)); err != nil {
+		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.preview, "", w.finalOutputTruncated)); err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
@@ -2527,12 +2669,17 @@ func (w *worker) finish() {
 		w.clearTask()
 		w.preview = ""
 		w.stream.Reset()
+		w.finalizedStreamBytes = 0
 		w.clearTaskConfirmations()
 	} else if w.preview != "" {
-		w.say(w.preview)
+		for _, part := range taskReplies(w.preview, "", w.finalOutputTruncated) {
+			w.say(part)
+		}
 	}
 	w.lastAssistant = nil
 	w.finalAssistantTexts = nil
+	w.finalAssistantBytes = 0
+	w.finalOutputTruncated = false
 	w.finishProgressWhenReady()
 }
 
@@ -2554,17 +2701,12 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 		return false
 	}
 	taskID := w.active
-	text := w.preview
-	if text != "" {
-		text += "\n\n"
-	}
-	text += notice
 	var err error
 	switch state {
 	case "uncertain":
-		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, telegram.SplitForTelegram(text, telegram.MaxMessageUTF16))
+		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.preview, notice, w.finalOutputTruncated))
 	case "cancelled":
-		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, telegram.SplitForTelegram(text, telegram.MaxMessageUTF16))
+		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.preview, notice, w.finalOutputTruncated))
 	default:
 		panic("invalid terminal state")
 	}
@@ -2582,7 +2724,10 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.preview = ""
 	w.lastAssistant = nil
 	w.finalAssistantTexts = nil
+	w.finalAssistantBytes = 0
+	w.finalOutputTruncated = false
 	w.stream.Reset()
+	w.finalizedStreamBytes = 0
 	w.clearTaskConfirmations()
 	w.finishProgressWhenReady()
 	return true
@@ -2611,16 +2756,34 @@ func assistantText(m message) string {
 	return strings.Join(texts, "\n")
 }
 
-func assistantTexts(messages []message) []string {
-	var texts []string
+func boundedAssistantTexts(messages []message, limit int) (string, bool, bool) {
+	var preview strings.Builder
+	found := false
 	for _, m := range messages {
-		if m.Role == "assistant" {
-			if text := assistantText(m); text != "" {
-				texts = append(texts, text)
-			}
+		if m.Role != "assistant" {
+			continue
 		}
+		text := assistantText(m)
+		if text == "" {
+			continue
+		}
+		found = true
+		separator := ""
+		if preview.Len() != 0 {
+			separator = "\n\n"
+		}
+		remaining := limit - preview.Len()
+		if len(separator)+len(text) > remaining {
+			if remaining > len(separator) {
+				preview.WriteString(separator)
+				preview.WriteString(truncateUTF8(text, remaining-len(separator)))
+			}
+			return preview.String(), found, true
+		}
+		preview.WriteString(separator)
+		preview.WriteString(text)
 	}
-	return texts
+	return preview.String(), found, false
 }
 
 func assistantTerminalState(m message) terminalResult {
@@ -2788,7 +2951,13 @@ func (w *worker) event(raw []byte) {
 		w.finishProgressTool(e.ToolCallID, e.IsError)
 	case "message_update":
 		if e.AssistantMessageEvent.Type == "text_delta" {
-			w.stream.WriteString(e.AssistantMessageEvent.Delta)
+			delta := e.AssistantMessageEvent.Delta
+			pendingBytes := w.stream.Len() - w.finalizedStreamBytes
+			if len(delta) > maxAssistantOutputBytes-w.stream.Len() || len(delta) > maxAssistantOutputBytes-w.finalAssistantBytes-pendingBytes {
+				w.assistantBudgetExceeded()
+				return
+			}
+			w.stream.WriteString(delta)
 			w.preview = w.stream.String()
 		}
 	case "auto_compaction_start":
@@ -2805,6 +2974,8 @@ func (w *worker) event(raw []byte) {
 		w.progress.ActiveTools = make(map[string]progressTool)
 		w.lastAssistant = nil
 		w.finalAssistantTexts = nil
+		w.finalAssistantBytes = 0
+		w.finalizedStreamBytes = w.stream.Len()
 	case "message_end":
 		var m message
 		if json.Unmarshal(e.Message, &m) == nil && m.Role == "assistant" {
@@ -2815,8 +2986,14 @@ func (w *worker) event(raw []byte) {
 				ErrorStatus:                m.ErrorStatus,
 			}
 			if text := assistantText(m); text != "" {
+				if len(text) > maxAssistantOutputBytes-w.finalAssistantBytes {
+					w.assistantBudgetExceeded()
+					return
+				}
 				w.finalAssistantTexts = append(w.finalAssistantTexts, text)
+				w.finalAssistantBytes += len(text)
 			}
+			w.finalizedStreamBytes = w.stream.Len()
 		}
 	case "agent_end":
 		if e.IsTerminal != nil && !*e.IsTerminal {
@@ -2824,9 +3001,10 @@ func (w *worker) event(raw []byte) {
 			return
 		}
 		w.clearAwaitingContinuation()
-		texts := assistantTexts(e.Messages)
-		if len(texts) > 0 {
-			w.preview = strings.Join(texts, "\n\n")
+		text, found, truncated := boundedAssistantTexts(e.Messages, maxFinalReplyBytes)
+		if found {
+			w.preview = text
+			w.finalOutputTruncated = truncated
 		} else if len(w.finalAssistantTexts) > 0 {
 			w.preview = strings.Join(w.finalAssistantTexts, "\n\n")
 		}

@@ -21,10 +21,38 @@ import (
 )
 
 const (
-	maxFrame     = 1 << 20
-	maxLogical   = 64 << 20
-	chunkPayload = 256 << 10
+	maxFrame            = 1 << 20
+	maxLogical          = 64 << 20
+	maxRPCBufferedBytes = 64 << 20
+	chunkPayload        = 256 << 10
 )
+
+var errQueueOverflow = errors.New("omp: RPC byte budget exceeded; execution state uncertain")
+
+// byteBudget is shared by the reader and the event forwarder. Credits remain
+// held for an event until a receiver accepts it from the public channel.
+type byteBudget struct{ used atomic.Int64 }
+
+func (b *byteBudget) reserve(n int) bool {
+	if b == nil || n == 0 {
+		return true
+	}
+	for {
+		used := b.used.Load()
+		if int64(n) > maxRPCBufferedBytes-used {
+			return false
+		}
+		if b.used.CompareAndSwap(used, used+int64(n)) {
+			return true
+		}
+	}
+}
+
+func (b *byteBudget) release(n int) {
+	if b != nil && n != 0 {
+		b.used.Add(-int64(n))
+	}
+}
 
 var errProtocol = errors.New("omp: invalid RPC frame")
 
@@ -53,6 +81,8 @@ type Client struct {
 	cmd                       *exec.Cmd
 	stdin, stdout             *os.File
 	events                    chan json.RawMessage
+	queuedEvents              chan json.RawMessage
+	bytes                     byteBudget
 	ready                     chan struct{}
 	readDone, done, stop      chan struct{}
 	stopOnce                  sync.Once
@@ -145,9 +175,10 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	}
 	inRead.Close()
 	outWrite.Close()
-	c := &Client{id: clientID, log: rpcLogger.With("client_id", clientID), cmd: cmd, stdin: inWrite, stdout: outRead, events: make(chan json.RawMessage, 128), ready: make(chan struct{}), readDone: make(chan struct{}), done: make(chan struct{}), stop: make(chan struct{}), writeGate: make(chan struct{}, 1), pending: make(map[string]request)}
+	c := &Client{id: clientID, log: rpcLogger.With("client_id", clientID), cmd: cmd, stdin: inWrite, stdout: outRead, events: make(chan json.RawMessage), queuedEvents: make(chan json.RawMessage, 128), ready: make(chan struct{}), readDone: make(chan struct{}), done: make(chan struct{}), stop: make(chan struct{}), writeGate: make(chan struct{}, 1), pending: make(map[string]request)}
 	c.frameLimit.Store(maxFrame)
 	go c.readLoop()
+	go c.forwardEvents()
 	go c.supervise(ctx, waited)
 	startup, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -174,6 +205,9 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 func (c *Client) Events() <-chan json.RawMessage { return c.events }
 func (c *Client) Done() <-chan struct{}          { return c.done }
 func (c *Client) ID() uint64                     { return c.id }
+
+// BufferedOutput includes partially read frames and events awaiting consumption.
+func (c *Client) BufferedOutput() bool { return c.bytes.used.Load() != 0 }
 
 // FrameLimit includes the newline delimiting a request frame.
 func (c *Client) FrameLimit() int { return int(c.frameLimit.Load()) }
@@ -474,21 +508,47 @@ func decodeObject(data []byte) (envelope, error) {
 	return frame, nil
 }
 
+// The reader never waits for consumers: the forwarding goroutine can block on
+// Events while the reader continues until a slot or byte credit is exhausted.
+func (c *Client) forwardEvents() {
+	defer close(c.events)
+	for {
+		select {
+		case <-c.stop:
+			return
+		case frame, ok := <-c.queuedEvents:
+			if !ok {
+				return
+			}
+			select {
+			case c.events <- frame:
+				c.bytes.release(cap(frame))
+			case <-c.stop:
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) readLoop() {
 	defer close(c.readDone)
-	defer close(c.events)
+	defer close(c.queuedEvents)
 	// After a fatal decode/queue error, keep draining until the supervisor reaps the group.
 	defer io.Copy(io.Discard, c.stdout)
 	reader := bufio.NewReaderSize(c.stdout, 64<<10)
-	decoder := frameDecoder{physical: maxFrame, logical: maxLogical}
+	decoder := frameDecoder{physical: maxFrame, logical: maxLogical, budget: &c.bytes}
 	ready := false
 	for {
-		data, err := readLine(reader, decoder.physical)
+		data, err := readLineBudget(reader, decoder.physical, &c.bytes)
 		if err != nil {
 			select {
 			case <-c.stop:
 				return
 			default:
+			}
+			if errors.Is(err, errQueueOverflow) {
+				c.queueOverflow(err)
+				return
 			}
 			if errors.Is(err, errProtocol) {
 				c.protocolFailure(errProtocol)
@@ -499,8 +559,17 @@ func (c *Client) readLoop() {
 		}
 		frame, err := decoder.push(data)
 		if err != nil {
-			c.protocolFailure(errProtocol)
+			c.bytes.release(cap(data))
+			c.bytes.release(cap(decoder.data))
+			if errors.Is(err, errQueueOverflow) {
+				c.queueOverflow(err)
+			} else {
+				c.protocolFailure(errProtocol)
+			}
 			return
+		}
+		if decoder.reassembled || frame == nil {
+			c.bytes.release(cap(data))
 		}
 		if frame == nil {
 			continue
@@ -508,9 +577,11 @@ func (c *Client) readLoop() {
 		env, err := decodeObject(frame)
 		if err != nil {
 			c.protocolFailure(errProtocol)
+			c.bytes.release(cap(frame))
 			return
 		}
 		if !ready {
+			c.bytes.release(cap(frame))
 			var announcement struct {
 				ProtocolVersion int   `json:"protocolVersion"`
 				Versions        []int `json:"supportedProtocolVersions"`
@@ -538,11 +609,13 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if env.Type == "ready" {
+			c.bytes.release(cap(frame))
 			c.protocolFailure(errProtocol)
 			return
 		}
 		c.logLifecycle(env, "received")
 		if env.Type == "response" {
+			c.bytes.release(cap(frame))
 			if env.Success == nil || env.Command == "" {
 				c.logLifecycle(env, "rejected")
 				c.protocolFailure(errors.New("omp: malformed RPC response"))
@@ -581,13 +654,15 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if env.Type == "command_output" && c.captureMetadata(frame) {
+			c.bytes.release(cap(frame))
 			continue
 		}
 		select {
-		case c.events <- json.RawMessage(frame):
-			// A buffered send confirms queueing, not consumption by the bridge.
+		case c.queuedEvents <- json.RawMessage(frame):
+			// The receiver, not this buffered send, releases byte credit.
 			c.logLifecycle(env, "event_queued")
 		default:
+			c.bytes.release(cap(frame))
 			c.logLifecycle(env, "rejected")
 			c.queueOverflow(errors.New("omp: event queue overflow; execution state uncertain"))
 			return
@@ -596,17 +671,37 @@ func (c *Client) readLoop() {
 }
 
 func readLine(reader *bufio.Reader, limit int) ([]byte, error) {
+	return readLineBudget(reader, limit, nil)
+}
+
+func readLineBudget(reader *bufio.Reader, limit int, budget *byteBudget) ([]byte, error) {
 	var data []byte
 	for {
 		part, err := reader.ReadSlice('\n')
-		if len(data)+len(part) > limit {
+		if len(part) > limit-len(data) {
+			budget.release(cap(data))
 			return nil, errProtocol
+		}
+		needed := len(data) + len(part)
+		if needed > cap(data) {
+			capacity := max(needed, 2*cap(data))
+			if capacity > limit {
+				capacity = limit
+			}
+			if !budget.reserve(capacity - cap(data)) {
+				budget.release(cap(data))
+				return nil, errQueueOverflow
+			}
+			replacement := make([]byte, len(data), capacity)
+			copy(replacement, data)
+			data = replacement
 		}
 		data = append(data, part...)
 		if err == nil {
 			return data[:len(data)-1], nil
 		}
 		if err != bufio.ErrBufferFull {
+			budget.release(cap(data))
 			return nil, err
 		}
 	}
@@ -617,9 +712,12 @@ type frameDecoder struct {
 	id                  string
 	count, length, next int
 	data                []byte
+	budget              *byteBudget
+	reassembled         bool
 }
 
 func (d *frameDecoder) push(data []byte) ([]byte, error) {
+	d.reassembled = false
 	env, err := decodeObject(data)
 	if err != nil {
 		return nil, err
@@ -648,6 +746,9 @@ func (d *frameDecoder) push(data []byte) ([]byte, error) {
 		if *chunk.Index != 0 {
 			return nil, errProtocol
 		}
+		if !d.budget.reserve(chunk.Length) {
+			return nil, errQueueOverflow
+		}
 		d.id, d.count, d.length, d.next = chunk.ID, chunk.Count, chunk.Length, 0
 		d.data = make([]byte, 0, chunk.Length)
 	}
@@ -665,8 +766,10 @@ func (d *frameDecoder) push(data []byte) ([]byte, error) {
 	result := d.data
 	d.id = ""
 	d.data = nil
+	d.reassembled = true
 	logical, err := decodeObject(result)
 	if err != nil || logical.Type == "rpc_chunk" {
+		d.budget.release(cap(result))
 		return nil, errProtocol
 	}
 	return result, nil

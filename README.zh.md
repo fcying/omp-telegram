@@ -200,6 +200,8 @@ Bridge 会从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BOT_T
 
 以上命令都可用于普通私聊和 topic. bot 菜单, 按钮和服务提示使用英语; 可以用任意语言提问, bridge 不翻译模型回复.
 
+在群组 topic 中, 所有获准使用 bot 的用户共享该 topic 的 OMP session 和 workspace, 包括上下文及命令效果. bot 的用户白名单不限制 Telegram 群成员查看消息: 能查看该 topic 的其他成员也能看到 bot 回复和导出文件. 敏感任务只应在可信的群组 topic 中运行.
+
 ### Session 导出
 
 `/export` 会列出当前 workspace 中保存的 OMP session, 并将选中的原生 `.jsonl` session 文件发送到 Telegram. 默认格式是 OMP 原始 main-session JSONL. `/export html` 则将选中的 session 导出为 standalone HTML viewer.
@@ -221,6 +223,8 @@ omp --resume /path/to/session.jsonl
 
 导出的 session 文件可能包含敏感的 conversation, tool, command 和 path 数据, 包括 prompts, assistant responses, tool calls, tool results, 本地路径, 命令输出, 源码片段以及意外出现在 transcript 中的 secrets. 只应将这些文件发送到可信的 Telegram 对话. 不会额外要求二次确认; 用户输入 `/export` 本身就是明确确认.
 
+在群组 topic 中, `/export` 将 session 文件发送到该 topic, 而不是私聊. 能访问该 topic 的其他群成员即使没有操作 bot 的权限, 也可能下载该文件.
+
 ### 常见问题与限制
 
 | 现象 | 检查项 |
@@ -232,6 +236,10 @@ omp --resume /path/to/session.jsonl
 | 数据库结构不支持 | 备份数据, 使用受支持的数据库或新数据目录; 不要手动修改版本号. |
 
 不支持语音/转写, 自动创建 topic, 以及任意终端或编辑器对话框. 部分确认和选择流程可以使用 Telegram 按钮, 但不是所有交互式工具审批都能远程完成. bridge 从不自动批准工具操作.
+
+资源上限: RPC client 的帧重组和待消费事件共用 64 MiB 字节预算. bridge 对任务完成前累计的 assistant 文本设置 4 MiB 上限. terminal event 到达前超过任一预算会使 runtime 失败, 任务结果为 uncertain, 且不会自动重放. 如果已确认完成的任务仅因最终回复超出展示预算, 任务仍为 done: Telegram 最多收到 32 条、合计 1 MiB 的回复文本, 并明确提示截断. bridge 不会截断 OMP 原生 session 历史.
+
+RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资源策略: 即使某个大 frame 符合协议, 同时占用预算的 physical chunk 或排队事件仍可能使其被拒绝. 同一条 assistant message 的 streamed delta 和 `message_end` 完整文本只计费一次; 保留的 stream buffer 自身也受 4 MiB 上限约束.
 
 ## Progress UI
 
@@ -247,7 +255,7 @@ omp --resume /path/to/session.jsonl
 
 `/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
 
-Progress 是 best-effort UI, 不影响最终回复的持久化交付.
+Progress 属于 best-effort UI, 不影响最终回复的持久化交付. 进度消息删除失败时, daemon 运行期间每分钟重试一次; Telegram 明确返回永久拒绝时放弃删除.
 
 Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以及进程输出.
 
