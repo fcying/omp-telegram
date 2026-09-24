@@ -139,6 +139,71 @@ func TestCycleRolesAppliesOrderedConfigOverlays(t *testing.T) {
 	}
 }
 
+func TestCycleRolesEnvironmentPoliciesAndExplicitOverlays(t *testing.T) {
+	t.Setenv("OMP_TEST_CONFIG_OVERLAYS", "1")
+	root := t.TempDir()
+	parentOverlay := filepath.Join(root, "parent.json")
+	explicitOverlay := filepath.Join(root, "explicit.json")
+	if err := os.WriteFile(parentOverlay, []byte(`{"cycleOrder":["parent"],"modelRoles":{"parent":"fixture/parent:low"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(explicitOverlay, []byte(`{"cycleOrder":["explicit"],"modelRoles":{"explicit":"fixture/explicit:high"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PI_CONFIG_FILES", parentOverlay)
+	policy, err := NewEnvironment("allowlist", []string{"OMP_TEST_CONFIG_OVERLAYS"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Config{Binary: exe, CWD: root, Environment: policy}
+	roles, err := CycleRoles(context.Background(), base)
+	wantDefault := []ModelRole{{Role: "slow", Selector: "fixture/deep:high"}, {Role: "default"}, {Role: "smol", Selector: "fixture/quick:low"}}
+	if err != nil || !reflect.DeepEqual(roles, wantDefault) {
+		t.Fatalf("allowlist roles with no explicit overlay = %#v, error = %v", roles, err)
+	}
+	base.Args = []string{"--config", explicitOverlay}
+	roles, err = CycleRoles(context.Background(), base)
+	wantExplicit := []ModelRole{{Role: "explicit", Selector: "fixture/explicit:high"}}
+	if err != nil || !reflect.DeepEqual(roles, wantExplicit) {
+		t.Fatalf("allowlist roles with explicit overlay = %#v, error = %v", roles, err)
+	}
+	denied, err := NewEnvironment("denylist", nil, []string{"PI_CONFIG_FILES"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.Environment = denied
+	base.Args = nil
+	roles, err = CycleRoles(context.Background(), base)
+	if err != nil || !reflect.DeepEqual(roles, wantDefault) {
+		t.Fatalf("denylisted parent overlay changed roles: %#v, error = %v", roles, err)
+	}
+	base.Args = []string{"--config", explicitOverlay}
+	roles, err = CycleRoles(context.Background(), base)
+	if err != nil || !reflect.DeepEqual(roles, wantExplicit) {
+		t.Fatalf("explicit overlay after denied parent = %#v, error = %v", roles, err)
+	}
+	allowed, err := NewEnvironment("allowlist", []string{"OMP_TEST_CONFIG_OVERLAYS", "PI_CONFIG_FILES"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.Environment = allowed
+	base.Args = nil
+	roles, err = CycleRoles(context.Background(), base)
+	wantParent := []ModelRole{{Role: "parent", Selector: "fixture/parent:low"}}
+	if err != nil || !reflect.DeepEqual(roles, wantParent) {
+		t.Fatalf("allowlisted parent overlay = %#v, error = %v", roles, err)
+	}
+	base.Args = []string{"--config", explicitOverlay}
+	roles, err = CycleRoles(context.Background(), base)
+	if err != nil || !reflect.DeepEqual(roles, wantExplicit) {
+		t.Fatalf("explicit overlay after allowlisted parent = %#v, error = %v", roles, err)
+	}
+}
+
 func TestCycleRolesRejectsInvalidConfigWithoutFallback(t *testing.T) {
 	t.Setenv("OMP_TEST_CONFIG_OVERLAYS", "1")
 	t.Setenv("PI_CONFIG_FILES", "")

@@ -304,7 +304,7 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 程序主动失效也统一使用该有界清理队列: 取消 resume 列表、原生 UI 取消、关闭或替换实例以及任务终结都会删除适用的 token, 并把已知菜单 message ID 加入清理队列. 任务终结会保留当前 generation 的独立 `/queue` viewer token, 因而与 dispatch 竞争的 callback 可以重新扫描实时 queue 并返回 `Task is no longer queued.`, 不会中止 active task. model、thinking、fast、compact、new 和原生 UI 选择属于当前运行实例的 runtime-bound confirmation, 会阻止正常空闲释放; 它们原有的过期机制仍会删除 token, 并在需要时取消当前 generation 的原生 UI. 独立的 `/resume` 菜单不依赖当前运行实例, 可以在 runtime 释放后继续有效. 明确的 runtime teardown 仍会使旧 runtime 菜单失效, `/close` 和 worker teardown 则清理全部 confirmation. 清理仍是尽力而为, worker context 已取消或队列溢出时不保证移除按钮.
 
-`/model` 在 worker 工作目录通过只读 `omp config get ... --json` 子进程读取 `cycleOrder` 和 `modelRoles`. 按参数顺序把 `--config` 文件追加到查询子进程继承的 `PI_CONFIG_FILES`, 由 OMP 自己合并覆盖配置. 支持两种参数写法, 工作目录相对路径和 `~/` 展开. 包含环境列表分隔符的路径通过继承的只读文件描述符传递, 避免被拆成不同文件. 不修改配置文件或父进程环境. 不通过切换模型枚举角色, 不重复实现 selector 解析. 选择角色时发送原生本地命令 `/model @role`, 并用 `get_state` 验证成功后的模型标识; 不转发原始命令输出. 切换要求原生与 bridge 都空闲且 bridge 队列为空. 尚不支持的 `--profile`, `--smol`, `--slow`, `--plan` 覆盖项仍会禁用角色菜单, 但可手动指定模型. 原生角色命令结果不确定时使 client 失效.
+`/model` 在 worker 工作目录通过只读 `omp config get ... --json` 子进程读取 `cycleOrder` 和 `modelRoles`. 按参数顺序把 `--config` 文件追加到查询子进程被允许继承的父进程 `PI_CONFIG_FILES`, 由 OMP 自己合并覆盖配置; allowlist 模式下未列入 `allow` 的父进程变量视为不存在, 显式 `omp.args` overlay 仍会生效. 支持两种参数写法, 工作目录相对路径和 `~/` 展开. 包含环境列表分隔符的路径通过继承的只读文件描述符传递, 避免被拆成不同文件. 不修改配置文件或父进程环境. 不通过切换模型枚举角色, 不重复实现 selector 解析. 选择角色时发送原生本地命令 `/model @role`, 并用 `get_state` 验证成功后的模型标识; 不转发原始命令输出. 切换要求原生与 bridge 都空闲且 bridge 队列为空. 尚不支持的 `--profile`, `--smol`, `--slow`, `--plan` 覆盖项仍会禁用角色菜单, 但可手动指定模型. 原生角色命令结果不确定时使 client 失效.
 
 `/thinking` 复用模型选择的 owner/generation/过期与空闲检查. 只有合法按钮被消费后才发送 `set_thinking_level`, 随后读取 `get_state.thinkingLevel`, 报告原生调整后的实际等级而不是回显请求值. 通过 OMP 现有 RPC 修改会话状态, 不编辑 OMP 配置文件, 不启动 agent turn.
 
@@ -353,12 +353,26 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 ## 进程与文件安全
 
 - 使用 argv 直接启动, 不经过 shell. 显式 `omp.args` 不允许覆盖桥接管理的 RPC 模式, cwd 或会话生命周期选项.
-- OMP RPC、ACP、模型查询、render、HTML export 和 doctor 探测继承环境时移除 `OMP_TELEGRAM_BOT_TOKEN`; 显式 OMP 配置变量保持原样. 此措施防止默认 bridge token 意外进入子进程环境, 不阻止访问同用户进程或其他 token 副本.
+- OMP RPC、ACP、模型查询、render、HTML export 和 doctor 探测使用 `[omp.environment]`: 默认 `mode = "denylist"`, 传递当前及未来新增的父进程环境变量, 但始终过滤 `OMP_TELEGRAM_BOT_TOKEN`. 可选 `deny = ["SOME_API_KEY"]` 从 OMP 子进程及用于准备 OMP 命令的父进程变量读取中排除指定变量, 变量仍留在 bridge 环境中; 如果 OMP 的 provider 需要被排除的 key, 则无法使用该 key 认证. 显式 `mode = "allowlist"` 改用必填的 `allow` 名单, 仅传递已列出且存在的父进程变量; `allow = []` 不传递任何变量. 两种模式即使另一种名单为空也拒绝混用. bot token 始终过滤且无需列入 `deny`: 列入 `allow` 会被拒绝, 列入 `deny` 则无额外效果. 显式 `omp.args` 配置 overlay 仍然生效, 不会因此放行其他父进程变量. 这不是沙箱: 省略 `HOME` 不会阻止访问文件系统、同用户进程或其他 token 副本.
 - 正常关闭先关闭 stdin 并继续读取输出, 必要时升级到进程组终止. 每个子进程只有一个 `Wait` 所有者.
 - Linux RPC/ACP 启动使用父死亡 SIGTERM. Linux 将此信号关联到创建子进程的 OS 线程, 因此线程锁定到 `Wait` 完成, 每个存活原生子进程占一个锁定线程.
 - 父死亡信号不是整个进程树 containment. 忽略信号, 后代残留, 脱离进程组或清除父死亡设置的程序, 仍需要部署层边界. 项目不强制 systemd/supervisor 配置.
 - 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `storage.data_dir/attachments/outbox/` 私有快照后入队. outbox state 持久化为任意终态后 best-effort 删除快照, 包括交付失败; workspace 源文件保持不变.
 - Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
+
+以下是两种互斥配置, 不能在同一个 TOML 文件中重复定义该 table:
+
+```toml
+[omp.environment]
+mode = "denylist"
+deny = ["SOME_API_KEY"]
+```
+
+```toml
+[omp.environment]
+mode = "allowlist"
+allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
+```
 
 ## 配置与路径契约
 
@@ -366,9 +380,9 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 
 根目录 `config.toml` 只内嵌一份. 仅当隐式默认文件不存在时才使用内嵌配置, 显式缺失文件及不可读/无效文件均报错.
 
-桥接配置使用分组 TOML table: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]` 和可选 `[logging.component_levels]`. 根级 flat 字段, 原 `[log_component_levels]` table, 放错 table 的字段以及 flat/grouped 混合布局都会拒绝. 这是有意的 breaking cutover: 升级前必须手动迁移现有私有配置; 程序不会自动重写.
+桥接配置使用分组 TOML table: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]` 以及可选 `[omp.environment]` 和 `[logging.component_levels]`. 根级 flat 字段, 原 `[log_component_levels]` table, 放错 table 的字段以及 flat/grouped 混合布局都会拒绝. 这是有意的 breaking cutover: 升级前必须手动迁移现有私有配置; 程序不会自动重写.
 
-环境变量在 TOML 解析后对每个字符串值只展开一次, 包括 `logging.level`、`logging.format` 以及 `[logging.component_levels]` 中的值. 组件名会先按六个支持的名称校验, 再展开覆盖值. `OMP_TELEGRAM_ARGS`、`OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 的可选引用可以未设置. 内嵌配置中的 `telegram.progress_mode` 读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空、未设置或非法时回退到 `summary`. 不读取专用日志环境变量. `logging.level` 默认 `info`, `logging.format` 默认 `text`, 组件覆盖只能使用六个固定组件名. `omp.args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 omp 自身默认值.
+环境变量在 TOML 解析后对配置字符串只展开一次, `[omp.environment]` 的模式和变量名除外, 它们均为字面值. 组件名会先按六个支持的名称校验, 再展开覆盖值. `OMP_TELEGRAM_ARGS`、`OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 的可选引用可以未设置. 内嵌配置中的 `telegram.progress_mode` 读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空、未设置或非法时回退到 `summary`. 不读取专用日志环境变量. `logging.level` 默认 `info`, `logging.format` 默认 `text`, 组件覆盖只能使用六个固定组件名. `omp.args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 OMP 自身模型与审批设置. `[omp.environment]` 默认使用无额外排除项的 denylist 模式; allowlist 模式必须显式提供可为空的有效 POSIX 变量名 `allow` 名单, 即使为空也拒绝 `deny`. denylist 模式则拒绝 `allow` (即使为空), 可选提供可为空的有效 POSIX 变量名 `deny` 名单.
 
 ## 开发与发布
 

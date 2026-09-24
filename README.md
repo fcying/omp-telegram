@@ -70,6 +70,9 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 binary = "omp"
 args = "${OMP_TELEGRAM_ARGS}"
 
+[omp.environment]
+mode = "denylist"
+
 [storage]
 data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
@@ -103,7 +106,7 @@ Configuration is selected in this order:
 
 An explicitly selected missing file, unreadable file, or invalid TOML causes startup to fail. Configuration uses the grouped tables shown above; legacy flat fields and mixed layouts are not accepted.
 
-Strings support `$VAR` and `${VAR}`. Use `$$` for a literal dollar sign. Environment references are expanded once after TOML parsing. The default references to `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset. An empty or invalid `telegram.progress_mode` falls back to `summary`. The token and allowlists must be provided. `.env` files are not loaded automatically.
+Configuration strings support `$VAR` and `${VAR}` except for `[omp.environment]` mode and `allow`/`deny` variable names, which are literal. Use `$$` for a literal dollar sign. Environment references are expanded once after TOML parsing. The default references to `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset. An empty or invalid `telegram.progress_mode` falls back to `summary`. The token and allowlists must be provided. `.env` files are not loaded automatically.
 
 Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An update is accepted only when both the sender and chat match their allowlists. Private-chat IDs normally match the user ID; group IDs are usually negative numbers.
 
@@ -116,6 +119,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Additional OMP arguments. Defaults to optional `OMP_TELEGRAM_ARGS`; an explicit empty string disables them. |
+| `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service environment variables except the bot token; optional `deny = [...]` keeps named variables in the bridge but removes them from OMP children (`[]` is valid). `mode = "allowlist"` requires `allow = [...]` and passes only listed, present parent variables (`[]` is valid). Do not set `allow` in denylist mode or `deny` in allowlist mode, even as `[]`. |
 | `storage.data_dir` | Database, lock, and outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
 | `storage.database_retention_days` | How long terminal bridge message metadata is retained. Default: `90`; `0` disables automatic cleanup. |
@@ -127,6 +131,28 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `[logging.component_levels]` | Optional per-component levels for `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. |
 
 `omp.args` supports shell-style quoting for argument grouping, but the value is passed directly and is never executed by a shell. OMP configuration overlays remain OMP configuration; the bridge does not modify your models, credentials, tools, or approval policy.
+
+To explicitly restrict OMP children, configure the table like this:
+
+```toml
+[omp.environment]
+mode = "allowlist"
+allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
+```
+
+Names in `allow` are literal POSIX environment variable names, not `$VAR` references. Only variables already set in the service environment are passed; missing names are omitted, not filled with empty values. Provider credentials must be individually opted in if OMP needs them; include proxy variables such as `HTTPS_PROXY` or locale variables such as `LANG` when required. The policy applies to OMP RPC and ACP sessions and auxiliary model queries, render, HTML export, and doctor commands. Explicit `omp.args` configuration overlays still work in allowlist mode, without implicitly adding their environment variables to `allow`. A minimal list can prevent OMP, its runtime, or a provider from working; include required runtime variables yourself. This limits child process environment inheritance, not access to `HOME`, filesystem files, other same-user processes, or credentials in OMP configuration; it is not a sandbox.
+
+Allowlist mode rejects `deny`, even an empty array; denylist mode rejects `allow`, even an empty array. Listing `OMP_TELEGRAM_BOT_TOKEN` in `allow` is rejected.
+
+To keep a provider key in the bridge without passing it to OMP, use denylist mode instead:
+
+```toml
+[omp.environment]
+mode = "denylist"
+deny = ["SOME_API_KEY"]
+```
+
+`deny` names are literal POSIX environment variable names, not `$VAR` references. They remain set in the bridge but are omitted from OMP child environments and parent-variable lookups used to prepare OMP commands. If OMP itself needs a denied provider key, it cannot authenticate using that key. The bot token is always removed from OMP children regardless of mode or `deny` and need not be listed.
 
 After changing configuration or its environment, restart the service. For background operation, use a process manager and explicitly provide the environment and a `PATH` containing both omp and its runtime.
 
@@ -154,7 +180,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 `--check` validates local configuration, finds the omp executable, and creates configured data and workspace directories. It does not test Telegram or model authentication. The final command runs in the foreground; Ctrl-C stops it.
 
-The bridge removes `OMP_TELEGRAM_BOT_TOKEN` from OMP child-process environments, including auxiliary commands. Other environment variables remain available to OMP; do not put the bot token in another inherited variable or OMP configuration. This is not filesystem or same-user process isolation.
+The bridge always removes `OMP_TELEGRAM_BOT_TOKEN` from OMP child-process environments, including auxiliary commands; listing it in allowlist `allow` is rejected, while adding it to denylist `deny` has no additional effect. By default, all other present and future environment variables remain available to OMP; do not put the bot token in another inherited variable or OMP configuration. This is not filesystem or same-user process isolation.
 
 ### Start a session
 

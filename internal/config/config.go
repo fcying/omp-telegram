@@ -26,6 +26,7 @@ type Config struct {
 	WorkspaceRoot         string
 	OMP                   string
 	OMPArgs               []string
+	OMPEnvironment        omp.Environment
 	DataDir               string
 	MaxWorkers            int
 	QueueCapacity         int
@@ -59,8 +60,15 @@ type telegramFileConfig struct {
 }
 
 type ompFileConfig struct {
-	Binary string `toml:"binary"`
-	Args   string `toml:"args"`
+	Binary      string                   `toml:"binary"`
+	Args        string                   `toml:"args"`
+	Environment ompEnvironmentFileConfig `toml:"environment"`
+}
+
+type ompEnvironmentFileConfig struct {
+	Mode  string    `toml:"mode"`
+	Allow *[]string `toml:"allow"`
+	Deny  *[]string `toml:"deny"`
 }
 
 type storageFileConfig struct {
@@ -104,8 +112,9 @@ func load(path, baseDir string) (Config, error) {
 			Token: "${OMP_TELEGRAM_BOT_TOKEN}",
 		},
 		OMP: ompFileConfig{
-			Binary: "omp",
-			Args:   "${OMP_TELEGRAM_ARGS}",
+			Binary:      "omp",
+			Args:        "${OMP_TELEGRAM_ARGS}",
+			Environment: ompEnvironmentFileConfig{Mode: "denylist"},
 		},
 		Storage: storageFileConfig{
 			WorkspaceRoot:         "${OMP_TELEGRAM_WORKSPACE_ROOT}",
@@ -200,6 +209,28 @@ func load(path, baseDir string) (Config, error) {
 	}
 	if err = omp.ValidateArgs(c.OMPArgs); err != nil {
 		return c, err
+	}
+	mode := raw.OMP.Environment.Mode
+	var allow []string
+	if raw.OMP.Environment.Allow != nil {
+		allow = *raw.OMP.Environment.Allow
+		if allow == nil {
+			allow = []string{}
+		}
+	}
+	var deny []string
+	if raw.OMP.Environment.Deny != nil {
+		deny = *raw.OMP.Environment.Deny
+		if deny == nil {
+			deny = []string{}
+		}
+	}
+	if mode == "allowlist" && allow == nil {
+		return c, errors.New("omp.environment.allow is required in allowlist mode")
+	}
+	c.OMPEnvironment, err = omp.NewEnvironment(mode, allow, deny)
+	if err != nil {
+		return c, errors.New("omp.environment has an invalid mode, variable name, or policy combination")
 	}
 	c.Token, c.OMP, c.DataDir = raw.Telegram.Token, raw.OMP.Binary, raw.Storage.DataDir
 	c.LogLevel, c.LogFormat, c.LogComponentLevels = raw.Logging.Level, raw.Logging.Format, raw.Logging.ComponentLevels

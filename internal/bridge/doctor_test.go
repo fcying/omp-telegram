@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
@@ -28,7 +29,7 @@ func TestCheckDoctorOMPFiltersBotToken(t *testing.T) {
 	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkDoctorOMP(context.Background(), binary); err != nil {
+	if err := checkDoctorOMP(context.Background(), binary, omp.Environment{}); err != nil {
 		t.Fatal("doctor version check failed")
 	}
 	data, err := os.ReadFile(capture)
@@ -37,6 +38,33 @@ func TestCheckDoctorOMPFiltersBotToken(t *testing.T) {
 	}
 	if string(data) != "false\npreserved-runtime-setting\npreserved-telegram-fixture\n" {
 		t.Fatal("doctor version child inherited the bot token or lost non-secret OMP environment")
+	}
+}
+
+func TestCheckDoctorOMPRestrictsEnvironment(t *testing.T) {
+	root := t.TempDir()
+	capture := filepath.Join(root, "environment")
+	t.Setenv("OMP_TEST_CAPTURE", capture)
+	t.Setenv("OMP_TEST_VISIBLE", "visible")
+	t.Setenv("OMP_TEST_PRIVATE", "private")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "fixture-only-not-a-credential")
+	binary := filepath.Join(root, "omp")
+	script := "#!/bin/sh\n" +
+		"if [ \"${OMP_TEST_PRIVATE+x}\" = x ] || [ \"${OMP_TELEGRAM_BOT_TOKEN+x}\" = x ]; then exit 1; fi\n" +
+		"printf '%s' \"$OMP_TEST_VISIBLE\" > \"$OMP_TEST_CAPTURE\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	environment, err := omp.NewEnvironment("allowlist", []string{"OMP_TEST_CAPTURE", "OMP_TEST_VISIBLE"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkDoctorOMP(context.Background(), binary, environment); err != nil {
+		t.Fatalf("doctor process received a forbidden variable: %v", err)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil || string(data) != "visible" {
+		t.Fatalf("doctor environment capture = %q, error = %v", data, err)
 	}
 }
 
@@ -64,7 +92,7 @@ func TestDoctorChecksReportSafeState(t *testing.T) {
 		doctorGetMe, doctorRunOMP, doctorStatfs = oldGetMe, oldRunOMP, oldStatfs
 	})
 	doctorGetMe = func(context.Context, *telegram.Client) error { return nil }
-	doctorRunOMP = func(context.Context, string) error { return nil }
+	doctorRunOMP = func(context.Context, string, omp.Environment) error { return nil }
 	doctorStatfs = func(string) (uint64, error) { return 2 << 30, nil }
 
 	checks := runDoctorChecks(context.Background(), config.Config{
@@ -150,7 +178,7 @@ func TestDoctorRunsAsyncRejectsDuplicateAndFencesRuntime(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	doctorRunOMP = func(context.Context, string) error { return nil }
+	doctorRunOMP = func(context.Context, string, omp.Environment) error { return nil }
 	doctorStatfs = func(string) (uint64, error) { return 2 << 30, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -258,7 +286,7 @@ func TestDoctorSnapshotsBindingBeforeAsyncWork(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	doctorRunOMP = func(context.Context, string) error { return nil }
+	doctorRunOMP = func(context.Context, string, omp.Environment) error { return nil }
 	doctorStatfs = func(string) (uint64, error) { return 2 << 30, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -320,7 +348,7 @@ func TestDoctorTimeoutCanRetry(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	doctorRunOMP = func(ctx context.Context, _ string) error {
+	doctorRunOMP = func(ctx context.Context, _ string, _ omp.Environment) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -368,7 +396,7 @@ func TestDoctorTimeoutCanRetry(t *testing.T) {
 
 	doctorTimeout = time.Second
 	doctorGetMe = func(context.Context, *telegram.Client) error { return nil }
-	doctorRunOMP = func(context.Context, string) error { return nil }
+	doctorRunOMP = func(context.Context, string, omp.Environment) error { return nil }
 	w.runDoctor()
 	select {
 	case result = <-w.doctorResults:
@@ -417,7 +445,7 @@ func TestDoctorStopsChecksAfterCancellation(t *testing.T) {
 		cancel()
 		return nil
 	}
-	doctorRunOMP = func(context.Context, string) error {
+	doctorRunOMP = func(context.Context, string, omp.Environment) error {
 		t.Fatal("doctor continued after cancellation")
 		return nil
 	}

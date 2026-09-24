@@ -563,7 +563,7 @@ func TestHTMLSnapshotTimeoutRemovesTarget(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := snapshotHTML(ctx, binary, input, spool, "omp-session-test.html"); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := snapshotHTML(ctx, binary, input, spool, "omp-session-test.html", omp.Environment{}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timed out HTML snapshot error = %v", err)
 	}
 	entries, err := os.ReadDir(spool)
@@ -599,7 +599,7 @@ func TestHTMLSnapshotRequiresFinalSpoolDirectorySync(t *testing.T) {
 		}
 		return syncErr
 	}
-	if _, err := snapshotHTML(context.Background(), binary, source, spool, "omp-session-test.html"); !errors.Is(err, syncErr) {
+	if _, err := snapshotHTML(context.Background(), binary, source, spool, "omp-session-test.html", omp.Environment{}); !errors.Is(err, syncErr) {
 		t.Fatalf("HTML snapshot sync failure = %v, want %v", err, syncErr)
 	}
 	if calls != 2 {
@@ -627,7 +627,7 @@ func TestHTMLSnapshotUsesStableSourceSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HTML_SOURCE", source)
-	file, err := snapshotHTML(context.Background(), binary, source, spool, "omp-session-test.html")
+	file, err := snapshotHTML(context.Background(), binary, source, spool, "omp-session-test.html", omp.Environment{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,6 +638,35 @@ func TestHTMLSnapshotUsesStableSourceSnapshot(t *testing.T) {
 	}
 	if data, err := os.ReadFile(source); err != nil || string(data) == string(original) {
 		t.Fatalf("source mutation did not occur in fixture: data=%q, error=%v", data, err)
+	}
+}
+
+func TestHTMLSnapshotRestrictsEnvironment(t *testing.T) {
+	root, spool := t.TempDir(), t.TempDir()
+	source := filepath.Join(root, "session.jsonl")
+	if err := os.WriteFile(source, []byte("native\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "omp-export")
+	script := "#!/bin/sh\nprintf '%s|%s|%s' \"${OMP_TEST_VISIBLE-unset}\" \"${OMP_TEST_PRIVATE-unset}\" \"${OMP_TELEGRAM_BOT_TOKEN-unset}\" > \"$3\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TEST_VISIBLE", "visible")
+	t.Setenv("OMP_TEST_PRIVATE", "private")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "fixture-only-not-a-credential")
+	environment, err := omp.NewEnvironment("allowlist", []string{"OMP_TEST_VISIBLE"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := snapshotHTML(context.Background(), binary, source, spool, "omp-session-test.html", environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Path)
+	data, err := os.ReadFile(file.Path)
+	if err != nil || string(data) != "visible|unset|unset" {
+		t.Fatalf("HTML exporter environment = %q, error = %v", data, err)
 	}
 }
 
@@ -657,7 +686,7 @@ func TestHTMLSnapshotRejectsSymlinkedSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HTML_EXPORT_MARKER", marker)
-	if _, err := snapshotHTML(context.Background(), binary, link, spool, "omp-session-test.html"); err == nil {
+	if _, err := snapshotHTML(context.Background(), binary, link, spool, "omp-session-test.html", omp.Environment{}); err == nil {
 		t.Fatal("HTML snapshot accepted a symlinked source")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -694,7 +723,7 @@ func TestHTMLSnapshotStopsExporterWhenOutputGrowsTooLarge(t *testing.T) {
 	t.Setenv("HTML_EXPORT_COMPLETED", marker)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := snapshotHTMLWithLimit(ctx, binary, source, spool, "omp-session-test.html", 32); !errors.Is(err, errSessionExportTooLarge) {
+	if _, err := snapshotHTMLWithLimit(ctx, binary, source, spool, "omp-session-test.html", 32, omp.Environment{}); !errors.Is(err, errSessionExportTooLarge) {
 		t.Fatalf("growing HTML export error = %v, want %v", err, errSessionExportTooLarge)
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -1167,7 +1196,7 @@ func TestHTMLSnapshotRejectsInvalidOutputAndCleansTarget(t *testing.T) {
 			if err := os.WriteFile(binary, []byte(tc.script), 0700); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := snapshotHTML(context.Background(), binary, input, spool, "omp-session-test.html"); err == nil || tc.large && !errors.Is(err, errSessionExportTooLarge) {
+			if _, err := snapshotHTML(context.Background(), binary, input, spool, "omp-session-test.html", omp.Environment{}); err == nil || tc.large && !errors.Is(err, errSessionExportTooLarge) {
 				t.Fatalf("invalid HTML output error = %v", err)
 			}
 			entries, err := os.ReadDir(spool)

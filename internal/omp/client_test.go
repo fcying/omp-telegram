@@ -235,10 +235,137 @@ func TestOMPChildProcessesSanitizeEnvironment(t *testing.T) {
 	if err := os.WriteFile(exportBinary, []byte(exportScript), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportHTML(ctx, exportBinary, input, output); err != nil {
+	if err := ExportHTML(ctx, exportBinary, input, output, Environment{}); err != nil {
 		t.Fatal("HTML export child failed")
 	}
 	assertChildEnvironment(t, capture, []string{baseConfig})
+}
+
+func TestOMPChildProcessesUseAllowlistEnvironment(t *testing.T) {
+	root := t.TempDir()
+	capture := filepath.Join(root, "child-environment")
+	t.Setenv("OMP_TEST_CHILD_ENV_RESULT", capture)
+	t.Setenv("OMP_TEST_OMP_ENV", "preserved-runtime-setting")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_FLAG", "excluded-parent-setting")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "secret")
+	t.Setenv("PI_CONFIG_FILES", filepath.Join(root, "excluded-parent-config.json"))
+	policy, err := NewEnvironment("allowlist", []string{"OMP_TEST_CHILD_ENV_RESULT", "OMP_TEST_OMP_ENV"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	assertCaptured := func() {
+		t.Helper()
+		data, err := os.ReadFile(capture)
+		if err != nil {
+			t.Fatalf("native child did not record environment: %v", err)
+		}
+		if got := string(data); got != "false\npreserved-runtime-setting\n\n\n" {
+			t.Fatalf("native child received unlisted parent environment: %q", got)
+		}
+		if err := os.Remove(capture); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := Start(ctx, Config{Binary: exe, Environment: policy}, testRPCLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertCaptured()
+	listCfg := listFixture(t, "normal")
+	listCfg.Environment = policy
+	writeListPage(t, listCfg, 0, []map[string]any{}, "")
+	if _, err := ListSessions(ctx, listCfg); err != nil {
+		t.Fatal(err)
+	}
+	assertCaptured()
+	cwd := filepath.Join(root, "workspace")
+	file := filepath.Join(cwd, "session.jsonl")
+	writeSessionHeader(t, file, "native-id", cwd)
+	renderBinary := filepath.Join(root, "omp-render")
+	renderScript := "#!/bin/sh\n" + childEnvironmentCaptureScript() +
+		"printf 'session  %s\\n' \"$PWD/session.jsonl\" >&2\n"
+	if err := os.WriteFile(renderBinary, []byte(renderScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ResolveSessionPath(ctx, Config{Binary: renderBinary, CWD: cwd, Environment: policy}, "native-id"); err != nil || got != file {
+		t.Fatalf("rendered session = %q, error = %v", got, err)
+	}
+	assertCaptured()
+	input := filepath.Join(root, "export.jsonl")
+	output := filepath.Join(root, "export.html")
+	if err := os.WriteFile(input, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	exportBinary := filepath.Join(root, "omp-export")
+	exportScript := "#!/bin/sh\n" + childEnvironmentCaptureScript() +
+		"printf '<html>fixture</html>' > \"$3\"\n"
+	if err := os.WriteFile(exportBinary, []byte(exportScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ExportHTML(ctx, exportBinary, input, output, policy); err != nil {
+		t.Fatal(err)
+	}
+	assertCaptured()
+}
+
+func TestOMPChildProcessesUseDenylistEnvironment(t *testing.T) {
+	root := t.TempDir()
+	capture := filepath.Join(root, "child-environment")
+	t.Setenv("OMP_TEST_CHILD_ENV_RESULT", capture)
+	t.Setenv("OMP_TEST_OMP_ENV", "preserved-runtime-setting")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_FLAG", "parent-secret")
+	t.Setenv("PI_CONFIG_FILES", filepath.Join(root, "parent-config.json"))
+	t.Setenv(botTokenName, "bot-secret")
+	policy, err := NewEnvironment("denylist", nil, []string{"OMP_TELEGRAM_FIXTURE_FLAG", "PI_CONFIG_FILES"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	assertCaptured := func() {
+		t.Helper()
+		data, err := os.ReadFile(capture)
+		if err != nil {
+			t.Fatalf("native child did not record environment: %v", err)
+		}
+		if got := string(data); got != "false\npreserved-runtime-setting\n\n\n" {
+			t.Fatalf("native child received excluded variables or lost permitted variables: %q", got)
+		}
+		if err := os.Remove(capture); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := Start(ctx, Config{Binary: exe, Environment: policy}, testRPCLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertCaptured()
+	listCfg := listFixture(t, "normal")
+	listCfg.Environment = policy
+	writeListPage(t, listCfg, 0, []map[string]any{}, "")
+	if _, err := ListSessions(ctx, listCfg); err != nil {
+		t.Fatal(err)
+	}
+	assertCaptured()
+	if got := os.Getenv("OMP_TELEGRAM_FIXTURE_FLAG"); got != "parent-secret" {
+		t.Fatal("exclusion changed the bridge parent environment")
+	}
 }
 
 func TestReadLargePhysicalFrame(t *testing.T) {

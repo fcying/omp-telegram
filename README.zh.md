@@ -70,6 +70,9 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 binary = "omp"
 args = "${OMP_TELEGRAM_ARGS}"
 
+[omp.environment]
+mode = "denylist"
+
 [storage]
 data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
@@ -103,7 +106,7 @@ format = "text"
 
 显式指定的文件不存在, 文件不可读或 TOML 无效时, 启动都会失败. 配置必须使用上面示例中的分组 table; 旧的 flat 字段和 flat/grouped 混合布局不再接受.
 
-字符串支持 `$VAR` 和 `${VAR}`, `$$` 表示字面美元符号. TOML 解析后每个环境变量引用只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置. `telegram.progress_mode` 为空或非法时回退到 `summary`. token 和白名单必须提供. 程序不会自动加载 `.env` 文件.
+配置字符串支持 `$VAR` 和 `${VAR}`, 但 `[omp.environment]` 的模式与 `allow`/`deny` 变量名为字面值, 不展开引用. `$$` 表示字面美元符号. TOML 解析后其他环境变量引用只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置. `telegram.progress_mode` 为空或非法时回退到 `summary`. token 和白名单必须提供. 程序不会自动加载 `.env` 文件.
 
 `telegram.allowed_users` 和 `telegram.allowed_chats` 都是必填项. 只有发送者和 chat 同时命中白名单时才接受 update. 普通私聊的 chat ID 通常等于 user ID; 群组 chat ID 通常是负数.
 
@@ -116,6 +119,7 @@ format = "text"
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见 [Progress UI](#progress-ui). |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | OMP 额外参数. 默认读取可选的 `OMP_TELEGRAM_ARGS`; 显式空字符串禁用额外参数. |
+| `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"`, 传递服务环境中当前及未来新增的所有变量, 但始终过滤 bot token; 可选 `deny = [...]` 从 OMP 子进程移除指定变量, 变量仍留在 bridge 中 (`[]` 合法). `mode = "allowlist"` 必须提供 `allow = [...]`, 只传递列出且已存在的父进程变量 (`[]` 合法). denylist 模式不能提供 `allow`, allowlist 模式不能提供 `deny`, 即使是 `[]`. |
 | `storage.data_dir` | 数据库, lock 和待发送附件的存储目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
 | `storage.database_retention_days` | 终态 bridge 消息 metadata 的保留天数. 默认 `90`; `0` 关闭自动清理. |
@@ -127,6 +131,28 @@ format = "text"
 | `[logging.component_levels]` | 可选的组件级别覆盖: `daemon`, `bridge`, `rpc`, `telegram`, `store` 和 `media`. |
 
 `omp.args` 支持用于分组参数的 shell-style quoting, 但参数直接传递, 绝不由 shell 执行. OMP overlay 仍然属于 OMP 配置; bridge 不会自动修改模型, 凭据, 工具或审批策略.
+
+要显式限制 OMP 子进程, 将该 table 配置为:
+
+```toml
+[omp.environment]
+mode = "allowlist"
+allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
+```
+
+`allow` 中的名称是字面 POSIX 环境变量名, 不解析 `$VAR` 引用. 只有服务环境中已设置的变量会传给子进程; 缺失的变量会省略, 不会补充空值. OMP 所需的 provider 凭据必须逐一列出; 如需代理或语言环境变量, 请分别列出 `HTTPS_PROXY` 或 `LANG`. 此策略覆盖 OMP RPC、ACP session 以及模型查询、render、HTML export 和 doctor 等辅助命令. 显式 `omp.args` 配置 overlay 在 allowlist 模式下仍然有效, 但不会隐式将相应环境变量加入 `allow`. 过短的名单可能使 OMP、运行时或 provider 无法工作; 请自行列出必要的运行时变量. 这仅限制子进程继承的环境, 不限制访问 `HOME`、文件系统、同用户其他进程或 OMP 配置中的凭据; 它不是沙箱.
+
+Allowlist 模式拒绝 `deny`, 即使是空数组; denylist 模式拒绝 `allow`, 即使是空数组. `allow` 中列出 `OMP_TELEGRAM_BOT_TOKEN` 会被拒绝.
+
+若要让 provider key 留在 bridge 中, 但不传给 OMP, 可改用 denylist 模式:
+
+```toml
+[omp.environment]
+mode = "denylist"
+deny = ["SOME_API_KEY"]
+```
+
+`deny` 中的名称是字面 POSIX 环境变量名, 不解析 `$VAR` 引用. 变量仍存在于 bridge 的父进程环境中, 但不会传给 OMP 子进程, OMP 命令准备阶段的父进程变量读取也会忽略它. 如果 OMP 自己依赖被排除的 provider key, 就无法使用该 key 认证. 无论采用哪种模式或是否设置 `deny`, bot token 始终从 OMP 子进程环境中移除, 无需列出.
 
 修改配置或环境变量后需重启服务. 后台运行时请使用进程管理器, 明确提供环境变量, 并确保 `PATH` 同时包含 omp 及其运行时.
 
@@ -154,7 +180,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 `--check` 检查本地配置, 查找 omp 可执行文件, 并创建配置中的数据及工作目录. 它不验证 Telegram 或模型认证. 最后一条命令前台运行服务, Ctrl-C 退出.
 
-Bridge 会从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BOT_TOKEN`. 其他环境变量仍会传给 OMP; 不要把 bot token 放进其他会继承的变量或 OMP 配置. 这不提供文件系统隔离或同用户进程隔离.
+Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BOT_TOKEN`; allowlist 的 `allow` 中列出该变量会被拒绝, denylist 的 `deny` 中列出它则无额外效果. 默认情况下, 当前及未来新增的其他环境变量都会传给 OMP; 不要把 bot token 放进其他会继承的变量或 OMP 配置. 这不提供文件系统隔离或同用户进程隔离.
 
 ### 开始 session
 
