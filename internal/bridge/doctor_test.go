@@ -14,6 +14,32 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
+func TestCheckDoctorOMPFiltersBotToken(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "child-environment")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "fixture-only-not-a-credential")
+	t.Setenv("OMP_TEST_OMP_ENV", "preserved-runtime-setting")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_FLAG", "preserved-telegram-fixture")
+	t.Setenv("OMP_TEST_CHILD_ENV_RESULT", capture)
+	binary := filepath.Join(t.TempDir(), "omp")
+	script := "#!/bin/sh\n" +
+		"token_present=false\n" +
+		"if [ \"${OMP_TELEGRAM_BOT_TOKEN+x}\" = x ]; then token_present=true; fi\n" +
+		"printf '%s\\n%s\\n%s\\n' \"$token_present\" \"$OMP_TEST_OMP_ENV\" \"$OMP_TELEGRAM_FIXTURE_FLAG\" > \"$OMP_TEST_CHILD_ENV_RESULT\"\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkDoctorOMP(context.Background(), binary); err != nil {
+		t.Fatal("doctor version check failed")
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal("doctor version fixture did not record its environment")
+	}
+	if string(data) != "false\npreserved-runtime-setting\npreserved-telegram-fixture\n" {
+		t.Fatal("doctor version child inherited the bot token or lost non-secret OMP environment")
+	}
+}
+
 func TestDoctorChecksReportSafeState(t *testing.T) {
 	dataDir := t.TempDir()
 	workspace := t.TempDir()

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
@@ -261,6 +262,7 @@ func checkDoctorOMP(ctx context.Context, binary string) error {
 		return errors.New("omp binary is unavailable")
 	}
 	cmd := exec.CommandContext(ctx, binary, "--version")
+	cmd.Env = omp.ChildEnv()
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()

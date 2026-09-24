@@ -134,6 +134,7 @@ func readModelConfig(ctx context.Context, cfg Config, key string, configFiles []
 		cfg.Binary = "omp"
 	}
 	cmd := exec.Command(cfg.Binary, "config", "get", key, "--json")
+	cmd.Env = ChildEnv()
 	cmd.Dir = cfg.CWD
 	defer func() {
 		for _, file := range cmd.ExtraFiles {
@@ -159,7 +160,7 @@ func readModelConfig(ctx context.Context, cfg Config, key string, configFiles []
 			}
 			files = append(files, path)
 		}
-		cmd.Env = append(cmd.Environ(), "PI_CONFIG_FILES="+strings.Join(files, string(os.PathListSeparator)))
+		cmd.Env = append(cmd.Env, "PI_CONFIG_FILES="+strings.Join(files, string(os.PathListSeparator)))
 	}
 	outRead, outWrite, err := os.Pipe()
 	if err != nil {

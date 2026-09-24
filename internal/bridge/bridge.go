@@ -1424,6 +1424,10 @@ func (w *worker) operationFinished(result operationResult) {
 		w.log.LogAttrs(context.Background(), slog.LevelDebug, "rpc request failed", attrs...)
 	}
 	if result.kind == "prompt" {
+		if errors.Is(result.err, omp.ErrRequestTooLarge) {
+			w.finishCancelled("Prompt exceeds the omp RPC frame limit. No task was submitted.")
+			return
+		}
 		if result.err != nil {
 			w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
 			w.closeLogicalSession()
@@ -2330,6 +2334,35 @@ func (w *worker) status() {
 		return client.Call(ctx, "get_state", nil)
 	}, "")
 }
+
+// promptInlineCount reserves the longest possible uint64 request ID before dispatch.
+func promptInlineCount(message string, images []media.Image, limit int) (int, bool) {
+	base, _ := json.Marshal(struct {
+		Type    string `json:"type"`
+		ID      string `json:"id"`
+		Message string `json:"message"`
+	}{Type: "prompt", ID: "18446744073709551615", Message: message})
+	used := len(base) + 1 // Newline framing.
+	if used > limit {
+		return 0, false
+	}
+	used += len(`,"images":[]`)
+	for i, image := range images {
+		withoutData := image
+		withoutData.Data = ""
+		encoded, _ := json.Marshal(withoutData)
+		additional := len(encoded) + len(image.Data) // Base64 needs no JSON escaping.
+		if i > 0 {
+			additional++
+		}
+		if used+additional > limit {
+			return i, true
+		}
+		used += additional
+	}
+	return len(images), true
+}
+
 func (w *worker) dispatch() {
 	if !w.canDispatch() {
 		return
@@ -2339,7 +2372,21 @@ func (w *worker) dispatch() {
 		return
 	}
 	q := w.queue[0]
+	inline, fits := promptInlineCount(q.text, q.images, client.FrameLimit())
+	w.queue[0] = queued{}
 	w.queue = w.queue[1:]
+	if !fits {
+		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		if w.mark(q.id, "failed") {
+			w.logQueuedTaskComplete(q.id, "failed")
+			w.say("Prompt exceeds the omp RPC frame limit. No task was submitted.")
+		}
+		return
+	}
+	if inline < len(q.images) {
+		clear(q.images[inline:])
+		q.images = q.images[:inline]
+	}
 	if !w.submit(q) {
 		return
 	}

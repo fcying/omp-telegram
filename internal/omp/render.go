@@ -68,6 +68,7 @@ func ResolveSessionPath(ctx context.Context, cfg Config, sessionID string) (stri
 	args = append(args, cfg.Args...)
 	args = append(args, "render", sessionID, "-q", "-t")
 	cmd := exec.Command(binary, args...)
+	cmd.Env = ChildEnv()
 	cmd.Dir = cfg.CWD
 	cmd.Stdout = io.Discard
 	diagnostics := &limitedBuffer{limit: maxRenderDiagnostics}

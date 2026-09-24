@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -285,7 +286,7 @@ func TestMain(m *testing.M) {
 		}
 		sessionID = strings.TrimSuffix(filepath.Base(session), ".jsonl")
 		emit(map[string]any{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": []int{1, 2}, "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
-		streaming := false
+		var streaming atomic.Bool
 		modelProvider, modelID := "fixture", "safe"
 		thinkingLevel := "medium"
 		fastEnabled, fastActive := false, false
@@ -293,6 +294,7 @@ func TestMain(m *testing.M) {
 		rootPrompts := 0
 		uiReplies := 0
 		scan := bufio.NewScanner(os.Stdin)
+		scan.Buffer(make([]byte, 64<<10), (1<<20)+1)
 		for scan.Scan() {
 			var cmd map[string]any
 			if json.Unmarshal(scan.Bytes(), &cmd) != nil {
@@ -309,12 +311,12 @@ func TestMain(m *testing.M) {
 				if failed, _ := cmd["isError"].(bool); failed {
 					text = "attachment rejected"
 				}
-				streaming = false
+				streaming.Store(false)
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				continue
 			case "get_state":
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies}
-				resp["data"].(map[string]any)["isStreaming"] = streaming
+				resp["data"].(map[string]any)["isStreaming"] = streaming.Load()
 				resp["data"].(map[string]any)["isCompacting"] = false
 			case "set_session_name":
 				name, _ := cmd["name"].(string)
@@ -324,7 +326,7 @@ func TestMain(m *testing.M) {
 					sessionName = strings.TrimSpace(name)
 				}
 			case "handoff":
-				if streaming {
+				if streaming.Load() {
 					resp["success"] = false
 				} else if cmd["customInstructions"] == "hold" {
 					recordFixtureRPCOrder("handoff")
@@ -390,10 +392,10 @@ func TestMain(m *testing.M) {
 					break
 				}
 				if fixtureHoldsRPC(typ) {
-					streaming = false
+					streaming.Store(false)
 					continue
 				}
-				streaming = false
+				streaming.Store(false)
 				emit(resp)
 				emit(map[string]any{"type": "agent_end", "messages": []any{}})
 				continue
@@ -441,17 +443,17 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
-				if _, ok := cmd["streamingBehavior"]; ok || streaming {
+				if _, ok := cmd["streamingBehavior"]; ok || streaming.Load() {
 					os.Exit(2)
 				}
 				emit(resp)
-				streaming = true
+				streaming.Store(true)
 				emit(map[string]any{"type": "agent_start"})
 				if text == "missing-terminal" || text == "nonterminal-only" {
 					if text == "nonterminal-only" {
 						emit(map[string]any{"type": "agent_end", "isTerminal": false})
 					}
-					streaming = false
+					streaming.Store(false)
 					continue
 				}
 				if text == "event-flood" {
@@ -459,6 +461,37 @@ func TestMain(m *testing.M) {
 						for i := 0; i < 100000; i++ {
 							emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "flood"}})
 							time.Sleep(time.Millisecond)
+						}
+					}()
+					continue
+				}
+				if text == "event-pressure" {
+					startedPath := os.Getenv("OMP_TELEGRAM_FIXTURE_EVENT_FLOOD_STARTED")
+					stopPath := os.Getenv("OMP_TELEGRAM_FIXTURE_EVENT_FLOOD_STOP")
+					donePath := os.Getenv("OMP_TELEGRAM_FIXTURE_EVENT_FLOOD_DONE")
+					go func() {
+						for i := range 100000 {
+							if i%64 == 0 {
+								if _, err := os.Stat(stopPath); err == nil {
+									break
+								}
+							}
+							eventType := "auto_retry_start"
+							if i%2 != 0 {
+								eventType = "auto_retry_end"
+							}
+							emit(map[string]any{"type": eventType})
+							if i == 63 {
+								if err := os.WriteFile(startedPath, nil, 0600); err != nil {
+									os.Exit(2)
+								}
+							}
+							time.Sleep(time.Millisecond)
+						}
+						streaming.Store(false)
+						emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "answer: event-flood"}}}}})
+						if err := os.WriteFile(donePath, nil, 0600); err != nil {
+							os.Exit(2)
 						}
 					}()
 					continue
@@ -494,7 +527,7 @@ func TestMain(m *testing.M) {
 				}
 				emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text}})
 				emit(map[string]any{"type": "agent_end", "isTerminal": false})
-				streaming = false
+				streaming.Store(false)
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}}})
 				continue
 			}
@@ -674,6 +707,7 @@ func (f *fakeHTTP) has(thread int64, text string) bool {
 	return false
 }
 func waitFor(t *testing.T, fn func() bool) {
+	t.Helper()
 	waitForTimeout(t, 5*time.Second, fn)
 }
 
@@ -1406,6 +1440,74 @@ func TestRPCEventFloodDoesNotStarveControlInput(t *testing.T) {
 	send(update(3, 11, "/status"))
 	// Race-instrumented child-process event handling can be delayed under CI load.
 	waitForTimeout(t, 15*time.Second, func() bool { return f.has(11, "fixture/safe") })
+}
+
+func TestRPCEventsWithPendingTelegramInputs(t *testing.T) {
+	floodDir := t.TempDir()
+	startedPath := filepath.Join(floodDir, "started")
+	stopPath := filepath.Join(floodDir, "stop")
+	donePath := filepath.Join(floodDir, "done")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_EVENT_FLOOD_STARTED", startedPath)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_EVENT_FLOOD_STOP", stopPath)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_EVENT_FLOOD_DONE", donePath)
+	wait := func(condition func() bool) {
+		t.Helper()
+		waitForTimeout(t, 15*time.Second, condition)
+	}
+
+	f, db, send := setupBridge(t)
+	send(update(1, 11, "/new "+t.TempDir()))
+	wait(func() bool { binding, err := db.Binding(99, -10, 11); return err == nil && binding.Session != "" })
+	send(update(2, 11, "event-pressure"))
+	wait(func() bool {
+		_, err := os.Stat(startedPath)
+		return err == nil
+	})
+	wait(func() bool {
+		var state string
+		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state) == nil && state == "submitted"
+	})
+
+	// Keep the emitter running until both queued inputs and independent controls
+	// have produced observable results; no sleep is used to guess when load starts.
+	for _, input := range []struct {
+		id   int64
+		text string
+	}{
+		{id: 3, text: "queued-under-flood-one"},
+		{id: 4, text: "queued-under-flood-two"},
+	} {
+		send(update(input.id, 11, input.text))
+		wait(func() bool {
+			var state string
+			return db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", input.id).Scan(&state) == nil && state == "pending"
+		})
+	}
+	send(update(5, 11, "/status"))
+	wait(func() bool { return f.has(11, "fixture/safe") })
+	send(update(6, 11, "/name flood-control"))
+	wait(func() bool { return f.has(11, "Session named: flood-control") })
+
+	if _, err := os.Stat(donePath); err == nil {
+		t.Fatal("event flood ended before the test released it")
+	}
+	if err := os.WriteFile(stopPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	wait(func() bool {
+		_, err := os.Stat(donePath)
+		return err == nil
+	})
+
+	for _, id := range []int64{2, 3, 4} {
+		wait(func() bool {
+			var state string
+			return db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&state) == nil && state == "done"
+		})
+	}
+	wait(func() bool {
+		return f.has(11, "answer: queued-under-flood-one") && f.has(11, "answer: queued-under-flood-two")
+	})
 }
 
 func TestPromptStopRPCOrderUnderDelayedAcknowledgement(t *testing.T) {
@@ -2799,6 +2901,31 @@ func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 	case err := <-w.b.fatal:
 		t.Fatalf("duplicate uncertain transition reported fatal error: %v", err)
 	default:
+	}
+}
+
+func TestOversizedPromptRejectedBeforeWriteKeepsSession(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	before, client := w.binding, w.client
+	requireStoreOK(t, w.b.db.Accept(2, []byte(`{"update_id":2}`)))
+	requireStoreOK(t, w.b.db.Submit(2, 2))
+	w.beginTask(queued{id: 2, replyTo: 2})
+	w.startOperation("prompt", client, func(ctx context.Context) (json.RawMessage, error) {
+		return client.Call(ctx, "prompt", map[string]any{"message": strings.Repeat("x", client.FrameLimit())})
+	}, 2, "")
+	result := waitOperation(t, w)
+	if !errors.Is(result.err, omp.ErrRequestTooLarge) {
+		t.Fatalf("oversized prompt error = %v", result.err)
+	}
+	w.operationReturned(result)
+	var state string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state))
+	if state != "cancelled" || w.active != 0 || w.client != client || !sameBindingIdentity(w.binding, before) {
+		t.Fatalf("pre-write rejection changed session: state=%q active=%d client=%v binding=%+v", state, w.active, w.client, w.binding)
+	}
+	if _, err := client.Call(context.Background(), "get_state", nil); err != nil {
+		t.Fatalf("runtime stopped after pre-write rejection: %v", err)
 	}
 }
 

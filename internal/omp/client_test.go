@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -22,7 +23,27 @@ func testRPCLogger() *slog.Logger {
 
 const rpcSensitiveCanary = "SECRET_PROMPT SECRET_OUTPUT SECRET_TOKEN https://api.telegram.org/botSECRET_TOKEN/ Authorization: SECRET_HEADER"
 
+func recordFixtureChildEnvironment() {
+	path := os.Getenv("OMP_TEST_CHILD_ENV_RESULT")
+	if path == "" {
+		return
+	}
+	tokenPresent := false
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if name == "OMP_TELEGRAM_BOT_TOKEN" {
+			tokenPresent = true
+			break
+		}
+	}
+	data := fmt.Sprintf("%t\n%s\n%s\n%s\n", tokenPresent, os.Getenv("OMP_TEST_OMP_ENV"), os.Getenv("OMP_TELEGRAM_FIXTURE_FLAG"), os.Getenv("PI_CONFIG_FILES"))
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		os.Exit(3)
+	}
+}
+
 func TestMain(m *testing.M) {
+	recordFixtureChildEnvironment()
 	if len(os.Args) > 1 && os.Args[1] == "config" {
 		fixtureModelConfig()
 		os.Exit(0)
@@ -81,6 +102,133 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(m.Run())
+}
+
+func childEnvironmentCaptureScript() string {
+	return "token_present=false\n" +
+		"if [ \"${OMP_TELEGRAM_BOT_TOKEN+x}\" = x ]; then token_present=true; fi\n" +
+		"printf '%s\\n%s\\n%s\\n%s\\n' \"$token_present\" \"$OMP_TEST_OMP_ENV\" \"$OMP_TELEGRAM_FIXTURE_FLAG\" \"$PI_CONFIG_FILES\" > \"$OMP_TEST_CHILD_ENV_RESULT\"\n"
+}
+
+func assertChildEnvironment(t *testing.T, path string, wantConfigFiles []string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal("child environment fixture did not record its environment")
+	}
+	fields := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(fields) != 4 || fields[0] != "false" {
+		t.Fatal("child process inherited the bridge bot token")
+	}
+	if fields[1] != "preserved-runtime-setting" || fields[2] != "preserved-telegram-fixture" {
+		t.Fatal("child process did not preserve non-secret OMP environment")
+	}
+	gotConfigFiles := filepath.SplitList(fields[3])
+	if len(gotConfigFiles) != len(wantConfigFiles) {
+		t.Fatal("child process did not preserve PI_CONFIG_FILES overlays")
+	}
+	for i, want := range wantConfigFiles {
+		if gotConfigFiles[i] != want {
+			t.Fatal("child process did not preserve PI_CONFIG_FILES overlays")
+		}
+	}
+}
+
+func TestOMPChildProcessesSanitizeEnvironment(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "child-environment")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "fixture-only-not-a-credential")
+	t.Setenv("OMP_TEST_OMP_ENV", "preserved-runtime-setting")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_FLAG", "preserved-telegram-fixture")
+	t.Setenv("OMP_TEST_CHILD_ENV_RESULT", capture)
+	t.Setenv("PI_CONFIG_FILES", "")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := os.Remove(capture); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	client, err := Start(ctx, Config{Binary: exe}, testRPCLogger())
+	if err != nil {
+		t.Fatal("runtime child failed to start")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal("runtime child failed to close")
+	}
+	assertChildEnvironment(t, capture, nil)
+
+	if err := os.Remove(capture); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	listCfg := listFixture(t, "normal")
+	writeListPage(t, listCfg, 0, []map[string]any{}, "")
+	if _, err := ListSessions(ctx, listCfg); err != nil {
+		t.Fatal("ACP listing child failed")
+	}
+	assertChildEnvironment(t, capture, nil)
+
+	root := t.TempDir()
+	baseConfig := filepath.Join(root, "environment.json")
+	cliConfig := filepath.Join(root, "cli.json")
+	if err := os.WriteFile(baseConfig, []byte(`{"cycleOrder":["base"],"modelRoles":{"base":"fixture/base:low"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cliConfig, []byte(`{"cycleOrder":["overlay"],"modelRoles":{"overlay":"fixture/overlay:high"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TEST_CONFIG_OVERLAYS", "1")
+	t.Setenv("PI_CONFIG_FILES", baseConfig)
+	if err := os.Remove(capture); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	roles, err := CycleRoles(ctx, Config{Binary: exe, CWD: root, Args: []string{"--config", cliConfig}})
+	if err != nil || len(roles) != 1 || roles[0] != (ModelRole{Role: "overlay", Selector: "fixture/overlay:high"}) {
+		t.Fatal("model config child did not apply the PI_CONFIG_FILES overlay")
+	}
+	assertChildEnvironment(t, capture, []string{baseConfig, cliConfig})
+
+	if err := os.Remove(capture); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(root, "workspace")
+	session := filepath.Join(cwd, "session.jsonl")
+	writeSessionHeader(t, session, "native-id", cwd)
+	renderBinary := filepath.Join(root, "omp-render")
+	renderScript := "#!/bin/sh\n" +
+		"[ \"$1\" = render ] && [ \"$2\" = native-id ] && [ \"$3\" = -q ] && [ \"$4\" = -t ] || exit 11\n" +
+		childEnvironmentCaptureScript() +
+		"printf 'session  %s\\nopen  fixture\\n' \"$PWD/session.jsonl\" >&2\n"
+	if err := os.WriteFile(renderBinary, []byte(renderScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveSessionPath(ctx, Config{Binary: renderBinary, CWD: cwd}, "native-id"); err != nil {
+		t.Fatal("render child failed")
+	}
+	assertChildEnvironment(t, capture, []string{baseConfig})
+
+	if err := os.Remove(capture); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	input := filepath.Join(root, "export-session.jsonl")
+	output := filepath.Join(root, "export.html")
+	if err := os.WriteFile(input, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	exportBinary := filepath.Join(root, "omp-export")
+	exportScript := "#!/bin/sh\n" +
+		"[ \"$1\" = --export ] || exit 11\n" +
+		childEnvironmentCaptureScript() +
+		"printf '%s' '<html>fixture</html>' > \"$3\"\n"
+	if err := os.WriteFile(exportBinary, []byte(exportScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ExportHTML(ctx, exportBinary, input, output); err != nil {
+		t.Fatal("HTML export child failed")
+	}
+	assertChildEnvironment(t, capture, []string{baseConfig})
 }
 
 func TestReadLargePhysicalFrame(t *testing.T) {

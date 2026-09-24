@@ -154,6 +154,8 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 `--check` validates local configuration, finds the omp executable, and creates configured data and workspace directories. It does not test Telegram or model authentication. The final command runs in the foreground; Ctrl-C stops it.
 
+The bridge removes `OMP_TELEGRAM_BOT_TOKEN` from OMP child-process environments, including auxiliary commands. Other environment variables remain available to OMP; do not put the bot token in another inherited variable or OMP configuration. This is not filesystem or same-user process isolation.
+
 ### Start a session
 
 Use `/new` with a project name or path:
@@ -263,7 +265,7 @@ To receive a file, ask OMP directly, for example, "Send me the report as a file.
 | Send a document | 50 MB |
 | Send a photo | 10 MB, JPEG or PNG |
 
-Incoming files are stored under `.telegram/incoming/` in the selected workspace. Large images may be represented by a preview or a local file path. Image understanding depends on the selected model, and document reading depends on its available tools. Stopping a task does not delete an attachment already submitted to OMP.
+Incoming files are stored under `.telegram/incoming/` in the selected workspace. Large images may be represented by a preview or a local file path. Album prompts include only the leading inline images that fit the negotiated RPC frame; omitted images remain accessible at their listed local paths. A prompt too large even without images is rejected before submission without closing the session. Image understanding depends on the selected model, and document reading depends on its available tools. Stopping a task does not delete an attachment already submitted to OMP.
 
 Outgoing attachments are copied into a private delivery snapshot before being queued for Telegram delivery, so later changes to the original file do not change the queued payload.
 

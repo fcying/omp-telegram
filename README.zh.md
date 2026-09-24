@@ -154,6 +154,8 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 `--check` 检查本地配置, 查找 omp 可执行文件, 并创建配置中的数据及工作目录. 它不验证 Telegram 或模型认证. 最后一条命令前台运行服务, Ctrl-C 退出.
 
+Bridge 会从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BOT_TOKEN`. 其他环境变量仍会传给 OMP; 不要把 bot token 放进其他会继承的变量或 OMP 配置. 这不提供文件系统隔离或同用户进程隔离.
+
 ### 开始 session
 
 使用 `/new` 加项目名或路径:
@@ -263,7 +265,7 @@ Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以
 | 发送文档 | 50 MB |
 | 发送照片 | 10 MB, JPEG 或 PNG |
 
-收到的文件保留在所选 workspace 的 `.telegram/incoming/` 下. 大图可能以预览或本地文件路径提供给模型. 识图能力取决于模型, 文档读取能力取决于可用工具. `/stop` 不会删除已经提交给 OMP 的附件.
+收到的文件保留在所选 workspace 的 `.telegram/incoming/` 下. 大图可能以预览或本地文件路径提供给模型. 相册 prompt 仅内联能够放进协商后的 RPC frame 的前几张图片; 其余图片仍可通过列出的本地路径访问. 如果去掉内联图片后 prompt 仍超限, 则在提交前拒绝该任务, 不关闭 session. 识图能力取决于模型, 文档读取能力取决于可用工具. `/stop` 不会删除已经提交给 OMP 的附件.
 
 输出附件会在加入 Telegram 交付队列前复制到私有 delivery snapshot, 因此源文件之后的变化不会改变已经排队的内容.
 
