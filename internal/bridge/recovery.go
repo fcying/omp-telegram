@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -60,6 +62,42 @@ func (b *Bridge) bindingForWorker(key target) (store.Binding, error) {
 	return binding, err
 }
 
+func savedSessionAvailable(session, workspace string) bool {
+	if !filepath.IsAbs(session) || !filepath.IsAbs(workspace) {
+		return false
+	}
+	file, err := os.Stat(session)
+	if err != nil || !file.Mode().IsRegular() {
+		return false
+	}
+	dir, err := os.Stat(workspace)
+	return err == nil && dir.IsDir()
+}
+
+func (w *worker) restoreBinding() {
+	w.restoring = false
+	if !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
+		sessionID := w.sessionID
+		if w.persistClosed() {
+			w.releaseSession()
+			w.logRuntimeEvent(slog.LevelInfo, "restore_runtime_skipped", "session_file_unavailable", "startup restore skipped", sessionID)
+			w.say("The saved omp session file or working directory is unavailable, so startup restore was skipped. Use /new to start a new session.")
+		}
+		return
+	}
+	if !w.binding.Interrupted {
+		return
+	}
+	if err := w.b.db.SetInterrupted(w.binding, false); err != nil {
+		w.b.storeLog.Error("interrupted state persistence failed", "event", "binding_write_failed", "reason", "clear_interrupted", "error_kind", "persistence")
+		w.b.fail(err)
+		w.cancel()
+		return
+	}
+	w.binding.Interrupted = false
+	w.say("⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted.")
+}
+
 func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker) error {
 	intents, err := b.db.PendingStarts(b.bot.ID)
 	if err != nil {
@@ -71,7 +109,7 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 		b.storeLog.Error("session binding read failed", "event", "binding_read_failed", "reason", "running_bindings", "error_kind", "persistence")
 		return err
 	}
-	// Snapshot before polling starts: restoring an instance must not restart old prompts.
+	// Snapshot before polling starts: saved prompts must not restart with their bindings.
 	if err := b.cancelPendingPrompts("restore"); err != nil {
 		return err
 	}

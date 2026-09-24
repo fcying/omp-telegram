@@ -294,7 +294,7 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 `/queue` 显示当前 worker 的 running 状态、pending 数量、附件 preparation 状态, 每页最多六个 pending task. Task preview 使用有界文本或 `Preparing attachment...`; callback data 使用随机菜单 token 加 `cancel:<inbox_id>`. 处理 callback 时重新扫描实时 queue. 如果任务期间已 dispatch, 返回 `Task is no longer queued.`, 绝不把操作转换成 active abort.
 
-`last_used_at` 是 Unix time, 迁移旧数据时为 0. 显式 `/new` 或 `/resume` 成功, root/review/attachment prompt 被接受, 以及 name、model、thinking、fast mode、compact、handoff 和 abort 等原生 session-changing command 成功后 touch. startup restore、lazy restore 本身、`/status`、`/bindings`、`/help` 和 viewer 翻页不会 touch. touch 失败只记录 metadata persistence error, 不会改变已经接受的任务结果. startup restore 会把旧值复制到新 generation, 不会刷新时间.
+`last_used_at` 是 Unix time, 迁移旧数据时为 0. 显式 `/new` 或 `/resume` 成功, root/review/attachment prompt 被接受, 以及 name、model、thinking、fast mode、compact、handoff 和 abort 等原生 session-changing command 成功后 touch. 启动恢复 binding、按需恢复 runtime 本身、`/status`、`/bindings`、`/help` 和 viewer 翻页不会 touch. touch 失败只记录 metadata persistence error, 不会改变已经接受的任务结果. 启动恢复保留已有 binding generation 和时间戳.
 
 `DeleteClosedBinding` 和 `PrepareStart` 都针对同一组 binding 与 intent row 使用 generation-fenced transaction. 删除只有在目标已关闭且没有 startup intent 时成功; closed binding 的启动必须先确认预期 row 仍存在, 并在同一事务中插入 intent. 因此 intent 先提交会使删除失败, 删除先提交会使 stale start 失败. 成功删除还会同时删除 bridge history snapshot, 并推进不持久化的 Bridge 级 binding mutation epoch, 使其他 worker 持有的菜单立即成为 stale. 它绝不删除 workspace、原生 session 文件或 omp 原生 history. 如果删除目标意外是当前 worker, worker 会清理内存中的 binding identity; UI 正常情况下会禁用该操作.
 
@@ -323,7 +323,7 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 未提交的启动意图表示转换尚未完成, 不表示可以再次启动一个 omp 进程. 恢复会保留已保存 binding 供显式处理, 再次尝试新转换前需要执行 `/close`, 然后执行 `/new` 或 `/resume`.
 
-每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的自动恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. 这是 bridge 级 two-phase commit: 先持久化意图, 再发布运行绑定; 不保证进程启动 exactly once. `/close` 会先删除待完成意图, 再关闭当前绑定.
+每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的按需恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. 这是 bridge 级 two-phase commit: 先持久化意图, 再发布运行绑定; 不保证进程启动 exactly once. `/close` 会先删除待完成意图, 再关闭当前绑定.
 
 `running` 表示恢复资格, 不是实时 PID 状态:
 
@@ -334,8 +334,8 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 | `/stop` | 保留实例和恢复资格, 清空等待 prompt |
 | `/close` | 删除待完成意图, 保存 `running=0`, 再关闭实例 |
 | worker 回收运行期故障实例 | 清除恢复资格, 活动任务转为不确定 |
-| 启动自动恢复时缺失原生 session 文件或 workspace | 保存 `running=0`, 记录 info 级跳过日志并提示使用 `/new`; 绝不创建替代 session |
-| 其他启动自动恢复失败 | 保留已保存身份和恢复资格, 供手动恢复或下次服务重启使用 |
+| 启动恢复 binding 时缺失原生 session 文件或 workspace | 保存 `running=0`, 记录 info 级跳过日志并提示使用 `/new`; 绝不创建替代 session |
+| 按需恢复运行期失败 | 保留已保存身份和恢复资格; 不提交或重放 prompt |
 
 ### 空闲运行期释放
 
@@ -346,9 +346,9 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 
 成功 RPC 会刷新空闲计时并使 watchdog 证据失效. 失败 RPC 只使 watchdog 证据及正在进行的探测失效, 不刷新空闲计时.
 
-重启后, 已提交且 `running=1` 的 binding 会恢复准确的 session 文件和目录. 在恢复任何 OMP 进程前, daemon 根据每个符合条件 binding 已持久化的原生 session ID 重建逻辑 session claim; 被 `worker.max_workers` 阻塞的 binding 会持续持有该 claim, 直到显式 `/close`, 因而其他对话不能恢复同一 session. 自动恢复成功时不发送 ready 消息. 被标记为中断的 binding 只收到独立的中断警告, 并在新 generation 中清除标记; 显式 `/new` 和 `/resume` 仍发送 ready 消息. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 如果启动前发现已保存的 session 文件或 workspace 不可用, bridge 会保存 `running=0`, 记录 `restore_runtime_skipped`, 并提示使用 `/new`; 绝不创建替代 session. 其他启动失败仍保留已保存身份和恢复资格, 供手动恢复或下次服务重启使用. OMP 新 session 可能先返回身份, 再持久化 history file.
+重启后, daemon 在开始轮询前根据每个符合条件且 `running=1` 的 binding 已持久化的原生 session ID 重建逻辑 session claim. 它验证已保存的 session 文件和工作目录, 但不启动 OMP 进程, 也不占用 `worker.max_workers` 名额. 下一条 prompt 或原生控制命令才启动 OMP 并校验原 session 身份; 首条请求可能稍慢. `/status` 显示已保存的 session 为 released, 不启动进程. 被标记为中断的 binding 只收到独立的中断警告, 并在不改变 generation 的情况下清除标记; 显式 `/new` 和 `/resume` 仍发送 ready 消息. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 如果启动时发现已保存的 session 文件或 workspace 不可用, bridge 会保存 `running=0`, 记录 `restore_runtime_skipped`, 并提示使用 `/new`; 绝不创建替代 session. 按需重连失败仍保留已保存身份, 不提交或重放请求. OMP 新 session 可能先返回身份, 再持久化 history file.
 
-持久化的逻辑 session claim 就是 restore claim: 它在进程启动前依据保存的原生 session 身份重建, 并在 worker 容量延迟重连期间保持.
+持久化的逻辑 session claim 就是 restore claim: 它在启动任何进程前依据保存的原生 session 身份重建, 并在运行期 released 或 worker 容量延迟重连期间保持.
 
 ## 进程与文件安全
 

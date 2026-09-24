@@ -46,7 +46,7 @@ database_retention_days = 90
 
 [worker]
 # max_workers maximum: 64 connected OMP processes.
-max_workers = 4
+max_workers = 8
 # queue_capacity maximum: 1024 waiting tasks per conversation.
 queue_capacity = 16
 # Release an unused OMP runtime after this duration while retaining the logical session.

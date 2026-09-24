@@ -79,7 +79,7 @@ workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 database_retention_days = 90
 
 [worker]
-max_workers = 4
+max_workers = 8
 queue_capacity = 16
 idle_timeout = "30m"
 
@@ -123,7 +123,7 @@ format = "text"
 | `storage.data_dir` | 数据库, lock 和待发送附件的存储目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
 | `storage.database_retention_days` | 终态 bridge 消息 metadata 的保留天数. 默认 `90`; `0` 关闭自动清理. |
-| `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `4`; 配置最大值 `64`. |
+| `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `8`; 配置最大值 `64`. |
 | `worker.queue_capacity` | 每个对话最多等待的任务数. 默认 `16`; 配置最大值 `1024`. |
 | `worker.idle_timeout` | 保留 session 的同时释放持续空闲 OMP 进程前的时长. 默认 `30m`; `0` 或 `disabled` 关闭. |
 | `logging.level` | 全局日志级别: `debug`, `info`, `warn` 或 `error`. 默认 `info`. |
@@ -315,7 +315,7 @@ Reply context 只来自当前 Update 解码出的 `ReplyToMessage` 和 `Quote`. 
 
 ## Sessions and Recovery
 
-已提交的 session 会在 daemon 重启后保留.
+已提交的 session 会在 daemon 重启后保留. 启动时 bridge 只恢复已保存的身份, 不启动 OMP 进程; 第一条 prompt 或 OMP 控制命令才会重连原 session, 因而可能稍慢.
 
 结果不确定的活动操作不会自动重放.
 
@@ -323,7 +323,7 @@ daemon 停止时仍在等待的任务会取消. 决定重发前先检查聊天�
 
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
 - 服务启动时如果已保存的 OMP session 文件或 workspace 不可用, 包括尚未持久化 history 的新 session, bridge 会跳过恢复并将 binding 保持为 closed, 提示使用 `/new`; 不会创建替代 session. 其他 session 切换失败时, 执行 `/close`, 再执行 `/new` 或 `/resume`.
-- `worker.idle_timeout` 可能释放空闲 OMP 进程, 但只有在 OMP 已写入可恢复的 session 文件后才会释放. 新建 native session 在此之前可能保持 connected. 下一条 prompt 或 OMP 控制命令会恢复同一个 session.
+- `worker.idle_timeout` 可能释放空闲 OMP 进程, 但只有在 OMP 已写入可恢复的 session 文件后才会释放. 新建 native session 在此之前可能保持 connected. 下一条 prompt 或 OMP 控制命令会恢复同一个 session. 如果重连失败, bridge 只发送一条错误提示, 不提交 prompt.
 - **删除 Telegram topic 前先发送 `/close`.** 删除 topic 不会自动停止对应的 OMP session.
 
 每个对话有独立的 session, 但使用同一 workspace 的 session 会共享文件. 不同对话不是文件系统或凭据沙箱.
