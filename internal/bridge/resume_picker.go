@@ -208,7 +208,7 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 	w.resumeCancel = cancel
 	request, generation := w.resumeRequest, binding.Generation
 	epoch := w.b.bindingsEpoch.Load()
-	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: w.b.cfg.OMPArgs}
+	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -355,7 +355,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 		w.say("Wait for the current task and queue to finish before exporting.")
 		return
 	}
-	if !currentExact && omp.HasCustomSessionDir(w.b.cfg.OMPArgs) {
+	if !currentExact && omp.HasCustomSessionDir(w.b.cfg.OMPArgs, w.b.cfg.OMPEnvironment) {
 		w.say("Cannot export an inactive session when omp uses a custom session directory.")
 		return
 	}
@@ -380,7 +380,8 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 	}
 	bindingSession := committed.Session
 	bindingSessionID := committed.SessionID
-	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: workspace, Args: w.b.cfg.OMPArgs}
+	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: workspace, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}
+	environment := cfg.Environment
 	spool := filepath.Join(w.b.cfg.DataDir, "attachments", "outbox")
 	w.background.Add(1)
 	go func() {
@@ -403,7 +404,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 				htmlCtx, htmlCancel := context.WithTimeout(ctx, 30*time.Second)
 				defer htmlCancel()
 				run := func() {
-					file, err = snapshotHTML(htmlCtx, w.b.cfg.OMP, source, spool, "omp-session-"+shortSessionID(session.ID)+".html")
+					file, err = snapshotHTML(htmlCtx, w.b.cfg.OMP, source, spool, "omp-session-"+shortSessionID(session.ID)+".html", environment)
 				}
 				if w.b.mediaSlots == nil {
 					run()

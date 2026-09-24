@@ -134,7 +134,7 @@ func readModelConfig(ctx context.Context, cfg Config, key string, configFiles []
 		cfg.Binary = "omp"
 	}
 	cmd := exec.Command(cfg.Binary, "config", "get", key, "--json")
-	cmd.Env = ChildEnv()
+	cmd.Env = ChildEnv(cfg.Environment)
 	cmd.Dir = cfg.CWD
 	defer func() {
 		for _, file := range cmd.ExtraFiles {
@@ -142,7 +142,8 @@ func readModelConfig(ctx context.Context, cfg Config, key string, configFiles []
 		}
 	}()
 	if len(configFiles) != 0 {
-		files := filepath.SplitList(os.Getenv("PI_CONFIG_FILES"))
+		base, _ := cfg.Environment.Lookup("PI_CONFIG_FILES")
+		files := filepath.SplitList(base)
 		for _, path := range configFiles {
 			if strings.ContainsRune(path, os.PathListSeparator) {
 				// The native environment list has no escaping for ':' in Linux paths.

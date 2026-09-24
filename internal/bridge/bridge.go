@@ -2043,7 +2043,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		}
 	}
 	w.beginRuntimeStart()
-	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs}, w.b.rpcLog)
+	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
 	if e != nil {
 		if reserved {
 			<-w.b.slots

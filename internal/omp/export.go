@@ -10,7 +10,7 @@ import (
 
 // ExportHTML delegates HTML rendering to the native omp CLI.
 // It intentionally does not pass bridge RPC, cwd, resume, or omp.args options.
-func ExportHTML(ctx context.Context, binary, sessionFile, outputFile string) error {
+func ExportHTML(ctx context.Context, binary, sessionFile, outputFile string, environment Environment) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -21,7 +21,7 @@ func ExportHTML(ctx context.Context, binary, sessionFile, outputFile string) err
 		return errors.New("omp: HTML export requires absolute paths")
 	}
 	cmd := exec.Command(binary, "--export", sessionFile, outputFile)
-	cmd.Env = ChildEnv()
+	cmd.Env = ChildEnv(environment)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := runProcess(ctx, cmd); err != nil {

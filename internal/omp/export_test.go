@@ -174,6 +174,54 @@ func TestResolveSessionPathRejectsCustomSessionDirectory(t *testing.T) {
 	}
 }
 
+func TestResolveSessionPathRespectsEnvironmentPolicy(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "workspace")
+	file := filepath.Join(cwd, "session.jsonl")
+	writeSessionHeader(t, file, "native-id", cwd)
+	binary := filepath.Join(root, "omp-render")
+	writeRenderScript(t, binary)
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", filepath.Join(root, "parent-store"))
+	allowlist, err := NewEnvironment("allowlist", []string{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if HasCustomSessionDir(nil, allowlist) {
+		t.Fatal("parent session store leaked into allowlist policy")
+	}
+	if !HasCustomSessionDir(nil, Environment{}) {
+		t.Fatal("denylist parent session store was ignored")
+	}
+	cfg := Config{Binary: binary, CWD: cwd, Environment: allowlist}
+	if got, err := ResolveSessionPath(context.Background(), cfg, "native-id"); err != nil || got != file {
+		t.Fatalf("allowlist renderer could not resolve default session: path=%q error=%v", got, err)
+	}
+	denied, err := NewEnvironment("denylist", nil, []string{"PI_CODING_AGENT_SESSION_DIR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if HasCustomSessionDir(nil, denied) {
+		t.Fatal("denied parent session store was considered a custom session directory")
+	}
+	cfg.Environment = denied
+	if got, err := ResolveSessionPath(context.Background(), cfg, "native-id"); err != nil || got != file {
+		t.Fatalf("denied parent session store blocked default session: path=%q error=%v", got, err)
+	}
+	cfg.Args = []string{"--session-dir", filepath.Join(root, "explicit-store")}
+	if _, err := ResolveSessionPath(context.Background(), cfg, "native-id"); !errors.Is(err, ErrCustomSessionDir) {
+		t.Fatalf("explicit session directory accepted: %v", err)
+	}
+	allowed, err := NewEnvironment("allowlist", []string{"PI_CODING_AGENT_SESSION_DIR"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Args = nil
+	cfg.Environment = allowed
+	if _, err := ResolveSessionPath(context.Background(), cfg, "native-id"); !errors.Is(err, ErrCustomSessionDir) {
+		t.Fatalf("allowed parent session directory accepted: %v", err)
+	}
+}
+
 func TestExportHTMLDelegatesToNativeCLI(t *testing.T) {
 	root := t.TempDir()
 	input := filepath.Join(root, "session.jsonl")
@@ -191,7 +239,7 @@ func TestExportHTMLDelegatesToNativeCLI(t *testing.T) {
 	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := ExportHTML(context.Background(), binary, input, output); err != nil {
+	if err := ExportHTML(context.Background(), binary, input, output, Environment{}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(output)
@@ -213,7 +261,7 @@ func TestExportHTMLHonorsContextCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := ExportHTML(ctx, binary, input, output); !errors.Is(err, context.DeadlineExceeded) {
+	if err := ExportHTML(ctx, binary, input, output, Environment{}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("cancelled HTML export error = %v", err)
 	}
 }

@@ -209,8 +209,9 @@ func (w *worker) startModelRoles(client *omp.Client, request modelOperationReque
 	workspace := w.binding.Workspace
 	args := append([]string(nil), w.b.cfg.OMPArgs...)
 	binary := w.b.cfg.OMP
+	environment := w.b.cfg.OMPEnvironment
 	w.startOperation("model_roles", client, func(ctx context.Context) (json.RawMessage, error) {
-		roles, err := omp.CycleRoles(ctx, omp.Config{Binary: binary, CWD: workspace, Args: args})
+		roles, err := omp.CycleRoles(ctx, omp.Config{Binary: binary, CWD: workspace, Args: args, Environment: environment})
 		if err != nil {
 			return nil, err
 		}

@@ -26,14 +26,15 @@ var errSessionPathResolution = errors.New("omp: native session path resolution f
 var ErrCustomSessionDir = errors.New("omp: native render does not support custom session directory")
 
 // HasCustomSessionDir reports whether OMP is configured to use a non-default session store.
-func HasCustomSessionDir(args []string) bool {
+func HasCustomSessionDir(args []string, environment Environment) bool {
 	for _, arg := range args {
 		name, _, _ := strings.Cut(arg, "=")
 		if name == "--session-dir" {
 			return true
 		}
 	}
-	return os.Getenv("PI_CODING_AGENT_SESSION_DIR") != ""
+	dir, _ := environment.Lookup("PI_CODING_AGENT_SESSION_DIR")
+	return dir != ""
 }
 
 // ResolveSessionPath asks the native renderer to resolve a resumable session.
@@ -45,7 +46,7 @@ func ResolveSessionPath(ctx context.Context, cfg Config, sessionID string) (stri
 	if cfg.Resume != "" || !filepath.IsAbs(cfg.CWD) || !validRenderSessionID(sessionID) {
 		return "", errSessionPathResolution
 	}
-	if HasCustomSessionDir(cfg.Args) {
+	if HasCustomSessionDir(cfg.Args, cfg.Environment) {
 		return "", ErrCustomSessionDir
 	}
 	if err := ValidateArgs(cfg.Args); err != nil {
@@ -68,7 +69,7 @@ func ResolveSessionPath(ctx context.Context, cfg Config, sessionID string) (stri
 	args = append(args, cfg.Args...)
 	args = append(args, "render", sessionID, "-q", "-t")
 	cmd := exec.Command(binary, args...)
-	cmd.Env = ChildEnv()
+	cmd.Env = ChildEnv(cfg.Environment)
 	cmd.Dir = cfg.CWD
 	cmd.Stdout = io.Discard
 	diagnostics := &limitedBuffer{limit: maxRenderDiagnostics}

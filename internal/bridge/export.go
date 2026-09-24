@@ -107,11 +107,11 @@ func SnapshotSession(ctx context.Context, spoolRoot, sessionFile string) (result
 }
 
 // snapshotHTML writes native OMP HTML output from a stable bridge-owned source snapshot.
-func snapshotHTML(ctx context.Context, binary, sessionFile, spoolRoot, displayName string) (media.File, error) {
-	return snapshotHTMLWithLimit(ctx, binary, sessionFile, spoolRoot, displayName, media.MaxDocumentBytes)
+func snapshotHTML(ctx context.Context, binary, sessionFile, spoolRoot, displayName string, environment omp.Environment) (media.File, error) {
+	return snapshotHTMLWithLimit(ctx, binary, sessionFile, spoolRoot, displayName, media.MaxDocumentBytes, environment)
 }
 
-func snapshotHTMLWithLimit(ctx context.Context, binary, sessionFile, spoolRoot, displayName string, maxBytes int64) (result media.File, err error) {
+func snapshotHTMLWithLimit(ctx context.Context, binary, sessionFile, spoolRoot, displayName string, maxBytes int64, environment omp.Environment) (result media.File, err error) {
 	if err = ctx.Err(); err != nil {
 		return media.File{}, err
 	}
@@ -140,7 +140,7 @@ func snapshotHTMLWithLimit(ctx context.Context, binary, sessionFile, spoolRoot, 
 	if err = target.Close(); err != nil {
 		return media.File{}, errors.New("cannot prepare HTML snapshot")
 	}
-	if err = exportHTMLWithLimit(ctx, binary, source.Path, targetPath, maxBytes); err != nil {
+	if err = exportHTMLWithLimit(ctx, binary, source.Path, targetPath, maxBytes, environment); err != nil {
 		return media.File{}, err
 	}
 	info, statErr := os.Lstat(targetPath)
@@ -183,7 +183,7 @@ func snapshotHTMLWithLimit(ctx context.Context, binary, sessionFile, spoolRoot, 
 	return result, nil
 }
 
-func exportHTMLWithLimit(ctx context.Context, binary, sessionFile, outputFile string, maxBytes int64) error {
+func exportHTMLWithLimit(ctx context.Context, binary, sessionFile, outputFile string, maxBytes int64, environment omp.Environment) error {
 	exportCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	exceeded := make(chan struct{}, 1)
@@ -209,7 +209,7 @@ func exportHTMLWithLimit(ctx context.Context, binary, sessionFile, outputFile st
 			}
 		}
 	}()
-	err := omp.ExportHTML(exportCtx, binary, sessionFile, outputFile)
+	err := omp.ExportHTML(exportCtx, binary, sessionFile, outputFile, environment)
 	cancel()
 	<-monitorDone
 	select {

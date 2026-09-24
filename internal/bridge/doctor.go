@@ -153,7 +153,7 @@ func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client
 	if !appendChecks(checkDoctorStorage(cfg.DataDir)) {
 		return checks
 	}
-	if !appendChecks(checkDoctorOMPWithTimeout(ctx, cfg.OMP)) {
+	if !appendChecks(checkDoctorOMPWithTimeout(ctx, cfg.OMP, cfg.OMPEnvironment)) {
 		return checks
 	}
 	workspace, session := checkDoctorWorkspaceSession(binding, runtime)
@@ -247,22 +247,22 @@ func checkDoctorStorage(dataDir string) doctorCheck {
 	return doctorCheck{Name: "Storage", Level: doctorOK}
 }
 
-func checkDoctorOMPWithTimeout(parent context.Context, binary string) doctorCheck {
+func checkDoctorOMPWithTimeout(parent context.Context, binary string, environment omp.Environment) doctorCheck {
 	ctx, cancel := context.WithTimeout(parent, doctorOMPTimeout)
 	defer cancel()
-	if err := doctorRunOMP(ctx, binary); err != nil {
+	if err := doctorRunOMP(ctx, binary, environment); err != nil {
 		return doctorCheck{Name: "OMP binary", Level: doctorFail, Message: "executable check failed"}
 	}
 	return doctorCheck{Name: "OMP binary", Level: doctorOK}
 }
 
-func checkDoctorOMP(ctx context.Context, binary string) error {
+func checkDoctorOMP(ctx context.Context, binary string, environment omp.Environment) error {
 	info, err := os.Stat(binary)
 	if err != nil || !info.Mode().IsRegular() {
 		return errors.New("omp binary is unavailable")
 	}
 	cmd := exec.CommandContext(ctx, binary, "--version")
-	cmd.Env = omp.ChildEnv()
+	cmd.Env = omp.ChildEnv(environment)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()
