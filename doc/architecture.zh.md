@@ -346,7 +346,7 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 
 成功 RPC 会刷新空闲计时并使 watchdog 证据失效. 失败 RPC 只使 watchdog 证据及正在进行的探测失效, 不刷新空闲计时.
 
-重启后, 已提交且 `running=1` 的 binding 会恢复准确的 session 文件和目录. 在恢复任何 OMP 进程前, daemon 根据每个符合条件 binding 已持久化的原生 session ID 重建逻辑 session claim; 被 `worker.max_workers` 阻塞的 binding 会持续持有该 claim, 直到显式 `/close`, 因而其他对话不能恢复同一 session. 被标记为中断的 binding 会在 `omp is ready` 消息中追加 warning, 并在新 generation 中清除标记; 空闲会话恢复保持静默. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 如果启动前发现已保存的 session 文件或 workspace 不可用, bridge 会保存 `running=0`, 记录 `restore_runtime_skipped`, 并提示使用 `/new`; 绝不创建替代 session. 其他启动失败仍保留已保存身份和恢复资格, 供手动恢复或下次服务重启使用. OMP 新 session 可能先返回身份, 再持久化 history file.
+重启后, 已提交且 `running=1` 的 binding 会恢复准确的 session 文件和目录. 在恢复任何 OMP 进程前, daemon 根据每个符合条件 binding 已持久化的原生 session ID 重建逻辑 session claim; 被 `worker.max_workers` 阻塞的 binding 会持续持有该 claim, 直到显式 `/close`, 因而其他对话不能恢复同一 session. 自动恢复成功时不发送 ready 消息. 被标记为中断的 binding 只收到独立的中断警告, 并在新 generation 中清除标记; 显式 `/new` 和 `/resume` 仍发送 ready 消息. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 如果启动前发现已保存的 session 文件或 workspace 不可用, bridge 会保存 `running=0`, 记录 `restore_runtime_skipped`, 并提示使用 `/new`; 绝不创建替代 session. 其他启动失败仍保留已保存身份和恢复资格, 供手动恢复或下次服务重启使用. OMP 新 session 可能先返回身份, 再持久化 history file.
 
 持久化的逻辑 session claim 就是 restore claim: 它在进程启动前依据保存的原生 session 身份重建, 并在 worker 容量延迟重连期间保持.
 
