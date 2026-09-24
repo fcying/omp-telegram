@@ -266,19 +266,6 @@ func TestReleasedRuntimeFailureDoesNotSubmitPrompt(t *testing.T) {
 	}
 }
 
-func TestFailedStartupRestorePreservesLogicalSession(t *testing.T) {
-	w, _, _, before := releasedIdleWorker(t)
-	if _, err := w.ensureRuntime(); err != nil {
-		t.Fatal("could not restore fixture runtime")
-	}
-	w.restoring = true
-	w.closeFailedStart()
-	w.restoring = false
-	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) || !w.b.sessionInUse(w.sessionID) {
-		t.Fatalf("failed startup restoration closed logical session: binding=%+v runtime=%d client=%t", w.binding, w.runtime, w.client != nil)
-	}
-}
-
 func TestIdleReleaseRequiresQuiescentRuntime(t *testing.T) {
 	w, _, _, _ := releasedIdleWorker(t)
 	for _, tc := range []struct {

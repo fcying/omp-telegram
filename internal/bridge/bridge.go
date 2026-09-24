@@ -1240,7 +1240,7 @@ func (w *worker) ensureRuntime() (*omp.Client, error) {
 		return nil, errors.New("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
 	}
 	w.beginRuntimeResume()
-	w.start(true, w.binding.Session, w.binding.Workspace, false)
+	failure := w.start(true, w.binding.Session, w.binding.Workspace, false)
 	w.endRuntimeResume()
 	if client, ok := w.runtimeClient(); ok {
 		w.logRuntimeEvent(slog.LevelInfo, "runtime_resume", "lazy", "runtime resumed", w.sessionID)
@@ -1248,6 +1248,9 @@ func (w *worker) ensureRuntime() (*omp.Client, error) {
 	}
 	if w.ctx.Err() == nil {
 		w.logRuntimeEvent(slog.LevelWarn, "restore_runtime_failed", "lazy", "runtime restore failed", w.sessionID)
+	}
+	if failure != "" {
+		return nil, errors.New(failure)
 	}
 	return nil, errors.New("Failed to resume the released OMP session. No prompt was submitted.")
 }
@@ -1293,11 +1296,7 @@ func (w *worker) run() {
 	if w.startIntent != nil {
 		w.say("A requested " + w.startIntent.Kind + " session start was interrupted before omp identity was saved. The outcome is uncertain. Use /close to cancel it, then use /new or /resume explicitly.")
 	} else if w.restoring {
-		w.start(true, w.binding.Session, w.binding.Workspace, false)
-		w.restoring = false
-		if _, connected := w.runtimeClient(); !connected && w.ctx.Err() == nil && w.binding.Running {
-			w.logRuntimeEvent(slog.LevelWarn, "restore_runtime_failed", "resume", "runtime restore failed", w.sessionID)
-		}
+		w.restoreBinding()
 	}
 	tick := time.NewTicker(1500 * time.Millisecond)
 	defer tick.Stop()
@@ -1875,12 +1874,19 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 	return old.Workspace, nil
 }
 
-func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
-	w.startInternal(resume, target, expectedCWD, replace, 0, false)
+func (w *worker) start(resume bool, target, expectedCWD string, replace bool) string {
+	return w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, 0, false))
 }
 
 func (w *worker) startFenced(resume bool, target, expectedCWD string, replace bool, generation int64) {
-	w.startInternal(resume, target, expectedCWD, replace, generation, true)
+	w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, generation, true))
+}
+
+func (w *worker) reportStartFailure(message string) string {
+	if message != "" && !w.runtimeResuming {
+		w.say(message)
+	}
+	return message
 }
 
 func (w *worker) renameNewTopic(workspace string) {
@@ -1918,27 +1924,22 @@ func (w *worker) topicRenameFinished(result topicRenameResult) {
 	w.say("The session started, but the Telegram topic title could not be updated.")
 }
 
-func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool) {
+func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool) string {
 	if _, connected := w.runtimeClient(); connected && !replace {
-		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
-		return
+		return "An instance is already running. Use /new for a fresh session, or /close before resuming another session."
 	}
 	if w.runtime == runtimeStarting {
-		w.say("OMP is already starting.")
-		return
+		return "OMP is already starting."
 	}
 	if w.startIntent != nil && !w.restoring {
-		w.say("A previous session start is still uncertain. Use /close before starting another session.")
-		return
+		return "A previous session start is still uncertain. Use /close before starting another session."
 	}
 	if w.exportCancel != nil && !w.restoring {
-		w.say("The omp session operation is still loading. Wait for the export to finish.")
-		return
+		return "The omp session operation is still loading. Wait for the export to finish."
 	}
 	old, e := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if e != nil && !errors.Is(e, sql.ErrNoRows) {
-		w.say("Failed to read the session.")
-		return
+		return "Failed to read the session."
 	}
 	oldMissing := errors.Is(e, sql.ErrNoRows)
 	renameTopic := !resume && !w.restoring && w.key.thread != 0 && oldMissing
@@ -1955,36 +1956,21 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 
 	if resume {
 		if w.restoring {
-			info, err := os.Stat(target)
-			workspaceInfo, workspaceErr := os.Stat(expectedCWD)
-			if !filepath.IsAbs(target) || err != nil || !info.Mode().IsRegular() || !filepath.IsAbs(expectedCWD) || workspaceErr != nil || !workspaceInfo.IsDir() {
-				if !w.runtimeResuming {
-					sessionID := w.sessionID
-					if w.persistClosed() {
-						w.releaseSession()
-						w.logRuntimeEvent(slog.LevelInfo, "restore_runtime_skipped", "session_file_unavailable", "startup restore skipped", sessionID)
-						w.say("The saved omp session file or working directory is unavailable, so startup restore was skipped. Use /new to start a new session.")
-					}
-					return
-				}
-				w.say("Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session.")
-				return
+			if !savedSessionAvailable(target, expectedCWD) {
+				return "Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session."
 			}
 			cwd = expectedCWD
 		} else if !validSessionID(target) {
-			w.say("Usage: /resume, or /resume <omp session ID>.")
-			return
+			return "Usage: /resume, or /resume <omp session ID>."
 		}
 		if !w.runtimeResuming && w.b.sessionInUseByOther(w, target) {
-			w.say("This session is already running in another conversation. Close that instance first, or use a full session ID.")
-			return
+			return "This session is already running in another conversation. Close that instance first, or use a full session ID."
 		}
 		session = target
 	} else {
 		cwd = target
 		if !filepath.IsAbs(cwd) {
-			w.say("Invalid working directory.")
-			return
+			return "Invalid working directory."
 		}
 	}
 	reuseSlot := replace && w.runtime == runtimeConnected && w.client != nil
@@ -1994,8 +1980,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		case w.b.slots <- struct{}{}:
 			reserved = true
 		default:
-			w.say("The active instance limit has been reached.")
-			return
+			return "The active instance limit has been reached."
 		}
 	}
 	if !resume {
@@ -2003,8 +1988,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 			if reserved {
 				<-w.b.slots
 			}
-			w.say("Failed to create the working directory.")
-			return
+			return "Failed to create the working directory."
 		}
 	}
 	if !w.restoring {
@@ -2027,8 +2011,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 			if reserved {
 				<-w.b.slots
 			}
-			w.say("Failed to save the startup intent.")
-			return
+			return "Failed to save the startup intent."
 		}
 		w.startIntent = &intent
 		w.binding = old
@@ -2050,13 +2033,12 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		}
 		w.runtimeStopped()
 		if w.runtimeResuming {
-			w.say("Failed to resume the released OMP session. No prompt was submitted.")
-		} else if resume {
-			w.say("Failed to resume omp. The startup outcome is uncertain; use /close before retrying.")
-		} else {
-			w.say("Failed to start omp. The startup outcome is uncertain; use /close before retrying.")
+			return "Failed to resume the released OMP session. No prompt was submitted."
 		}
-		return
+		if resume {
+			return "Failed to resume omp. The startup outcome is uncertain; use /close before retrying."
+		}
+		return "Failed to start omp. The startup outcome is uncertain; use /close before retrying."
 	}
 	w.runtimeStarted(c)
 	w.initMedia()
@@ -2066,59 +2048,53 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	if e != nil {
 		w.logRuntimeEvent(slog.LevelError, "runtime_identity_invalid", "failure", "runtime session identity unavailable", "")
 		w.closeFailedStart()
-		w.say("Cannot obtain omp session identity and working directory. The instance has been closed.")
-		return
+		return "Cannot obtain omp session identity and working directory. The instance has been closed."
 	}
 	if resume && !w.restoring && !strings.HasPrefix(strings.ToLower(info.ID), strings.ToLower(target)) {
 		w.closeFailedStart()
-		w.say("The resumed session did not match the requested omp session ID.")
-		return
+		return "The resumed session did not match the requested omp session ID."
 	}
 	if w.restoring && !sameSessionFile(info.File, target) {
 		w.closeFailedStart()
-		w.say("omp did not restore the saved session file. The instance has been closed.")
-		return
+		return "omp did not restore the saved session file. The instance has been closed."
+	}
+	if w.runtimeResuming && !strings.EqualFold(info.ID, old.SessionID) {
+		w.closeFailedStart()
+		return "omp did not restore the saved session identity. The instance has been closed."
 	}
 	if !resume {
 		expectedCWD = cwd
 	}
 	if expectedCWD != "" && !sameWorkspace(info.CWD, expectedCWD) {
 		w.closeFailedStart()
-		w.say("omp selected a different working directory. The instance has been closed.")
-		return
+		return "omp selected a different working directory. The instance has been closed."
 	}
 	if !w.claimSession(info.File, info.ID) {
 		w.closeFailedStart()
-		w.say("This omp session is already active in another conversation.")
-		return
+		return "This omp session is already active in another conversation."
 	}
 	if _, e = w.call("set_host_tools", map[string]any{"tools": telegramSendTools}); e != nil {
 		w.closeFailedStart()
-		w.say("Cannot register Telegram attachment delivery. The instance has been closed.")
-		return
+		return "Cannot register Telegram attachment delivery. The instance has been closed."
 	}
-	interrupted := w.restoring && !w.runtimeResuming && old.Interrupted
 	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: nextGeneration, LastUsedAt: old.LastUsedAt, Running: true}
 
 	if w.runtimeResuming {
 		binding = old
-	} else if w.restoring {
-		e = w.b.db.Save(binding)
 	} else {
 		e = w.b.db.CommitStart(binding)
 	}
 	if e != nil {
 		w.b.storeLog.Error("session binding persistence failed", "event", "binding_write_failed", "reason", "commit_start", "error_kind", "persistence")
 		w.closeFailedStart()
-		w.say("Failed to save the session binding. The instance has been closed.")
-		return
+		return "Failed to save the session binding. The instance has been closed."
 	}
 	w.binding = binding
 	w.startIntent = nil
 	w.preview, w.lastPreview = "", ""
 	w.previewID = 0
 	w.touchActivity()
-	if !w.runtimeResuming && !w.restoring {
+	if !w.runtimeResuming {
 		w.touchBinding()
 	}
 	if !w.runtimeResuming {
@@ -2141,16 +2117,10 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	if renameTopic {
 		w.renameNewTopic(info.CWD)
 	}
-	if w.runtimeResuming {
-		return
+	if !w.runtimeResuming {
+		w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
 	}
-	if w.restoring {
-		if interrupted {
-			w.say("⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted.")
-		}
-		return
-	}
-	w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
+	return ""
 }
 func (w *worker) handle(in incoming) {
 	w.touchLogicalActivity()

@@ -983,7 +983,7 @@ allowed_chats = [-10]
 	if c.Token != "literal-token" || c.OMP != omp || len(c.OMPArgs) != 0 || c.DataDir != base || c.WorkspaceRoot != filepath.Join(base, "workspace") {
 		t.Fatalf("omitted optional tables did not use defaults: %#v", c)
 	}
-	if c.MaxWorkers != 4 || c.QueueCapacity != 16 || c.DatabaseRetentionDays != 90 || c.IdleTimeout != 30*time.Minute || c.LogLevel != "info" || c.LogFormat != "text" || len(c.LogComponentLevels) != 0 {
+	if c.MaxWorkers != 8 || c.QueueCapacity != 16 || c.DatabaseRetentionDays != 90 || c.IdleTimeout != 30*time.Minute || c.LogLevel != "info" || c.LogFormat != "text" || len(c.LogComponentLevels) != 0 {
 		t.Fatalf("omitted optional table defaults changed: %#v", c)
 	}
 }

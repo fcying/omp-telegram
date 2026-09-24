@@ -79,7 +79,7 @@ workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
 database_retention_days = 90
 
 [worker]
-max_workers = 4
+max_workers = 8
 queue_capacity = 16
 idle_timeout = "30m"
 
@@ -123,7 +123,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `storage.data_dir` | Database, lock, and outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
 | `storage.database_retention_days` | How long terminal bridge message metadata is retained. Default: `90`; `0` disables automatic cleanup. |
-| `worker.max_workers` | Maximum number of connected OMP processes. Default: `4`; maximum: `64`. |
+| `worker.max_workers` | Maximum number of connected OMP processes. Default: `8`; maximum: `64`. |
 | `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`; maximum: `1024`. |
 | `worker.idle_timeout` | Time before releasing an otherwise idle OMP process while keeping its session available. Default: `30m`; `0` or `disabled` turns this off. |
 | `logging.level` | Global log level: `debug`, `info`, `warn`, or `error`. Default: `info`. |
@@ -315,7 +315,7 @@ Reply context is derived only from the current Update's decoded `ReplyToMessage`
 
 ## Sessions and Recovery
 
-Committed sessions survive daemon restarts.
+Committed sessions survive daemon restarts. At startup, the bridge restores their saved identities without launching OMP processes; the first prompt or OMP control command reconnects the original session and may take longer.
 
 Uncertain in-flight operations are not automatically replayed.
 
@@ -323,7 +323,7 @@ Tasks that were still waiting when the daemon stopped are cancelled. Check the c
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
 - If the saved OMP session file or workspace is unavailable at startup, including a fresh session with no persisted history, recovery is skipped, the binding is kept closed, and the bridge tells you to use `/new`; it never creates a replacement session. For other session-switching failures, use `/close` followed by `/new` or `/resume`.
-- `worker.idle_timeout` may release an unused OMP process without closing the session, but only after OMP has written a recoverable session file. A fresh native session may remain connected until then. The next prompt or OMP control command resumes the same session.
+- `worker.idle_timeout` may release an unused OMP process without closing the session, but only after OMP has written a recoverable session file. A fresh native session may remain connected until then. The next prompt or OMP control command resumes the same session. If reconnection fails, the bridge sends one error notice and does not submit the prompt.
 - **Send `/close` before deleting a Telegram topic.** Deleting a topic does not automatically stop its OMP session.
 
 Each conversation has its own session, but sessions that use the same workspace share files. Separate conversations are not filesystem or credential sandboxes.

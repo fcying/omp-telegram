@@ -122,7 +122,7 @@ func load(path, baseDir string) (Config, error) {
 			DatabaseRetentionDays: int64(90),
 		},
 		Worker: workerFileConfig{
-			MaxWorkers:    int64(4),
+			MaxWorkers:    int64(8),
 			QueueCapacity: int64(16),
 			IdleTimeout:   "30m",
 		},

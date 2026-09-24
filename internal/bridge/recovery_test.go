@@ -126,15 +126,22 @@ func (d *recoveryDaemon) state(id int64) string {
 	return state
 }
 
-func (d *recoveryDaemon) restored(before store.Binding) store.Binding {
+func (d *recoveryDaemon) outputCount(thread int64) int {
 	d.t.Helper()
-	waitFor(d.t, func() bool {
-		b, err := d.db.Binding(before.Bot, before.Chat, before.Thread)
-		return err == nil && b.Generation > before.Generation
-	})
+	var count int
+	if err := d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE chat=? AND thread=?", d.chat, thread).Scan(&count); err != nil {
+		d.t.Fatal(err)
+	}
+	return count
+}
+
+func (d *recoveryDaemon) cold(before store.Binding) store.Binding {
+	d.t.Helper()
+	d.command(before.Thread, "/status")
+	waitFor(d.t, func() bool { return d.fake.has(before.Thread, "OMP: released") })
 	after := d.binding(before.Thread)
-	if after.Session != before.Session || after.Workspace != before.Workspace || !after.Running {
-		d.t.Fatalf("restore changed session identity or lost running intent: before=%+v after=%+v", before, after)
+	if after != before {
+		d.t.Fatalf("startup changed saved binding: before=%+v after=%+v", before, after)
 	}
 	return after
 }
@@ -210,10 +217,10 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 	// absolute native file path can recover these sessions.
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
 	d.start()
-	restoredLive := d.restored(live)
-	restoredStopped := d.restored(stopped)
-	if restoredLive.LastUsedAt != lastUsedBeforeRestart[11] || restoredStopped.LastUsedAt != lastUsedBeforeRestart[22] {
-		t.Fatalf("startup restore changed last-used timestamps: before=%v live=%d stopped=%d", lastUsedBeforeRestart, restoredLive.LastUsedAt, restoredStopped.LastUsedAt)
+	coldLive := d.cold(live)
+	coldStopped := d.cold(stopped)
+	if coldLive.LastUsedAt != lastUsedBeforeRestart[11] || coldStopped.LastUsedAt != lastUsedBeforeRestart[22] {
+		t.Fatalf("startup binding recovery changed last-used timestamps: before=%v live=%d stopped=%d", lastUsedBeforeRestart, coldLive.LastUsedAt, coldStopped.LastUsedAt)
 	}
 	waitFor(t, func() bool { return d.fake.has(11, "Gateway restarted while the previous task was active") })
 	if d.fake.has(22, "Gateway restarted while the previous task was active") {
@@ -315,7 +322,7 @@ func TestDaemonRecoveryPreservesPrivateChatWithoutReplayingTasks(t *testing.T) {
 	d.stop()
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
 	d.start()
-	d.restored(before)
+	d.cold(before)
 	waitFor(t, func() bool { return d.fake.has(0, "Gateway restarted while the previous task was active") })
 	if state := d.state(uncertain); state != "uncertain" {
 		t.Fatalf("interrupted private submission became %q", state)
@@ -421,7 +428,29 @@ func TestDaemonRecoverySkipsMissingSessionWithoutReplacement(t *testing.T) {
 	}
 }
 
-func TestDaemonRecoveryHonorsReducedWorkerLimit(t *testing.T) {
+func TestDaemonRecoveryMissingSessionAfterStartupReportsOnce(t *testing.T) {
+	d := newRecoveryDaemon(t, 1)
+	d.command(11, "/new "+t.TempDir())
+	before := d.binding(11)
+	d.stop()
+	d.start()
+	d.cold(before)
+	if err := os.Remove(before.Session); err != nil {
+		t.Fatal(err)
+	}
+	previous := d.outputCount(11)
+	id := d.send(11, "cwd")
+	waitInputDone(t, d.db, id)
+	waitFor(t, func() bool { return d.fake.has(11, "Cannot restore the saved omp session.") })
+	if got := d.outputCount(11); got != previous+1 {
+		t.Fatalf("missing session replies = %d, want 1", got-previous)
+	}
+	if d.state(id) == "submitted" || d.binding(11) != before {
+		t.Fatal("missing session submitted a prompt or changed the saved binding")
+	}
+}
+
+func TestDaemonRecoveryStartsProcessesOnlyOnDemand(t *testing.T) {
 	d := newRecoveryDaemon(t, 2)
 	d.command(11, "/new "+t.TempDir())
 	d.command(22, "/new "+t.TempDir())
@@ -429,62 +458,67 @@ func TestDaemonRecoveryHonorsReducedWorkerLimit(t *testing.T) {
 	d.stop()
 	d.cfg.MaxWorkers = 1
 	d.start()
-	waitFor(t, func() bool {
-		restored := 0
-		blocked := 0
-		for _, b := range before {
-			after := d.binding(b.Thread)
-			switch {
-			case after.Generation > b.Generation:
-				restored++
-			case after.Generation == b.Generation:
-				blocked++
-			}
-		}
-		return restored == 1 && blocked == 1
-	})
-	var blocked store.Binding
 	for _, b := range before {
-		after := d.binding(b.Thread)
-		if after.Generation == b.Generation {
-			blocked = b
-			break
+		d.cold(b)
+		if !d.fake.has(b.Thread, "Idle: n/a") {
+			t.Fatalf("topic %d did not report an unconnected saved session", b.Thread)
 		}
 	}
-	if blocked.SessionID == "" {
-		t.Fatal("could not identify the binding blocked by worker capacity")
-	}
-	d.command(blocked.Thread, "/status")
-	waitFor(t, func() bool { return d.fake.has(blocked.Thread, "OMP: released") })
-	if !d.fake.has(blocked.Thread, "Idle: n/a") {
-		t.Fatal("capacity-blocked released status omitted unknown idle state")
-	}
-	// Each probe runs after its topic's automatic restoration attempt.
-	for _, b := range before {
-		d.command(b.Thread, "capacity-probe")
-	}
-	waitFor(t, func() bool {
-		return d.fake.has(11, "answer: capacity-probe") || d.fake.has(22, "answer: capacity-probe")
-	})
-	restored, answered := 0, 0
-	for _, b := range before {
-		after := d.binding(b.Thread)
-		if after.Session != b.Session || after.Workspace != b.Workspace || !after.Running {
-			t.Fatalf("capacity pressure discarded saved identity or intent: %+v", after)
-		}
-		if after.Generation > b.Generation {
-			restored++
-		}
-		if d.fake.has(b.Thread, "answer: capacity-probe") {
-			answered++
-		}
-	}
-	if restored != 1 || answered != 1 {
-		t.Fatalf("worker cap: restored=%d responding=%d, want one each", restored, answered)
-	}
-	d.command(33, "/resume "+blocked.SessionID)
+	d.command(33, "/resume "+before[1].SessionID)
 	if _, err := d.db.Binding(99, d.chat, 33); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("resume of a capacity-blocked logical session created a binding: %v", err)
+		t.Fatalf("resume of a cold session claimed by another topic created a binding: %v", err)
+	}
+	d.command(33, "/new "+t.TempDir())
+	waitFor(t, func() bool { return d.fake.has(33, "omp is ready.") })
+	blocked := d.send(11, "cwd")
+	waitInputDone(t, d.db, blocked)
+	waitFor(t, func() bool { return d.fake.has(11, "The active instance limit has been reached.") })
+	if d.state(blocked) == "submitted" || d.fake.has(11, "answer: "+before[0].Workspace) || d.binding(11) != before[0] {
+		t.Fatal("capacity failure submitted a prompt or replaced the saved session")
+	}
+	d.command(33, "/close")
+	for _, b := range before {
+		id := d.send(b.Thread, "cwd")
+		waitFor(t, func() bool { return d.fake.has(b.Thread, "answer: "+b.Workspace) })
+		waitInputDone(t, d.db, id)
+		if after := d.binding(b.Thread); !sameBindingIdentity(after, b) {
+			t.Fatalf("on-demand resume changed the saved binding: before=%+v after=%+v", b, after)
+		}
+		d.command(b.Thread, "/close")
+	}
+}
+
+func TestDaemonRecoveryRejectsChangedNativeSessionIdentity(t *testing.T) {
+	d := newRecoveryDaemon(t, 1)
+	d.command(11, "/new "+t.TempDir())
+	changed := d.binding(11)
+	d.stop()
+	changed.SessionID = "aaaaaaaa-0000-4000-8000-000000000001"
+	db, err := store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Save(changed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.start()
+	d.cold(changed)
+	previous := d.outputCount(11)
+	id := d.send(11, "cwd")
+	waitInputDone(t, d.db, id)
+	waitFor(t, func() bool { return d.fake.has(11, "omp did not restore the saved session identity") })
+	if got := d.outputCount(11); got != previous+1 {
+		t.Fatalf("identity mismatch replies = %d, want 1", got-previous)
+	}
+	if d.state(id) == "submitted" || d.binding(11) != changed || d.fake.has(11, "answer: "+changed.Workspace) {
+		t.Fatal("identity mismatch submitted a prompt or changed the saved session")
+	}
+	d.command(22, "/new "+t.TempDir())
+	if !d.binding(22).Running {
+		t.Fatal("rejected runtime retained the process slot")
 	}
 }
 
