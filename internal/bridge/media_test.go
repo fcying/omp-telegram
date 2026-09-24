@@ -154,6 +154,7 @@ func TestTwoPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 
 func TestOversizedAlbumReportsErrorWithoutClosingSession(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 4
 	command("/new " + t.TempDir())
 	client := w.client
 	command("large album")
