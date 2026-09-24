@@ -2339,6 +2339,27 @@ func (w *worker) dispatch() {
 		return
 	}
 	q := w.queue[0]
+	fields := map[string]any{"message": q.text}
+	if len(q.images) > 0 {
+		fields["images"] = q.images
+	}
+	if err := client.CheckCallSize("prompt", fields); err != nil {
+		w.queue = w.queue[1:]
+		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		if w.mark(q.id, "failed") {
+			w.logQueuedTaskComplete(q.id, "failed")
+			if errors.Is(err, omp.ErrFrameTooLarge) {
+				if len(q.images) > 0 {
+					w.say("Message and attachments exceed omp's RPC size limit. Send fewer or smaller images.")
+				} else {
+					w.say("Message exceeds omp's RPC size limit. Shorten it and try again.")
+				}
+			} else {
+				w.say("Message could not be encoded for omp. It was not submitted.")
+			}
+		}
+		return
+	}
 	w.queue = w.queue[1:]
 	if !w.submit(q) {
 		return
@@ -2355,10 +2376,6 @@ func (w *worker) dispatch() {
 	w.lastPreview = ""
 	w.previewID = 0
 	w.previewStopToken = ""
-	fields := map[string]any{"message": q.text}
-	if len(q.images) > 0 {
-		fields["images"] = q.images
-	}
 	w.startOperation("prompt", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "prompt", fields)
 	}, q.id, "")

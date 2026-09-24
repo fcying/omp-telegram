@@ -152,6 +152,55 @@ func TestTwoPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 	waitInputDone(t, db, 3)
 }
 
+func TestOversizedAlbumReportsErrorWithoutClosingSession(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	client := w.client
+	command("large album")
+	if len(w.queue) != 1 {
+		t.Fatalf("queued tasks = %d, want 1", len(w.queue))
+	}
+	directory := filepath.Join(w.binding.Workspace, ".telegram", "incoming", "large-album")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	imageData := strings.Repeat("A", 600<<10) // Each represents a 450 KiB image encoded as base64.
+	w.queue[0].album = true
+	w.queue[0].directory = directory
+	w.queue[0].images = []media.Image{
+		{Type: "image", Data: imageData, MimeType: "image/jpeg"},
+		{Type: "image", Data: imageData, MimeType: "image/jpeg"},
+	}
+	w.dispatch()
+	if w.client != client || w.active != 0 || w.busy || len(w.queue) != 0 {
+		t.Fatal("oversized album disrupted the running session")
+	}
+	var state, notice string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "failed" {
+		t.Fatalf("oversized album state = %q, error %v", state, err)
+	}
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&notice); err != nil || !strings.Contains(notice, "exceed omp's RPC size limit") {
+		t.Fatalf("oversized album notice = %q, error %v", notice, err)
+	}
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("rejected album directory remains: %v", err)
+	}
+	var runtimeState struct {
+		FixtureRootPrompts int `json:"fixtureRootPrompts"`
+	}
+	raw, err := client.Call(w.ctx, "get_state", nil)
+	if err != nil || json.Unmarshal(raw, &runtimeState) != nil || runtimeState.FixtureRootPrompts != 0 {
+		t.Fatalf("oversized album reached omp: state=%s, error=%v", raw, err)
+	}
+	command("next prompt")
+	w.dispatch()
+	result := waitOperation(t, w)
+	if result.kind != "prompt" || result.err != nil {
+		t.Fatalf("next prompt result = %+v", result)
+	}
+	w.operationReturned(result)
+}
+
 func TestPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 	f, db, send := setupBridge(t)
 	data := testPNG(t)

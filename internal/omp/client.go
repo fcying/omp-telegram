@@ -28,6 +28,9 @@ const (
 
 var errProtocol = errors.New("omp: invalid RPC frame")
 
+// ErrFrameTooLarge means the RPC request was rejected before any bytes were written.
+var ErrFrameTooLarge = errors.New("omp: RPC request exceeds frame limit")
+
 var nextClientID atomic.Uint64
 
 type Config struct {
@@ -295,14 +298,38 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 	close(c.done)
 }
 
-// Send writes a one-way frame, preserving the caller's correlation ID.
-func (c *Client) Send(ctx context.Context, frame map[string]any) error {
+func (c *Client) encodeFrame(frame map[string]any) ([]byte, error) {
 	data, err := json.Marshal(frame)
 	if err != nil {
-		return errors.New("omp: cannot encode RPC request")
+		return nil, errors.New("omp: cannot encode RPC request")
 	}
 	if len(data)+1 > int(c.frameLimit.Load()) {
-		return errors.New("omp: RPC request exceeds frame limit")
+		return nil, ErrFrameTooLarge
+	}
+	return data, nil
+}
+
+func callFrame(typeName string, fields map[string]any, id string) map[string]any {
+	frame := make(map[string]any, len(fields)+2)
+	for k, v := range fields {
+		frame[k] = v
+	}
+	frame["type"] = typeName
+	frame["id"] = id
+	return frame
+}
+
+// CheckCallSize reserves space for the longest possible request ID before a task is submitted.
+func (c *Client) CheckCallSize(typeName string, fields map[string]any) error {
+	_, err := c.encodeFrame(callFrame(typeName, fields, strconv.FormatUint(^uint64(0), 10)))
+	return err
+}
+
+// Send writes a one-way frame, preserving the caller's correlation ID.
+func (c *Client) Send(ctx context.Context, frame map[string]any) error {
+	data, err := c.encodeFrame(frame)
+	if err != nil {
+		return err
 	}
 	select {
 	case c.writeGate <- struct{}{}:
@@ -344,13 +371,8 @@ func (c *Client) Send(ctx context.Context, frame map[string]any) error {
 
 // Call resolves the command acknowledgment, not the completion of an agent turn.
 func (c *Client) Call(ctx context.Context, typeName string, fields map[string]any) (json.RawMessage, error) {
-	frame := make(map[string]any, len(fields)+2)
-	for k, v := range fields {
-		frame[k] = v
-	}
-	frame["type"] = typeName
 	id := strconv.FormatUint(c.next.Add(1), 10)
-	frame["id"] = id
+	frame := callFrame(typeName, fields, id)
 	r := request{command: typeName, result: make(chan result, 1)}
 	c.mu.Lock()
 	c.pending[id] = r
