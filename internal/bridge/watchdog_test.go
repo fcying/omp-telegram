@@ -270,7 +270,23 @@ func TestIdleProbeRejectsOldOwnershipAndQueuedActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.idleProbeFinished(result, now.Add(time.Minute))
-	if w.client != result.client || w.active != 0 {
-		t.Fatal("probe retired runtime instead of honoring queued terminal event")
+	if w.client != result.client {
+		t.Fatal("probe retired runtime despite queued RPC output")
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for w.active != 0 {
+		select {
+		case raw, ok := <-result.client.Events():
+			if !ok {
+				t.Fatal("runtime closed before queued terminal event")
+			}
+			w.event(raw)
+		case <-deadline.C:
+			t.Fatal("queued terminal event did not complete the task")
+		}
+	}
+	if w.client != result.client {
+		t.Fatal("terminal event retired runtime")
 	}
 }

@@ -203,7 +203,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 Telegram chat 的已保存 conversation/session binding, 并在可用时显示原生 session name. Pending, open 和当前对话不能删除; 其他 topic 的 closed binding 确认后可删除, 只删除 bridge metadata, 不删除 workspace 或 OMP 原生 history. |
-| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 当前 conversation 和 workspace 的 pinned session 会排在前面; 每行都有 Pin 或 Unpin 按钮. |
+| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 每个编号条目显示完整 ID 和更新时间; 简短标题选择按钮与 Pin/Unpin 同行. 当前 conversation 和 workspace 的 pinned session 会排在前面. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
 | `/export` | 从当前 workspace 打开原生 OMP session 导出 picker. 默认导出原始 main session JSONL; 源文件会复制到私有 attachment outbox, 保留经过安全处理的原文件名, 并受 50 MB document 限制. 当前 session 在 task 或队列活跃时会直接拒绝, 空闲后需要重新执行 `/export`. |
 | `/export html` | 打开原生 OMP HTML 导出的 picker. bridge 会先把选中的 main session JSONL snapshot 到私有 spool, 再从这个稳定 snapshot 调用原生 exporter; 不包含 companion 或 subagent transcript. 结果文件名为 `omp-session-<short-id>.html`; exporter 超时为 30 秒, 输出增长受 50 MB document 限制. |
@@ -217,7 +217,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/fast [on\|off\|status]` | 选择 fast mode, 显式开启或关闭, 或查看状态. |
 | `/compact` | 空闲时经确认压缩当前 context. |
 | `/handoff [补充要求]` | 空闲且队列为空时运行 OMP 原生 handoff. |
-| `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. |
+| `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. 原生选择对话框 (包括 commit 列表) 每页显示 8 项, 只在需要时显示翻页按钮. |
 | `/help` | 查看帮助. |
 
 普通文字, 附件和 `/review` 都按对话排队并串行执行. 任务运行期间发送的消息会等待当前任务结束, 不会打断活动任务. 不同对话可以并行工作, 受 worker 配置上限影响.

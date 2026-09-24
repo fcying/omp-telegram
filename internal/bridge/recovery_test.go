@@ -211,8 +211,26 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
 	})
-	lastUsedBeforeRestart := map[int64]int64{11: d.binding(11).LastUsedAt, 22: d.binding(22).LastUsedAt}
 	d.stop()
+	// Prompt acceptance may touch last_used_at after the submitted inbox state is visible.
+	snapshot, err := store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedLive, err := snapshot.Binding(99, d.chat, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedStopped, err := snapshot.Binding(99, d.chat, 22)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	live.LastUsedAt = persistedLive.LastUsedAt
+	stopped.LastUsedAt = persistedStopped.LastUsedAt
+	lastUsedBeforeRestart := map[int64]int64{11: live.LastUsedAt, 22: stopped.LastUsedAt}
 	// A changed discovery root makes ID-based resume fail; only the saved
 	// absolute native file path can recover these sessions.
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
@@ -249,7 +267,7 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 		}
 	}
 	var warnings int
-	err := d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE chat=? AND thread=? AND text LIKE '%Gateway restarted while the previous task was active%'", d.chat, 11).Scan(&warnings)
+	err = d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE chat=? AND thread=? AND text LIKE '%Gateway restarted while the previous task was active%'", d.chat, 11).Scan(&warnings)
 	if err != nil || warnings != 1 {
 		t.Fatalf("interrupted topic warnings after restart = %d, error = %v", warnings, err)
 	}

@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -211,6 +212,120 @@ func TestNativeSelectionCleanupFailureDoesNotCloseSession(t *testing.T) {
 	assertKeyboardClears(t, f, messageID, expiredMessageID)
 	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("scheduled expiry allowed a stale confirmation to replace the session")
+	}
+}
+
+func TestNativeUISelectionShowsSinglePageWithoutNavigation(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.owner = 7
+	options := make([]string, uiSelectPageSize)
+	for i := range options {
+		options[i] = fmt.Sprintf("commit %02d", i)
+	}
+	raw, err := json.Marshal(map[string]any{"type": "extension_ui_request", "id": "review-commits", "method": "select", "title": "Choose commit", "options": options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.event(raw)
+	text, rows := pickerView(t, f)
+	if strings.Contains(text, "Page ") || len(rows) != len(options)+1 || rows[len(options)][0]["text"] != "Cancel" {
+		t.Fatalf("single-page commit choices = %q; %v", text, rows)
+	}
+	data := rows[len(options)-1][0]["callback_data"].(string)
+	messageID := int64(f.messageCount())
+	w.callback(&telegram.CallbackQuery{ID: "select-commit", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+	result, err := w.call("get_state", nil)
+	var state struct {
+		Replies int    `json:"fixtureUIReplies"`
+		Value   string `json:"fixtureUIValue"`
+	}
+	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 1 || state.Value != options[len(options)-1] {
+		t.Fatalf("selected native commit = %+v, error %v", state, err)
+	}
+}
+
+func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.owner = 7
+	options := make([]string, 22)
+	for i := range options {
+		options[i] = fmt.Sprintf("commit %02d", i)
+	}
+	raw, err := json.Marshal(map[string]any{"type": "extension_ui_request", "id": "review-commits", "method": "select", "title": "Choose commit", "options": options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.event(raw)
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "Page 1/3") || len(rows) != uiSelectPageSize+2 || rows[uiSelectPageSize][0]["text"] != "Next" {
+		t.Fatalf("first commit page = %q; %v", text, rows)
+	}
+	first := rows[0][0]["callback_data"].(string)
+	next := rows[uiSelectPageSize][0]["callback_data"].(string)
+	messageID := int64(f.messageCount())
+	click := func(user int64, data string) {
+		w.callback(&telegram.CallbackQuery{ID: "review-callback", From: telegram.User{ID: user}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+	}
+	click(8, next)
+	text, _ = pickerView(t, f)
+	if !strings.Contains(text, "Page 1/3") {
+		t.Fatal("another user paged the native commit menu")
+	}
+	click(7, next)
+	text, rows = pickerView(t, f)
+	if !strings.Contains(text, "Page 2/3") || len(rows) != uiSelectPageSize+2 || len(rows[uiSelectPageSize]) != 2 {
+		t.Fatalf("middle commit page = %q; %v", text, rows)
+	}
+	click(7, first)
+	if _, exists := w.confirms[strings.SplitN(first, ":", 2)[0]]; exists {
+		t.Fatal("old commit page retained an actionable token")
+	}
+	click(7, rows[uiSelectPageSize][0]["callback_data"].(string))
+	text, rows = pickerView(t, f)
+	if !strings.Contains(text, "Page 1/3") {
+		t.Fatalf("previous did not return to first commit page: %q", text)
+	}
+	click(7, rows[uiSelectPageSize][0]["callback_data"].(string))
+	text, rows = pickerView(t, f)
+	if !strings.Contains(text, "Page 2/3") {
+		t.Fatalf("next did not reopen middle commit page: %q", text)
+	}
+	click(7, rows[uiSelectPageSize][1]["callback_data"].(string))
+	text, rows = pickerView(t, f)
+	if !strings.Contains(text, "Page 3/3") || len(rows) != 8 || rows[4][0]["text"] != options[20] {
+		t.Fatalf("last commit page = %q; %v", text, rows)
+	}
+	result, err := w.call("get_state", nil)
+	var state struct {
+		Replies int    `json:"fixtureUIReplies"`
+		Value   string `json:"fixtureUIValue"`
+	}
+	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 0 {
+		t.Fatalf("navigation submitted a native choice: %+v, error %v", state, err)
+	}
+	click(7, rows[4][0]["callback_data"].(string))
+	result, err = w.call("get_state", nil)
+	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 1 || state.Value != options[20] {
+		t.Fatalf("last-page choice = %+v, error %v", state, err)
+	}
+	raw, err = json.Marshal(map[string]any{"type": "extension_ui_request", "id": "review-cancel", "method": "select", "title": "Choose commit", "options": options[:9]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.event(raw)
+	_, rows = pickerView(t, f)
+	messageID = int64(f.messageCount())
+	click(7, rows[uiSelectPageSize][0]["callback_data"].(string))
+	text, rows = pickerView(t, f)
+	if !strings.Contains(text, "Page 2/2") || len(rows) != 3 {
+		t.Fatalf("cancel page = %q; %v", text, rows)
+	}
+	click(7, rows[2][0]["callback_data"].(string))
+	result, err = w.call("get_state", nil)
+	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 2 || state.Value != "" {
+		t.Fatalf("cancel response = %+v, error %v", state, err)
 	}
 }
 

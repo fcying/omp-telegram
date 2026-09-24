@@ -203,7 +203,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List saved conversation/session bindings for this Telegram chat, including native session names when available. Pending, open, and current entries cannot be deleted; a closed entry from another topic can delete bridge metadata without deleting workspace or native OMP history. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Pinned sessions for this conversation and workspace appear first; each row has a Pin or Unpin button. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Each numbered entry shows its full ID and update time; a short-title selection button and Pin/Unpin share a row. Pinned sessions for this conversation and workspace appear first. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
 | `/export` | Open a read-only picker for native OMP session export from the current workspace. The default format is the original main-session JSONL; the source is copied to the private attachment outbox, its filename is retained after sanitization, and the 50 MB document limit applies. Selecting the current session is rejected while its task or queue is active; run `/export` again after it becomes idle. |
 | `/export html` | Open the export picker for native OMP HTML rendering. The bridge first snapshots only the selected main-session JSONL into its private spool, then invokes the native exporter from that stable snapshot; companion or subagent transcripts are not included. The result is stored as `omp-session-<short-id>.html`; exporter timeout is 30 seconds and output growth is bounded by the 50 MB document limit. |
@@ -217,7 +217,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/fast [on\|off\|status]` | Choose fast mode, explicitly enable or disable it, or inspect its status. |
 | `/compact` | Compact the current context while idle, after confirmation. |
 | `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue. |
-| `/review [arguments]` | Run OMP's native `/review` command as a queued task. |
+| `/review [arguments]` | Run OMP's native `/review` command as a queued task. Native selection dialogs, including commit lists, show eight options per page and display navigation only when needed. |
 | `/help` | Show help. |
 
 Ordinary text, attachments, and `/review` are queued per conversation and run sequentially. A message sent while another task is running waits in that conversation; it does not interrupt the active task. Different conversations can run concurrently up to the configured worker capacity.
