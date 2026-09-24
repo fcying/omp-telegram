@@ -21,6 +21,7 @@ func ExportHTML(ctx context.Context, binary, sessionFile, outputFile string) err
 		return errors.New("omp: HTML export requires absolute paths")
 	}
 	cmd := exec.Command(binary, "--export", sessionFile, outputFile)
+	cmd.Env = ChildEnv()
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := runProcess(ctx, cmd); err != nil {

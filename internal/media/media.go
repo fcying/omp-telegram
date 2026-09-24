@@ -251,7 +251,7 @@ func imageInput(ctx context.Context, file *os.File) ([]Image, string) {
 		}
 		data, err := io.ReadAll(io.LimitReader(file, maxInlineBytes+1))
 		if err == nil && len(data) <= maxInlineBytes {
-			return []Image{{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: "image/" + format}}, "The original image is included inline."
+			return []Image{{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: "image/" + format}}, "The original image is saved locally and may be included inline."
 		}
 	}
 	width, height := config.Width, config.Height
@@ -276,7 +276,7 @@ func imageInput(ctx context.Context, file *os.File) ([]Image, string) {
 			return nil, unavailable
 		}
 		if buffer.Len() <= maxInlineBytes {
-			return []Image{{Type: "image", Data: base64.StdEncoding.EncodeToString(buffer.Bytes()), MimeType: "image/jpeg"}}, "A bounded JPEG preview is included inline; the original file is retained."
+			return []Image{{Type: "image", Data: base64.StdEncoding.EncodeToString(buffer.Bytes()), MimeType: "image/jpeg"}}, "A bounded JPEG preview may be included inline; the original file is retained."
 		}
 	}
 	return nil, unavailable + " A preview could not fit the inline image budget."

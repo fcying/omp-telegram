@@ -50,6 +50,7 @@ func ListSessions(ctx context.Context, cfg Config) ([]SessionSummary, error) {
 	}
 	args := append([]string{"acp", "--cwd", cfg.CWD}, cfg.Args...)
 	cmd := exec.Command(cfg.Binary, args...)
+	cmd.Env = ChildEnv()
 	cmd.Dir = cfg.CWD
 	inRead, inWrite, err := os.Pipe()
 	if err != nil {

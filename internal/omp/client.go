@@ -28,6 +28,9 @@ const (
 
 var errProtocol = errors.New("omp: invalid RPC frame")
 
+// ErrRequestTooLarge means the request was rejected before any bytes were written.
+var ErrRequestTooLarge = errors.New("omp: RPC request exceeds frame limit")
+
 var nextClientID atomic.Uint64
 
 type Config struct {
@@ -113,6 +116,7 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	}
 	args = append(args, cfg.Args...)
 	cmd := exec.Command(cfg.Binary, args...)
+	cmd.Env = ChildEnv()
 	cmd.Dir = cfg.CWD
 	// A descriptor avoids os/exec copy goroutines waiting on inherited stderr.
 	stderr, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
@@ -170,6 +174,9 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 func (c *Client) Events() <-chan json.RawMessage { return c.events }
 func (c *Client) Done() <-chan struct{}          { return c.done }
 func (c *Client) ID() uint64                     { return c.id }
+
+// FrameLimit includes the newline delimiting a request frame.
+func (c *Client) FrameLimit() int { return int(c.frameLimit.Load()) }
 
 func (c *Client) failure() error {
 	c.mu.Lock()
@@ -301,8 +308,8 @@ func (c *Client) Send(ctx context.Context, frame map[string]any) error {
 	if err != nil {
 		return errors.New("omp: cannot encode RPC request")
 	}
-	if len(data)+1 > int(c.frameLimit.Load()) {
-		return errors.New("omp: RPC request exceeds frame limit")
+	if len(data)+1 > c.FrameLimit() {
+		return ErrRequestTooLarge
 	}
 	select {
 	case c.writeGate <- struct{}{}:

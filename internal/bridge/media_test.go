@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -150,6 +152,109 @@ func TestTwoPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 	waitFor(t, func() bool { return f.has(11, "answer: images=2; image=8x8; Telegram album:") })
 	waitInputDone(t, db, 2)
 	waitInputDone(t, db, 3)
+}
+
+func TestPromptInlineCountMatchesSerializedFrame(t *testing.T) {
+	message := "compare <one>\n& two"
+	images := []media.Image{
+		{Type: "image", Data: "YWJj+/==", MimeType: "image/jpeg"},
+		{Type: "image", Data: "ZGVm", MimeType: "image/<png>&"},
+	}
+	frameSize := func(inline []media.Image) int {
+		frame := map[string]any{"type": "prompt", "id": "18446744073709551615", "message": message}
+		if len(inline) > 0 {
+			frame["images"] = inline
+		}
+		data, err := json.Marshal(frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(data) + 1 // Include the RPC newline.
+	}
+	textSize := frameSize(nil)
+	firstSize := frameSize(images[:1])
+	bothSize := frameSize(images)
+	for _, tc := range []struct {
+		name   string
+		images []media.Image
+		limit  int
+		count  int
+		fits   bool
+	}{
+		{"text exactly fits", nil, textSize, 0, true},
+		{"text exceeds by one", nil, textSize - 1, 0, false},
+		{"one image exactly fits", images[:1], firstSize, 1, true},
+		{"one image exceeds by one", images[:1], firstSize - 1, 0, true},
+		{"first of two fits", images, firstSize, 1, true},
+		{"second image exceeds by one", images, bothSize - 1, 1, true},
+		{"two images exactly fit", images, bothSize, 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			count, fits := promptInlineCount(message, tc.images, tc.limit)
+			if count != tc.count || fits != tc.fits {
+				t.Fatalf("inline count=%d, fits=%t; want %d, %t for limit %d", count, fits, tc.count, tc.fits, tc.limit)
+			}
+		})
+	}
+}
+
+func TestLargePhotoAlbumKeepsSessionAndOriginalPaths(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 1500, 1000))
+	rng := rand.New(rand.NewPCG(7, 11))
+	for i := 0; i < len(img.Pix); i += 4 {
+		value := rng.Uint32()
+		img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = byte(value), byte(value>>8), byte(value>>16), 255
+	}
+	var photo []byte
+	for quality := 60; quality >= 20; quality -= 5 {
+		var encoded bytes.Buffer
+		if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: quality}); err != nil {
+			t.Fatal(err)
+		}
+		if encoded.Len() > 384*1024 && encoded.Len() <= 512*1024 {
+			photo = encoded.Bytes()
+			break
+		}
+	}
+	if photo == nil {
+		t.Fatal("could not produce an individually valid photo pair exceeding the RPC frame")
+	}
+	f, db, send := setupBridge(t)
+	f.mu.Lock()
+	f.files = map[string][]byte{"large-a": photo, "large-b": photo}
+	f.mu.Unlock()
+	send(update(1, 11, "/new "+t.TempDir()))
+	waitBinding(t, db, 11)
+	before, err := db.Binding(99, -10, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := update(2, 11, "")
+	first.Message.MediaGroupID = "large-album"
+	first.Message.Caption = "compare originals"
+	first.Message.Photo = []telegram.PhotoSize{{FileID: "large-a", Width: 1500, Height: 1000, FileSize: int64(len(photo))}}
+	second := update(3, 11, "")
+	second.Message.MediaGroupID = "large-album"
+	second.Message.Photo = []telegram.PhotoSize{{FileID: "large-b", Width: 1500, Height: 1000, FileSize: int64(len(photo))}}
+	send(first)
+	send(second)
+	waitFor(t, func() bool {
+		return f.has(11, "answer: image=1500x1000; Telegram album:\ncompare originals") && f.has(11, "2. ")
+	})
+	waitInputDone(t, db, 2)
+	waitInputDone(t, db, 3)
+	for _, name := range []string{"001-photo.jpg", "002-photo.jpg"} {
+		paths, err := filepath.Glob(filepath.Join(before.Workspace, ".telegram", "incoming", "*", name))
+		if err != nil || len(paths) != 1 {
+			t.Fatalf("album original %s not retained: %v, %v", name, paths, err)
+		}
+	}
+	send(update(4, 11, "after large album"))
+	waitFor(t, func() bool { return f.has(11, "answer: after large album") })
+	after, err := db.Binding(99, -10, 11)
+	if err != nil || !after.Running || after.Generation != before.Generation || after.Session != before.Session {
+		t.Fatalf("large album changed the session: %+v, %v", after, err)
+	}
 }
 
 func TestPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
