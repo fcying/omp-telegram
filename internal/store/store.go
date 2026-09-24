@@ -389,6 +389,23 @@ func (s *Store) Accept(id int64, raw []byte) error {
 	return tx.Commit()
 }
 
+// AcceptIgnored durably records an unauthorized update without retaining its payload.
+func (s *Store) AcceptIgnored(id int64) error {
+	tx, e := s.DB.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	if _, e = tx.Exec("INSERT INTO inbox(id,raw,state,created_at,updated_at) VALUES(?,X'','ignored',?,?) ON CONFLICT(id) DO NOTHING", id, now, now); e != nil {
+		return e
+	}
+	if _, e = tx.Exec("INSERT INTO meta VALUES('offset',?) ON CONFLICT(key) DO UPDATE SET value=MAX(value,excluded.value)", id+1); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
 // Pending returns at most limit pending inputs from the beginning of the inbox.
 func (s *Store) Pending(limit int) ([]Input, error) {
 	return s.PendingAfter(-1, int64(^uint64(0)>>1), limit)
@@ -469,7 +486,11 @@ func (s *Store) Mark(id int64, state InboxState) error {
 	default:
 		return fmt.Errorf("%w: %s", ErrInboxStateTransition, state)
 	}
-	result, err := s.DB.Exec("UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state IN ("+expected+")", string(state), time.Now().Unix(), id)
+	columns := "state=?,updated_at=?"
+	if state == InboxIgnored {
+		columns += ",raw=X''"
+	}
+	result, err := s.DB.Exec("UPDATE inbox SET "+columns+" WHERE id=? AND state IN ("+expected+")", string(state), time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}

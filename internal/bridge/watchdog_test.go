@@ -52,17 +52,30 @@ func TestRejectedNativeCallInvalidatesIdleEvidence(t *testing.T) {
 
 func drainWatchdogEvents(t *testing.T, w *worker) {
 	t.Helper()
-	// Consume the prompt acknowledgment before using a later RPC as the event barrier.
+	// The later response guarantees earlier events have entered the client queue.
 	w.operationReturned(waitOperation(t, w))
-	if _, err := w.client.Call(w.ctx, "get_state", nil); err != nil {
+	client := w.client
+	if _, err := client.Call(w.ctx, "get_state", nil); err != nil {
 		t.Fatal(err)
 	}
-	for {
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for client.BufferedOutput() {
 		select {
-		case raw := <-w.client.Events():
+		case raw, ok := <-client.Events():
+			if !ok {
+				w.failed()
+				return
+			}
 			w.event(raw)
-		default:
-			return
+			if w.client != client {
+				return
+			}
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("buffered RPC event was not forwarded")
 		}
 	}
 }

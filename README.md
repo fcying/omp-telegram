@@ -200,6 +200,8 @@ Ordinary text, attachments, and `/review` are queued per conversation and run se
 
 All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.
 
+In a group topic, all allowed users share that topic's OMP session and workspace, including its context and command effects. Telegram group membership is not restricted by the bot's user allowlist: other members who can view the topic can also see bot replies and exported files. Use a trusted group topic for sensitive work.
+
 ### Session export
 
 `/export` lists saved OMP sessions in the current workspace and sends the selected native `.jsonl` session file to Telegram. The default format is the original OMP main-session JSONL. `/export html` exports the selected session as a standalone HTML viewer instead.
@@ -221,6 +223,8 @@ If the old working directory recorded in the session no longer exists, OMP may a
 
 Exported session files may contain sensitive conversation, tool, command, and path data, including prompts, assistant responses, tool calls, tool results, local paths, command output, source snippets, and secrets accidentally present in the transcript. Only send them to trusted Telegram conversations. No additional confirmation is requested; entering `/export` is the explicit user action.
 
+In a group topic, `/export` sends the session file into that topic, not a private chat. Any group member with access to the topic may download it, even if they are not allowed to send commands to the bot.
+
 ### Troubleshooting and limitations
 
 | Symptom | Check |
@@ -232,6 +236,10 @@ Exported session files may contain sensitive conversation, tool, command, and pa
 | Unsupported database schema | Back up the data and use a supported database or fresh data directory; do not change a version number by hand. |
 
 Voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
+
+Resource limits: the RPC client shares a 64 MiB byte budget across frame reassembly and queued events. The bridge limits accumulated assistant text before completion to 4 MiB. Exceeding either budget before a terminal event fails the runtime and leaves the task outcome uncertain; it is not replayed automatically. A completed task whose final reply exceeds the display budget stays completed: Telegram receives at most 32 messages and 1 MiB of reply text, with an explicit truncation notice. OMP's native session history is not truncated by the bridge.
+
+The 64 MiB RPC buffer budget is a resource policy separate from the 64 MiB logical-frame protocol limit: a permitted large frame can still exceed the budget when a physical chunk or queued events also occupy it. Streamed deltas and their completed `message_end` text count once toward the assistant output limit; the retained stream buffer also has its own 4 MiB cap.
 
 ## Progress UI
 
@@ -247,7 +255,7 @@ Progress for a new task is delayed for approximately three seconds, so short tas
 
 `/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
 
-Progress is best-effort UI and does not affect durable final-reply delivery.
+Progress is best-effort UI and does not affect durable final-reply delivery. Failed progress-message deletion is retried once a minute while the daemon runs; confirmed permanent Telegram rejections abandon deletion.
 
 Progress does not display model reasoning, raw tool arguments or results, command text, or process output.
 

@@ -44,7 +44,7 @@ flowchart LR
 
 启动顺序为: 加载配置, 锁定数据目录, 初始化数据库并整理遗留状态, `getMe`, 校验数据库 Bot 归属, 注册命令, 恢复实例, 再启动 polling 和交付. `--version` 在加载配置前返回. `--check` 检查本地配置并创建配置中的目录, 不打开数据库或验证 Telegram 认证.
 
-收到的 update 先持久化, 再进行路由鉴权. 未授权输入标记为 ignored, 不能启动进程, 下载文件或执行命令. 用户和 chat 必须同时在白名单中, 普通私聊也必须同时允许 user ID 和相同的私聊 chat ID. 鉴权通过后, 接受非零 thread ID 或 private 类型 chat 的消息; 没有 topic 的群组消息只获得操作指引, 不推断目标话题.
+收到的 update 在持久化前鉴权. 授权输入在 inbox 中保留用于路由的 typed update; 未授权输入只保留 update ID, ignored 状态和接收时间, 同时原子地推进 offset. 未授权输入不能启动进程, 下载文件或执行命令. 用户和 chat 必须同时在白名单中, 普通私聊也必须同时允许 user ID 和相同的私聊 chat ID. 鉴权通过后, 接受非零 thread ID 或 private 类型 chat 的消息; 没有 topic 的群组消息只获得操作指引, 不推断目标话题. 群组 topic 中的获准用户共享同一 OMP session; 能查看该 topic 的群成员即使不能操作 bot, 也能看到 bot 回复及 `/export` 附件.
 
 ### 并发模型
 
@@ -52,7 +52,8 @@ flowchart LR
 - 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
 - `/queue` 只读取当前 worker 内存中的 `queue`、`active` 和 `busy`. 它是当前对话范围的 viewer; Cancel 按钮定位 bridge pending inbox ID, 绝不中止 active task 或管理 OMP native queue. 队列只存在于 runtime: worker shutdown 会取消剩余 pending inbox, 不会恢复 queue entry.
 - 附件准备和上传异步且有并发上限. 尚在准备的附件保留其队列位置.
-- RPC stdout reader 不执行 Telegram HTTP 交付. 事件缓冲有界, 协议错误或持续积压会使 client 失败, 不允许内存无限增长.
+- RPC stdout reader 不执行 Telegram HTTP 交付. 帧重组预留容量和排队的异步事件字节数共用 64 MiB credit 预算, worker 收到事件后归还 credit. 协议错误或积压超限会使 client 失败, 不允许内存无限增长. worker 对 terminal 前累计的 assistant 文本单独设置 4 MiB 上限. terminal 前任一预算溢出都会关闭 runtime, 将任务结果标记为 uncertain, 且不自动重放. terminal event 已确认后只有展示超限时会截断: 最多发送 32 条、合计 1 MiB 的 Telegram 回复文本并明确提示, 任务仍为 done.
+  64 MiB logical frame 协议上限和 64 MiB 缓冲资源策略彼此独立: 即使 frame 符合协议, 在 physical chunk 或排队事件同时占用预算时仍可能因资源上限被拒绝. 已完成的 assistant message 在 4 MiB 逻辑输出预算中替换其在途 streamed 文本; 保留的 stream buffer 另受 4 MiB 上限约束.
 - `worker.max_workers` 限制已连接的 OMP 进程, 不限制逻辑 session. 正数 `worker.idle_timeout` 可释放空闲 worker 的进程并归还 slot, 同时保留已验证的 binding 和 session claim.
 
 Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关联响应. `Call("prompt")` 成功只代表请求被接受, 不代表任务完成. 只有 `isTerminal` 不为 `false` 的 `agent_end` 事件或本地命令完成信号才能结束任务, 非终结事件不能开始下一条排队 prompt. 终结 assistant message 的 `stopReason=error` 或非空 `errorMessage` 使输入以 `uncertain` 提交; `stopReason=aborted` 以 `cancelled` 提交; 其他有确认文本的情况以 `done` 提交. `uncertain` 和 `cancelled` 的终态结果仍可交付 partial text. uncertain 失败回复可包含有长度上限的 `errorMessage` 摘要, 但会先脱敏凭据、request ID、URL 和绝对路径; 不转发不安全详情或 provider classification. 分帧和重组都有明确边界, 不回退到 PTY/ANSI 解析.
@@ -149,6 +150,7 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
 
 带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
+进度消息删除的临时失败会保留关联, daemon 正常运行期间每分钟及启动时重试. Telegram 明确永久拒绝时清除关联并停止重试.
 保留策略绝不删除 binding, history, startup intent, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 ### Schema 版本

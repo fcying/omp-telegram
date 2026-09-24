@@ -454,6 +454,81 @@ func TestAcceptAtomicDedupAndOffset(t *testing.T) {
 	}
 }
 
+func TestAcceptIgnoredAtomicMinimalDedupAndOffset(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	update := []byte(`{"update_id":20,"message":{"from":{"id":123},"chat":{"id":456},"text":"private"}}`)
+	requireStoreOK(t, s.Accept(20, update))
+	requireStoreOK(t, s.AcceptIgnored(30))
+
+	var rawType, state string
+	var rawLength int
+	var replyTo, progressMessageID, createdAt, updatedAt int64
+	requireStoreOK(t, s.DB.QueryRow("SELECT typeof(raw),length(raw),state,reply_to,progress_message_id,created_at,updated_at FROM inbox WHERE id=30").Scan(
+		&rawType, &rawLength, &state, &replyTo, &progressMessageID, &createdAt, &updatedAt,
+	))
+	if rawType != "blob" || rawLength != 0 || state != string(InboxIgnored) || replyTo != 0 || progressMessageID != 0 || createdAt <= 0 || updatedAt != createdAt {
+		t.Fatalf("ignored row retained data or missed receive time: raw=%s/%d state=%s reply=%d progress=%d created=%d updated=%d", rawType, rawLength, state, replyTo, progressMessageID, createdAt, updatedAt)
+	}
+	offset, err := s.Offset()
+	requireStoreOK(t, err)
+	if offset != 31 {
+		t.Fatalf("ignored update offset = %d, want 31", offset)
+	}
+
+	// Neither flavor of duplicate may rewrite the first durable decision.
+	requireStoreOK(t, s.AcceptIgnored(20))
+	requireStoreOK(t, s.Accept(30, update))
+	var originalRaw []byte
+	requireStoreOK(t, s.DB.QueryRow("SELECT raw,state FROM inbox WHERE id=20").Scan(&originalRaw, &state))
+	if string(originalRaw) != string(update) || state != string(InboxPending) {
+		t.Fatalf("ignored duplicate rewrote authorized row: state=%s raw=%s", state, originalRaw)
+	}
+	requireStoreOK(t, s.DB.QueryRow("SELECT length(raw),state FROM inbox WHERE id=30").Scan(&rawLength, &state))
+	if rawLength != 0 || state != string(InboxIgnored) {
+		t.Fatalf("authorized duplicate rewrote ignored row: state=%s raw length=%d", state, rawLength)
+	}
+	offset, err = s.Offset()
+	requireStoreOK(t, err)
+	if offset != 31 {
+		t.Fatalf("duplicate update changed offset to %d", offset)
+	}
+	// A pending update can become unauthorized before routing after a config change.
+	requireStoreOK(t, s.Mark(20, InboxIgnored))
+	requireStoreOK(t, s.DB.QueryRow("SELECT length(raw),state FROM inbox WHERE id=20").Scan(&rawLength, &state))
+	if rawLength != 0 || state != string(InboxIgnored) {
+		t.Fatalf("late ignored update retained payload: state=%s raw length=%d", state, rawLength)
+	}
+
+	_, err = s.DB.Exec(`CREATE TRIGGER reject_ignored_offset BEFORE UPDATE ON meta WHEN NEW.key='offset' BEGIN SELECT RAISE(ABORT,'offset failure'); END`)
+	requireStoreOK(t, err)
+	if err = s.AcceptIgnored(40); err == nil {
+		t.Fatal("accepted ignored update despite offset failure")
+	}
+	var count int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM inbox WHERE id=40").Scan(&count))
+	if count != 0 {
+		t.Fatal("offset failure left partially committed ignored update")
+	}
+	offset, err = s.Offset()
+	requireStoreOK(t, err)
+	if offset != 31 {
+		t.Fatalf("failed ignored update advanced offset to %d", offset)
+	}
+
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	requireStoreOK(t, s.DB.QueryRow("SELECT length(raw),state FROM inbox WHERE id=30").Scan(&rawLength, &state))
+	if rawLength != 0 || state != string(InboxIgnored) {
+		t.Fatalf("restart lost minimal ignored row: state=%s raw length=%d", state, rawLength)
+	}
+	offset, err = s.Offset()
+	requireStoreOK(t, err)
+	if offset != 31 {
+		t.Fatalf("restart lost ignored offset: %d", offset)
+	}
+}
+
 func TestPendingBatchesAreBoundedAndOrdered(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	for id := int64(10); id <= 14; id++ {
