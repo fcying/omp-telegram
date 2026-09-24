@@ -692,7 +692,7 @@ func waitForTimeout(t *testing.T, timeout time.Duration, fn func() bool) {
 func drainControlOperations(t *testing.T, w *worker) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for w.controlBusy {
+	for w.controlInProgress() {
 		select {
 		case result := <-w.operations:
 			w.operationReturned(result)
@@ -1450,7 +1450,7 @@ func TestRuntimeReplacementDropsQueuedStaleRPC(t *testing.T) {
 		ctx:                ctx,
 		cancel:             cancel,
 		binding:            store.Binding{Generation: 1},
-		active:             2,
+		taskState:          taskState{active: 2},
 		turn:               1,
 		rpcOperationActive: true,
 		rpcOperations: []rpcOperation{{
@@ -1596,7 +1596,7 @@ func TestTailUTF16(t *testing.T) {
 	}
 }
 func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "off"}}), busy: true})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "off"}}), taskState: taskState{busy: true}})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`))
 	w.flushPreview()
@@ -1613,7 +1613,7 @@ func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
 }
 
 func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}}), active: 10, busy: true})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}}), taskState: taskState{active: 10, busy: true}})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"PRIVATE"}}`))
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read","arguments":{"path":"SECRET path"},"result":"SECRET result"}`))
@@ -1644,14 +1644,15 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 }
 
 func TestManualCompactionDoesNotReuseTaskProgress(t *testing.T) {
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}}), busy: true, compacting: true, previewID: 42})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}}), progressTransport: progressTransport{previewID: 42}})
+	w.beginSessionOperation(sessionOperationCompact)
 	if got := w.renderProgress(); got != "" {
 		t.Fatalf("manual compaction rendered task progress: %q", got)
 	}
 }
 
 func TestAgentStartPreservesRetryState(t *testing.T) {
-	w := testWorker(t, &worker{active: 10, busy: true})
+	w := testWorker(t, &worker{taskState: taskState{active: 10, busy: true}})
 	w.event([]byte(`{"type":"auto_retry_start"}`))
 	if !w.progress.Retrying {
 		t.Fatal("auto_retry_start did not enable retry state")
@@ -1667,7 +1668,7 @@ func TestAgentStartPreservesRetryState(t *testing.T) {
 }
 
 func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
-	w := testWorker(t, &worker{active: 0, busy: true})
+	w := testWorker(t, &worker{taskState: taskState{active: 0, busy: true}})
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"telegram_send"}`))
 	w.event([]byte(`{"type":"host_tool_call","id":"host-1","toolCallId":"tool-1","toolName":"telegram_send"}`))
 	w.event([]byte(`{"type":"host_tool_cancel","targetId":"host-1"}`))
@@ -1681,7 +1682,7 @@ func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
 }
 
 func TestProgressStatusPriorityAndBounds(t *testing.T) {
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), active: 10, busy: true, preview: strings.Repeat("😀", maxProgressUnits)})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), taskState: taskState{active: 10, busy: true}, preview: strings.Repeat("😀", maxProgressUnits)})
 	w.startProgressTool("tool-1", "bash")
 	w.compacting = true
 	if !strings.Contains(w.renderProgress(), "Status: Compacting context...") {
@@ -1699,13 +1700,13 @@ func TestProgressCompletionFences(t *testing.T) {
 		{generation: 6, turn: 8, id: 99, text: "stale generation"},
 		{generation: 7, turn: 9, id: 99, text: "stale turn"},
 	} {
-		w := testWorker(t, &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current", finishing: true})
+		w := testWorker(t, &worker{binding: store.Binding{Generation: 7}, turn: 8, progressTransport: progressTransport{previewBusy: true, previewID: 42, lastPreview: "current", finishing: true}})
 		w.previewFinished(result)
 		if w.previewID != 42 || w.lastPreview != "current" || !w.finishing {
 			t.Fatalf("stale progress result changed current turn: %#v", w)
 		}
 	}
-	w := testWorker(t, &worker{binding: store.Binding{Generation: 7}, turn: 8, previewBusy: true, previewID: 42, lastPreview: "current"})
+	w := testWorker(t, &worker{binding: store.Binding{Generation: 7}, turn: 8, progressTransport: progressTransport{previewBusy: true, previewID: 42, lastPreview: "current"}})
 	w.previewFinished(previewResult{generation: 7, turn: 8, id: 42, text: "failed", err: errors.New("edit failed")})
 	if w.progressSuppressed || w.lastPreview != "current" || w.previewID != 42 {
 		t.Fatal("edit failure was not retained for a later retry")
@@ -1730,18 +1731,16 @@ func TestProgressEditCannotRestoreClearedAssociation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w := testWorker(t, &worker{
-		b:             testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, db: db, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
-		binding:       store.Binding{Generation: 7},
-		turn:          8,
-		ctx:           ctx,
-		cancel:        cancel,
-		active:        10,
-		busy:          true,
-		preview:       "late edit",
-		previewID:     77,
-		lastPreview:   "current",
-		previewResult: make(chan previewResult, 1),
-		confirms:      make(map[string]confirmation),
+		b:                 testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, db: db, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
+		binding:           store.Binding{Generation: 7},
+		turn:              8,
+		ctx:               ctx,
+		cancel:            cancel,
+		taskState:         taskState{active: 10, busy: true},
+		preview:           "late edit",
+		progressTransport: progressTransport{previewID: 77, lastPreview: "current"},
+		previewResult:     make(chan previewResult, 1),
+		confirms:          make(map[string]confirmation),
 	})
 	w.flushPreview()
 	result := <-w.previewResult
@@ -1782,10 +1781,8 @@ func TestProgressAssociationFailureDeletesSentMessage(t *testing.T) {
 		binding:       store.Binding{Generation: 1},
 		ctx:           ctx,
 		cancel:        cancel,
-		active:        10,
-		owner:         7,
+		taskState:     taskState{active: 10, owner: 7, busy: true},
 		turn:          1,
-		busy:          true,
 		preview:       "working",
 		previewResult: make(chan previewResult, 1),
 		confirms:      make(map[string]confirmation),
@@ -1826,7 +1823,7 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, preview: "answer", confirms: map[string]confirmation{}})
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, preview: "answer", confirms: map[string]confirmation{}})
 			w.finish()
 			output, err := db.NextOutput()
 			if err != nil || output.Text != "answer" {
@@ -1986,10 +1983,8 @@ func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
 		binding:       store.Binding{Generation: 1},
 		ctx:           ctx,
 		cancel:        cancel,
-		active:        10,
-		owner:         7,
+		taskState:     taskState{active: 10, owner: 7, busy: true},
 		turn:          1,
-		busy:          true,
 		preview:       "working",
 		previewResult: make(chan previewResult, 1),
 		confirms:      make(map[string]confirmation)})
@@ -2030,7 +2025,7 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, previewBusy: true, preview: "answer", busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, progressTransport: progressTransport{previewBusy: true}, preview: "answer", confirms: map[string]confirmation{}})
 	w.finish()
 	o, e := db.NextOutput()
 	if e != nil || o.Text != "answer" {
@@ -2055,7 +2050,7 @@ func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"partial answer"}}`))
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"error","errorMessage":"SECRET upstream diagnostics"}]}`))
 	var state string
@@ -2085,7 +2080,7 @@ func TestNormalTerminalCompletionIsDone(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"final answer"}],"stopReason":"stop"}]}`))
 	var state string
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "done" {
@@ -2185,7 +2180,7 @@ func TestCompactedTerminalEventsUseMessageEndMetadata(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 			w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"` + tc.preview + `"}}`))
 			w.event([]byte(`{"type":"message_end","message":` + tc.message + `}`))
 			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[],"messageCount":1}`))
@@ -2215,7 +2210,7 @@ func TestTerminalFailureNoticeRedactsSensitiveDetails(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"Upstream could not find model. API_KEY=hidden-value request-id=trace-123 https://provider.example/models /home/worker/model.json"}]}`))
 	output, err := db.NextOutput()
 	if err != nil {
@@ -2265,7 +2260,7 @@ func TestAgentStartClearsTerminalMetadata(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"aborted","errorMessage":"Request was aborted"}}`))
 	w.event([]byte(`{"type":"agent_start"}`))
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"final answer"}}`))
@@ -2307,7 +2302,7 @@ func TestTerminalAbortIsCancelled(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 			w.event([]byte(tc.event))
 			var state string
 			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "cancelled" {
@@ -2335,7 +2330,7 @@ func TestNonterminalAgentEndDoesNotCompleteInput(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":[{"role":"assistant","stopReason":"error"}]}`))
 	var state string
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "submitted" || w.active != 10 {
@@ -2357,7 +2352,7 @@ func TestTerminalWithoutTextIsUncertain(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, active: 10, busy: true, confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 	w.event([]byte(`{"type":"agent_end"}`))
 	var state string
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "uncertain" {
@@ -2366,7 +2361,7 @@ func TestTerminalWithoutTextIsUncertain(t *testing.T) {
 }
 
 func TestDispatchWaitsForPreviewCleanup(t *testing.T) {
-	w := testWorker(t, &worker{client: &omp.Client{}, finishing: true, queue: []queued{{id: 1}}})
+	w := testWorker(t, &worker{client: &omp.Client{}, progressTransport: progressTransport{finishing: true}, queue: []queued{{id: 1}}})
 	w.dispatch()
 	if len(w.queue) != 1 {
 		t.Fatal("next prompt dispatched before prior preview cleanup")
@@ -2374,7 +2369,7 @@ func TestDispatchWaitsForPreviewCleanup(t *testing.T) {
 }
 
 func TestDispatchWaitsForControlOperation(t *testing.T) {
-	w := testWorker(t, &worker{client: &omp.Client{}, controlBusy: true, queue: []queued{{id: 1}}})
+	w := testWorker(t, &worker{client: &omp.Client{}, controlOp: controlStatus, queue: []queued{{id: 1}}})
 	w.dispatch()
 	if len(w.queue) != 1 {
 		t.Fatal("next prompt dispatched while a control operation was pending")
@@ -2820,7 +2815,7 @@ func TestFailedResponseMarksTaskUncertainOnce(t *testing.T) {
 	b := testBridge(t, &Bridge{db: db, fatal: make(chan error, 1)})
 	w := testWorker(t, &worker{
 		b: b, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel,
-		binding: store.Binding{Bot: 99, Chat: -10, Thread: 11}, active: 10,
+		binding: store.Binding{Bot: 99, Chat: -10, Thread: 11}, taskState: taskState{active: 10},
 		confirms: make(map[string]confirmation),
 	})
 	w.event([]byte(`{"type":"response","success":false}`))

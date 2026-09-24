@@ -35,7 +35,7 @@ func startTimedFixtureOperation(t *testing.T, w *worker, kind, method string, fi
 	if client == nil {
 		t.Fatal("fixture runtime is not connected")
 	}
-	w.controlBusy = true
+	w.beginControlOperation(controlModel)
 	w.startOperation(kind, client, func(ctx context.Context) (json.RawMessage, error) {
 		callCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
@@ -67,8 +67,8 @@ func acceptWorkerInput(t *testing.T, w *worker, id int64, text string) {
 
 func assertRetiredOperationClient(t *testing.T, w *worker, client *omp.Client, binding store.Binding) {
 	t.Helper()
-	if w.client != nil || w.runtime != runtimeReleased || w.controlBusy || !w.binding.Running || !sameBindingIdentity(w.binding, binding) {
-		t.Fatalf("uncertain operation did not retire only its runtime: client=%v runtime=%v controlBusy=%t binding=%+v", w.client, w.runtime, w.controlBusy, w.binding)
+	if w.client != nil || w.runtime != runtimeReleased || w.controlInProgress() || !w.binding.Running || !sameBindingIdentity(w.binding, binding) {
+		t.Fatalf("uncertain operation did not retire only its runtime: client=%v runtime=%v controlInProgress=%t binding=%+v", w.client, w.runtime, w.controlInProgress(), w.binding)
 	}
 	waitFor(t, func() bool {
 		select {
@@ -104,7 +104,7 @@ func TestAbortTimeoutRetiresRuntimeAndContinuesQueueOnFreshClient(t *testing.T) 
 	if len(w.queue) != 1 {
 		t.Fatal("queued prompt was not retained while abort was pending")
 	}
-	w.controlBusy = true
+	w.beginControlOperation(controlAbort)
 	w.startOperation("abort", oldClient, func(ctx context.Context) (json.RawMessage, error) {
 		callCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
@@ -159,7 +159,7 @@ func TestRejectedAbortKeepsRuntime(t *testing.T) {
 	command("/new " + t.TempDir())
 	client := w.client
 	command("/stop")
-	if w.client != client || w.runtime != runtimeConnected || w.controlBusy {
+	if w.client != client || w.runtime != runtimeConnected || w.controlInProgress() {
 		t.Fatal("explicit abort rejection invalidated the reusable runtime")
 	}
 }
@@ -201,7 +201,7 @@ func TestRejectedModelMutationKeepsRuntime(t *testing.T) {
 	command("/new " + t.TempDir())
 	client := w.client
 	command("/model fixture/rejected")
-	if w.client != client || w.runtime != runtimeConnected || w.controlBusy {
+	if w.client != client || w.runtime != runtimeConnected || w.controlInProgress() {
 		t.Fatal("explicit model rejection invalidated the reusable runtime")
 	}
 	assertPickerModel(t, w, "fixture", "safe")
@@ -215,7 +215,7 @@ func TestQueuedPromptAfterUncertainModelSwitchUsesFreshClient(t *testing.T) {
 	before := w.binding
 	oldClient := w.client
 	request := modelOperationRequest{action: "model_switch"}
-	w.controlBusy = true
+	w.beginControlOperation(controlModel)
 	w.startOperation("model_set_model", oldClient, func(ctx context.Context) (json.RawMessage, error) {
 		callCtx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
@@ -260,7 +260,7 @@ func TestModelRoleFailureRetiresRuntimeWithoutClosingBinding(t *testing.T) {
 	command("/new " + t.TempDir())
 	before := w.binding
 	client := w.client
-	w.controlBusy = true
+	w.beginControlOperation(controlModel)
 	w.startOperation("model_set_role", client, func(ctx context.Context) (json.RawMessage, error) {
 		model, err := client.SetModelRole(ctx, "slow")
 		if err != nil {
@@ -331,7 +331,7 @@ func TestModelRoleFailureDoesNotRaceClientDone(t *testing.T) {
 	logs := &runtimeLogCapture{exitSeen: make(chan struct{})}
 	w.log = slog.New(slog.NewTextHandler(logs, nil)).With("chat_id", w.key.chat, "thread_id", w.key.thread)
 	w.b.cfg.QueueCapacity = 4
-	w.controlBusy = true
+	w.beginControlOperation(controlModel)
 	acceptWorkerInput(t, w, 2, "queued after role failure")
 	if len(w.queue) != 1 {
 		t.Fatal("prompt did not queue behind the model role operation")
@@ -406,7 +406,7 @@ func TestMalformedModelMutationResultsRetireRuntime(t *testing.T) {
 			command("/new " + t.TempDir())
 			client := w.client
 			before := w.binding
-			w.controlBusy = true
+			w.beginControlOperation(controlModel)
 			w.operationFinished(operationResult{
 				generation: w.binding.Generation,
 				clientID:   client.ID(),

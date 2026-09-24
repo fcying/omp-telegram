@@ -34,7 +34,7 @@ type modelFastResult struct {
 
 func (w *worker) beginModelState(action string, request modelOperationRequest) bool {
 	allowBusy := action == "fast_status"
-	if w.controlBusy {
+	if w.controlInProgress() {
 		w.say("The session operation is still loading.")
 		return false
 	}
@@ -47,7 +47,7 @@ func (w *worker) beginModelState(action string, request modelOperationRequest) b
 		w.say(err.Error())
 		return false
 	}
-	w.controlBusy = true
+	w.beginControlOperation(controlModel)
 	w.startOperation("model_state", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "get_state", nil)
 	}, 0, "", request)
@@ -72,7 +72,7 @@ func modelOperationFailure(action string) string {
 func (w *worker) modelOperationFinished(result operationResult) {
 	request, ok := result.meta.(modelOperationRequest)
 	if !ok {
-		w.controlBusy = false
+		w.endControlOperation()
 		return
 	}
 	if result.err != nil || result.cancelled {
@@ -87,25 +87,25 @@ func (w *worker) modelOperationFinished(result operationResult) {
 				w.releaseRuntimeWithReason(true, "failure")
 			}
 		}
-		w.controlBusy = false
+		w.endControlOperation()
 		w.say(modelOperationFailure(request.action))
 		return
 	}
 	client, connected := w.runtimeClient()
 	if !connected || client.ID() != result.clientID {
-		w.controlBusy = false
+		w.endControlOperation()
 		return
 	}
 	switch result.kind {
 	case "model_state":
 		var state modelSettings
 		if json.Unmarshal(result.data, &state) != nil {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.say(modelOperationFailure(request.action))
 			return
 		}
 		if request.action != "fast_status" && (state.IsStreaming || state.IsCompacting) {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.say("Wait for the current task to finish before changing model settings.")
 			return
 		}
@@ -138,13 +138,13 @@ func (w *worker) modelOperationFinished(result operationResult) {
 				return client.Call(ctx, "set_fast_mode", map[string]any{"enabled": request.enabled})
 			}, 0, "", request)
 		case "fast_status":
-			w.controlBusy = false
+			w.endControlOperation()
 			w.say(fastModeText(state.FastModeEnabled, state.FastModeActive))
 		}
 	case "model_roles":
 		var roles []omp.ModelRole
 		if json.Unmarshal(result.data, &roles) != nil {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.say("Cannot read OMP's cycle roles for this configuration. Use /model provider/model.")
 			return
 		}
@@ -152,22 +152,22 @@ func (w *worker) modelOperationFinished(result operationResult) {
 	case "model_set_role":
 		var model omp.Model
 		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.say(modelOperationFailure("model_select"))
 			return
 		}
-		w.controlBusy = false
+		w.endControlOperation()
 		w.touchBinding()
 		w.say("Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + ".")
 	case "model_set_model":
 		var model omp.Model
 		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
 			w.say(modelOperationFailure("model_switch"))
 			return
 		}
-		w.controlBusy = false
+		w.endControlOperation()
 		w.touchBinding()
 		w.say("Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + ".")
 	case "model_set_thinking":
@@ -177,12 +177,12 @@ func (w *worker) modelOperationFinished(result operationResult) {
 	case "model_verify_thinking":
 		var state modelSettings
 		if json.Unmarshal(result.data, &state) != nil || state.ThinkingLevel == "" {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
 			w.say("OMP did not report the resulting thinking level. The change could not be confirmed.")
 			return
 		}
-		w.controlBusy = false
+		w.endControlOperation()
 		w.touchBinding()
 		text := "Thinking level: " + menuText(state.ThinkingLevel, 32)
 		if state.ThinkingLevel != request.requested {
@@ -192,16 +192,16 @@ func (w *worker) modelOperationFinished(result operationResult) {
 	case "model_set_fast":
 		var fast modelFastResult
 		if json.Unmarshal(result.data, &fast) != nil || fast.Enabled == nil || fast.Active == nil {
-			w.controlBusy = false
+			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
 			w.say(modelOperationFailure("fast_select"))
 			return
 		}
-		w.controlBusy = false
+		w.endControlOperation()
 		w.touchBinding()
 		w.say(fastModeText(fast.Enabled, fast.Active))
 	default:
-		w.controlBusy = false
+		w.endControlOperation()
 	}
 }
 
@@ -224,13 +224,13 @@ func (w *worker) showModelPicker(user int64) {
 
 func (w *worker) showModelPickerReady(user int64, current omp.Model, models []omp.ModelRole) {
 	if len(models) == 0 {
-		w.controlBusy = false
+		w.endControlOperation()
 		w.say("No cycle roles are configured in OMP. Use /model provider/model.")
 		return
 	}
 	// Telegram allows at most 100 inline buttons, including Cancel.
 	if len(models) > 99 {
-		w.controlBusy = false
+		w.endControlOperation()
 		w.say("Too many cycle roles for a Telegram menu. Use /model provider/model.")
 		return
 	}
@@ -248,7 +248,7 @@ func (w *worker) showModelPickerReady(user int64, current omp.Model, models []om
 	if current.Provider != "" && current.ID != "" {
 		identity = menuText(current.Provider+"/"+current.ID, 256)
 	}
-	w.controlBusy = false
+	w.endControlOperation()
 	w.confirm(request, "Choose an OMP cycle role\nCurrent model: "+identity, options)
 }
 
@@ -271,7 +271,7 @@ func (w *worker) showThinkingPicker(user int64) {
 
 func (w *worker) showThinkingPickerReady(user int64, state modelSettings) {
 	if state.ThinkingLevel == "" {
-		w.controlBusy = false
+		w.endControlOperation()
 		w.say("OMP did not report a thinking level for this session.")
 		return
 	}
@@ -284,7 +284,7 @@ func (w *worker) showThinkingPickerReady(user int64, state modelSettings) {
 		labels = append(labels, label)
 	}
 	labels = append(labels, "Cancel")
-	w.controlBusy = false
+	w.endControlOperation()
 	w.confirm(confirmation{action: "thinking", method: "select", user: user, options: thinkingLevels[:]},
 		"Choose a thinking level\nCurrent effective level: "+menuText(state.ThinkingLevel, 32)+"\nOMP may adjust the requested level to match the model's capabilities.", labels)
 }
@@ -307,7 +307,7 @@ func (w *worker) showFastPicker(user int64) {
 
 func (w *worker) showFastPickerReady(user int64, state modelSettings) {
 	if state.FastModeEnabled == nil || state.FastModeActive == nil {
-		w.controlBusy = false
+		w.endControlOperation()
 		w.say("OMP did not report fast mode support for this session.")
 		return
 	}
@@ -318,7 +318,7 @@ func (w *worker) showFastPickerReady(user int64, state modelSettings) {
 	} else {
 		labels[1] += " [current]"
 	}
-	w.controlBusy = false
+	w.endControlOperation()
 	w.confirm(confirmation{action: "fast", method: "select", user: user, options: options}, "Choose fast mode\n"+fastModeText(state.FastModeEnabled, state.FastModeActive), labels)
 }
 

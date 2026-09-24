@@ -42,6 +42,32 @@ func TestHandoffResultPreservesSessionAndReleasesQueue(t *testing.T) {
 	}
 }
 
+func TestHandoffHoldsQueuedRootUntilOperationResult(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.b.cfg.QueueCapacity = 2
+	command("/handoff preserve decisions")
+	command("queued root")
+	w.dispatch()
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "pending" || w.taskActive() {
+		t.Fatalf("handoff dispatched root before its result: state=%q active=%d error=%v", state, w.active, err)
+	}
+	select {
+	case result := <-w.operations:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		w.operationReturned(result)
+	case <-time.After(5 * time.Second):
+		t.Fatal("handoff did not complete")
+	}
+	w.dispatch()
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "submitted" || w.active != 3 {
+		t.Fatalf("handoff did not release queued root: state=%q active=%d error=%v", state, w.active, err)
+	}
+}
+
 func TestPendingHandoffAllowsHelpCloseAndNewSession(t *testing.T) {
 	f, db, send := setupBridge(t)
 	send(update(1, 11, "/new "+t.TempDir()))
@@ -116,7 +142,11 @@ func TestUncertainHandoffAndCompactReleaseRuntime(t *testing.T) {
 			command("/new test")
 			before := w.binding
 			client := w.client
-			w.busy, w.compacting = true, true
+			operation := sessionOperationCompact
+			if scenario.kind == "handoff" {
+				operation = sessionOperationHandoff
+			}
+			w.beginSessionOperation(operation)
 
 			if scenario.pendingRPC {
 				w.startOperation("handoff", client, func(ctx context.Context) (json.RawMessage, error) {
@@ -149,7 +179,7 @@ func TestUncertainHandoffAndCompactReleaseRuntime(t *testing.T) {
 					err:        scenario.err,
 				})
 			}
-			if w.client != nil || w.runtime != runtimeReleased || !w.binding.Running || w.busy || w.compacting {
+			if w.client != nil || w.runtime != runtimeReleased || !w.binding.Running || w.busy || w.compacting || w.sessionOperationActive() {
 				t.Fatal("uncertain native operation retained or wedged its runtime")
 			}
 

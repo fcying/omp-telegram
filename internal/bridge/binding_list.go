@@ -317,7 +317,7 @@ func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 	c.options = nil
 	start, end := page*queuePageSize, min((page+1)*queuePageSize, len(w.queue))
 	running := "no"
-	if w.active != 0 && w.busy {
+	if w.taskRunning() {
 		running = "yes"
 	}
 	var text strings.Builder
