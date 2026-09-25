@@ -108,9 +108,11 @@ RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单�
 
 Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务一个 bot, 因此日志中不重复记录. Chat 和 thread ID 不是凭据, 但可以关联具体对话; 应限制日志访问权限, 公开日志前将其替换为一致的占位符.
 
-实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 和 `verbose` 的可编辑状态视图相同, 均显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; 只有 `verbose` 额外发送独立的活动历史消息. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 修正匹配的活跃工具名及尚未发送的活动起始记录. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 只对该活跃根任务发送原生 `abort`; 不同于 `/stop`, 保留 bridge 延后 prompt, 在取消完成后按顺序调度; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
+实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 的可编辑状态视图显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 在同一条消息中额外显示最近的工具完成记录, 不发送第二条 Activity 消息. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 只对该活跃根任务发送原生 `abort`; 不同于 `/stop`, 保留 bridge 延后 prompt, 在取消完成后按顺序调度; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
 
-在 `verbose` 模式下, 活跃根任务还可在相同的三秒延迟后发送 best-effort 活动消息. 工具启动/结束仅使用有界工具名和状态; 已完成的 assistant 文本只有在后续工具或 agent start 确认其为中途内容后才展示. host tool 名称修正会更新未发送的起始记录; 起始记录已经尝试发送后, 完成记录沿用当时显示的名称. 每条消息汇总最多六条最近事件, 每个根任务最多尝试发送八条. actor 管理待发送事件、单次进行中的请求, 以及每次 HTTP 请求完成后开始的十秒冷却, 包括失败和超时. 发送或冷却期间的事件合并到下一批, 不在阻塞的 sender 后缓存快照. 活动消息回复原始 Telegram 输入, 没有 Stop 按钮, 不重试, 不作为模型上下文保存, 在任务结束后保留. 原有单条可编辑 preview 和持久化最终回复维持各自的投递和清理规则. 任务结算、替换和 shutdown 丢弃待发送事件并取消进行中的请求; 旧 generation、turn 或 active task 的结果不能修改新任务. Telegram 可能在响应返回前或请求超时后接受消息, 因此不保证客户端显示间隔或 exactly-once.
+assistant text delta 更新可编辑 preview 的 `Output`; 已完成的 assistant 文本仍可用于持久化最终回复. 仅 `verbose` 在当前根任务的内存中保留最近 12 次已完成工具调用的工具名、结果状态 (`completed` 或 `failed`) 和四舍五入后的耗时, 更早的调用只统计数量. 只有匹配的 `tool_execution_end` 才记录结果; 忽略部分工具更新及原始结果. 工具历史复用已有单条 preview 及其 Stop 按钮, 不发送第二条 Activity 消息. preview 和持久化最终回复继续独立投递、清理.
+
+开发版 schema 12 曾持久化旧 Activity 消息 ID. 迁移至 schema 13 时, 这些 ID 随表一起删除; Telegram 中仍存在的旧 Activity 消息之后无法自动清理. 旧版发送已被接受但无法取得消息 ID 时同样无法自动清理.
 
 Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.5 秒 worker tick 中检查. 已有消息更新、typing 和持久化最终回复保持独立行为. 每条 progress preview 都关联其根 inbox. 对于任意终态 inbox (`done`, `cancelled`, `ignored`, `failed` 或 `uncertain`), 所有关联 outbox 分段进入终态交付状态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后, bridge 就会尝试删除该 progress; `pending` 和 `sending` 分段会推迟清理. 因此终态回复交付失败不会继续保留 progress 关联. 这个关联只是本地清理辅助信息, 不是永久 retention pin: 当终态数据达到 retention cutoff 且没有关联的 `pending` 或 `sending` outbox 工作时, cleanup 只清除本地关联, 保留 Telegram 消息. 已确认的不可重试 Telegram 删除拒绝也会释放持久化关联. 传输失败、429、5xx 和不确定响应会保留关联以便后续重试. 启动时会重试上次运行留下的已完成关联.
 
@@ -160,7 +162,9 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 11. 空库在同一事务中创建所有表、索引和版本号. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites、持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 13. 空库在同一事务中创建所有表、索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites、持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
+
+历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 现有版本 12 数据库直接升级到 13. 其他表、记录、binding 和 session 数据保持不变. 版本高于 13 的数据库仍不受支持.
 
 ### 输入与完成事务
 

@@ -140,6 +140,64 @@ func TestInitialProgressSurvivesNativeActivity(t *testing.T) {
 	}
 }
 
+func TestToolHistoryEditsProgressWithSameStopButton(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.ProgressMode = "verbose"
+	w.b.cfg.QueueCapacity = 1
+	w.previewResult = make(chan previewResult, 1)
+	command("/new " + t.TempDir())
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	w.event([]byte(`{"type":"agent_start"}`))
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Checking source"}}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read","args":{"path":"SECRET path"}}`))
+	before := f.messageCount()
+	allowInitialProgress(w)
+	w.flushPreview()
+	var initial previewResult
+	select {
+	case initial = <-w.previewResult:
+		if initial.err != nil || initial.id == 0 {
+			t.Fatalf("progress send failed: %+v", initial)
+		}
+		w.previewFinished(initial)
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial progress not sent")
+	}
+	stop := f.button(before)
+	if !strings.HasPrefix(stop, "stop-7-") {
+		t.Fatalf("initial Stop callback = %q", stop)
+	}
+	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"read-1","partialResult":{"content":[{"type":"text","text":"SECRET partial"}]}}`))
+	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"read-1","toolName":"read","result":{"content":[{"type":"text","text":"SECRET result"}]}}`))
+	w.flushPreview()
+	select {
+	case result := <-w.previewResult:
+		if result.err != nil || result.id != initial.id || result.created {
+			t.Fatalf("progress edit failed: %+v", result)
+		}
+		w.previewFinished(result)
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool completion did not edit progress")
+	}
+	f.mu.Lock()
+	if len(f.messages) != before+2 {
+		f.mu.Unlock()
+		t.Fatalf("tool activity created another message: %d new requests", f.messageCount()-before)
+	}
+	edit := f.messages[before+1]
+	text, _ := edit["text"].(string)
+	messageID := edit["message_id"]
+	f.mu.Unlock()
+	if messageID != float64(initial.id) || !strings.Contains(text, "Status: Running") || !strings.Contains(text, "Recent tools:\n- read: completed (") || !strings.Contains(text, "Output:\nChecking source") || strings.Contains(text, "SECRET") {
+		t.Fatalf("edited verbose progress is missing details or leaked result: id=%v, text=%q", messageID, text)
+	}
+	if got := f.button(before + 1); got != stop {
+		t.Fatalf("progress edit replaced Stop callback: %q", got)
+	}
+}
+
 func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"

@@ -14,9 +14,11 @@ install bin_dir=(env_var("HOME") / "tool/omp-telegram"): build
     install -m 755 omp-telegram {{quote(bin_dir / "omp-telegram")}}
     echo "Installed omp-telegram to {{bin_dir / "omp-telegram"}}."
 
-# Install the binary and restart the existing supervised daemon.
+# Build/install run synchronously; the supervisor restart is detached and delayed.
+# Run `just deploy` and move on after it returns; do not check its exit status or the restart.
 deploy: install
-    supervisord ctl restart omp-telegram
+    setsid bash -c 'sleep 5; supervisord ctl restart omp-telegram' >/dev/null 2>&1 < /dev/null &
+    echo "Restart scheduled in 5s."
 
 # Run unit tests without touching the supervised daemon.
 test:

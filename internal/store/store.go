@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 11
+const schemaVersion = 13
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -52,7 +52,9 @@ var (
 	ErrStaleBinding          = errors.New("stale binding")
 )
 
-type Store struct{ DB *sql.DB }
+type Store struct {
+	DB *sql.DB
+}
 type Binding struct {
 	Bot, Chat, Thread             int64
 	Workspace, Session, SessionID string
@@ -192,7 +194,7 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, e
 	}
-	return &Store{db}, nil
+	return &Store{DB: db}, nil
 }
 
 func initialize(db *sql.DB) error {
@@ -335,6 +337,18 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 11
+	}
+	if version == 11 {
+		if _, e = tx.Exec(`CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id))`); e != nil {
+			return e
+		}
+		version = 12
+	}
+	if version == 12 {
+		if _, e = tx.Exec("DROP TABLE activity_messages"); e != nil {
+			return e
+		}
+		version = 13
 	}
 
 	if e = backfillSessionIDs(tx); e != nil {
@@ -901,7 +915,8 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 		return 0, nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, "SELECT path FROM outbox WHERE id IN (SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM inbox AS progress WHERE progress.id=candidate.inbox_id AND progress.progress_message_id>0) ORDER BY candidate.id LIMIT ?) AND kind IN ('photo','document')", cutoff, messageCleanupBatchSize)
+	const query = "SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM inbox AS progress WHERE progress.id=candidate.inbox_id AND progress.progress_message_id>0) ORDER BY candidate.id LIMIT ?"
+	rows, err := tx.QueryContext(ctx, "SELECT path FROM outbox WHERE id IN ("+query+") AND kind IN ('photo','document')", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -917,7 +932,7 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 	if err = rows.Close(); err != nil {
 		return 0, nil, err
 	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM outbox WHERE id IN (SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM inbox AS progress WHERE progress.id=candidate.inbox_id AND progress.progress_message_id>0) ORDER BY candidate.id LIMIT ?)", cutoff, messageCleanupBatchSize)
+	result, err := tx.ExecContext(ctx, "DELETE FROM outbox WHERE id IN ("+query+")", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, nil, err
 	}

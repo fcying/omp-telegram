@@ -214,7 +214,6 @@ type worker struct {
 	taskState
 	turn uint64
 	progressTransport
-	timeline               progressTimeline
 	compacting             bool
 	progress               progressState
 	operations             chan operationResult
@@ -284,6 +283,7 @@ type previewResult struct {
 
 const (
 	maxActiveTools       = 6
+	maxRecentTools       = 12
 	maxToolNameUnits     = 64
 	maxPreviewUnits      = 2200
 	maxProgressUnits     = 3500
@@ -293,14 +293,23 @@ const (
 var logicalWorkerIdleTimeout = 5 * time.Minute
 
 type progressState struct {
-	StartedAt   time.Time
-	ActiveTools map[string]progressTool
-	Retrying    bool
+	StartedAt    time.Time
+	ActiveTools  map[string]progressTool
+	RecentTools  []progressToolResult
+	EarlierTools int
+	Retrying     bool
 }
 
 type progressTool struct {
-	ID   string
-	Name string
+	ID        string
+	Name      string
+	StartedAt time.Time
+}
+
+type progressToolResult struct {
+	Name     string
+	Duration time.Duration
+	Failed   bool
 }
 
 type operationResult struct {
@@ -918,10 +927,10 @@ func (b *Bridge) reconcileProgressCleanup(ctx context.Context) {
 	messages, err := b.db.CompletedProgressMessages()
 	if err != nil {
 		b.storeLog.Warn("completed progress lookup failed", "event", "progress_cleanup_state_failed")
-		return
-	}
-	for _, message := range messages {
-		b.deleteProgressMessage(ctx, message)
+	} else {
+		for _, message := range messages {
+			b.deleteProgressMessage(ctx, message)
+		}
 	}
 }
 
@@ -1040,11 +1049,9 @@ func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 func (w *worker) beginTask(q queued) {
 	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true}
 	w.turn++
-	w.startTimeline()
 }
 
 func (w *worker) clearTask() {
-	w.stopTimeline()
 	w.active = 0
 	w.activeReplyTo = 0
 	w.awaitingContinuation = false
@@ -1305,7 +1312,6 @@ func (w *worker) run() {
 		now := time.Now()
 		w.typing()
 		w.flushPreview()
-		w.flushTimeline(now)
 		w.expire()
 		w.probeStuckTask(now)
 		w.releaseIdleRuntime(now)
@@ -1332,10 +1338,6 @@ func (w *worker) run() {
 			continue
 		case result := <-w.previewResult:
 			w.previewFinished(result)
-			w.dispatch()
-			continue
-		case result := <-w.timeline.results:
-			w.timelineFinished(result)
 			w.dispatch()
 			continue
 		case result := <-w.operations:
@@ -1414,8 +1416,6 @@ func (w *worker) run() {
 			w.failed()
 		case result := <-w.previewResult:
 			w.previewFinished(result)
-		case result := <-w.timeline.results:
-			w.timelineFinished(result)
 		case result := <-w.operations:
 			w.operationReturned(result)
 		case result := <-w.topicRenameResults:
@@ -1595,7 +1595,6 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.clearQueue()
 	w.clearAlbums()
 	w.cancelHostRequests()
-	w.stopTimeline()
 	w.progress = progressState{}
 	w.progressSuppressed = false
 	w.turn++
@@ -2918,9 +2917,7 @@ func (w *worker) event(raw []byte) {
 	w.logLifecycle(e)
 	switch e.Type {
 	case "host_tool_call":
-		if w.renameProgressTool(e.ToolCallID, e.ToolName) {
-			w.renameTimelineStart(e.ToolCallID, e.ToolName)
-		}
+		w.renameProgressTool(e.ToolCallID, e.ToolName)
 		w.hostSend(e)
 	case "host_tool_cancel":
 		if cancel, ok := w.hostRequests[e.TargetID]; ok {
@@ -2928,27 +2925,9 @@ func (w *worker) event(raw []byte) {
 			delete(w.hostRequests, e.TargetID)
 		}
 	case "tool_execution_start":
-		w.promoteTimelineAssistant()
-		if e.ToolCallID != "" && e.ToolName != "" {
-			if _, active := w.progress.ActiveTools[e.ToolCallID]; !active {
-				w.addTimelineStart(e.ToolCallID, e.ToolName)
-			}
-		}
 		w.startProgressTool(e.ToolCallID, e.ToolName)
 	case "tool_execution_end":
-		if tool, active := w.progress.ActiveTools[e.ToolCallID]; active {
-			state := "completed"
-			if e.IsError {
-				state = "failed"
-			}
-			name := menuText(tool.Name, maxToolNameUnits)
-			if sentName, ok := w.timeline.sentNames[e.ToolCallID]; ok {
-				name = sentName
-			}
-			w.addTimelineLine("- " + name + ": " + state)
-		}
-		delete(w.timeline.sentNames, e.ToolCallID)
-		delete(w.progress.ActiveTools, e.ToolCallID)
+		w.endProgressTool(e.ToolCallID, e.IsError)
 	case "message_update":
 		if e.AssistantMessageEvent.Type == "text_delta" {
 			delta := e.AssistantMessageEvent.Delta
@@ -2972,7 +2951,6 @@ func (w *worker) event(raw []byte) {
 		if !w.taskActive() {
 			return
 		}
-		w.promoteTimelineAssistant()
 		w.clearAwaitingContinuation()
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)
@@ -2996,9 +2974,6 @@ func (w *worker) event(raw []byte) {
 				}
 				w.finalAssistantTexts = append(w.finalAssistantTexts, text)
 				w.finalAssistantBytes += len(text)
-				if w.timeline.enabled && w.timeline.attempts < maxTimelineAttempts {
-					w.timeline.assistant = menuText(text, 480)
-				}
 			}
 			w.finalizedStreamBytes = w.stream.Len()
 		}
@@ -3095,7 +3070,7 @@ func (w *worker) startProgressTool(id, name string) {
 	if w.progress.ActiveTools == nil {
 		w.progress.ActiveTools = make(map[string]progressTool)
 	}
-	w.progress.ActiveTools[id] = progressTool{ID: id, Name: clipUTF16(name, maxToolNameUnits)}
+	w.progress.ActiveTools[id] = progressTool{ID: id, Name: clipUTF16(name, maxToolNameUnits), StartedAt: time.Now()}
 }
 
 func (w *worker) renameProgressTool(id, name string) bool {
@@ -3109,6 +3084,24 @@ func (w *worker) renameProgressTool(id, name string) bool {
 	tool.Name = clipUTF16(name, maxToolNameUnits)
 	w.progress.ActiveTools[id] = tool
 	return true
+}
+
+func (w *worker) endProgressTool(id string, failed bool) {
+	tool, ok := w.progress.ActiveTools[id]
+	if !ok {
+		return
+	}
+	delete(w.progress.ActiveTools, id)
+	if w.b == nil || w.b.cfg.ProgressMode != "verbose" {
+		return
+	}
+	result := progressToolResult{Name: tool.Name, Duration: time.Since(tool.StartedAt).Round(time.Second), Failed: failed}
+	if len(w.progress.RecentTools) < maxRecentTools {
+		w.progress.RecentTools = append(w.progress.RecentTools, result)
+		return
+	}
+	w.progress.RecentTools[w.progress.EarlierTools%maxRecentTools] = result
+	w.progress.EarlierTools++
 }
 
 func sortedProgressTools(tools map[string]progressTool) []progressTool {
@@ -3163,6 +3156,21 @@ func (w *worker) renderProgress() string {
 				break
 			}
 			lines = append(lines, progressToolLine(tool))
+		}
+		sections = append(sections, strings.Join(lines, "\n"))
+	}
+	if w.b != nil && w.b.cfg.ProgressMode == "verbose" && len(w.progress.RecentTools) > 0 {
+		lines := []string{"Recent tools:"}
+		if w.progress.EarlierTools > 0 {
+			lines = append(lines, fmt.Sprintf("- %d earlier omitted", w.progress.EarlierTools))
+		}
+		for i := range w.progress.RecentTools {
+			tool := w.progress.RecentTools[(w.progress.EarlierTools+i)%len(w.progress.RecentTools)]
+			status := "completed"
+			if tool.Failed {
+				status = "failed"
+			}
+			lines = append(lines, fmt.Sprintf("- %s: %s (%s)", tool.Name, status, tool.Duration))
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}

@@ -587,8 +587,6 @@ type fakeHTTP struct {
 	sendResponses         map[int64][]fakeHTTPResponse
 	forumTopicEditGate    <-chan struct{}
 	forumTopicEditStarted chan struct{}
-	activityGate          <-chan struct{}
-	activityStarted       chan string
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -636,18 +634,6 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 			result = []telegram.Update{}
 		}
 	case "sendMessage", "editMessageText":
-		if text, ok := req["text"].(string); filepath.Base(r.URL.Path) == "sendMessage" && ok && strings.HasPrefix(text, "Activity:\n") {
-			if f.activityStarted != nil {
-				f.activityStarted <- text
-			}
-			if f.activityGate != nil {
-				select {
-				case <-f.activityGate:
-				case <-r.Context().Done():
-					return nil, r.Context().Err()
-				}
-			}
-		}
 		f.mu.Lock()
 		f.messages = append(f.messages, req)
 		id := len(f.messages)
@@ -1755,19 +1741,91 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 		t.Fatal("ending one tool removed a concurrent tool")
 	}
 	progress := w.renderProgress()
-	for _, want := range []string{"checking bridge", "bash: running", "Status: Running tool..."} {
+	for _, want := range []string{"Status: Running tool...", "Tools:\n- bash: running", "Output:\nchecking bridge"} {
 		if !strings.Contains(progress, want) {
 			t.Fatalf("summary progress missing %q: %q", want, progress)
 		}
 	}
-	for _, hidden := range []string{"PRIVATE", "SECRET path", "SECRET result", "read: completed", "toolCallId"} {
+	if len(w.progress.RecentTools) != 0 || w.progress.EarlierTools != 0 {
+		t.Fatalf("summary recorded completed tools: %+v", w.progress)
+	}
+	for _, hidden := range []string{"Recent tools:", "read: completed", "PRIVATE", "SECRET path", "SECRET result", "toolCallId"} {
 		if strings.Contains(progress, hidden) {
 			t.Fatalf("summary progress leaked %q: %q", hidden, progress)
 		}
 	}
 	w.b.cfg.ProgressMode = "verbose"
-	if got := w.renderProgress(); got != progress {
-		t.Fatalf("verbose preview duplicated tool history: %q", got)
+	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"bash-1","isError":true,"result":"SECRET result"}`))
+	verbose := w.renderProgress()
+	for _, want := range []string{"Status: Running\n\nRecent tools:\n- bash: failed (", "Output:\nchecking bridge"} {
+		if !strings.Contains(verbose, want) {
+			t.Fatalf("verbose progress missing %q: %q", want, verbose)
+		}
+	}
+	for _, hidden := range []string{"read: completed", "SECRET result", "PRIVATE"} {
+		if strings.Contains(verbose, hidden) {
+			t.Fatalf("verbose progress leaked %q: %q", hidden, verbose)
+		}
+	}
+	w.b.cfg.ProgressMode = "summary"
+	if got := w.renderProgress(); strings.Contains(got, "Recent tools:") || strings.Contains(got, "bash: failed") || !strings.Contains(got, "Status: Running\n\nOutput:") {
+		t.Fatalf("summary showed verbose tool history: %q", got)
+	}
+}
+
+func TestVerboseProgressShowsInterimOutputWithoutDuplicateActivity(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, db.Submit(10, 42))
+	fake := &fakeHTTP{}
+	previous := http.DefaultTransport
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	ctx, cancel := context.WithCancel(context.Background())
+	w := testWorker(t, &worker{
+		b:             testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}, db: db, tg: newTestTelegram(t)}),
+		key:           target{chat: -10, thread: 11},
+		ctx:           ctx,
+		cancel:        cancel,
+		binding:       store.Binding{Generation: 1},
+		turn:          1,
+		taskState:     taskState{active: 10, activeReplyTo: 2, owner: 7, busy: true},
+		previewResult: make(chan previewResult, 1),
+		confirms:      make(map[string]confirmation),
+	})
+	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Inspecting source"}}`))
+	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Inspecting source"}]}}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`))
+	done := make(chan struct{})
+	go func() {
+		w.run()
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("worker did not stop")
+		}
+	}()
+	waitFor(t, func() bool { return fake.messageCount() == 1 })
+	select {
+	case <-time.After(2 * time.Second):
+	case <-done:
+		t.Fatal("worker stopped during progress display")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.messages) != 1 {
+		t.Fatalf("interim text generated duplicate Telegram messages: %+v", fake.messages)
+	}
+	text, _ := fake.messages[0]["text"].(string)
+	if !strings.Contains(text, "Output:\nInspecting source") || !strings.Contains(text, "read: running") || strings.Contains(text, "Activity:") {
+		t.Fatalf("interim progress lost output or tool state: %q", text)
 	}
 }
 
@@ -1820,6 +1878,23 @@ func TestProgressStatusPriorityAndBounds(t *testing.T) {
 	progress := w.renderProgress()
 	if !strings.Contains(progress, "Status: Retrying automatically...") || len(utf16.Encode([]rune(progress))) > maxProgressUnits {
 		t.Fatalf("retry priority or progress bound failed: %d UTF-16 units", len(utf16.Encode([]rune(progress))))
+	}
+	for i := range maxRecentTools + 2 {
+		id := fmt.Sprintf("tool-%d", i)
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":%q,"toolName":%q}`, id, id)))
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"isError":%t,"result":{"content":[{"type":"text","text":"PRIVATE RESULT"}]}}`, id, i == maxRecentTools+1)))
+	}
+	progress = w.renderProgress()
+	for _, want := range []string{"2 earlier omitted", "tool-2: completed", "tool-13: failed"} {
+		if !strings.Contains(progress, want) {
+			t.Fatalf("tool history missing %q: %q", want, progress)
+		}
+	}
+	if strings.Index(progress, "tool-2: completed") >= strings.Index(progress, "tool-13: failed") {
+		t.Fatalf("recent tool history reordered: %q", progress)
+	}
+	if strings.Contains(progress, "tool-1: completed") || strings.Contains(progress, "PRIVATE RESULT") || utf16Length(progress) > maxProgressUnits {
+		t.Fatalf("unbounded or sensitive tool history: %q", progress)
 	}
 }
 
