@@ -306,48 +306,58 @@ func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 	if page >= pages {
 		page = pages - 1
 	}
-	var random [12]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		w.say("Cannot create the queue menu.")
-		return
+	var token string
+	if len(w.queue) != 0 {
+		var random [12]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			w.say("Cannot create the queue menu.")
+			return
+		}
+		token = hex.EncodeToString(random[:])
+		c.action = "queue"
+		c.page = page
+		c.expires = time.Now().Add(2 * time.Minute)
+		c.generation = w.conversationGeneration()
+		c.options = nil
 	}
-	token := hex.EncodeToString(random[:])
-	c.action = "queue"
-	c.page = page
-	c.expires = time.Now().Add(2 * time.Minute)
-	c.generation = w.conversationGeneration()
-	c.options = nil
 	start, end := page*queuePageSize, min((page+1)*queuePageSize, len(w.queue))
 	running := "no"
 	if w.taskRunning() {
 		running = "yes"
 	}
 	var text strings.Builder
-	fmt.Fprintf(&text, "Queue\nRunning: %s\nPending: %d\nPage %d/%d", running, len(w.queue), page+1, pages)
-	keyboard := &telegram.Keyboard{}
-	for i, q := range w.queue[start:end] {
-		if i == 0 {
-			text.WriteString("\n")
+	fmt.Fprintf(&text, "Queue\nRunning: %s\nPending: %d", running, len(w.queue))
+	var keyboard *telegram.Keyboard
+	if len(w.queue) != 0 {
+		fmt.Fprintf(&text, "\nPage %d/%d", page+1, pages)
+		keyboard = &telegram.Keyboard{}
+		for i, q := range w.queue[start:end] {
+			if i == 0 {
+				text.WriteString("\n")
+			}
+			label := menuText(fmt.Sprintf("%d. %s", start+i+1, queueTaskText(q)), 128)
+			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{
+				{Text: label, Disabled: &telegram.DisabledButton{}},
+				{Text: "Cancel", CallbackData: fmt.Sprintf("%s:cancel:%d", token, q.id), Style: "danger"},
+			})
 		}
-		label := menuText(fmt.Sprintf("%d. %s", start+i+1, queueTaskText(q)), 128)
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{
-			{Text: label, Disabled: &telegram.DisabledButton{}},
-			{Text: "Cancel", CallbackData: fmt.Sprintf("%s:cancel:%d", token, q.id), Style: "danger"},
-		})
+		navigation := []telegram.Button{}
+		if page > 0 {
+			navigation = append(navigation, telegram.Button{Text: "Previous", CallbackData: token + ":previous"})
+		}
+		if page+1 < pages {
+			navigation = append(navigation, telegram.Button{Text: "Next", CallbackData: token + ":next"})
+		}
+		navigation = append(navigation, telegram.Button{Text: "Close", CallbackData: token + ":close"})
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	}
-	navigation := []telegram.Button{}
-	if page > 0 {
-		navigation = append(navigation, telegram.Button{Text: "Previous", CallbackData: token + ":previous"})
-	}
-	if page+1 < pages {
-		navigation = append(navigation, telegram.Button{Text: "Next", CallbackData: token + ":next"})
-	}
-	navigation = append(navigation, telegram.Button{Text: "Close", CallbackData: token + ":close"})
-	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
 	var err error
 	if messageID != 0 {
+		if keyboard == nil {
+			keyboard = &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}}
+		}
 		err = w.b.tg.Edit(ctx, w.key.chat, messageID, text.String(), keyboard)
 	} else {
 		var message telegram.Message
@@ -356,6 +366,9 @@ func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 	}
 	if err != nil {
 		w.say("Failed to display the queue. Use /queue to try again.")
+		return
+	}
+	if len(w.queue) == 0 {
 		return
 	}
 	c.messageID = messageID

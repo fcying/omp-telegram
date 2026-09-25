@@ -2942,6 +2942,9 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		if !w.taskActive() {
+			return
+		}
 		w.clearAwaitingContinuation()
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)

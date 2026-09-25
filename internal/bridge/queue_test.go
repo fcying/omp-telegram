@@ -11,9 +11,10 @@ import (
 )
 
 type queueMenuSnapshot struct {
-	messageID int64
-	text      string
-	rows      [][]map[string]any
+	messageID   int64
+	text        string
+	rows        [][]map[string]any
+	hasKeyboard bool
 }
 
 func queueReady(t *testing.T, w *worker, command func(string)) {
@@ -37,13 +38,14 @@ func latestQueueMenu(t *testing.T, f *fakeHTTP) queueMenuSnapshot {
 	defer f.mu.Unlock()
 	for i := len(f.messages) - 1; i >= 0; i-- {
 		message := f.messages[i]
-		markup, ok := message["reply_markup"].(map[string]any)
-		if !ok {
+		text, ok := message["text"].(string)
+		if !ok || !strings.HasPrefix(text, "Queue\n") {
 			continue
 		}
-		rawRows, ok := markup["inline_keyboard"].([]any)
-		if !ok {
-			continue
+		markup, hasKeyboard := message["reply_markup"].(map[string]any)
+		var rawRows []any
+		if hasKeyboard {
+			rawRows, _ = markup["inline_keyboard"].([]any)
 		}
 		rows := make([][]map[string]any, 0, len(rawRows))
 		for _, rawRow := range rawRows {
@@ -58,9 +60,9 @@ func latestQueueMenu(t *testing.T, f *fakeHTTP) queueMenuSnapshot {
 		if rawID, ok := message["message_id"].(float64); ok {
 			messageID = int64(rawID)
 		}
-		return queueMenuSnapshot{messageID: messageID, text: message["text"].(string), rows: rows}
+		return queueMenuSnapshot{messageID: messageID, text: text, rows: rows, hasKeyboard: hasKeyboard}
 	}
-	t.Fatal("queue keyboard missing")
+	t.Fatal("queue message missing")
 	return queueMenuSnapshot{}
 }
 
@@ -281,26 +283,32 @@ func TestQueueViewerShowsEmptyQueue(t *testing.T) {
 	queueReady(t, w, command)
 	command("/queue")
 	menu := latestQueueMenu(t, f)
-	if !strings.Contains(menu.text, "Running: no") || !strings.Contains(menu.text, "Pending: 0") {
+	if menu.text != "Queue\nRunning: no\nPending: 0" {
 		t.Fatalf("empty queue summary = %q", menu.text)
 	}
-	if len(menu.rows) != 1 || len(menu.rows[0]) != 1 || menu.rows[0][0]["text"] != "Close" {
-		t.Fatalf("empty queue buttons = %+v", menu.rows)
+	if menu.hasKeyboard || len(menu.rows) != 0 {
+		t.Fatalf("empty queue exposed a keyboard: %+v", menu)
+	}
+	for _, c := range w.confirms {
+		if c.action == "queue" {
+			t.Fatal("empty queue created an actionable token")
+		}
 	}
 }
 
-func TestQueueCloseAfterClearCanRetryKeyboardRemoval(t *testing.T) {
+func TestQueueCloseAfterCancelCanRetryKeyboardRemoval(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	queueReady(t, w, command)
 	w.b.cfg.QueueCapacity = 2
 	command("missing-terminal")
 	w.dispatch()
-	command("pending")
+	command("pending one")
+	command("pending two")
 	command("/queue")
 	menu := latestQueueMenu(t, f)
-	clickQueue(w, 7, menu.messageID, queueCancelData(t, menu, "pending"))
+	clickQueue(w, 7, menu.messageID, queueCancelData(t, menu, "pending one"))
 	menu = latestQueueMenu(t, f)
-	if len(w.queue) != 0 || !strings.Contains(menu.text, "Pending: 0") {
+	if len(w.queue) != 1 || !strings.Contains(menu.text, "Pending: 1") {
 		t.Fatalf("queue after cancel = %+v, menu = %q", w.queue, menu.text)
 	}
 	data := queueButtonData(t, menu, "Close")
@@ -363,8 +371,13 @@ func TestQueueCancelPreservesOrderAndReportsEachTask(t *testing.T) {
 		t.Fatalf("last task state = %q", got)
 	}
 	menu := latestQueueMenu(t, f)
-	if !strings.Contains(menu.text, "Pending: 0") || !strings.Contains(menu.text, "Page 1/1") {
-		t.Fatalf("refreshed empty queue = %q", menu.text)
+	if menu.text != "Queue\nRunning: no\nPending: 0" || !menu.hasKeyboard || len(menu.rows) != 0 {
+		t.Fatalf("refreshed empty queue retained buttons: %+v", menu)
+	}
+	for _, c := range w.confirms {
+		if c.action == "queue" && c.messageID == menu.messageID {
+			t.Fatal("empty queue retained an actionable token")
+		}
 	}
 }
 
