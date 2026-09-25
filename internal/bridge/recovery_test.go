@@ -151,6 +151,7 @@ func TestForeignBotCommandsRemainIgnoredAfterRestart(t *testing.T) {
 	ids := []int64{
 		d.send(0, "/status@OtherBot"),
 		d.send(0, "/review@OtherBot foo"),
+		d.send(0, "/foo@OtherBot"),
 	}
 	for _, id := range ids {
 		waitFor(t, func() bool {
@@ -174,6 +175,51 @@ func TestForeignBotCommandsRemainIgnoredAfterRestart(t *testing.T) {
 	var replies int
 	if err := d.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&replies); err != nil || replies != 1 {
 		t.Fatalf("foreign commands generated replies: count=%d, err=%v", replies, err)
+	}
+}
+
+func TestPendingSlashMessagesKeepTheirRoutingAfterRestart(t *testing.T) {
+	d := newRecoveryDaemonForChat(t, 1, 7)
+	d.command(0, "/help")
+	d.stop()
+	preCrash, err := store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPending := d.nextID + 1
+	inputs := []struct {
+		text, state string
+	}{
+		{"/review@OtherBot foo", "ignored"},
+		{"/foo@OtherBot", "ignored"},
+		{"/stauts@fixture_bot", "cancelled"},
+		{"/opt/user@host/file 是什么", "cancelled"},
+		{"/tmp/foo@bar", "cancelled"},
+	}
+	for _, input := range inputs {
+		d.nextID++
+		u := update(d.nextID, 0, input.text)
+		u.Message.Chat.ID = d.chat
+		u.Message.Chat.Type = "private"
+		raw, err := json.Marshal(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := preCrash.Accept(d.nextID, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := preCrash.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.start()
+	d.command(0, "/help@FIXTURE_BOT")
+	for i, input := range inputs {
+		id := firstPending + int64(i)
+		waitFor(t, func() bool { return d.state(id) == input.state })
+	}
+	if got := d.outputCount(0); got != 2 {
+		t.Fatalf("recovered slash messages produced %d replies, want only the two help replies", got)
 	}
 }
 
@@ -567,7 +613,7 @@ func TestDaemonShutdownCancelsPendingQueue(t *testing.T) {
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", active).Scan(&state) == nil && state == "submitted"
 	})
-	queuedText := d.send(11, "queued text before shutdown")
+	queuedPath := d.send(11, "/opt/tmp 是什么目录")
 	queuedReview := d.send(11, "/review queued-before-shutdown")
 	sendAttachment := func(fileID string, photo bool) int64 {
 		d.nextID++
@@ -582,7 +628,7 @@ func TestDaemonShutdownCancelsPendingQueue(t *testing.T) {
 	}
 	queuedPhoto := sendAttachment("shutdown-photo", true)
 	queuedDocument := sendAttachment("shutdown-document", false)
-	queued := []int64{queuedText, queuedReview, queuedPhoto, queuedDocument}
+	queued := []int64{queuedPath, queuedReview, queuedPhoto, queuedDocument}
 	waitFor(t, func() bool {
 		for _, id := range queued {
 			var state string
