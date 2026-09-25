@@ -587,6 +587,8 @@ type fakeHTTP struct {
 	sendResponses         map[int64][]fakeHTTPResponse
 	forumTopicEditGate    <-chan struct{}
 	forumTopicEditStarted chan struct{}
+	activityGate          <-chan struct{}
+	activityStarted       chan string
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -634,6 +636,18 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 			result = []telegram.Update{}
 		}
 	case "sendMessage", "editMessageText":
+		if text, ok := req["text"].(string); filepath.Base(r.URL.Path) == "sendMessage" && ok && strings.HasPrefix(text, "Activity:\n") {
+			if f.activityStarted != nil {
+				f.activityStarted <- text
+			}
+			if f.activityGate != nil {
+				select {
+				case <-f.activityGate:
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+			}
+		}
 		f.mu.Lock()
 		f.messages = append(f.messages, req)
 		id := len(f.messages)
@@ -1752,9 +1766,8 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 		}
 	}
 	w.b.cfg.ProgressMode = "verbose"
-	progress = w.renderProgress()
-	if !strings.Contains(progress, "Recent tool activity:") || !strings.Contains(progress, "read: completed") {
-		t.Fatalf("verbose progress omitted recent completion: %q", progress)
+	if got := w.renderProgress(); got != progress {
+		t.Fatalf("verbose preview duplicated tool history: %q", got)
 	}
 }
 
@@ -1791,8 +1804,8 @@ func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
 		t.Fatal("host tool event ended progress before tool_execution_end")
 	}
 	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"tool-1"}`))
-	if len(w.progress.ActiveTools) != 0 || len(w.progress.RecentTools) != 1 || w.progress.RecentTools[0].Running {
-		t.Fatal("tool_execution_end did not exclusively complete host tool progress")
+	if len(w.progress.ActiveTools) != 0 {
+		t.Fatal("tool_execution_end did not clear active host tool")
 	}
 }
 

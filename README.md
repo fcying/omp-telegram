@@ -269,15 +269,17 @@ The 64 MiB RPC buffer budget is a resource policy separate from the 64 MiB logic
 
 ## Progress UI
 
-`telegram.progress_mode` controls the live task status message.
+`telegram.progress_mode` controls live task status and activity messages.
 
 Supported values:
 
 - `off` disables progress messages and typing actions.
 - `summary` shows assistant output, active tool names, and task state.
-- `verbose` also shows recent observable tool activity.
+- `verbose` keeps the same editable status view as `summary` and additionally sends bounded, grouped activity messages that remain visible.
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
+
+Verbose activity messages group tool starts/completions and confirmed mid-turn assistant text. Only one request is in flight per task; the next attempt waits at least ten seconds after it completes, even on failure or timeout. Events observed meanwhile are merged into the next message, not buffered as a stale snapshot. At most eight sends are attempted per task. Telegram may accept a message before responding or despite a timeout, so exact client display spacing is not guaranteed. Activity messages remain in the chat after the final reply; the editable status message still disappears after final delivery. Short tasks may send no activity messages.
 
 `/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
 

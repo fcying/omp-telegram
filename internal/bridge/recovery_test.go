@@ -383,6 +383,7 @@ func TestDaemonRecoveryPreservesPrivateChatWithoutReplayingTasks(t *testing.T) {
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", queued).Scan(&state) == nil && state == "pending"
 	})
+	before = d.binding(0)
 	d.stop()
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
 	d.start()
