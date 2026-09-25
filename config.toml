@@ -12,8 +12,8 @@ allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 # Telegram live task progress.
 #
 # off: Disable live progress and typing actions.
-# summary: Show assistant activity, active tools, and task state.
-# verbose: Also show recent observable tool activity.
+# summary: Show task Status, active Tools, and assistant Output.
+# verbose: Add recent completed tools to the same editable message.
 # Raw thinking/reasoning and unfiltered tool arguments are never sent.
 # Unset, empty, or invalid values fall back to summary.
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"

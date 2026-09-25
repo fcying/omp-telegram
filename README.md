@@ -269,17 +269,19 @@ The 64 MiB RPC buffer budget is a resource policy separate from the 64 MiB logic
 
 ## Progress UI
 
-`telegram.progress_mode` controls live task status and activity messages.
+`telegram.progress_mode` controls live task progress.
 
 Supported values:
 
 - `off` disables progress messages and typing actions.
 - `summary` shows assistant output, active tool names, and task state.
-- `verbose` keeps the same editable status view as `summary` and additionally sends bounded, grouped activity messages that remain visible.
+- `verbose` adds the 12 most recent completed tool calls, their outcomes, and elapsed times to the same editable message.
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
-Verbose activity messages group tool starts/completions and confirmed mid-turn assistant text. Only one request is in flight per task; the next attempt waits at least ten seconds after it completes, even on failure or timeout. Events observed meanwhile are merged into the next message, not buffered as a stale snapshot. At most eight sends are attempted per task. Telegram may accept a message before responding or despite a timeout, so exact client display spacing is not guaranteed. Activity messages remain in the chat after the final reply; the editable status message still disappears after final delivery. Short tasks may send no activity messages.
+The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows up to 12 completed tool calls under `Recent tools`, counting earlier calls as omitted to fit Telegram's message limit. Tool arguments, partial results, final results, reasoning, commands, stdout, and stderr are not forwarded; OMP's raw tool output can contain credentials or private files. The same message retains its **Stop** button through edits. No separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
+
+New databases use schema 13 without an Activity table. Existing schema 11 and 12 databases upgrade automatically to 13; the migration drops the short-lived development `activity_messages` table even if it contains records. Other tables and session data remain intact, but old Activity messages represented only by those records can no longer be deleted automatically.
 
 `/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
 

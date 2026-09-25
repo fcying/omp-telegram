@@ -27,6 +27,14 @@ func requireStoreOK(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+func requireNoActivityTable(t *testing.T, s *Store) {
+	t.Helper()
+	var count int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='activity_messages'").Scan(&count))
+	if count != 0 {
+		t.Fatalf("schema 13 activity_messages tables = %d, want 0", count)
+	}
+}
 
 func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
@@ -36,6 +44,7 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	if version != schemaVersion {
 		t.Fatalf("new database version = %d, want %d", version, schemaVersion)
 	}
+	requireNoActivityTable(t, s)
 	var indexCount int
 	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_outbox_inbox_state'").Scan(&indexCount))
 	if indexCount != 1 {
@@ -49,10 +58,127 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
+	requireNoActivityTable(t, s)
 	pending, err := s.Pending(256)
 	requireStoreOK(t, err)
 	if len(pending) != 1 || pending[0].ID != 10 {
 		t.Fatal("reopening the current schema lost existing input")
+	}
+}
+
+func TestVersionElevenMigratesToThirteen(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	_, err := s.DB.Exec("PRAGMA user_version=11")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var version int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	if version != schemaVersion {
+		t.Fatalf("version 11 reopened as %d, want 13", version)
+	}
+	requireNoActivityTable(t, s)
+	binding, err := s.Binding(1, 2, 3)
+	requireStoreOK(t, err)
+	if binding.Workspace != "/workspace" || binding.Session != "/session" {
+		t.Fatalf("v11 migration lost workspace/session binding: %+v", binding)
+	}
+	var state string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != string(InboxUncertain) {
+		t.Fatalf("v11 migration lost submitted input: state=%q", state)
+	}
+}
+
+func TestVersionTwelveMigrationRollsBackOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
+	_, err := s.DB.Exec(`CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	if reopened, err := Open(dir); err == nil {
+		reopened.Close()
+		t.Fatal("v12 missing inbox was accepted")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+	requireStoreOK(t, err)
+	defer db.Close()
+	var version, activityTables int
+	var workspace, session string
+	requireStoreOK(t, db.QueryRow("PRAGMA user_version").Scan(&version))
+	requireStoreOK(t, db.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='activity_messages'").Scan(&activityTables))
+	requireStoreOK(t, db.QueryRow("SELECT workspace,session FROM bindings WHERE bot=1 AND chat=2 AND thread=3").Scan(&workspace, &session))
+	if version != 12 || activityTables != 1 || workspace != "/workspace" || session != "/session" {
+		t.Fatalf("failed v12 migration changed data: version=%d activity=%d workspace=%q session=%q", version, activityTables, workspace, session)
+	}
+}
+
+func TestVersionTwelveMigratesToThirteenWithoutOtherDataLoss(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
+	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	requireStoreOK(t, s.SetProgressMessage(10, 99))
+	_, err := s.DB.Exec(`INSERT INTO outbox(inbox_id,chat,thread,text,state) VALUES (10,2,3,'pending reply','pending');
+CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id));
+INSERT INTO activity_messages(inbox_id,chat,message_id) VALUES (10,2,91);
+PRAGMA user_version=12;`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var version int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	if version != schemaVersion {
+		t.Fatalf("version 12 reopened as %d, want 13", version)
+	}
+	requireNoActivityTable(t, s)
+	binding, err := s.Binding(1, 2, 3)
+	requireStoreOK(t, err)
+	if binding.Workspace != "/workspace" || binding.Session != "/session" {
+		t.Fatalf("v12 migration lost workspace/session binding: %+v", binding)
+	}
+	var state string
+	var raw []byte
+	var progress int
+	requireStoreOK(t, s.DB.QueryRow("SELECT state,raw,progress_message_id FROM inbox WHERE id=10").Scan(&state, &raw, &progress))
+	if state != string(InboxUncertain) || string(raw) != `{"update_id":10}` || progress != 99 {
+		t.Fatalf("v12 migration lost inbox metadata: state=%q raw=%q progress=%d", state, raw, progress)
+	}
+	var text, outboxState string
+	requireStoreOK(t, s.DB.QueryRow("SELECT text,state FROM outbox WHERE inbox_id=10").Scan(&text, &outboxState))
+	if text != "pending reply" || outboxState != string(OutboxPending) {
+		t.Fatalf("v12 migration lost pending outbox: text=%q state=%q", text, outboxState)
+	}
+}
+
+func TestVersionTwelveMissingTableLeavesDataUntouched(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	_, err := s.DB.Exec("PRAGMA user_version=12")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	if reopened, err := Open(dir); err == nil {
+		reopened.Close()
+		t.Fatal("version 12 without Activity table was accepted")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+	requireStoreOK(t, err)
+	defer db.Close()
+	var version, tables int
+	var state string
+	requireStoreOK(t, db.QueryRow("PRAGMA user_version").Scan(&version))
+	requireStoreOK(t, db.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='activity_messages'").Scan(&tables))
+	requireStoreOK(t, db.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if version != 12 || tables != 0 || state != string(InboxSubmitted) {
+		t.Fatalf("rejected v12 changed data: version=%d tables=%d state=%q", version, tables, state)
 	}
 }
 
@@ -72,7 +198,7 @@ func TestOpenEscapesQuestionMarkInDirectory(t *testing.T) {
 }
 
 func TestUnsupportedSchemaLeavesDataUntouched(t *testing.T) {
-	for name, version := range map[string]int{"unversioned": 0, "future": schemaVersion + 1} {
+	for name, version := range map[string]int{"unversioned": 0, "future": 14} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
@@ -116,6 +242,7 @@ PRAGMA user_version=1;`)
 	if version != schemaVersion {
 		t.Fatalf("migrated version = %d, want %d", version, schemaVersion)
 	}
+	requireNoActivityTable(t, s)
 	if _, err := s.PendingStarts(1); err != nil {
 		t.Fatalf("startup intent migration missing table: %v", err)
 	}
@@ -246,6 +373,7 @@ func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
 		t.Fatalf("cleared progress cleanup remained ready=%t, err=%v", ready, err)
 	}
 }
+
 func TestTerminalProgressWaitsForFinalReplyDelivery(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	for _, tc := range []struct {
@@ -819,6 +947,7 @@ PRAGMA user_version=3;`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, db.Close())
 	s := openTestStore(t, dir)
+	requireNoActivityTable(t, s)
 	var version int
 	var inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo int64
 	var sessionID string
@@ -1011,6 +1140,7 @@ PRAGMA user_version=7;`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, db.Close())
 	s := openTestStore(t, dir)
+	requireNoActivityTable(t, s)
 	var version int
 	var lastUsed int64
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
@@ -1047,6 +1177,7 @@ PRAGMA user_version=10;`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, db.Close())
 	s := openTestStore(t, dir)
+	requireNoActivityTable(t, s)
 	var version int
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	out, err := s.NextOutput()

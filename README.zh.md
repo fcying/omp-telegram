@@ -269,17 +269,19 @@ RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资�
 
 ## Progress UI
 
-`telegram.progress_mode` 控制任务实时状态和活动消息.
+`telegram.progress_mode` 控制任务实时进度.
 
 支持的值:
 
 - `off` - 关闭 progress 消息和 typing action.
-- `summary` - 显示 assistant 输出, 活动工具名和任务状态.
-- `verbose` - 可编辑状态视图与 `summary` 相同, 另外发送有上限、会保留的分组活动消息.
+- `summary` - 显示 assistant 输出、活动工具名和任务状态.
+- `verbose` - 在同一条可编辑消息中额外显示最近 12 次已完成工具调用的结果状态和耗时.
 
 新任务的 progress 会延迟约三秒, 因此短任务通常只发送最终回复. 活跃任务带有 **Stop** 按钮. 它只中止当前任务; `/stop` 还会清除对话中已经排队的任务, 按钮则让这些任务在取消完成后继续执行.
 
-Verbose 活动消息汇总工具启动/结束与已确认的中途 assistant 文本. 每个任务同一时间只发起一次请求; 包括失败或超时在内, 下一次尝试需在上次完成后至少等待十秒. 等待期间的事件会合并到下一条消息, 不缓存过期快照. 每个任务最多尝试发送八条. Telegram 可能在返回响应前或请求超时后接受消息, 因此不保证客户端显示的精确间隔. 活动消息会在最终回复后保留; 可编辑的状态消息仍在最终回复交付后清理. 短任务可能没有活动消息.
+可编辑状态消息在 `Output` 显示 assistant 文本, 在 `Tools` 显示活动工具. `verbose` 还会在 `Recent tools` 显示最近最多 12 次工具调用的完成状态和耗时, 更早的调用会统计省略数量, 以适应 Telegram 消息长度限制. 不转发工具参数、部分结果、最终结果、reasoning、命令文本、stdout 或 stderr; OMP 原始工具输出可能包含凭据或私人文件. 同一条消息在编辑更新时保留 **Stop** 按钮. 不再单独发送重复 assistant 文本的 Activity 消息. 任务最终回复与实时进度保持独立.
+
+新数据库使用 schema 13, 不创建 Activity 表. 现有 schema 11 和 12 数据库自动升级到 13; 迁移会删除短暂开发版的 `activity_messages` 表, 即使表中仍有记录. 其他表和 session 数据保持不变, 但仅由这些记录标识的旧 Activity 消息之后无法自动删除.
 
 `/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
 
