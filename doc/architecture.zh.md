@@ -69,6 +69,8 @@ Progress Stop 只中止 active task. `/queue` Cancel 只移除选中的 bridge p
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存错误 metadata 用于分类结果; uncertain 回复只可能包含经过长度限制和脱敏的 `errorMessage` 摘要, 不会原样转发 metadata.
 
+`agent_start` 只有在 bridge 输入占用 active lane 时才能修改任务 busy 状态. 任务结算后的迟到或非请求 start 不能重新触发 typing 或阻塞排队 prompt. `/status` 报告 OMP 原生 streaming 状态, bridge 队列派发则使用自己的 active-task 状态.
+
 ### 缺失终结信号与 watchdog
 
 缺失终结信号走独立的保守恢复路径, 绝不当作成功. 活跃 busy 根任务必须至少 30 秒无活动, 且没有 compact/handoff、retry、运行中工具、host request 或原生 UI 等待. 后台 `get_state` 请求超时为 5 秒, 不阻塞 actor 处理控制命令. `isStreaming` 和 `isCompacting` 都必须明确为 `false`; 缺失/null/格式错误字段及请求错误会丢弃确认. 两次确认至少相隔 30 秒. 所有事件 (包括未知或格式错误事件) 和普通 RPC 活动都会使探测失效. 结果按 client 身份、generation、turn、active input 和活动 revision 隔离, 已排队事件优先于探测结果. 确认缺失完成后, 复用原有 uncertain 结果原子事务和进度清理, 再先关闭旧 client, 后派发队列; 保留逻辑 session claim 和排队输入, 按需 resume, 不重放旧任务. 终态、turn 变化、runtime 释放和 shutdown 都会取消待处理 typing 请求, 请求仍有 4 秒超时.
@@ -293,7 +295,7 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 列表每页六条. Pending、open 和当前对话的删除按钮使用不带 callback data 的 Telegram disabled button. 只有其他对话的 closed binding 可以打开 danger 样式的删除确认. 每个列表和删除 callback 都校验授权用户、当前对话 generation、过期时间、来源消息 ID、action token、目标 binding generation 以及 Bridge 级内存 binding mutation epoch. `DeleteClosedBinding` 成功后会推进所有 worker 共享的 epoch, 即使被删除的 generation 随后复用, 旧 `/bindings` 菜单和删除确认仍会失效. 重新执行 `/bindings` 也会使旧 viewer token 失效; 旧 callback 不能翻页或清除新页面.
 
-`/queue` 显示当前 worker 的 running 状态、pending 数量、附件 preparation 状态, 每页最多六个 pending task. Task preview 使用有界文本或 `Preparing attachment...`; callback data 使用随机菜单 token 加 `cancel:<inbox_id>`. 处理 callback 时重新扫描实时 queue. 如果任务期间已 dispatch, 返回 `Task is no longer queued.`, 绝不把操作转换成 active abort.
+`/queue` 显示当前 worker 的 running 状态、pending 数量、附件 preparation 状态, 每页最多六个 pending task. Task preview 使用有界文本或 `Preparing attachment...`; callback data 使用随机菜单 token 加 `cancel:<inbox_id>`. 处理 callback 时重新扫描实时 queue. 如果任务期间已 dispatch, 返回 `Task is no longer queued.`, 绝不把操作转换成 active abort. 空队列只显示标题、running 状态和 pending 数量, 不带页码、keyboard 或 token; 取消最后一个任务时, 编辑后的状态附带空 inline keyboard 来移除旧按钮.
 
 `/queue` 和 `/bindings` viewer 的 Close 与有业务副作用的选择不同: 只有 `editMessageReplyMarkup` 成功后才消费 token 并返回 `Closed`. 如果 Telegram 拒绝编辑或请求超时, token 保持有效, 可在过期前再次点击 Close; pending task 和 binding 均不受影响.
 

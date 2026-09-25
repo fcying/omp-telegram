@@ -237,6 +237,33 @@ func TestTerminalCancelsPendingTyping(t *testing.T) {
 	}
 }
 
+func TestLateAgentStartDoesNotWedgeIdleQueue(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 2
+	w.b.cfg.ProgressMode = "summary"
+	command("/new " + t.TempDir())
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}`))
+	if w.active != 0 || w.busy {
+		t.Fatal("terminal event did not release the task")
+	}
+	command("next task")
+	w.event([]byte(`{"type":"agent_start"}`))
+	if w.taskOrSessionBusy() {
+		t.Fatal("late agent start made the idle worker busy")
+	}
+	w.typing()
+	if !w.lastTyping.IsZero() {
+		t.Fatal("late agent start resumed typing")
+	}
+	w.dispatch()
+	if w.active == 0 || len(w.queue) != 0 {
+		t.Fatal("late agent start prevented queued prompt dispatch")
+	}
+}
+
 func TestIdleProbeRejectsOldOwnershipAndQueuedActivity(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 1

@@ -281,7 +281,7 @@ RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资�
 
 `/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
 
-`/queue` 和 `/bindings` 列表的 Close 按钮只有在 Telegram 成功移除 inline keyboard 后才返回 `Closed`. 如果编辑失败, 菜单保持可操作, 可以在过期前再次点击 Close.
+`/queue` 的 pending 队列为空时不显示页码或按钮; 取消最后一个任务后刷新消息会移除键盘. 对于有 pending task 的 `/queue` 菜单及所有 `/bindings` 菜单, Close 只有在 Telegram 成功移除 inline keyboard 后才返回 `Closed`. 如果编辑失败, 菜单保持可操作, 可以在过期前再次点击 Close.
 
 Progress 属于 best-effort UI, 不影响最终回复的持久化交付. 进度消息删除失败时, daemon 运行期间每分钟重试一次; Telegram 明确返回永久拒绝时放弃删除.
 
