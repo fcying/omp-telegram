@@ -123,6 +123,7 @@ type albumEvent struct {
 
 type confirmation struct {
 	action, uiID, method string
+	uiTitle              string
 	workspace            string
 	exportFormat         string
 	options              []string
@@ -143,6 +144,7 @@ type confirmation struct {
 	deleteThread         int64
 	deleteGeneration     int64
 	page                 int
+	uiSelectMenu         bool
 }
 type runtimeState uint8
 
@@ -3456,6 +3458,10 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
 	}
+	if c.uiSelectMenu && (q.Message == nil || q.Message.MessageID != c.messageID) {
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return callbackDone
+	}
 	if (c.action == "resume" || c.action == "export") && (q.Message == nil || q.Message.MessageID != c.messageID) {
 		delete(w.confirms, token)
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
@@ -3483,9 +3489,35 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		return callbackDone
 	}
+	if c.uiSelectMenu && (index == "previous" || index == "next") {
+		page := c.page - 1
+		if index == "next" {
+			page = c.page + 1
+		}
+		pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize
+		if page < 0 || page >= pages {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			return callbackDone
+		}
+		if w.showUISelectPage(c, page, c.messageID) {
+			delete(w.confirms, token)
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+		} else {
+			delete(w.confirms, token)
+			w.clearKeyboard(c.messageID)
+		}
+		return callbackDone
+	}
 	n, err := strconv.Atoi(index)
 	if err != nil || n < 0 || (c.action == "stop" && n != 0) || (c.method != "select" && c.action != "stop" && n > 1) || (c.method == "select" && n > len(c.options)) {
 		return callbackDone
+	}
+	if c.uiSelectMenu && n < len(c.options) {
+		start := c.page * uiSelectPageSize
+		if n < start || n >= min(start+uiSelectPageSize, len(c.options)) {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			return callbackDone
+		}
 	}
 	if c.action == "stop" {
 		if c.active != w.active || c.turn != w.turn || !w.taskRunning() {
@@ -3637,24 +3669,84 @@ func (w *worker) cancelStart() bool {
 	return true
 }
 
+const uiSelectPageSize = 8
+
+func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) bool {
+	pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize
+	if page < 0 || page >= pages {
+		return false
+	}
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		w.cancelUI(c)
+		w.say("Cannot create the native selection menu. The dialog was canceled.")
+		return false
+	}
+	token := hex.EncodeToString(random[:])
+	text := c.uiTitle
+	if pages > 1 {
+		text += fmt.Sprintf("\nPage %d/%d", page+1, pages)
+	}
+	keyboard := &telegram.Keyboard{}
+	start, end := page*uiSelectPageSize, min((page+1)*uiSelectPageSize, len(c.options))
+	for i := start; i < end; i++ {
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: c.options[i], CallbackData: fmt.Sprintf("%s:%d", token, i)}})
+	}
+	var navigation []telegram.Button
+	if page > 0 {
+		navigation = append(navigation, telegram.Button{Text: "Previous", CallbackData: token + ":previous"})
+	}
+	if page+1 < pages {
+		navigation = append(navigation, telegram.Button{Text: "Next", CallbackData: token + ":next"})
+	}
+	if len(navigation) != 0 {
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
+	}
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: "Cancel", CallbackData: fmt.Sprintf("%s:%d", token, len(c.options))}})
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+	var err error
+	if messageID != 0 {
+		err = w.b.tg.Edit(ctx, w.key.chat, messageID, text, keyboard)
+	} else {
+		var message telegram.Message
+		message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, telegram.SendOptions{Keyboard: keyboard})
+		messageID = message.MessageID
+	}
+	if err != nil {
+		w.cancelUI(c)
+		w.say("Failed to display the native selection menu. The dialog was canceled.")
+		return false
+	}
+	c.page, c.messageID = page, messageID
+	c.expires = time.Now().Add(2 * time.Minute)
+	w.confirms[token] = c
+	w.touchActivity()
+	return true
+}
+
 func (w *worker) ui(e rpcEvent) {
 	switch e.Method {
 	case "confirm", "select":
 		var msg string
 		_ = json.Unmarshal(e.Message, &msg)
 		c := confirmation{action: "ui", uiID: e.ID, method: e.Method, options: e.Options}
-		options := e.Options
 		if e.Method == "confirm" {
-			options = []string{"Confirm", "Cancel"}
-		} else if len(options) == 0 || len(options) > 20 {
+			w.confirm(c, e.Title+"\n"+msg, []string{"Confirm", "Cancel"})
+			return
+		}
+		if len(e.Options) == 0 {
 			w.cancelUI(c)
 			w.say("The number of options is unsupported. The dialog was canceled.")
 			return
 		}
-		if e.Method == "select" {
-			options = append(append([]string(nil), options...), "Cancel")
+		c.user, c.generation, c.uiSelectMenu = w.owner, w.binding.Generation, true
+		parts := split(e.Title+"\n"+msg, 3700)
+		c.uiTitle = "Choose an option"
+		if len(parts) != 0 {
+			c.uiTitle = parts[0]
 		}
-		w.confirm(c, e.Title+"\n"+msg, options)
+		w.showUISelectPage(c, 0, 0)
 	case "input", "editor":
 		w.cancelUI(confirmation{uiID: e.ID})
 		w.say("Input dialogs are not supported and have been canceled. Provide the information in a normal message.")

@@ -293,6 +293,7 @@ func TestMain(m *testing.M) {
 		sessionName := ""
 		rootPrompts := 0
 		uiReplies := 0
+		uiValue := ""
 		scan := bufio.NewScanner(os.Stdin)
 		scan.Buffer(make([]byte, 64<<10), (1<<20)+1)
 		for scan.Scan() {
@@ -305,6 +306,7 @@ func TestMain(m *testing.M) {
 			switch typ {
 			case "extension_ui_response":
 				uiReplies++
+				uiValue, _ = cmd["value"].(string)
 				continue
 			case "host_tool_result":
 				text := "attachment accepted"
@@ -315,7 +317,7 @@ func TestMain(m *testing.M) {
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				continue
 			case "get_state":
-				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies}
+				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies, "fixtureUIValue": uiValue}
 				resp["data"].(map[string]any)["isStreaming"] = streaming.Load()
 				resp["data"].(map[string]any)["isCompacting"] = false
 			case "set_session_name":

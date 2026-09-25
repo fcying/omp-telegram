@@ -1085,20 +1085,21 @@ func TestTouchAndDeleteClosedBindingFenceGeneration(t *testing.T) {
 	second.Session = "/sessions/two.jsonl"
 	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/one", "pinned-session", true))
 	requireStoreOK(t, s.Save(second))
-	changed, err := s.TouchBinding(1, 2, 3, first.Generation)
+	usedAt := int64(1_000_000_123)
+	changed, err := s.TouchBinding(1, 2, 3, first.Generation, usedAt)
 	requireStoreOK(t, err)
 	if changed {
 		t.Fatal("stale generation was touched")
 	}
-	changed, err = s.TouchBinding(1, 2, 3, second.Generation)
+	changed, err = s.TouchBinding(1, 2, 3, second.Generation, usedAt)
 	requireStoreOK(t, err)
 	if !changed {
 		t.Fatal("current generation was not touched")
 	}
 	current, err := s.Binding(1, 2, 3)
 	requireStoreOK(t, err)
-	if current.LastUsedAt <= 0 {
-		t.Fatal("touch did not persist last-used timestamp")
+	if current.LastUsedAt != usedAt {
+		t.Fatalf("touch persisted timestamp %d, want %d", current.LastUsedAt, usedAt)
 	}
 	deleted, err := s.DeleteClosedBinding(1, 2, 3, first.Generation)
 	requireStoreOK(t, err)

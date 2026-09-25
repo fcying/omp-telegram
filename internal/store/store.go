@@ -676,8 +676,8 @@ func (s *Store) BindingsForChat(bot, chat int64) ([]BindingListEntry, error) {
 	return result, nil
 }
 
-func (s *Store) TouchBinding(bot, chat, thread, generation int64) (bool, error) {
-	result, err := s.DB.Exec("UPDATE bindings SET last_used_at=? WHERE bot=? AND chat=? AND thread=? AND generation=?", time.Now().Unix(), bot, chat, thread, generation)
+func (s *Store) TouchBinding(bot, chat, thread, generation, usedAt int64) (bool, error) {
+	result, err := s.DB.Exec("UPDATE bindings SET last_used_at=? WHERE bot=? AND chat=? AND thread=? AND generation=?", usedAt, bot, chat, thread, generation)
 	if err != nil {
 		return false, err
 	}

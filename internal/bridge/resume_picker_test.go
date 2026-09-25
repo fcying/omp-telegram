@@ -146,7 +146,7 @@ func finishResumeList(t *testing.T, w *worker) resumeListResult {
 	}
 }
 
-func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
+func pickerView(t *testing.T, f *fakeHTTP) (string, [][]map[string]any) {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -159,16 +159,29 @@ func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 		if !ok {
 			continue
 		}
-		var buttons []map[string]any
+		keyboard := make([][]map[string]any, 0, len(rows))
 		for _, row := range rows {
+			buttons := make([]map[string]any, 0, len(row.([]any)))
 			for _, button := range row.([]any) {
 				buttons = append(buttons, button.(map[string]any))
 			}
+			keyboard = append(keyboard, buttons)
 		}
-		return buttons
+		text, _ := f.messages[i]["text"].(string)
+		return text, keyboard
 	}
 	t.Fatal("session picker keyboard missing")
-	return nil
+	return "", nil
+}
+
+func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
+	t.Helper()
+	_, rows := pickerView(t, f)
+	var buttons []map[string]any
+	for _, row := range rows {
+		buttons = append(buttons, row...)
+	}
+	return buttons
 }
 
 func resumeButtons(t *testing.T, f *fakeHTTP) []map[string]any {
@@ -198,23 +211,31 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	sessions := setResumeFixtures(t, original.Workspace, 10)
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
+	text, rows := pickerView(t, f)
 	buttons := resumeButtons(t, f)
-	if len(buttons) != 10 {
-		t.Fatalf("first page has %d buttons, want eight choices, next, cancel", len(buttons))
+	if len(buttons) != 10 || len(rows) != 10 {
+		t.Fatalf("first page: %d choices, %d rows; want eight sessions, next, cancel", len(buttons), len(rows))
 	}
 	for i := range 8 {
-		if !strings.Contains(buttons[i]["text"].(string), sessions[i].Title) {
-			t.Fatalf("choice %d lost native ordering or title: %v", i, buttons[i])
+		listed := strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) && strings.Contains(text, "ID: "+sessions[i].ID)
+		paired := len(rows[i]) == 2 && strings.Contains(rows[i][0]["text"].(string), sessions[i].Title) && rows[i][1]["text"] == "Pin"
+		if !listed || !paired {
+			t.Fatalf("session %d lost identity or adjacent pin action: %s; %v", i, text, rows[i])
 		}
 	}
+	if !strings.Contains(text, "2026-09-20 12:00 UTC") {
+		t.Fatalf("native update time missing: %q", text)
+	}
 	clickResume(w, 7, buttons[8]["callback_data"].(string))
+	text, rows = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || !strings.Contains(buttons[0]["text"].(string), sessions[8].Title) || !strings.Contains(buttons[1]["text"].(string), sessions[9].Title) {
-		t.Fatalf("second page does not contain final native choices: %v", buttons)
+	if len(buttons) != 4 || len(rows) != 4 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
+		t.Fatalf("second page does not contain final native choices: %s; %v", text, buttons)
 	}
 	clickResume(w, 7, buttons[2]["callback_data"].(string))
+	text, _ = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 10 || !strings.Contains(buttons[0]["text"].(string), sessions[0].Title) {
+	if len(buttons) != 10 || !strings.Contains(text, "1. "+sessions[0].Title) {
 		t.Fatal("previous did not return to first page")
 	}
 	if !sameBindingIdentity(w.binding, original) {
@@ -238,9 +259,12 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	requireStoreOK(t, w.b.db.SetPinnedSession(w.b.bot.ID, w.key.chat, w.key.thread, before.Workspace, sessions[1].ID, true))
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
+	text, rows := pickerView(t, f)
 	buttons := pickerButtons(t, f)
-	if !strings.Contains(buttons[0]["text"].(string), sessions[1].Title) || buttons[1]["text"] != "Unpin" {
-		t.Fatalf("pinned session was not first: %v", buttons[:2])
+	listed := strings.Contains(text, "1. "+sessions[1].Title+" [pinned]")
+	paired := len(rows[0]) == 2 && strings.Contains(buttons[0]["text"].(string), sessions[1].Title) && buttons[1]["text"] == "Unpin"
+	if !listed || !paired {
+		t.Fatalf("pinned session was not first with adjacent unpin: %s; %v", text, rows[0])
 	}
 	clickResume(w, 7, buttons[1]["callback_data"].(string))
 	if !sameBindingIdentity(w.binding, before) {
@@ -251,20 +275,15 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	if len(pinned) != 0 {
 		t.Fatalf("unpin left favorites: %+v", pinned)
 	}
+	text, rows = pickerView(t, f)
 	buttons = pickerButtons(t, f)
-	if !strings.Contains(buttons[0]["text"].(string), sessions[0].Title) || buttons[1]["text"] != "Pin" {
-		t.Fatalf("native order was not restored after unpin: %v", buttons[:2])
+	if !strings.Contains(text, "1. "+sessions[0].Title) || buttons[1]["text"] != "Pin" {
+		t.Fatalf("native order was not restored after unpin: %s; %v", text, buttons[:2])
 	}
-	var pinData string
-	for i, button := range buttons {
-		if strings.Contains(button["text"].(string), sessions[2].Title) && i+1 < len(buttons) {
-			pinData = buttons[i+1]["callback_data"].(string)
-			break
-		}
+	if len(rows[2]) != 2 || rows[2][1]["text"] != "Pin" {
+		t.Fatal("third session pin button missing")
 	}
-	if pinData == "" {
-		t.Fatal("session pin button missing")
-	}
+	pinData := rows[2][1]["callback_data"].(string)
 	clickResume(w, 7, pinData)
 	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("pin toggle changed the active session")
@@ -274,9 +293,9 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	if _, ok := pinned[strings.ToLower(sessions[2].ID)]; !ok || len(pinned) != 1 {
 		t.Fatalf("pinned session state = %+v", pinned)
 	}
-	buttons = pickerButtons(t, f)
-	if !strings.Contains(buttons[0]["text"].(string), sessions[2].Title) || buttons[1]["text"] != "Unpin" {
-		t.Fatalf("newly pinned session was not promoted: %v", buttons[:2])
+	text, rows = pickerView(t, f)
+	if !strings.Contains(text, "1. "+sessions[2].Title+" [pinned]") || rows[0][1]["text"] != "Unpin" {
+		t.Fatalf("newly pinned session was not promoted: %s; %v", text, rows[0])
 	}
 }
 
@@ -577,9 +596,13 @@ func TestResumePickerRefusesAnotherTopicsActiveSession(t *testing.T) {
 func TestExportPickerRejectsCallbackFromDifferentMessage(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new test")
-	setResumeFixtures(t, w.binding.Workspace, 1)
+	sessions := setResumeFixtures(t, w.binding.Workspace, 1)
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
+	text, rows := pickerView(t, f)
+	if len(rows) != 2 || len(rows[0]) != 1 || rows[0][0]["text"] != "1. Export" || !strings.Contains(text, "ID: "+sessions[0].ID) {
+		t.Fatalf("export picker lost its single export action or session identity: %s; %v", text, rows)
+	}
 	data := resumeButtons(t, f)[0]["callback_data"].(string)
 	before := w.binding
 	w.callback(&telegram.CallbackQuery{ID: "stale-export-picker", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: 999}, Data: data})

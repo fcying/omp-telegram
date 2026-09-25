@@ -38,13 +38,14 @@ func (w *worker) touchBinding() {
 	if w.b == nil || w.b.db == nil || w.binding.Generation == 0 {
 		return
 	}
-	updated, err := w.b.db.TouchBinding(w.b.bot.ID, w.key.chat, w.key.thread, w.binding.Generation)
+	usedAt := time.Now().Unix()
+	updated, err := w.b.db.TouchBinding(w.b.bot.ID, w.key.chat, w.key.thread, w.binding.Generation, usedAt)
 	if err != nil {
 		w.b.storeLog.Error("binding last-used timestamp failed", "event", "binding_write_failed", "reason", "touch_last_used", "error_kind", "persistence")
 		return
 	}
 	if updated {
-		w.binding.LastUsedAt = time.Now().Unix()
+		w.binding.LastUsedAt = usedAt
 	}
 }
 

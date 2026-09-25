@@ -520,26 +520,21 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	if c.action == "export" {
 		heading = "Export omp session"
 	}
-	fmt.Fprintf(&text, "%s\nWorkspace: %s\n", heading, menuText(c.workspace, 512))
+	fmt.Fprintf(&text, "%s | Page %d/%d\nWorkspace: %s\n\n", heading, page+1, pages, menuText(c.workspace, 512))
 	if c.action == "export" {
 		fmt.Fprintf(&text, "Format: %s\n", strings.ToUpper(c.exportFormat))
 	}
-	fmt.Fprintf(&text, "Page %d/%d\n", page+1, pages)
 	keyboard := &telegram.Keyboard{}
-	add := func(label string, option resumePickerOption) {
+	add := func(label string, option resumePickerOption) telegram.Button {
 		index := len(c.options)
 		c.options = append(c.options, label)
 		c.pickerOptions = append(c.pickerOptions, option)
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, index)}})
+		return telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, index)}
 	}
 	for i, session := range c.sessions[start:end] {
 		title := menuText(session.Title, 40)
 		if title == "" {
 			title = "Untitled"
-		}
-		id := session.ID
-		if len(id) > 8 {
-			id = id[len(id)-8:]
 		}
 		marker := ""
 		if w.bindingSessionSelected(session.ID) {
@@ -549,26 +544,36 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 			marker += " [pinned]"
 		}
 		sessionIndex := start + i
-		fmt.Fprintf(&text, "\n%d. %s%s\nID: %s\n", sessionIndex+1, title, marker, session.ID)
+		fmt.Fprintf(&text, "%d. %s%s", sessionIndex+1, title, marker)
 		if updated, err := time.Parse(time.RFC3339Nano, session.UpdatedAt); err == nil {
-			fmt.Fprintf(&text, "Updated: %s\n", updated.UTC().Format("2006-01-02 15:04 UTC"))
+			fmt.Fprintf(&text, " | %s", updated.UTC().Format("2006-01-02 15:04 UTC"))
 		}
-		add(fmt.Sprintf("%d. %s [%s]", sessionIndex+1, menuText(title, 28), id), resumePickerOption{session: sessionIndex, action: "select"})
+		fmt.Fprintf(&text, "\nID: %s\n", session.ID)
+		selectLabel := menuText(title, 20)
+		if c.action == "export" {
+			selectLabel = "Export"
+		}
+		row := []telegram.Button{add(fmt.Sprintf("%d. %s", sessionIndex+1, selectLabel), resumePickerOption{session: sessionIndex, action: "select"})}
 		if c.action == "resume" {
 			pinLabel := "Pin"
 			if sessionIsPinned(session, c.pinnedSessions) {
 				pinLabel = "Unpin"
 			}
-			add(pinLabel, resumePickerOption{session: sessionIndex, action: "toggle_pin"})
+			row = append(row, add(pinLabel, resumePickerOption{session: sessionIndex, action: "toggle_pin"}))
 		}
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
 	}
+	var navigation []telegram.Button
 	if page > 0 {
-		add("Previous", resumePickerOption{action: "previous"})
+		navigation = append(navigation, add("Previous", resumePickerOption{action: "previous"}))
 	}
 	if page+1 < pages {
-		add("Next", resumePickerOption{action: "next"})
+		navigation = append(navigation, add("Next", resumePickerOption{action: "next"}))
 	}
-	add("Cancel", resumePickerOption{action: "cancel"})
+	if len(navigation) != 0 {
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
+	}
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{add("Cancel", resumePickerOption{action: "cancel"})})
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
 	var err error
