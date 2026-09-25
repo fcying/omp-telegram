@@ -269,15 +269,17 @@ RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资�
 
 ## Progress UI
 
-`telegram.progress_mode` 控制实时任务状态消息.
+`telegram.progress_mode` 控制任务实时状态和活动消息.
 
 支持的值:
 
 - `off` - 关闭 progress 消息和 typing action.
 - `summary` - 显示 assistant 输出, 活动工具名和任务状态.
-- `verbose` - 另外显示最近的可观察工具活动.
+- `verbose` - 可编辑状态视图与 `summary` 相同, 另外发送有上限、会保留的分组活动消息.
 
 新任务的 progress 会延迟约三秒, 因此短任务通常只发送最终回复. 活跃任务带有 **Stop** 按钮. 它只中止当前任务; `/stop` 还会清除对话中已经排队的任务, 按钮则让这些任务在取消完成后继续执行.
+
+Verbose 活动消息汇总工具启动/结束与已确认的中途 assistant 文本. 每个任务同一时间只发起一次请求; 包括失败或超时在内, 下一次尝试需在上次完成后至少等待十秒. 等待期间的事件会合并到下一条消息, 不缓存过期快照. 每个任务最多尝试发送八条. Telegram 可能在返回响应前或请求超时后接受消息, 因此不保证客户端显示的精确间隔. 活动消息会在最终回复后保留; 可编辑的状态消息仍在最终回复交付后清理. 短任务可能没有活动消息.
 
 `/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
 

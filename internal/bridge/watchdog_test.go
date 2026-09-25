@@ -198,7 +198,7 @@ func TestIdleConfirmationResetAndFences(t *testing.T) {
 	for _, block := range []func(){
 		func() { w.compacting = true },
 		func() { w.progress.Retrying = true },
-		func() { w.progress.ActiveTools = map[string]progressTool{"tool": {Running: true}} },
+		func() { w.progress.ActiveTools = map[string]progressTool{"tool": {Name: "read"}} },
 		func() { w.hostRequests = map[string]context.CancelFunc{"host": func() {}} },
 		func() { w.confirms["ui"] = confirmation{action: "ui"} },
 	} {
