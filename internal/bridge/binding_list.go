@@ -509,11 +509,18 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 		return callbackDone
 	}
 	action := c.options[n]
+	if action == "close" {
+		if err := w.b.tg.ClearKeyboard(ctx, w.key.chat, c.messageID); err != nil {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Could not close the bindings menu. Tap Close again.")
+			return callbackDone
+		}
+		delete(w.confirms, token)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Closed")
+		return callbackDone
+	}
 	delete(w.confirms, token)
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
 	switch {
-	case action == "close":
-		w.clearKeyboard(c.messageID)
 	case action == "previous":
 		w.showBindingsPage(c, c.page-1, c.messageID)
 	case action == "next":

@@ -289,6 +289,41 @@ func TestQueueViewerShowsEmptyQueue(t *testing.T) {
 	}
 }
 
+func TestQueueCloseAfterClearCanRetryKeyboardRemoval(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	queueReady(t, w, command)
+	w.b.cfg.QueueCapacity = 2
+	command("missing-terminal")
+	w.dispatch()
+	command("pending")
+	command("/queue")
+	menu := latestQueueMenu(t, f)
+	clickQueue(w, 7, menu.messageID, queueCancelData(t, menu, "pending"))
+	menu = latestQueueMenu(t, f)
+	if len(w.queue) != 0 || !strings.Contains(menu.text, "Pending: 0") {
+		t.Fatalf("queue after cancel = %+v, menu = %q", w.queue, menu.text)
+	}
+	data := queueButtonData(t, menu, "Close")
+	token, _, _ := strings.Cut(data, ":")
+	f.failKeyboardClear = true
+	clickQueue(w, 7, menu.messageID, data)
+	if got := lastCallback(t, f); got != "Could not close the queue menu. Tap Close again." {
+		t.Fatalf("failed cleanup callback = %q", got)
+	}
+	if _, ok := w.confirms[token]; !ok {
+		t.Fatal("failed keyboard cleanup consumed the Close button")
+	}
+	f.failKeyboardClear = false
+	clickQueue(w, 7, menu.messageID, data)
+	if got := lastCallback(t, f); got != "Closed" {
+		t.Fatalf("successful close callback = %q", got)
+	}
+	if _, ok := w.confirms[token]; ok {
+		t.Fatal("successful Close left the menu actionable")
+	}
+	assertKeyboardClears(t, f, int(menu.messageID), int(menu.messageID))
+}
+
 func TestQueueCancelPreservesOrderAndReportsEachTask(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 4
