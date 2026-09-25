@@ -220,7 +220,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/review [arguments]` | Run OMP's native `/review` command as a queued task. Native selection dialogs, including commit lists, show eight options per page and display navigation only when needed. |
 | `/help` | Show help. |
 
-Ordinary text, attachments, and `/review` are queued per conversation and run sequentially. A message sent while another task is running waits in that conversation; it does not interrupt the active task. Different conversations can run concurrently up to the configured worker capacity.
+Ordinary text, attachments, and `/review` are queued per conversation and run sequentially. Only the listed bridge commands (plus `/start`) are handled as controls; other slash-prefixed text such as `/opt/tmp`, `/opt/user@host/file`, or `/stauts` is sent to OMP as an ordinary prompt. Only a syntactically valid `/command@bot` token is treated as bot-addressed; messages addressed to a different bot are ignored. A message sent while another task is running waits in that conversation; it does not interrupt the active task. Different conversations can run concurrently up to the configured worker capacity.
 
 `/doctor` checks runtime configuration, Telegram `getMe`, SQLite health, data-directory write access, the configured OMP binary, the current workspace and saved session, runtime state, uncertain inbox/outbox records, and free disk space. It returns fixed safe summaries only; it never includes tokens, headers, prompts, raw RPC state, or full local paths. If conversation state changes while checks run, the result is discarded.
 

@@ -50,6 +50,7 @@ flowchart LR
 
 - 每个对话使用 actor 风格的 worker. 普通文字, 附件和 `/review` 都作为独立 prompt 进入 bridge 延后队列, 串行执行. bridge 只在当前任务结束后提交下一条 prompt.
 - 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
+- 命令识别使用已注册的 bridge 命令及隐藏的 `/start` 别名. 仅当 `@bot` 前是单段 Telegram 命令名 (1-32 位 ASCII 字母、数字或下划线), 且目标是同类字符组成的 5-32 位用户名形状时才识别定向. `/opt/user@host/file` 等路径仍是普通 prompt. 发给其他 bot 的命令在重启前已 pending 时也会标为 ignored; 启动时取消 pending 的斜杠 prompt, 不自动重放.
 - `/queue` 只读取当前 worker 内存中的 `queue`、`active` 和 `busy`. 它是当前对话范围的 viewer; Cancel 按钮定位 bridge pending inbox ID, 绝不中止 active task 或管理 OMP native queue. 队列只存在于 runtime: worker shutdown 会取消剩余 pending inbox, 不会恢复 queue entry.
 - 附件准备和上传异步且有并发上限. 尚在准备的附件保留其队列位置.
 - RPC stdout reader 不执行 Telegram HTTP 交付. 帧重组预留容量和排队的异步事件字节数共用 64 MiB credit 预算, worker 收到事件后归还 credit. 协议错误或积压超限会使 client 失败, 不允许内存无限增长. worker 对 terminal 前累计的 assistant 文本单独设置 4 MiB 上限. terminal 前任一预算溢出都会关闭 runtime, 将任务结果标记为 uncertain, 且不自动重放. terminal event 已确认后只有展示超限时会截断: 最多发送 32 条、合计 1 MiB 的 Telegram 回复文本并明确提示, 任务仍为 done.

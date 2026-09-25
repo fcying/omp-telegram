@@ -3004,17 +3004,23 @@ func TestIdleReviewWithArgumentsCompletes(t *testing.T) {
 	waitInputDone(t, db, 3)
 }
 
-func TestUnsupportedFollowupDoesNotStartTask(t *testing.T) {
-	w, _, command := setupWorkspaceWorker(t)
-	command("/new " + t.TempDir())
-	command("/followup must not run")
-	w.dispatch()
-	if w.busy || w.active != 0 || len(w.queue) != 0 {
-		t.Fatal("unsupported followup started or queued a task")
-	}
-	var state string
-	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "done" {
-		t.Fatalf("unsupported command state=%q, err=%v", state, err)
+func TestUnknownSlashTextRunsAsOrdinaryPrompt(t *testing.T) {
+	f, db, send := setupBridge(t)
+	send(update(1, 11, "/new "+t.TempDir()))
+	waitBinding(t, db, 11)
+	for i, text := range []string{
+		"/opt/tmp 是什么目录 做什么用的",
+		"/tmp",
+		"/foo/bar 这个路径不存在",
+		"/stauts",
+		"/opt/user@host/file 是什么",
+		"/tmp/foo@bar",
+		"/stauts@fixture_bot",
+	} {
+		id := int64(i + 2)
+		send(update(id, 11, text))
+		waitFor(t, func() bool { return f.has(11, "answer: "+text) })
+		waitInputDone(t, db, id)
 	}
 }
 

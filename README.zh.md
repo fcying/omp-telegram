@@ -220,7 +220,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. 原生选择对话框 (包括 commit 列表) 每页显示 8 项, 只在需要时显示翻页按钮. |
 | `/help` | 查看帮助. |
 
-普通文字, 附件和 `/review` 都按对话排队并串行执行. 任务运行期间发送的消息会等待当前任务结束, 不会打断活动任务. 不同对话可以并行工作, 受 worker 配置上限影响.
+普通文字, 附件和 `/review` 都按对话排队并串行执行. 只有表中列出的 bridge 命令 (以及 `/start`) 走控制路径; 其他以 `/` 开头的文字, 如 `/opt/tmp`, `/opt/user@host/file` 或 `/stauts`, 会作为普通 prompt 发送给 OMP. 只有符合语法的 `/command@bot` token 才视为 bot 定向; 明确发给其他 bot 的命令会被忽略. 任务运行期间发送的消息会等待当前任务结束, 不会打断活动任务. 不同对话可以并行工作, 受 worker 配置上限影响.
 
 `/doctor` 检查运行时配置, Telegram `getMe`, SQLite 健康状态, data directory 写入能力, 配置的 OMP binary, 当前 workspace 和保存的 session, runtime 状态, 不确定的 inbox/outbox 记录以及磁盘剩余空间. 只返回固定的安全摘要, 不包含 token, header, prompt, 原始 RPC state 或完整本地路径. 检查期间如果 conversation state 发生变化, 结果会丢弃.
 

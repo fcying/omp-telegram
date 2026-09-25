@@ -178,7 +178,7 @@ func (b *Bridge) cancelPendingPrompts(reason string) error {
 		cursor = pending[len(pending)-1].ID
 		for _, in := range pending {
 			var update telegram.Update
-			if json.Unmarshal(in.Raw, &update) != nil || update.Message == nil || !deferredPrompt(update.Message) {
+			if json.Unmarshal(in.Raw, &update) != nil || update.Message == nil || !deferredPrompt(update.Message, b.bot.Username) {
 				continue
 			}
 			if err := b.db.Mark(in.ID, "cancelled"); err != nil {
@@ -189,7 +189,7 @@ func (b *Bridge) cancelPendingPrompts(reason string) error {
 	}
 }
 
-func deferredPrompt(message *telegram.Message) bool {
+func deferredPrompt(message *telegram.Message, botUsername string) bool {
 	if len(message.Photo) != 0 || message.Document != nil {
 		return true
 	}
@@ -197,11 +197,11 @@ func deferredPrompt(message *telegram.Message) bool {
 	if !strings.HasPrefix(text, "/") {
 		return true
 	}
-	command := strings.Fields(text)[0]
-	if name, _, ok := strings.Cut(command, "@"); ok {
-		command = name
+	command, foreign := parseSlashCommandToken(strings.Fields(text)[0], botUsername)
+	if foreign {
+		return false
 	}
-	return command == "/review"
+	return command == "/review" || !knownBridgeCommand(command)
 }
 
 func sameSessionFile(left, right string) bool {

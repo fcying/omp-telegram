@@ -2171,13 +2171,14 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	fields := strings.Fields(text)
-	cmd := fields[0]
-	if name, bot, ok := strings.Cut(cmd, "@"); ok {
-		if !strings.EqualFold(bot, w.b.bot.Username) {
-			w.mark(in.id, "ignored")
-			return
-		}
-		cmd = name
+	cmd, foreign := parseSlashCommandToken(fields[0], w.b.bot.Username)
+	if foreign {
+		w.mark(in.id, "ignored")
+		return
+	}
+	if !knownBridgeCommand(cmd) {
+		w.enqueuePrompt(in, text)
+		return
 	}
 	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 	if cmd == "/review" {
@@ -2303,8 +2304,6 @@ func (w *worker) handle(in incoming) {
 			return
 		}
 		w.confirm(confirmation{action: "compact", user: in.msg.From.ID}, "Compact the current session?", []string{"Confirm", "Cancel"})
-	default:
-		w.say("Unsupported command. Use /help.")
 	}
 }
 func (w *worker) handoff(instructions string) {
