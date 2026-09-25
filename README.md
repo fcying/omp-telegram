@@ -281,6 +281,8 @@ Progress for a new task is delayed for approximately three seconds, so short tas
 
 `/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
 
+The `/queue` and `/bindings` viewers' Close buttons report `Closed` only after Telegram removes the inline keyboard. If that edit fails, the menu stays open and Close can be retried until the menu expires.
+
 Progress is best-effort UI and does not affect durable final-reply delivery. Failed progress-message deletion is retried once a minute while the daemon runs; confirmed permanent Telegram rejections abandon deletion.
 
 Progress does not display model reasoning, raw tool arguments or results, command text, or process output.

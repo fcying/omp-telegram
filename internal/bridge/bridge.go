@@ -3408,8 +3408,11 @@ func (w *worker) queueCallback(ctx context.Context, q *telegram.CallbackQuery, t
 	}
 	switch {
 	case action == "close":
+		if err := w.b.tg.ClearKeyboard(ctx, w.key.chat, c.messageID); err != nil {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Could not close the queue menu. Tap Close again.")
+			return callbackDone
+		}
 		delete(w.confirms, token)
-		w.clearKeyboard(c.messageID)
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Closed")
 	case action == "previous":
 		delete(w.confirms, token)

@@ -247,6 +247,34 @@ func TestBindingCallbacksUseSentMessageID(t *testing.T) {
 	})
 }
 
+func TestBindingCloseRetriesFailedKeyboardRemoval(t *testing.T) {
+	w, fake := newBindingTestWorker(t, nil)
+	entries := []store.BindingListEntry{{Binding: &store.Binding{Bot: 99, Chat: -10, Thread: 22, Generation: 1, Running: true}}}
+	w.showBindingsPage(confirmation{bindings: entries, user: 7}, 0, 0)
+	messageID := int64(fake.messageCount())
+	data := bindingButton(t, fake, "Close")
+	click := func() {
+		t.Helper()
+		if result := w.callback(&telegram.CallbackQuery{ID: "close", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data}); result != callbackDone {
+			t.Fatalf("close callback result = %v", result)
+		}
+	}
+	fake.failKeyboardClear = true
+	click()
+	if got := lastCallback(t, fake); got != "Could not close the bindings menu. Tap Close again." {
+		t.Fatalf("failed cleanup callback = %q", got)
+	}
+	if c := onlyBindingConfirmation(t, w); c.messageID != messageID {
+		t.Fatalf("failed cleanup lost the menu identity: %+v", c)
+	}
+	fake.failKeyboardClear = false
+	click()
+	if got := lastCallback(t, fake); got != "Closed" || len(w.confirms) != 0 {
+		t.Fatalf("retry result = %q, confirmations = %d", got, len(w.confirms))
+	}
+	assertKeyboardClears(t, fake, int(messageID), int(messageID))
+}
+
 func TestBindingDeleteCallbackDeletesClosedBinding(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	if err != nil {
