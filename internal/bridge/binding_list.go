@@ -1,12 +1,14 @@
 package bridge
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -57,7 +59,7 @@ func (w *worker) invalidateBindingMenus() {
 	}
 }
 
-func (w *worker) showBindings(user int64) {
+func (w *worker) showBindings(user int64, oldestFirst bool, page int) {
 	w.invalidateBindingMenus()
 	epoch := w.b.bindingsEpoch.Load()
 	entries, err := w.b.db.BindingsForChat(w.b.bot.ID, w.key.chat)
@@ -70,9 +72,49 @@ func (w *worker) showBindings(user int64) {
 		w.say("No saved conversation bindings.")
 		return
 	}
+	w.sortBindings(entries, oldestFirst)
 	generation := w.conversationGeneration()
-	w.showBindingsPage(confirmation{action: "bindings", method: "list", user: user, bindings: entries, generation: generation, epoch: epoch}, 0, 0)
+	page = max(0, min(page, (len(entries)-1)/bindingPageSize))
+	w.showBindingsPage(confirmation{action: "bindings", method: "list", user: user, bindings: entries, generation: generation, epoch: epoch, bindingsOld: oldestFirst}, page, 0)
 	w.lookupBindingNames(entries, generation)
+}
+
+func (w *worker) sortBindings(entries []store.BindingListEntry, oldestFirst bool) {
+	now := time.Now().Unix()
+	slices.SortFunc(entries, func(left, right store.BindingListEntry) int {
+		leftRank, rightRank := 2, 2
+		if left.Intent != nil {
+			leftRank = 1
+		}
+		if right.Intent != nil {
+			rightRank = 1
+		}
+		if bindingThread(left) == w.key.thread {
+			leftRank = 0
+		}
+		if bindingThread(right) == w.key.thread {
+			rightRank = 0
+		}
+		if leftRank != rightRank {
+			return cmp.Compare(leftRank, rightRank)
+		}
+		if leftRank == 2 {
+			leftUsed, rightUsed := bindingLastUsedAt(left), bindingLastUsedAt(right)
+			if leftUsed <= 0 || leftUsed > now {
+				leftUsed = 0
+			}
+			if rightUsed <= 0 || rightUsed > now {
+				rightUsed = 0
+			}
+			if leftUsed != rightUsed {
+				if oldestFirst && leftUsed != 0 && rightUsed != 0 {
+					return cmp.Compare(leftUsed, rightUsed)
+				}
+				return cmp.Compare(rightUsed, leftUsed)
+			}
+		}
+		return cmp.Compare(bindingThread(left), bindingThread(right))
+	})
 }
 
 func bindingSessionID(entry store.BindingListEntry) string {
@@ -185,14 +227,12 @@ func (w *worker) bindingNamesLoaded(result bindingNamesResult) {
 }
 
 func bindingSessionName(entry store.BindingListEntry) string {
-	if name := menuText(entry.SessionName, 160); name != "" {
+	if name := menuText(entry.SessionName, 32); name != "" {
 		return name
 	}
-	if entry.Intent != nil && entry.Intent.Kind == "new" {
-		return "pending"
-	}
-	return "unknown"
+	return menuText(filepath.Base(bindingWorkspace(entry)), 32)
 }
+
 func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 	pages := (len(c.bindings) + bindingPageSize - 1) / bindingPageSize
 	if page < 0 || page >= pages {
@@ -210,15 +250,16 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 	start, end := page*bindingPageSize, min((page+1)*bindingPageSize, len(c.bindings))
 	var text strings.Builder
 	home, _ := os.UserHomeDir()
-	fmt.Fprintf(&text, "Saved bindings\nPage %d/%d", page+1, pages)
-	keyboard := &telegram.Keyboard{}
-	addInfo := func(label string) {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: menuText(label, 512), Disabled: &telegram.DisabledButton{}}})
+	if c.bindingsOld {
+		fmt.Fprintf(&text, "Saved bindings (oldest first)\nPage %d/%d", page+1, pages)
+	} else {
+		fmt.Fprintf(&text, "Saved bindings\nPage %d/%d", page+1, pages)
 	}
-	add := func(label, action string, style string) {
+	keyboard := &telegram.Keyboard{}
+	button := func(label, action string) telegram.Button {
 		index := len(c.options)
 		c.options = append(c.options, action)
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, index), Style: style}})
+		return telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, index)}
 	}
 	for i, entry := range c.bindings[start:end] {
 		index := start + i
@@ -230,27 +271,39 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 		if current {
 			marker = " [current]"
 		}
-		title := menuText(fmt.Sprintf("%d. %s%s", index+1, bindingConversationTitle(entry), marker), 128)
-		row := []telegram.Button{{Text: title, Disabled: &telegram.DisabledButton{}}}
+		topic := "Main chat"
+		if thread := bindingThread(entry); thread != 0 {
+			topic = fmt.Sprintf("#%d", thread)
+		}
+		title := menuText(fmt.Sprintf("%d. %s · %s%s", index+1, bindingSessionName(entry), topic, marker), 128)
+		age := formatLastUsed(bindingLastUsedAt(entry))
+		status := bindingEntryStatus(entry)
+		if age != "unknown" {
+			status += " " + strings.TrimSuffix(age, " ago")
+		}
+		detail := menuText(fmt.Sprintf("%s · %s", status, statusWorkspace(bindingWorkspace(entry), home)), 128)
+		titleButton := telegram.Button{Text: title}
 		if bindingCanDelete(entry, current) {
 			optionIndex := len(c.options)
 			c.options = append(c.options, "delete:"+strconv.Itoa(index))
-			row = append(row, telegram.Button{Text: "Del", CallbackData: fmt.Sprintf("%s:%d", token, optionIndex), Style: "danger"})
+			titleButton.CallbackData = fmt.Sprintf("%s:%d", token, optionIndex)
 		} else {
-			row = append(row, telegram.Button{Text: "Del", Disabled: &telegram.DisabledButton{}})
+			titleButton.Disabled = &telegram.DisabledButton{}
 		}
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
-		addInfo(fmt.Sprintf("%s · Last used: %s", bindingEntryStatus(entry), formatLastUsed(bindingLastUsedAt(entry))))
-		addInfo(statusWorkspace(bindingWorkspace(entry), home))
-		addInfo(fmt.Sprintf("Name: %s · %s", bindingSessionName(entry), bindingSession(entry)))
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard,
+			[]telegram.Button{titleButton},
+			[]telegram.Button{{Text: detail, Disabled: &telegram.DisabledButton{}}},
+		)
 	}
+	navigation := make([]telegram.Button, 0, 3)
 	if page > 0 {
-		add("Previous", "previous", "")
+		navigation = append(navigation, button("Previous", "previous"))
 	}
 	if page+1 < pages {
-		add("Next", "next", "")
+		navigation = append(navigation, button("Next", "next"))
 	}
-	add("Close", "close", "")
+	navigation = append(navigation, button("Close", "close"))
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
 	var err error
@@ -378,17 +431,21 @@ func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 	w.confirms[token] = c
 }
 
-func bindingConversationTitle(entry store.BindingListEntry) string {
-	thread := int64(0)
+func bindingThread(entry store.BindingListEntry) int64 {
 	if entry.Binding != nil {
-		thread = entry.Binding.Thread
-	} else if entry.Intent != nil {
-		thread = entry.Intent.Thread
+		return entry.Binding.Thread
 	}
-	if thread == 0 {
-		return "Main chat"
+	if entry.Intent != nil {
+		return entry.Intent.Thread
 	}
-	return fmt.Sprintf("Topic %d", thread)
+	return 0
+}
+
+func bindingConversationTitle(entry store.BindingListEntry) string {
+	if thread := bindingThread(entry); thread != 0 {
+		return fmt.Sprintf("Topic %d", thread)
+	}
+	return "Main chat"
 }
 
 func bindingEntryStatus(entry store.BindingListEntry) string {
@@ -418,28 +475,6 @@ func bindingWorkspace(entry store.BindingListEntry) string {
 	return "unknown"
 }
 
-func bindingSession(entry store.BindingListEntry) string {
-	if entry.Intent != nil {
-		if entry.Intent.Kind == "new" {
-			return "pending"
-		}
-		if entry.Intent.Session != "" {
-			return shortBindingSession(entry.Intent.Session)
-		}
-	}
-	if entry.Binding != nil && entry.Binding.SessionID != "" {
-		return shortBindingSession(entry.Binding.SessionID)
-	}
-	return "unknown"
-}
-
-func shortBindingSession(id string) string {
-	if len(id) <= 8 {
-		return id
-	}
-	return "..." + id[len(id)-8:]
-}
-
 func formatLastUsed(timestamp int64) string {
 	if timestamp <= 0 {
 		return "unknown"
@@ -456,12 +491,97 @@ func formatLastUsed(timestamp int64) string {
 	case age < 24*time.Hour:
 		return fmt.Sprintf("%dh ago", int(age/time.Hour))
 	default:
-		return fmt.Sprintf("%dd %dh ago", int(age/(24*time.Hour)), int(age/time.Hour)%24)
+		days, hours := int(age/(24*time.Hour)), int(age/time.Hour)%24
+		if hours == 0 {
+			return fmt.Sprintf("%dd ago", days)
+		}
+		return fmt.Sprintf("%dd %dh ago", days, hours)
 	}
 }
 
 func bindingCanDelete(entry store.BindingListEntry, current bool) bool {
-	return entry.Intent == nil && entry.Binding != nil && !entry.Binding.Running && !current
+	return entry.Intent == nil && entry.Binding != nil && !current
+}
+
+func (request bindingForgetRequest) reply(result bindingForgetResult) {
+	select {
+	case request.source.forgetResults <- result:
+	case <-request.source.ctx.Done():
+	}
+}
+
+func (w *worker) canForgetBinding() bool {
+	return (w.runtime == runtimeReleased && w.client == nil || w.canReleaseRuntime()) &&
+		!w.taskActive() && !w.sessionControlBusy() && !w.restoring && !w.runtimeResuming &&
+		!w.awaitingContinuation && !w.previewBusy && w.exportingSession == "" &&
+		len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 &&
+		len(w.hostRequests) == 0 && len(w.confirms) == 0 && len(w.operations) == 0 &&
+		len(w.rpcOperations) == 0 && !w.rpcOperationActive &&
+		len(w.previewResult) == 0 && len(w.mediaResults) == 0 && len(w.sendResults) == 0 &&
+		w.resumeCancel == nil && w.exportCancel == nil && w.bindingNameCancel == nil && w.doctorCancel == nil
+}
+
+func (w *worker) forgetBinding(request bindingForgetRequest) {
+	if w.ctx.Err() != nil {
+		request.reply(bindingForgetResult{status: "Binding changed. Use /bindings to refresh."})
+		return
+	}
+	if w.binding.Generation != request.generation || !w.binding.Running || w.startIntent != nil {
+		request.reply(bindingForgetResult{status: "Binding changed. Use /bindings to refresh."})
+		return
+	}
+	if !w.canForgetBinding() {
+		request.reply(bindingForgetResult{status: "Binding is busy. Try again when its task and queue are idle."})
+		return
+	}
+	w.exitMu.Lock()
+	if w.exitRequested || len(w.input) != 0 {
+		w.exitMu.Unlock()
+		request.reply(bindingForgetResult{status: "Binding is busy. Try again later."})
+		return
+	}
+	w.exitRequested = true
+	w.exitMu.Unlock()
+	defer func() {
+		if w.ctx.Err() == nil {
+			w.exitMu.Lock()
+			w.exitRequested = false
+			w.exitMu.Unlock()
+		}
+	}()
+	if !w.closeLogicalSession() {
+		request.reply(bindingForgetResult{status: "Failed to close the saved binding."})
+		return
+	}
+	ok, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, request.generation)
+	if err != nil {
+		w.b.storeLog.Error("binding deletion failed", "event", "binding_delete_failed", "reason", "transaction", "error_kind", "persistence")
+		request.reply(bindingForgetResult{status: "Failed to delete the saved binding."})
+		return
+	}
+	if !ok {
+		request.reply(bindingForgetResult{status: "Binding changed. Use /bindings to refresh."})
+		return
+	}
+	w.b.bindingsEpoch.Add(1)
+	request.reply(bindingForgetResult{ok: true})
+	w.cancel()
+}
+
+func (w *worker) forgetFinished(result bindingForgetResult) {
+	w.forgetPending = false
+	user := w.forgetUser
+	oldestFirst := w.forgetOld
+	page := w.forgetPage
+	w.forgetUser = 0
+	w.forgetOld = false
+	w.forgetPage = 0
+	if result.ok {
+		w.say("Saved binding deleted. Workspace and native OMP session history were preserved.")
+		w.showBindings(user, oldestFirst, page)
+		return
+	}
+	w.say(result.status)
 }
 
 func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery, token, index string, c confirmation) callbackResult {
@@ -499,6 +619,29 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Canceled")
 			return callbackDone
 		}
+		if c.deleteRunning {
+			if w.forgetPending || w.b.forgetRequests == nil {
+				_ = w.b.tg.AnswerCallback(ctx, q.ID, "Delete unavailable")
+				w.say("Another binding deletion is pending. Try again later.")
+				return callbackDone
+			}
+			w.forgetPending = true
+			w.forgetUser = c.user
+			w.forgetOld = c.bindingsOld
+			w.forgetPage = c.page
+			select {
+			case w.b.forgetRequests <- bindingForgetRequest{key: target{chat: c.deleteChat, thread: c.deleteThread}, generation: c.deleteGeneration, source: w}:
+				_ = w.b.tg.AnswerCallback(ctx, q.ID, "Deleting")
+			default:
+				w.forgetPending = false
+				w.forgetUser = 0
+				w.forgetOld = false
+				w.forgetPage = 0
+				_ = w.b.tg.AnswerCallback(ctx, q.ID, "Delete unavailable")
+				w.say("Binding deletion is unavailable. Try again later.")
+			}
+			return callbackDone
+		}
 		ok, err := w.b.db.DeleteClosedBinding(c.deleteBot, c.deleteChat, c.deleteThread, c.deleteGeneration)
 		if err != nil {
 			w.b.storeLog.Error("binding deletion failed", "event", "binding_delete_failed", "reason", "transaction", "error_kind", "persistence")
@@ -519,6 +662,7 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 			w.claimedSession = ""
 		}
 		w.say("Saved binding deleted. Workspace and native OMP session history were preserved.")
+		w.showBindings(c.user, c.bindingsOld, c.page)
 		return callbackDone
 	}
 	action := c.options[n]
@@ -548,11 +692,15 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 		current := (entry.Binding != nil && entry.Binding.Chat == w.key.chat && entry.Binding.Thread == w.key.thread) || (entry.Binding == nil && entry.Intent != nil && entry.Intent.Chat == w.key.chat && entry.Intent.Thread == w.key.thread)
 		if !bindingCanDelete(entry, current) {
 			w.clearKeyboard(c.messageID)
-			w.say("Only a closed binding in another conversation can be deleted.")
+			w.say("Only a binding in another conversation without a pending start can be deleted.")
 			return callbackDone
 		}
 		w.clearKeyboard(c.messageID)
-		w.confirm(confirmation{action: "binding_delete", method: "confirm", user: c.user, epoch: c.epoch, options: []string{"Delete", "Cancel"}, deleteBot: entry.Binding.Bot, deleteChat: entry.Binding.Chat, deleteThread: entry.Binding.Thread, deleteGeneration: entry.Binding.Generation}, fmt.Sprintf("Forget saved binding for %s?\nWorkspace and native OMP session history will NOT be deleted.", bindingConversationTitle(entry)), []string{"Delete", "Cancel"})
+		prompt := fmt.Sprintf("Forget saved binding for %s?\nWorkspace and native OMP session history will NOT be deleted.", bindingConversationTitle(entry))
+		if entry.Binding.Running {
+			prompt = fmt.Sprintf("Close and forget idle binding for %s?\nActive tasks and pending work cannot be deleted. Workspace and native OMP session history will NOT be deleted.", bindingConversationTitle(entry))
+		}
+		w.confirm(confirmation{action: "binding_delete", method: "confirm", user: c.user, epoch: c.epoch, bindingsOld: c.bindingsOld, page: c.page, options: []string{"Delete", "Cancel"}, deleteBot: entry.Binding.Bot, deleteChat: entry.Binding.Chat, deleteThread: entry.Binding.Thread, deleteGeneration: entry.Binding.Generation, deleteRunning: entry.Binding.Running}, prompt, []string{"Delete", "Cancel"})
 	}
 	return callbackDone
 }

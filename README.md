@@ -202,7 +202,8 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/stop` | Stop the current task and clear queued tasks while keeping the session open. A released session only clears queued tasks. |
 | `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
 | `/close` | Close the current session while preserving its files and OMP history. |
-| `/bindings` | List saved conversation/session bindings for this Telegram chat, including native session names when available. Pending, open, and current entries cannot be deleted; a closed entry from another topic can delete bridge metadata without deleting workspace or native OMP history. |
+| `/bindings` | List saved conversation/session bindings for this Telegram chat, with the current conversation first, pending starts next, then others by most recent use (unknown last). Each entry uses two full-width keyboard rows: a clickable session name (or workspace basename) and topic ID, then a read-only state, compact last-used age when known, and workspace. Clicking an eligible title opens a confirmation with a red Delete button; current-conversation and pending titles are disabled. An open entry must first be idle and its OMP process is closed. Workspace and native OMP history are preserved. |
+| `/bindings old` | Show older saved bindings first. Current-conversation and pending-start entries still lead; entries with known last-used times follow from oldest to newest, and unknown or future times come last. Pagination and deletion preserve this order. |
 | `/resume` | Choose a saved native OMP session from the current workspace. Each numbered entry shows its full ID and update time; a short-title selection button and Pin/Unpin share a row. Pinned sessions for this conversation and workspace appear first. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
 | `/export` | Open a read-only picker for native OMP session export from the current workspace. The default format is the original main-session JSONL; the source is copied to the private attachment outbox, its filename is retained after sanitization, and the 50 MB document limit applies. Selecting the current session is rejected while its task or queue is active; run `/export` again after it becomes idle. |
@@ -330,10 +331,13 @@ Tasks that were still waiting when the daemon stopped are cancelled. Check the c
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
 - If the saved OMP session file or workspace is unavailable at startup, including a fresh session with no persisted history, recovery is skipped, the binding is kept closed, and the bridge tells you to use `/new`; it never creates a replacement session. For other session-switching failures, use `/close` followed by `/new` or `/resume`.
 - `worker.idle_timeout` may release an unused OMP process without closing the session, but only after OMP has written a recoverable session file. A fresh native session may remain connected until then. The next prompt or OMP control command resumes the same session. If reconnection fails, the bridge sends one error notice and does not submit the prompt.
-- **Send `/close` before deleting a Telegram topic.** Deleting a topic does not automatically stop its OMP session.
+- **Send `/close` before deleting a Telegram topic when possible.** If the topic is already gone, use `/bindings` from another conversation in the same chat to close and forget its idle binding.
 
 Each conversation has its own session, but sessions that use the same workspace share files. Separate conversations are not filesystem or credential sandboxes.
-`/bindings` lists the saved bindings for the current Telegram chat. Pending, open, and current-conversation entries have disabled delete buttons. A closed binding from another topic can be forgotten after confirmation; this removes only bridge metadata and history snapshots, not the workspace or native OMP session history.
+`/bindings` lists the saved bindings for the current Telegram chat. Current-conversation and pending-start titles are disabled. A closed binding from another conversation can be forgotten after confirmation by tapping its title; an open binding can also be forgotten when it has no active task, queued work, or session operation. The bridge first closes its OMP process, then deletes the binding, bridge history snapshots, and favorites. The forget operation does not send a message to the target topic or delete the workspace or native OMP session history; previously queued outbox deliveries are retained.
+After a successful deletion, `/bindings` opens a fresh list of the remaining bindings in the selected order and on the same page. If that page no longer exists, it opens the new last page; if none remain, it reports that no bindings are saved.
+
+The `/bindings` page controls share one keyboard row: Next and Close on the first page, Previous, Next, and Close on middle pages, and Previous and Close on the last page. A single-page list shows only Close.
 
 ## Data and Retention
 
@@ -387,6 +391,8 @@ bridge = "debug"
 rpc = "debug"
 telegram = "info"
 ```
+
+At startup, `daemon_start` logs the effective `progress_mode`, `max_workers`, `queue_capacity`, `idle_timeout`, `database_retention_days`, `log_level`, and `log_format` at info level. It does not log the bot token, authorization lists, filesystem paths, OMP binary/arguments, or environment values. If the daemon component is configured above info, this record is filtered out.
 
 Supported components:
 

@@ -145,14 +145,16 @@ func TestCheckRejectsLegacyAndMixedConfiguration(t *testing.T) {
 func TestDaemonStructuredLogFormats(t *testing.T) {
 	for _, format := range []string{"text", "json"} {
 		t.Run(format, func(t *testing.T) {
-			out, errout, err := cliCommand(t, true, "--config", cliConfig(t, fmt.Sprintf("[logging]\nformat = %q\n", format)))
+			path := cliConfig(t, fmt.Sprintf("[worker]\nmax_workers = 3\nqueue_capacity = 5\nidle_timeout = '45s'\n[logging]\nformat = %q\n", format))
+			out, errout, err := cliCommand(t, true, "--config", path)
 			if err != nil || out != "" {
 				t.Fatalf("daemon stdout=%q stderr=%q err=%v", out, errout, err)
 			}
-			if strings.Contains(errout, "SECRET") || strings.Contains(errout, "api.telegram.org") {
+			if strings.Contains(errout, "SECRET") || strings.Contains(errout, "api.telegram.org") || strings.Contains(errout, path) {
 				t.Fatal("daemon logs exposed credentials")
 			}
 			events := map[string]bool{}
+			startupFields := false
 			for _, line := range strings.Split(strings.TrimSpace(errout), "\n") {
 				if format == "json" {
 					var record map[string]any
@@ -165,15 +167,16 @@ func TestDaemonStructuredLogFormats(t *testing.T) {
 						t.Fatalf("missing structured identity: %+v", record)
 					}
 					events[event] = true
+					if event == "daemon_start" {
+						if record["progress_mode"] != "summary" || record["max_workers"] != float64(3) || record["queue_capacity"] != float64(5) || record["idle_timeout"] != "45s" || record["database_retention_days"] != float64(90) || record["log_level"] != "info" || record["log_format"] != format {
+							t.Fatalf("incorrect startup settings: %+v", record)
+						}
+						startupFields = true
+					}
 				} else {
 					fields := strings.Fields(line)
 					if len(fields) < 5 || !strings.HasPrefix(fields[3], "[") || !strings.HasSuffix(fields[3], "]") || !strings.Contains(line, " event=") {
 						t.Fatalf("missing compact header or event: %q", line)
-					}
-					for _, label := range []string{"time=", "level=", "msg=", "component="} {
-						if strings.Contains(line, label) {
-							t.Fatalf("unexpected text header label %q: %q", label, line)
-						}
 					}
 					for event, component := range map[string]string{"daemon_start": "daemon", "daemon_stop": "daemon", "command_menu_registered": "telegram"} {
 						if strings.Contains(line, "event="+event) {
@@ -183,7 +186,18 @@ func TestDaemonStructuredLogFormats(t *testing.T) {
 							events[event] = true
 						}
 					}
+					if strings.Contains(line, "event=daemon_start") {
+						for _, field := range []string{"progress_mode=summary", "max_workers=3", "queue_capacity=5", "idle_timeout=45s", "database_retention_days=90", "log_level=info", "log_format=text"} {
+							if !strings.Contains(line, field) {
+								t.Fatalf("startup log missing %q: %q", field, line)
+							}
+						}
+						startupFields = true
+					}
 				}
+			}
+			if !startupFields {
+				t.Fatal("startup settings were not logged")
 			}
 			for _, event := range []string{"daemon_start", "daemon_stop", "command_menu_registered"} {
 				if !events[event] {

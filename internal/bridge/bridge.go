@@ -31,26 +31,27 @@ import (
 )
 
 type Bridge struct {
-	cfg           config.Config
-	db            *store.Store
-	tg            *telegram.Client
-	bot           telegram.User
-	log           *slog.Logger
-	telegramLog   *slog.Logger
-	storeLog      *slog.Logger
-	mediaLog      *slog.Logger
-	rpcLog        *slog.Logger
-	slots         chan struct{}
-	wg            sync.WaitGroup
-	fatal         chan error
-	mediaSlots    chan struct{}
-	resumeSlots   chan struct{}
-	sessionMu     sync.Mutex
-	sessionClaims map[string]sessionClaim
-	exportClaims  map[*worker]string
-	bindingsEpoch atomic.Uint64
-	ctx           context.Context
-	workerExits   chan workerExit
+	cfg            config.Config
+	db             *store.Store
+	tg             *telegram.Client
+	bot            telegram.User
+	log            *slog.Logger
+	telegramLog    *slog.Logger
+	storeLog       *slog.Logger
+	mediaLog       *slog.Logger
+	rpcLog         *slog.Logger
+	slots          chan struct{}
+	wg             sync.WaitGroup
+	fatal          chan error
+	mediaSlots     chan struct{}
+	resumeSlots    chan struct{}
+	sessionMu      sync.Mutex
+	sessionClaims  map[string]sessionClaim
+	exportClaims   map[*worker]string
+	bindingsEpoch  atomic.Uint64
+	ctx            context.Context
+	workerExits    chan workerExit
+	forgetRequests chan bindingForgetRequest
 }
 type incoming struct {
 	id       int64
@@ -62,6 +63,17 @@ type target struct{ chat, thread int64 }
 type workerExit struct {
 	key    target
 	worker *worker
+}
+
+type bindingForgetRequest struct {
+	key        target
+	generation int64
+	source     *worker
+}
+
+type bindingForgetResult struct {
+	status string
+	ok     bool
 }
 
 const deliveryWorkerCount = 4
@@ -139,10 +151,12 @@ type confirmation struct {
 	pinnedSessions       map[string]struct{}
 	models               []omp.ModelRole
 	bindings             []store.BindingListEntry
+	bindingsOld          bool
 	deleteBot            int64
 	deleteChat           int64
 	deleteThread         int64
 	deleteGeneration     int64
+	deleteRunning        bool
 	page                 int
 	uiSelectMenu         bool
 }
@@ -256,6 +270,12 @@ type worker struct {
 	doctorResults       chan doctorResult
 	doctorCancel        context.CancelFunc
 	doctorRequest       uint64
+	forgetRequests      chan bindingForgetRequest
+	forgetResults       chan bindingForgetResult
+	forgetPending       bool
+	forgetUser          int64
+	forgetOld           bool
+	forgetPage          int
 
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -399,7 +419,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
 	{Command: "export", Description: "Export an omp session: /export [html] [session-id]"},
-	{Command: "bindings", Description: "List saved conversation/session bindings"},
+	{Command: "bindings", Description: "List saved bindings: /bindings [old]"},
 	{Command: "status", Description: "Show session, model, context, speed and queue"},
 	{Command: "doctor", Description: "Run safe diagnostics"},
 	{Command: "name", Description: "Name the omp session: /name <title>"},
@@ -450,7 +470,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit)}
+	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit), forgetRequests: make(chan bindingForgetRequest, 16)}
 	defer func() {
 		cancel()
 		b.wg.Wait()
@@ -638,6 +658,10 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 
 		}
 		select {
+		case request := <-b.forgetRequests:
+			if target := workers[request.key]; target == nil || !target.tryForget(request) {
+				request.reply(bindingForgetResult{status: "Binding changed or busy. Use /bindings to refresh."})
+			}
 		case exit := <-b.workerExits:
 			removeExitedWorker(workers, exit)
 		case <-ctx.Done():
@@ -1042,6 +1066,20 @@ func (w *worker) tryInput(in incoming) bool {
 	}
 }
 
+func (w *worker) tryForget(request bindingForgetRequest) bool {
+	w.exitMu.Lock()
+	defer w.exitMu.Unlock()
+	if w.exitRequested {
+		return false
+	}
+	select {
+	case w.forgetRequests <- request:
+		return true
+	default:
+		return false
+	}
+}
+
 func (w *worker) taskActive() bool { return w.active != 0 }
 
 func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
@@ -1328,6 +1366,12 @@ func (w *worker) run() {
 		select {
 		case <-w.ctx.Done():
 			return
+		case request := <-w.forgetRequests:
+			w.forgetBinding(request)
+			continue
+		case result := <-w.forgetResults:
+			w.forgetFinished(result)
+			continue
 		case in := <-w.input:
 			w.handle(in)
 			w.dispatch()
@@ -1404,6 +1448,10 @@ func (w *worker) run() {
 		select {
 		case <-w.ctx.Done():
 			return
+		case request := <-w.forgetRequests:
+			w.forgetBinding(request)
+		case result := <-w.forgetResults:
+			w.forgetFinished(result)
 		case in := <-w.input:
 			w.handle(in)
 		case raw, ok := <-events:
@@ -2231,11 +2279,11 @@ func (w *worker) handle(in incoming) {
 			w.requestDirectExport(in.msg.From.ID, format, sessionID)
 		}
 	case "/bindings":
-		if arg != "" {
-			w.say("Usage: /bindings")
+		if arg != "" && arg != "old" {
+			w.say("Usage: /bindings [old]")
 			return
 		}
-		w.showBindings(in.msg.From.ID)
+		w.showBindings(in.msg.From.ID, arg == "old", 0)
 	case "/close":
 		if !w.closeLogicalSession() {
 			return
@@ -3372,8 +3420,20 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 		c.user = w.owner
 	}
 	k := &telegram.Keyboard{}
+	var deleteButtons []telegram.Button
 	for i, label := range options {
-		k.InlineKeyboard = append(k.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}})
+		button := telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}
+		if c.action == "binding_delete" {
+			if i == 0 {
+				button.Style = "danger"
+			}
+			deleteButtons = append(deleteButtons, button)
+		} else {
+			k.InlineKeyboard = append(k.InlineKeyboard, []telegram.Button{button})
+		}
+	}
+	if len(deleteButtons) != 0 {
+		k.InlineKeyboard = append(k.InlineKeyboard, deleteButtons)
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	w.touchActivity()

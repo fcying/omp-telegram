@@ -91,7 +91,7 @@ text 输出采用紧凑的 `YYYY-MM-DD HH:MM:SS LEVEL [component] message key=va
 
 RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单值 (`agent_start`、`agent_end`、`prompt_result`、`auto_compaction_start`、`auto_compaction_end` 或 `response`), phase 只能是 `received`、`event_queued`、`response_queued`、`response_ignored`、`rejected` 或 `handled`. `terminal` 只能是 `absent`、`true`、`false` 或 `invalid`. 只有能安全解析为无符号整数的本地十进制 request ID 才会记录 `request_id`. Bridge 生命周期记录保持组件和稳定事件字段; handled bridge 路径保持 debug 级别.
 
-日志元数据遵循审查过的白名单: 可按需记录 component/event 身份, 有界的 chat/thread ID 等数字状态, turn/generation, retry 次数, 错误分类和内部 session UUID 以便关联. 日志绝不包含 prompt、output、reasoning、token、header、URL、raw error 或 frame、tool 参数/结果、callback token、文件名、workspace/session 路径、配置或 `omp.args`. 异步 callback 捕获排队时的操作身份, 不从复用的 worker 读取动态身份. registry 创建前的配置和 CLI 错误保持普通文本, 不格式化为 JSON.
+日志元数据遵循审查过的白名单: 可按需记录 component/event 身份, 有界的 chat/thread ID 等数字状态, turn/generation, retry 次数, 错误分类和内部 session UUID 以便关联. 启动时 `daemon_start` 仅包含实际生效的 progress 模式、worker/queue 上限、空闲超时、数据库保留天数及日志级别/格式; 这条 info 事件受 daemon 组件级别控制. 日志绝不包含 prompt、output、reasoning、token、header、URL、raw error 或 frame、tool 参数/结果、callback token、文件名、workspace/session 路径、授权名单、未审查的配置值或 `omp.args`. 异步 callback 捕获排队时的操作身份, 不从复用的 worker 读取动态身份. registry 创建前的配置和 CLI 错误保持普通文本, 不格式化为 JSON.
 
 两种格式都输出到 stderr. 文件保存和轮转交给 supervisor/journald; 不增加异步日志队列、采样、网络上传或运行时级别重载. 共享 writer 只串行化此 registry 的记录, 不控制其他进程的输出. 日志写入错误不进入任务状态转换.
 
@@ -293,13 +293,19 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 ### Binding viewer
 
-`/bindings` 只读取当前 Bot 和 Telegram chat 的已提交 binding 以及未完成的 `startup_intents`. Bridge 按 `(bot,chat,thread)` 合并为一条展示记录; 存在 pending intent 时优先显示 pending, 不使用旧 binding 的 `running` 值判断状态. 展示状态为 `Pending new`、`Pending resume`、`Open` 和 `Closed`. Pending 使用 intent 的 workspace 和 resume 目标; `Last used` 仍来自旧的 committed binding. 第一次 `/new` 没有旧 binding 时显示 `Session: pending` 和 `Last used: unknown`.
+`/bindings` 只读取当前 Bot 和 Telegram chat 的已提交 binding 以及未完成的 `startup_intents`. Bridge 按 `(bot,chat,thread)` 合并为一条展示记录; 存在 pending intent 时优先显示 pending, 不使用旧 binding 的 `running` 值判断状态. 展示状态为 `Pending new`、`Pending resume`、`Open` 和 `Closed`. Pending 使用 intent workspace 和 resume session 目标, 最近使用时间仍来自旧的 committed binding; 第一次 `/new` 以 workspace 目录名为备用标题, 不显示未知时间.
 
-原生 session name 会按每个保存的 workspace, 通过短生命周期 `omp acp` `session/list` 查询尽力解析. name 只是 viewer 的临时 metadata, 不复制到 SQLite; 不可用或未命名的 session 显示 `unknown`, pending new session 显示 `pending`.
+原生 session name 会按每个保存的 workspace, 通过短生命周期 `omp acp` `session/list` 查询尽力解析. name 只是 viewer 的临时 metadata, 不复制进 SQLite; 不可用或未命名时使用 workspace 目录名作为标题. 长名称在拼接 topic ID 前截短, 确保 ID 仍可见.
 
-消息正文只保留 viewer header. 所有 binding 详情都渲染为 disabled inline-keyboard button: 每条记录占四行, 带编号的标题按钮与 `Del` 操作并列, 后面依次是 disabled 的状态/last-used、workspace 和合并后的 `Name`/短 session 行. 只有 `Del` 操作可以携带 callback data.
+消息正文只保留 viewer header. 每个 binding 占两行全宽 inline keyboard: 第一行是编号 session 标题及 `#thread` (或 `Main chat`), 第二行是 disabled 的状态、已知时的简短最近使用时间与 workspace. 整天数省略零小时 (例如 `4d` 而非 `4d 0h`); 未知时间直接省略. 标题和详情均清理并限制长度; 这里不显示完整 session ID. 可删除条目的整行标题是普通 callback 按钮, 不再有单独的 Del 控件. 当前对话及 pending 条目的标题禁用. 只有后续 Delete/Cancel 确认页的 Delete 按钮使用 danger 样式.
 
-列表每页六条. Pending、open 和当前对话的删除按钮使用不带 callback data 的 Telegram disabled button. 只有其他对话的 closed binding 可以打开 danger 样式的删除确认. 每个列表和删除 callback 都校验授权用户、当前对话 generation、过期时间、来源消息 ID、action token、目标 binding generation 以及 Bridge 级内存 binding mutation epoch. `DeleteClosedBinding` 成功后会推进所有 worker 共享的 epoch, 即使被删除的 generation 随后复用, 旧 `/bindings` 菜单和删除确认仍会失效. 重新执行 `/bindings` 也会使旧 viewer token 失效; 旧 callback 不能翻页或清除新页面.
+打开 `/bindings` 时, worker 对合并后的快照排序: 当前对话在前, pending start 其次, 其余按 `last_used_at` 降序. 零值和未来时间视为未知, 排在最后; 同组时间相同则按 thread ID 升序. 异步返回的原生 session name 只更新标题, 不重新排序. 列表每页六条. Pending 和当前对话的标题不带 callback data. 点击其他对话中可删除条目的标题会打开 Delete/Cancel 确认, 无论 binding 为 Open 还是 Closed. 每个列表和删除 callback 都校验授权用户、当前对话 generation、过期时间、来源消息 ID、action token、目标 binding generation 以及 Bridge 级内存 binding mutation epoch. `DeleteClosedBinding` 成功后会推进所有 worker 共享的 epoch, 即使被删除的 generation 随后复用, 旧 `/bindings` 菜单和删除确认仍会失效. 重新执行 `/bindings` 也会使旧 viewer token 失效; 旧 callback 不能翻页或清除新页面.
+
+`/bindings old` 仅把非当前、非 pending 条目中已知的 `last_used_at` 改为从旧到新排序; 当前对话和 pending 仍置顶, 零值或未来时间仍排末尾. 标题标明最久未使用优先模式. 翻页, 异步 session name 回填以及成功删除 Closed 或空闲 Open 条目后的新列表均保留该顺序.
+
+页脚只有一行 inline keyboard, 可用的翻页按钮排在 Close 前面: 首页为 Next/Close, 中间页为 Previous/Next/Close, 末页为 Previous/Close, 单页列表仅显示 Close.
+
+成功确认删除 Closed 或空闲 Open binding 后, 发起操作的 worker 会重新读取并发送带新 token 的 `/bindings` 列表, 保留来源页和选定排序. 如果来源页已消失, 则显示新的末页; 没有剩余 binding 时提示空列表. 删除失败时保留原有错误回复, 不显示过期列表.
 
 `/queue` 显示当前 worker 的 running 状态、pending 数量、附件 preparation 状态, 每页最多六个 pending task. Task preview 使用有界文本或 `Preparing attachment...`; callback data 使用随机菜单 token 加 `cancel:<inbox_id>`. 处理 callback 时重新扫描实时 queue. 如果任务期间已 dispatch, 返回 `Task is no longer queued.`, 绝不把操作转换成 active abort. 空队列只显示标题、running 状态和 pending 数量, 不带页码、keyboard 或 token; 取消最后一个任务时, 编辑后的状态附带空 inline keyboard 来移除旧按钮.
 
@@ -308,6 +314,8 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 `last_used_at` 是 Unix time, 迁移旧数据时为 0. 显式 `/new` 或 `/resume` 成功, root/review/attachment prompt 被接受, 以及 name、model、thinking、fast mode、compact、handoff 和 abort 等原生 session-changing command 成功后 touch. 启动恢复 binding、按需恢复 runtime 本身、`/status`、`/bindings`、`/help` 和 viewer 翻页不会 touch. Worker 用同一个时间戳更新数据库和内存 binding, 避免跨秒时出现 1 秒的偏差. touch 失败只记录 metadata persistence error, 不会改变已经接受的任务结果. 启动恢复保留已有 binding generation 和时间戳.
 
 `DeleteClosedBinding` 和 `PrepareStart` 都针对同一组 binding 与 intent row 使用 generation-fenced transaction. 删除只有在目标已关闭且没有 startup intent 时成功; closed binding 的启动必须先确认预期 row 仍存在, 并在同一事务中插入 intent. 因此 intent 先提交会使删除失败, 删除先提交会使 stale start 失败. 成功删除还会同时删除 bridge history snapshot, 并推进不持久化的 Bridge 级 binding mutation epoch, 使其他 worker 持有的菜单立即成为 stale. 它绝不删除 workspace、原生 session 文件或 omp 原生 history. 如果删除目标意外是当前 worker, worker 会清理内存中的 binding identity; UI 正常情况下会禁用该操作.
+
+对于 Open binding, 确认后的请求会经 Bridge 路由到目标 worker 再删除. Worker 拒绝旧 generation、startup intent、活动任务、未处理输入、排队工作和进行中的 session 操作. 空闲时先阻止新输入, 关闭 OMP 进程并持久化 closed binding, 然后调用 `DeleteClosedBinding`; 删除失败时保留 closed binding. Forget 操作只回复发起操作的对话, 不产生目标 topic 消息; 已排队的 outbox 投递保持不变. 现有 closed binding 的事务不变.
 
 合法的最终选择或取消会先消费 confirmation token, 再尽力通过 `editMessageReplyMarkup` 移除 inline keyboard, 不修改消息正文. 清理失败不阻止实际操作. 翻页直接更新原菜单. OMP 原生 `select` 对话框 (包括 `/review` 的 commit 选择) 每页显示 8 项, 回复 OMP 时仍使用原始选项值; 翻页轮换 token, 不回答原生对话框, 超过 20 项的列表也不再取消. 已知的过期菜单也会清理; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启.
 
