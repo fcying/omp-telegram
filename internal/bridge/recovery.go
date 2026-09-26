@@ -22,6 +22,7 @@ func (b *Bridge) newWorker(ctx context.Context, key target, binding store.Bindin
 		b: b, log: workerLog, key: key, binding: binding, runtimeLifecycle: runtimeLifecycle{restoring: restoring}, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
+		forgetRequests: make(chan bindingForgetRequest, 1), forgetResults: make(chan bindingForgetResult, 1),
 		topicRenameResults: make(chan topicRenameResult, 1), operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
 	}
 }
@@ -32,6 +33,11 @@ func (b *Bridge) runWorker(w *worker) {
 		defer b.wg.Done()
 		w.run()
 		w.markExitRequested()
+		select {
+		case request := <-w.forgetRequests:
+			request.reply(bindingForgetResult{status: "Binding changed. Use /bindings to refresh."})
+		default:
+		}
 		if b.workerExits == nil || b.ctx == nil {
 			return
 		}

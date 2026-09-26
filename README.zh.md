@@ -202,7 +202,8 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/stop` | 中止当前任务并清空排队任务, 保留 session. released session 只清空排队任务. |
 | `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
-| `/bindings` | 列出当前 Telegram chat 的已保存 conversation/session binding, 并在可用时显示原生 session name. Pending, open 和当前对话不能删除; 其他 topic 的 closed binding 确认后可删除, 只删除 bridge metadata, 不删除 workspace 或 OMP 原生 history. |
+| `/bindings` | 列出当前 Telegram chat 保存的 binding: 当前对话优先, pending start 其次, 其余按最近使用时间降序 (未知时间最后). 每条占两行全宽 keyboard: 第一行是可点击的原生 session name (没有时用 workspace 目录名) 和 topic ID, 第二行是只读的状态、已知时的简短最近使用时间与 workspace. 点击可删除条目的标题后进入确认页, 只有确认页的 Delete 按钮为红色; 当前对话及 pending 条目的标题禁用. open binding 必须空闲, 删除前先关闭其 OMP 进程. 保留 workspace 和 OMP 原生 history. |
+| `/bindings old` | 优先查看很久未使用的 binding. 当前对话和 pending start 仍置顶, 其余已知最近使用时间的条目按从旧到新排列, 未知或未来时间排最后. 翻页及删除后的刷新保留此顺序. |
 | `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 每个编号条目显示完整 ID 和更新时间; 简短标题选择按钮与 Pin/Unpin 同行. 当前 conversation 和 workspace 的 pinned session 会排在前面. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
 | `/export` | 从当前 workspace 打开原生 OMP session 导出 picker. 默认导出原始 main session JSONL; 源文件会复制到私有 attachment outbox, 保留经过安全处理的原文件名, 并受 50 MB document 限制. 当前 session 在 task 或队列活跃时会直接拒绝, 空闲后需要重新执行 `/export`. |
@@ -330,10 +331,13 @@ daemon 停止时仍在等待的任务会取消. 决定重发前先检查聊天�
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
 - 服务启动时如果已保存的 OMP session 文件或 workspace 不可用, 包括尚未持久化 history 的新 session, bridge 会跳过恢复并将 binding 保持为 closed, 提示使用 `/new`; 不会创建替代 session. 其他 session 切换失败时, 执行 `/close`, 再执行 `/new` 或 `/resume`.
 - `worker.idle_timeout` 可能释放空闲 OMP 进程, 但只有在 OMP 已写入可恢复的 session 文件后才会释放. 新建 native session 在此之前可能保持 connected. 下一条 prompt 或 OMP 控制命令会恢复同一个 session. 如果重连失败, bridge 只发送一条错误提示, 不提交 prompt.
-- **删除 Telegram topic 前先发送 `/close`.** 删除 topic 不会自动停止对应的 OMP session.
+- **能操作时, 删除 Telegram topic 前先发送 `/close`.** 如果 topic 已经删除, 可从同一 chat 的其他对话打开 `/bindings`, 关闭并忘记其空闲 binding.
 
 每个对话有独立的 session, 但使用同一 workspace 的 session 会共享文件. 不同对话不是文件系统或凭据沙箱.
-`/bindings` 列出当前 Telegram chat 的已保存 binding. Pending, open 和当前对话的删除按钮会禁用. 其他 topic 的 closed binding 可在确认后忘记; 只删除 bridge metadata 和 history snapshot, 不删除 workspace 或 OMP 原生 session history.
+`/bindings` 列出当前 Telegram chat 的已保存 binding. 当前对话及 pending-start 条目的标题禁用. 点击其他对话的 closed binding 标题可在确认后忘记; open binding 在没有活动任务、排队工作或 session 操作时也可忘记. Bridge 先关闭对应的 OMP 进程, 再删除 binding、bridge history snapshot 和 favorite. Forget 操作本身不会向目标 topic 发送消息或删除 workspace、OMP 原生 session history; 之前排队的 outbox 投递仍保留.
+删除成功后, `/bindings` 按当前选定的排序显示剩余 binding 的最新列表并留在原页. 如果原页已不存在, 则显示新的末页; 如果没有剩余 binding, 会提示没有已保存的 binding.
+
+`/bindings` 的翻页和 Close 按钮共用一行: 首页为 Next, Close; 中间页为 Previous, Next, Close; 末页为 Previous, Close. 单页列表只有 Close.
 
 ## 数据与保留
 
@@ -385,6 +389,8 @@ bridge = "debug"
 rpc = "debug"
 telegram = "info"
 ```
+
+启动时 `daemon_start` 以 info 级别记录实际生效的 `progress_mode`、`max_workers`、`queue_capacity`、`idle_timeout`、`database_retention_days`、`log_level` 和 `log_format`. 不记录 bot token、授权名单、文件系统路径、OMP binary/args 或环境变量值. 如果 daemon 组件的级别高于 info, 这条记录会被过滤.
 
 支持的组件:
 

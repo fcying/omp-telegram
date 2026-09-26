@@ -17,7 +17,7 @@ import (
 	"omp-telegram/internal/store"
 )
 
-var Version = "v0.7.3"
+var Version = "v0.7.4"
 
 func displayVersion() string {
 	revision := ""
@@ -96,7 +96,14 @@ func run() int {
 	defer db.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	logger.Info("daemon started", "event", "daemon_start")
+	logger.Info("daemon started", "event", "daemon_start",
+		"progress_mode", c.ProgressMode,
+		"max_workers", c.MaxWorkers,
+		"queue_capacity", c.QueueCapacity,
+		"idle_timeout", c.IdleTimeout.String(),
+		"database_retention_days", c.DatabaseRetentionDays,
+		"log_level", c.LogLevel,
+		"log_format", c.LogFormat)
 	if err := bridge.Run(ctx, c, db, logs); err != nil {
 		// The owning bridge boundary has already recorded the specific failure.
 		logger.Info("daemon stopped", "event", "daemon_stop", "result", "failed")
