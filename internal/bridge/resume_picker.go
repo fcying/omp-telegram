@@ -570,10 +570,8 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	if page+1 < pages {
 		navigation = append(navigation, add("Next", resumePickerOption{action: "next"}))
 	}
-	if len(navigation) != 0 {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
-	}
-	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{add("Cancel", resumePickerOption{action: "cancel"})})
+	navigation = append(navigation, add("Cancel", resumePickerOption{action: "cancel"}))
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
 	var err error
