@@ -207,7 +207,7 @@ func deferredPrompt(message *telegram.Message, botUsername string) bool {
 	if foreign {
 		return false
 	}
-	return command == "/review" || !knownBridgeCommand(command)
+	return command == "/review" || command == "/followup" || !knownBridgeCommand(command)
 }
 
 func sameSessionFile(left, right string) bool {

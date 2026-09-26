@@ -100,7 +100,7 @@ func TestAbortTimeoutRetiresRuntimeAndContinuesQueueOnFreshClient(t *testing.T) 
 		t.Fatal("fixture prompt did not become the active task")
 	}
 
-	acceptWorkerInput(t, w, 3, "queued after abort")
+	acceptWorkerInput(t, w, 3, "/followup queued after abort")
 	if len(w.queue) != 1 {
 		t.Fatal("queued prompt was not retained while abort was pending")
 	}

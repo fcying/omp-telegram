@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -406,6 +408,41 @@ func TestMain(m *testing.M) {
 			case "prompt":
 				text, _ := cmd["message"].(string)
 				recordFixtureRPCTrace(typ, text)
+				if behavior, ok := cmd["streamingBehavior"]; ok {
+					if behavior != "steer" || !streaming.Load() {
+						os.Exit(2)
+					}
+					if path := os.Getenv("OMP_TELEGRAM_FIXTURE_STEER_DB"); path != "" {
+						inboxID, err := strconv.ParseInt(os.Getenv("OMP_TELEGRAM_FIXTURE_STEER_INBOX"), 10, 64)
+						if err != nil {
+							os.Exit(2)
+						}
+						db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+						if err != nil {
+							os.Exit(2)
+						}
+						var state string
+						err = db.QueryRow("SELECT state FROM inbox WHERE id=?", inboxID).Scan(&state)
+						db.Close()
+						if err != nil || state != "submitted" {
+							os.Exit(2)
+						}
+					}
+					resp["data"] = map[string]any{"agentInvoked": true}
+					if mode := os.Getenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER"); mode != "" {
+						emit(map[string]any{"type": "agent_end", "isTerminal": false})
+						if mode == "executing" {
+							emit(map[string]any{"type": "agent_start"})
+						}
+						emit(resp)
+						continue
+					}
+					emit(resp)
+					emit(map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "completed", "sessionSettled": true})
+					streaming.Store(false)
+					emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "answer: " + text}}}}})
+					continue
+				}
 				if strings.HasPrefix(text, "/model @") {
 					if fixtureRejectsRPC("model_role") {
 						resp["success"] = false
@@ -445,7 +482,7 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
-				if _, ok := cmd["streamingBehavior"]; ok || streaming.Load() {
+				if streaming.Load() {
 					os.Exit(2)
 				}
 				emit(resp)
@@ -1390,7 +1427,7 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 		t.Fatal("topics selecting the same directory do not share files")
 	}
 	send(update(3, 11, "wait"))
-	send(update(4, 11, "must not run"))
+	send(update(4, 11, "/followup must not run"))
 	send(update(5, 22, "independent"))
 	waitFor(t, func() bool { return f.has(22, "answer: independent") })
 	if f.has(11, "independent") {
@@ -1480,8 +1517,8 @@ func TestRPCEventsWithPendingTelegramInputs(t *testing.T) {
 		id   int64
 		text string
 	}{
-		{id: 3, text: "queued-under-flood-one"},
-		{id: 4, text: "queued-under-flood-two"},
+		{id: 3, text: "/followup queued-under-flood-one"},
+		{id: 4, text: "/followup queued-under-flood-two"},
 	} {
 		send(update(input.id, 11, input.text))
 		wait(func() bool {

@@ -408,6 +408,73 @@ func TestTerminalProgressWaitsForFinalReplyDelivery(t *testing.T) {
 	}
 }
 
+func TestFinishSubmittedTransitions(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Accept(90, []byte(`{}`)))
+	for i, target := range []InboxState{InboxDone, InboxCancelled, InboxFailed, InboxUncertain} {
+		id := int64(100 + i)
+		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
+		requireStoreOK(t, s.Mark(id, InboxSubmitted))
+		requireStoreOK(t, s.FinishSubmitted(id, target))
+		var got string
+		requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=?", id).Scan(&got))
+		if got != string(target) {
+			t.Fatalf("inbox %d after settlement = %q, want %q", id, got, target)
+		}
+	}
+	var pending string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=90").Scan(&pending))
+	if pending != string(InboxPending) {
+		t.Fatalf("unrelated inbox state = %q, want pending", pending)
+	}
+}
+
+func TestFinishSubmittedRejectsWrongSourceAndTarget(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	for _, tc := range []struct {
+		name   string
+		id     int64
+		source InboxState
+		target InboxState
+	}{
+		{name: "pending to done", id: 100, source: InboxPending, target: InboxDone},
+		{name: "terminal to failed", id: 101, source: InboxDone, target: InboxFailed},
+		{name: "submitted to ignored", id: 102, source: InboxSubmitted, target: InboxIgnored},
+		{name: "submitted to submitted", id: 103, source: InboxSubmitted, target: InboxSubmitted},
+		{name: "submitted to invalid state", id: 104, source: InboxSubmitted, target: InboxState("unexpected")},
+		{name: "missing row", id: 105, target: InboxCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.source != "" {
+				requireStoreOK(t, s.Accept(tc.id, []byte(`{}`)))
+				if tc.source != InboxPending {
+					requireStoreOK(t, s.Mark(tc.id, tc.source))
+				}
+			}
+			if err := s.FinishSubmitted(tc.id, tc.target); !errors.Is(err, ErrInboxStateTransition) {
+				t.Fatalf("settlement error = %v, want ErrInboxStateTransition", err)
+			}
+			if tc.source != "" {
+				var got string
+				requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=?", tc.id).Scan(&got))
+				if got != string(tc.source) {
+					t.Fatalf("rejected settlement changed state to %q, want %q", got, tc.source)
+				}
+			}
+		})
+	}
+	requireStoreOK(t, s.Accept(106, []byte(`{}`)))
+	requireStoreOK(t, s.Mark(106, InboxSubmitted))
+	if err := s.Mark(106, InboxFailed); !errors.Is(err, ErrInboxStateTransition) {
+		t.Fatalf("root submitted-to-failed mark error = %v, want ErrInboxStateTransition", err)
+	}
+	var state string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=106").Scan(&state))
+	if state != string(InboxSubmitted) {
+		t.Fatalf("rejected root mark changed state to %q", state)
+	}
+}
+
 func TestFailedReplyMakesProgressCleanupReady(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))

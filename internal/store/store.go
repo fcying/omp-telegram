@@ -518,7 +518,28 @@ func (s *Store) Mark(id int64, state InboxState) error {
 	return nil
 }
 
-// Submit records a root task's originating Telegram message before OMP accepts it.
+// FinishSubmitted settles a submitted inbox row without changing root-task transitions.
+func (s *Store) FinishSubmitted(id int64, state InboxState) error {
+	switch state {
+	case InboxDone, InboxCancelled, InboxFailed, InboxUncertain:
+	default:
+		return fmt.Errorf("%w: %s", ErrInboxStateTransition, state)
+	}
+	result, err := s.DB.Exec("UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state='submitted'", string(state), time.Now().Unix(), id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("%w: %s", ErrInboxStateTransition, state)
+	}
+	return nil
+}
+
+// Submit records the originating Telegram message before sending a root prompt or steer to OMP.
 func (s *Store) Submit(id, replyTo int64) error {
 	if replyTo < 0 {
 		return errors.New("invalid reply target")

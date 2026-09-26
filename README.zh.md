@@ -13,7 +13,7 @@
 - 持久化的最终回复交付
 - 结构化日志
 
-每个普通私聊或 topic 都有自己的 OMP session. 普通文字, 附件和 `/review` 在同一对话内按顺序执行; 不同对话可以并行工作.
+每个普通私聊或 topic 都有自己的 OMP session. 任务运行中发送的普通文字会 steer 当前任务; 使用 `/followup <message>` 可排入独立的后续任务. 附件和 `/review` 保持原有 bridge 队列行为. 不同对话可以并行工作.
 
 ## 运行要求
 
@@ -21,6 +21,8 @@
 - 已安装支持 RPC protocol v2 的 omp 及其运行时, 例如 Bun. 使用运行服务的同一用户配置模型和认证.
 - 能访问 Telegram 和模型服务.
 - 一个 Telegram bot. 支持普通私聊, 私聊 topic 和群组 topic; 不支持没有 topic 的群组消息.
+
+文字 steer 要求 OMP >= 18.3.2: 这是目前实测能针对 `streamingBehavior: "steer"` 请求按 ID 返回 RPC v2 `prompt_result` 终态 (`completed`, `aborted`, `error`) 和 settlement 证据的最低版本. 这一新功能的版本要求高于 bridge 原有的 RPC v2 要求.
 
 同一个 bot token 同时只能由一个 polling 服务使用. 不能与 webhook 或其他 `getUpdates` 消费者同时运行.
 
@@ -200,6 +202,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. 对于没有 binding 的 Telegram topic, Telegram topic 标题会同步为解析后 workspace 的最后一级目录名; 后续替换 session 不会重命名 topic. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session. released session 只清空排队任务. |
+| `/followup <message>` | 在当前任务后排入独立的文字 prompt; 空闲时作为普通任务运行. |
 | `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 Telegram chat 保存的 binding: 当前对话优先, pending start 其次, 其余按最近使用时间降序 (未知时间最后). 每条占两行全宽 keyboard: 第一行是可点击的原生 session name (没有时用 workspace 目录名) 和 topic ID, 第二行是只读的状态、已知时的简短最近使用时间与 workspace. 点击可删除条目的标题后进入确认页, 只有确认页的 Delete 按钮为红色; 当前对话及 pending 条目的标题禁用. open binding 必须空闲, 删除前先关闭其 OMP 进程. 保留 workspace 和 OMP 原生 history. |
@@ -221,7 +224,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. 原生选择对话框 (包括 commit 列表) 每页显示 8 项, 只在需要时显示翻页按钮. |
 | `/help` | 查看帮助. |
 
-普通文字, 附件和 `/review` 都按对话排队并串行执行. 只有表中列出的 bridge 命令 (以及 `/start`) 走控制路径; 其他以 `/` 开头的文字, 如 `/opt/tmp`, `/opt/user@host/file` 或 `/stauts`, 会作为普通 prompt 发送给 OMP. 只有符合语法的 `/command@bot` token 才视为 bot 定向; 明确发给其他 bot 的命令会被忽略. 任务运行期间发送的消息会等待当前任务结束, 不会打断活动任务. 不同对话可以并行工作, 受 worker 配置上限影响.
+空闲时普通文字作为 root task 运行. 任务运行中, 普通文字 (包括 `/opt/tmp`, `/opt/user@host/file` 和 `/stauts` 等未知斜杠文字) 经 OMP 原生 RPC 队列 steer 同一个任务, 不产生第二条最终回复. 需要独立后续任务时使用 `/followup <message>`. 附件和 `/review` 在任务运行时仍走 bridge 队列; 第一版 steer 只支持纯文字. 只有列出的 bridge 命令 (以及 `/start`) 走控制路径. 明确发给其他 bot 的有效 `/command@bot` token 会被忽略. 不同对话可以并行工作, 受 worker 配置上限影响.
 
 `/doctor` 检查运行时配置, Telegram `getMe`, SQLite 健康状态, data directory 写入能力, 配置的 OMP binary, 当前 workspace 和保存的 session, runtime 状态, 不确定的 inbox/outbox 记录以及磁盘剩余空间. 只返回固定的安全摘要, 不包含 token, header, prompt, 原始 RPC state 或完整本地路径. 检查期间如果 conversation state 发生变化, 结果会丢弃.
 
@@ -285,6 +288,9 @@ RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资�
 新数据库使用 schema 13, 不创建 Activity 表. 现有 schema 11 和 12 数据库自动升级到 13; 迁移会删除短暂开发版的 `activity_messages` 表, 即使表中仍有记录. 其他表和 session 数据保持不变, 但仅由这些记录标识的旧 Activity 消息之后无法自动删除.
 
 `/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
+存在 steer fence 时, root 保持最终回复归属, 直到所有 steer 都结算且 OMP 确认 session settled. Progress Stop 保留 bridge follow-up, `/stop` 则清空. 两者在存在 steer fence 时都会立即终止旧 OMP 进程, 将 root 和未决 steer 记为 `uncertain` 且不重放, 之后才允许保留的 follow-up 在新 runtime 恢复. 已发生的工具副作用无法撤销, 强制终止也可能导致 OMP session 无法恢复.
+
+如果 steer 在连续探测中明确 idle 且原生工作始终 pending 达 5 分钟, watchdog 会强制停止旧进程, 将 root 和未决 steer 标为 `uncertain`, 保留 bridge follow-up 且不重放. 活动或非 idle 结果会重置宽限期. 完全静默且持续 pending 的合法异步工作也可能达到此上限.
 
 `/queue` 的 pending 队列为空时不显示页码或按钮; 取消最后一个任务后刷新消息会移除键盘. 对于有 pending task 的 `/queue` 菜单及所有 `/bindings` 菜单, Close 只有在 Telegram 成功移除 inline keyboard 后才返回 `Closed`. 如果编辑失败, 菜单保持可操作, 可以在过期前再次点击 Close.
 
@@ -326,7 +332,7 @@ Reply context 只来自当前 Update 解码出的 `ReplyToMessage` 和 `Quote`. 
 
 结果不确定的活动操作不会自动重放.
 
-daemon 停止时仍在等待的任务会取消. 决定重发前先检查聊天和 workspace.
+Bridge 待执行任务 (包括 `/followup` 及定向发给本 bot 的 follow-up) 会在停机时或崩溃后的启动恢复阶段取消, 不会重放. 决定重发前先检查聊天和 workspace.
 
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
 - 服务启动时如果已保存的 OMP session 文件或 workspace 不可用, 包括尚未持久化 history 的新 session, bridge 会跳过恢复并将 binding 保持为 closed, 提示使用 `/new`; 不会创建替代 session. 其他 session 切换失败时, 执行 `/close`, 再执行 `/new` 或 `/resume`.
@@ -423,10 +429,9 @@ just deploy
 
 目前没有列出的 bridge-side 计划功能.
 
-### 等待上游 OMP 支持
+### 可由上游 OMP 改进的能力
 
-- 可靠的活动 turn steering
-- 原生队列清空 / 原子 abort-and-clear
+- RPC 原子 abort-and-clear, 包括为从原生队列中清除的 prompt 返回关联的 `prompt_result`.
 
 ## 架构
 

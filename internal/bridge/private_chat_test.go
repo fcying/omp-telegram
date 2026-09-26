@@ -107,7 +107,7 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 	active := send(7, 0, "private", "wait")
 	waitFor(t, func() bool { return state(active) == "submitted" })
 	waitFor(t, func() bool { return has(7, 0, "Processing...") })
-	queued := send(7, 0, "private", "must-not-run")
+	queued := send(7, 0, "private", "/followup must-not-run")
 	command(7, 0, "private", "/stop")
 	waitFor(t, func() bool { return state(queued) == "cancelled" })
 	command(7, 0, "private", "/review private changes")

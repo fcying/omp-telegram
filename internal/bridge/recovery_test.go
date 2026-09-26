@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +179,27 @@ func TestForeignBotCommandsRemainIgnoredAfterRestart(t *testing.T) {
 	}
 }
 
+func TestDeferredPromptIncludesFollowup(t *testing.T) {
+	for _, input := range []struct {
+		text string
+		want bool
+	}{
+		{"ordinary text", true},
+		{"/review foo", true},
+		{"/followup foo", true},
+		{"/stauts", true},
+		{"/status", false},
+		{"/followup@FIXTURE_BOT foo", true},
+		{"/followup@OtherBot foo", false},
+	} {
+		t.Run(input.text, func(t *testing.T) {
+			if got := deferredPrompt(&telegram.Message{Text: input.text}, "fixture_bot"); got != input.want {
+				t.Fatalf("deferredPrompt(%q) = %t, want %t", input.text, got, input.want)
+			}
+		})
+	}
+}
+
 func TestPendingSlashMessagesKeepTheirRoutingAfterRestart(t *testing.T) {
 	d := newRecoveryDaemonForChat(t, 1, 7)
 	d.command(0, "/help")
@@ -192,6 +214,9 @@ func TestPendingSlashMessagesKeepTheirRoutingAfterRestart(t *testing.T) {
 	}{
 		{"/review@OtherBot foo", "ignored"},
 		{"/foo@OtherBot", "ignored"},
+		{"/followup@OtherBot later", "ignored"},
+		{"/followup later", "cancelled"},
+		{"/followup@FIXTURE_BOT later", "cancelled"},
 		{"/stauts@fixture_bot", "cancelled"},
 		{"/opt/user@host/file 是什么", "cancelled"},
 		{"/tmp/foo@bar", "cancelled"},
@@ -220,6 +245,100 @@ func TestPendingSlashMessagesKeepTheirRoutingAfterRestart(t *testing.T) {
 	}
 	if got := d.outputCount(0); got != 2 {
 		t.Fatalf("recovered slash messages produced %d replies, want only the two help replies", got)
+	}
+}
+
+func TestCrashRecoveryCancelsPendingFollowupsWithoutRPCReplay(t *testing.T) {
+	sessionRoot := t.TempDir()
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", sessionRoot)
+	trace := filepath.Join(t.TempDir(), "rpc-trace")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &recoveryDaemon{
+		t: t, root: t.TempDir(), chat: -10,
+		fake: &fakeHTTP{updates: make(chan telegram.Update, 32)},
+		cfg: config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10},
+			WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 4},
+	}
+	old := http.DefaultTransport
+	http.DefaultTransport = d.fake
+	t.Cleanup(func() {
+		defer func() { http.DefaultTransport = old }()
+		d.stop()
+	})
+	// Build crash residue before any daemon or worker exists; no teardown can cancel it.
+	preCrash, err := store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer preCrash.Close()
+	workspace := t.TempDir()
+	sessionID := "11111111-1111-4111-8111-111111111111"
+	session := filepath.Join(sessionRoot, sessionID+".jsonl")
+	header, err := json.Marshal(map[string]string{"type": "session", "id": sessionID, "cwd": workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(session, header, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preCrash.Save(store.Binding{Bot: 99, Chat: d.chat, Thread: 11, Workspace: workspace,
+		Session: session, SessionID: sessionID, Generation: 1, Running: true}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := []struct {
+		text, state string
+	}{
+		{"/followup RECOVERED_FOLLOWUP_EXECUTED", "cancelled"},
+		{"/followup@FIXTURE_BOT RECOVERED_DIRECTED_EXECUTED", "cancelled"},
+		{"/review RECOVERED_REVIEW_EXECUTED", "cancelled"},
+		{"RECOVERED_ORDINARY_EXECUTED", "cancelled"},
+		{"/status", "done"},
+		{"/followup@OtherBot RECOVERED_FOREIGN_EXECUTED", "ignored"},
+	}
+	for _, input := range inputs {
+		d.nextID++
+		u := update(d.nextID, 11, input.text)
+		raw, err := json.Marshal(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := preCrash.Accept(d.nextID, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var pending int
+	if err := preCrash.DB.QueryRow("SELECT count(*) FROM inbox WHERE state='pending'").Scan(&pending); err != nil || pending != len(inputs) {
+		t.Fatalf("crash residue must remain pending: count=%d err=%v", pending, err)
+	}
+	if err := preCrash.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.start()
+	d.command(11, "after restart")
+	for i, input := range inputs {
+		if state := d.state(int64(i + 1)); state != input.state {
+			t.Fatalf("recovered %q = %s, want %s", input.text, state, input.state)
+		}
+	}
+	d.stop()
+	prompts := 0
+	for _, request := range fixtureRPCTrace(trace) {
+		if request.kind != "prompt" {
+			continue
+		}
+		if strings.Contains(request.payload, "RECOVERED_") {
+			t.Fatalf("recovered queue replayed a prompt: %q", request.payload)
+		}
+		if request.payload == "after restart" {
+			prompts++
+		}
+	}
+	if prompts != 1 {
+		t.Fatalf("fresh post-restart prompt submissions = %d, want 1", prompts)
 	}
 }
 
@@ -614,7 +733,7 @@ func TestDaemonShutdownCancelsPendingQueue(t *testing.T) {
 		var state string
 		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", active).Scan(&state) == nil && state == "submitted"
 	})
-	queuedPath := d.send(11, "/opt/tmp 是什么目录")
+	queuedPath := d.send(11, "/followup /opt/tmp 是什么目录")
 	queuedReview := d.send(11, "/review queued-before-shutdown")
 	sendAttachment := func(fileID string, photo bool) int64 {
 		d.nextID++
