@@ -3840,10 +3840,8 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	if page+1 < pages {
 		navigation = append(navigation, telegram.Button{Text: "Next", CallbackData: token + ":next"})
 	}
-	if len(navigation) != 0 {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
-	}
-	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: "Cancel", CallbackData: fmt.Sprintf("%s:%d", token, len(c.options))}})
+	navigation = append(navigation, telegram.Button{Text: "Cancel", CallbackData: fmt.Sprintf("%s:%d", token, len(c.options))})
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
 	var err error

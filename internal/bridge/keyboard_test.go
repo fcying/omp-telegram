@@ -229,9 +229,10 @@ func TestNativeUISelectionShowsSinglePageWithoutNavigation(t *testing.T) {
 	}
 	w.event(raw)
 	text, rows := pickerView(t, f)
-	if strings.Contains(text, "Page ") || len(rows) != len(options)+1 || rows[len(options)][0]["text"] != "Cancel" {
+	if strings.Contains(text, "Page ") || len(rows) != len(options)+1 {
 		t.Fatalf("single-page commit choices = %q; %v", text, rows)
 	}
+	requirePickerFooter(t, rows, "Cancel")
 	data := rows[len(options)-1][0]["callback_data"].(string)
 	messageID := int64(f.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "select-commit", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
@@ -259,9 +260,10 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 	w.event(raw)
 	text, rows := pickerView(t, f)
-	if !strings.Contains(text, "Page 1/3") || len(rows) != uiSelectPageSize+2 || rows[uiSelectPageSize][0]["text"] != "Next" {
+	if !strings.Contains(text, "Page 1/3") || len(rows) != uiSelectPageSize+1 {
 		t.Fatalf("first commit page = %q; %v", text, rows)
 	}
+	requirePickerFooter(t, rows, "Next", "Cancel")
 	first := rows[0][0]["callback_data"].(string)
 	next := rows[uiSelectPageSize][0]["callback_data"].(string)
 	messageID := int64(f.messageCount())
@@ -275,9 +277,10 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 	click(7, next)
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/3") || len(rows) != uiSelectPageSize+2 || len(rows[uiSelectPageSize]) != 2 {
+	if !strings.Contains(text, "Page 2/3") || len(rows) != uiSelectPageSize+1 {
 		t.Fatalf("middle commit page = %q; %v", text, rows)
 	}
+	requirePickerFooter(t, rows, "Previous", "Next", "Cancel")
 	click(7, first)
 	if _, exists := w.confirms[strings.SplitN(first, ":", 2)[0]]; exists {
 		t.Fatal("old commit page retained an actionable token")
@@ -294,9 +297,10 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 	click(7, rows[uiSelectPageSize][1]["callback_data"].(string))
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 3/3") || len(rows) != 8 || rows[4][0]["text"] != options[20] {
+	if !strings.Contains(text, "Page 3/3") || len(rows) != 7 || rows[4][0]["text"] != options[20] {
 		t.Fatalf("last commit page = %q; %v", text, rows)
 	}
+	requirePickerFooter(t, rows, "Previous", "Cancel")
 	result, err := w.call("get_state", nil)
 	var state struct {
 		Replies int    `json:"fixtureUIReplies"`
@@ -319,10 +323,11 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	messageID = int64(f.messageCount())
 	click(7, rows[uiSelectPageSize][0]["callback_data"].(string))
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/2") || len(rows) != 3 {
+	if !strings.Contains(text, "Page 2/2") || len(rows) != 2 {
 		t.Fatalf("cancel page = %q; %v", text, rows)
 	}
-	click(7, rows[2][0]["callback_data"].(string))
+	requirePickerFooter(t, rows, "Previous", "Cancel")
+	click(7, rows[1][1]["callback_data"].(string))
 	result, err = w.call("get_state", nil)
 	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 2 || state.Value != "" {
 		t.Fatalf("cancel response = %+v, error %v", state, err)

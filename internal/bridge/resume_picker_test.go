@@ -174,6 +174,22 @@ func pickerView(t *testing.T, f *fakeHTTP) (string, [][]map[string]any) {
 	return "", nil
 }
 
+func requirePickerFooter(t *testing.T, rows [][]map[string]any, labels ...string) {
+	t.Helper()
+	if len(rows) == 0 {
+		t.Fatal("picker has no button rows")
+	}
+	footer := rows[len(rows)-1]
+	if len(footer) != len(labels) {
+		t.Fatalf("picker footer = %v, want %v", footer, labels)
+	}
+	for i, label := range labels {
+		if footer[i]["text"] != label {
+			t.Fatalf("picker footer = %v, want %v", footer, labels)
+		}
+	}
+}
+
 func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 	t.Helper()
 	_, rows := pickerView(t, f)
@@ -213,9 +229,10 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	w.resumeListed(finishResumeList(t, w))
 	text, rows := pickerView(t, f)
 	buttons := resumeButtons(t, f)
-	if len(buttons) != 10 || len(rows) != 10 {
-		t.Fatalf("first page: %d choices, %d rows; want eight sessions, next, cancel", len(buttons), len(rows))
+	if len(buttons) != 10 || len(rows) != 9 {
+		t.Fatalf("first page: %d choices, %d rows; want eight sessions and navigation: %v", len(buttons), len(rows), rows)
 	}
+	requirePickerFooter(t, rows, "Next", "Cancel")
 	for i := range 8 {
 		listed := strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) && strings.Contains(text, "ID: "+sessions[i].ID)
 		paired := len(rows[i]) == 2 && strings.Contains(rows[i][0]["text"].(string), sessions[i].Title) && rows[i][1]["text"] == "Pin"
@@ -229,9 +246,10 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	clickResume(w, 7, buttons[8]["callback_data"].(string))
 	text, rows = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || len(rows) != 4 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
-		t.Fatalf("second page does not contain final native choices: %s; %v", text, buttons)
+	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
+		t.Fatalf("second page does not contain final native choices: %s; %v", text, rows)
 	}
+	requirePickerFooter(t, rows, "Previous", "Cancel")
 	clickResume(w, 7, buttons[2]["callback_data"].(string))
 	text, _ = pickerView(t, f)
 	buttons = resumeButtons(t, f)
@@ -266,6 +284,7 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	if !listed || !paired {
 		t.Fatalf("pinned session was not first with adjacent unpin: %s; %v", text, rows[0])
 	}
+	requirePickerFooter(t, rows, "Cancel")
 	clickResume(w, 7, buttons[1]["callback_data"].(string))
 	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("pin toggle changed the active session")

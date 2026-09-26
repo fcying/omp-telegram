@@ -905,9 +905,10 @@ func TestExportPickerListsMultipleSessions(t *testing.T) {
 	w.resumeListed(finishResumeList(t, w))
 	text, rows := pickerView(t, f)
 	buttons := resumeButtons(t, f)
-	if len(buttons) != 10 || len(rows) != 10 {
-		t.Fatalf("export first page has %d choices in %d rows, want eight sessions, next, cancel", len(buttons), len(rows))
+	if len(buttons) != 10 || len(rows) != 9 {
+		t.Fatalf("export first page has %d choices in %d rows; want eight sessions and navigation: %v", len(buttons), len(rows), rows)
 	}
+	requirePickerFooter(t, rows, "Next", "Cancel")
 	for i := range 8 {
 		if !strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) || !strings.Contains(text, "ID: "+sessions[i].ID) || len(rows[i]) != 1 {
 			t.Fatalf("export choice %d lost native identity or single export action: %s; %v", i, text, rows[i])
@@ -916,9 +917,10 @@ func TestExportPickerListsMultipleSessions(t *testing.T) {
 	clickResume(w, 7, buttons[8]["callback_data"].(string))
 	text, rows = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || len(rows) != 4 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
-		t.Fatalf("export second page does not contain final native choices: %s; %v", text, buttons)
+	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
+		t.Fatalf("export second page does not contain final native choices: %s; %v", text, rows)
 	}
+	requirePickerFooter(t, rows, "Previous", "Cancel")
 }
 
 func TestDirectHTMLExportDoesNotOpenPicker(t *testing.T) {
