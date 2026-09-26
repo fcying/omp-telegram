@@ -13,7 +13,7 @@ It provides persistent Telegram conversations backed by OMP sessions, including:
 - durable final-reply delivery
 - structured logging
 
-Each ordinary private chat or topic has its own OMP session. Ordinary prompts, attachments, and `/review` run sequentially within that conversation; different conversations can work concurrently.
+Each ordinary private chat or topic has its own OMP session. While a task runs, ordinary text steers it; use `/followup <message>` for a separate task afterward. Attachments and `/review` keep their bridge queue behavior. Different conversations can work concurrently.
 
 ## Requirements
 
@@ -21,6 +21,8 @@ Each ordinary private chat or topic has its own OMP session. Ordinary prompts, a
 - An omp installation supporting RPC protocol v2 and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
+
+The bridge requires OMP >= 18.3.2 for text steering: that is the oldest version verified to provide request-ID-correlated RPC v2 `prompt_result` statuses (`completed`, `aborted`, `error`) and settlement evidence for `streamingBehavior: "steer"`. This is a newer requirement than the bridge's underlying RPC v2 requirement.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -200,6 +202,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On an unbound Telegram topic, the Telegram topic title is set to the resolved workspace basename; later replacements do not rename it. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session open. A released session only clears queued tasks. |
+| `/followup <message>` | Queue a separate text prompt after the active task; if idle, run it as the next ordinary task. |
 | `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List saved conversation/session bindings for this Telegram chat, with the current conversation first, pending starts next, then others by most recent use (unknown last). Each entry uses two full-width keyboard rows: a clickable session name (or workspace basename) and topic ID, then a read-only state, compact last-used age when known, and workspace. Clicking an eligible title opens a confirmation with a red Delete button; current-conversation and pending titles are disabled. An open entry must first be idle and its OMP process is closed. Workspace and native OMP history are preserved. |
@@ -221,7 +224,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/review [arguments]` | Run OMP's native `/review` command as a queued task. Native selection dialogs, including commit lists, show eight options per page and display navigation only when needed. |
 | `/help` | Show help. |
 
-Ordinary text, attachments, and `/review` are queued per conversation and run sequentially. Only the listed bridge commands (plus `/start`) are handled as controls; other slash-prefixed text such as `/opt/tmp`, `/opt/user@host/file`, or `/stauts` is sent to OMP as an ordinary prompt. Only a syntactically valid `/command@bot` token is treated as bot-addressed; messages addressed to a different bot are ignored. A message sent while another task is running waits in that conversation; it does not interrupt the active task. Different conversations can run concurrently up to the configured worker capacity.
+Idle ordinary text runs as a root task. While a task is running, text (including unknown slash-prefixed text such as `/opt/tmp`, `/opt/user@host/file`, or `/stauts`) steers that same task via OMP's native RPC queue; it does not create a second final reply. Use `/followup <message>` to queue a separate root task. Attachments and `/review` continue to use the bridge queue, including while a task is running; the initial steering implementation is text-only. Only the listed bridge commands (plus `/start`) are handled as controls. A syntactically valid `/command@bot` token addressed to a different bot is ignored. Different conversations can run concurrently up to the configured worker capacity.
 
 `/doctor` checks runtime configuration, Telegram `getMe`, SQLite health, data-directory write access, the configured OMP binary, the current workspace and saved session, runtime state, uncertain inbox/outbox records, and free disk space. It returns fixed safe summaries only; it never includes tokens, headers, prompts, raw RPC state, or full local paths. If conversation state changes while checks run, the result is discarded.
 
@@ -285,6 +288,9 @@ The editable status message shows assistant text under `Output` and active tools
 New databases use schema 13 without an Activity table. Existing schema 11 and 12 databases upgrade automatically to 13; the migration drops the short-lived development `activity_messages` table even if it contains records. Other tables and session data remain intact, but old Activity messages represented only by those records can no longer be deleted automatically.
 
 `/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
+When steering is pending, the active root remains the final-reply owner until every steer finishes and OMP confirms the session settled. Progress Stop preserves bridge follow-ups; `/stop` clears them. With a pending steer either Stop path immediately terminates the old OMP process, marks the root and unresolved steers `uncertain` without replay, then allows preserved follow-ups to resume on a fresh runtime. Already performed tool side effects cannot be undone, and a force-terminated OMP session may fail to resume.
+
+If steering remains explicitly idle with native pending work for five minutes of uninterrupted probe evidence, the watchdog force-stops the old process, marks the root and unresolved steers `uncertain`, and preserves bridge follow-ups without replay. Activity or a non-idle observation restarts this grace period. Legitimate async work that stays entirely silent and pending can also reach this limit.
 
 The `/queue` viewer shows no page number or buttons when the pending queue is empty; canceling the last task removes its keyboard when the message is refreshed. For `/queue` menus with pending tasks and for `/bindings` menus, Close reports `Closed` only after Telegram removes the inline keyboard. If that edit fails, the menu stays open and Close can be retried until the menu expires.
 
@@ -326,7 +332,7 @@ Committed sessions survive daemon restarts. At startup, the bridge restores thei
 
 Uncertain in-flight operations are not automatically replayed.
 
-Tasks that were still waiting when the daemon stopped are cancelled. Check the conversation and workspace before deciding to resend a request.
+Pending bridge tasks, including `/followup` and follow-ups addressed to this bot, are cancelled at shutdown or during startup after a crash, never replayed. Check the conversation and workspace before deciding to resend a request.
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
 - If the saved OMP session file or workspace is unavailable at startup, including a fresh session with no persisted history, recovery is skipped, the binding is kept closed, and the bridge tells you to use `/new`; it never creates a replacement session. For other session-switching failures, use `/close` followed by `/new` or `/resume`.
@@ -425,10 +431,9 @@ just deploy
 
 No bridge-side feature is currently listed here.
 
-### Waiting for upstream OMP support
+### Capabilities that upstream OMP could improve
 
-- Reliable active-turn steering
-- Native queue clear / atomic abort-and-clear
+- Atomic RPC abort-and-clear, including correlated `prompt_result` events for prompts removed from the native queue.
 
 ## Architecture
 

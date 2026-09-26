@@ -91,6 +91,7 @@ type Client struct {
 	next                      atomic.Uint64
 	frameLimit                atomic.Int64
 	closeRequested            atomic.Bool
+	hardStopRequested         atomic.Bool
 	transportEndedBeforeClose atomic.Bool
 	failureStop               atomic.Bool
 	contextCanceled           atomic.Bool
@@ -237,7 +238,7 @@ func (c *Client) transportEnded(err error) {
 	if !c.closeRequested.Load() && !c.failureStop.Load() && !c.contextCanceled.Load() {
 		c.transportEndedBeforeClose.Store(true)
 	}
-	if c.err == nil {
+	if c.err == nil && !c.hardStopRequested.Load() {
 		c.err = &classifiedError{kind: "process_exit", err: err}
 	}
 	c.mu.Unlock()
@@ -254,6 +255,26 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.err
+}
+
+// TerminateNow kills the process group before allowing stdin to close or drain.
+func (c *Client) TerminateNow() error {
+	select {
+	case <-c.done:
+		_ = c.Close()
+		return nil
+	default:
+	}
+	c.mu.Lock()
+	c.closeRequested.Store(true)
+	c.hardStopRequested.Store(true)
+	c.mu.Unlock()
+	killErr := syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
+	_ = c.Close()
+	if killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+		return killErr
+	}
+	return nil
 }
 
 func (c *Client) logProcessExit(level slog.Level, reason string) {
@@ -287,10 +308,12 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 	case err := <-waited:
 		exited = true
 		c.processExited(ctx)
-		if err != nil {
-			c.fail(&classifiedError{kind: "process_exit", err: errors.New("omp: process exited unsuccessfully")})
-		} else {
-			c.fail(&classifiedError{kind: "process_exit", err: errors.New("omp: process exited")})
+		if !c.hardStopRequested.Load() {
+			if err != nil {
+				c.fail(&classifiedError{kind: "process_exit", err: errors.New("omp: process exited unsuccessfully")})
+			} else {
+				c.fail(&classifiedError{kind: "process_exit", err: errors.New("omp: process exited")})
+			}
 		}
 	case <-ctx.Done():
 		c.contextCanceled.Store(true)
@@ -384,20 +407,42 @@ func (c *Client) Send(ctx context.Context, frame map[string]any) error {
 	return nil
 }
 
+// ReserveRequestID returns a correlation ID without sending a request.
+func (c *Client) ReserveRequestID() string {
+	return strconv.FormatUint(c.next.Add(1), 10)
+}
+
 // Call resolves the command acknowledgment, not the completion of an agent turn.
 func (c *Client) Call(ctx context.Context, typeName string, fields map[string]any) (json.RawMessage, error) {
+	return c.CallWithID(ctx, c.ReserveRequestID(), typeName, fields)
+}
+
+// CallWithID registers its correlation ID before writing the RPC request.
+func (c *Client) CallWithID(ctx context.Context, id, typeName string, fields map[string]any) (json.RawMessage, error) {
+	if id == "" {
+		return nil, errors.New("omp: empty RPC request ID")
+	}
+	r := request{command: typeName, result: make(chan result, 1)}
+	c.mu.Lock()
+	if _, found := c.pending[id]; found {
+		c.mu.Unlock()
+		return nil, errors.New("omp: duplicate pending RPC request ID")
+	}
+	c.pending[id] = r
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if current, found := c.pending[id]; found && current.result == r.result {
+			delete(c.pending, id)
+		}
+		c.mu.Unlock()
+	}()
 	frame := make(map[string]any, len(fields)+2)
 	for k, v := range fields {
 		frame[k] = v
 	}
 	frame["type"] = typeName
-	id := strconv.FormatUint(c.next.Add(1), 10)
 	frame["id"] = id
-	r := request{command: typeName, result: make(chan result, 1)}
-	c.mu.Lock()
-	c.pending[id] = r
-	c.mu.Unlock()
-	defer func() { c.mu.Lock(); delete(c.pending, id); c.mu.Unlock() }()
 	if err := c.Send(ctx, frame); err != nil {
 		return nil, err
 	}

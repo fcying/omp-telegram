@@ -12,23 +12,27 @@ import (
 
 const stuckTaskQuietPeriod = 30 * time.Second
 const idleProbeTimeout = 5 * time.Second
+const nativeSteerIdleLimit = 5 * time.Minute
 
 type idleProbeState struct {
-	revision  uint64
-	cancel    context.CancelFunc
-	results   chan idleProbeResult
-	confirmed time.Time
-	next      time.Time
+	revision     uint64
+	cancel       context.CancelFunc
+	results      chan idleProbeResult
+	confirmed    time.Time
+	next         time.Time
+	pendingSince time.Time
 }
 
 type idleProbeResult struct {
-	client     *omp.Client
-	generation int64
-	turn       uint64
-	active     int64
-	revision   uint64
-	idle       bool
-	err        error
+	client        *omp.Client
+	generation    int64
+	turn          uint64
+	active        int64
+	revision      uint64
+	idle          bool
+	settled       bool
+	pendingNative bool
+	err           error
 }
 
 func (w *worker) stopTyping() {
@@ -57,6 +61,7 @@ func (w *worker) resetIdleProbeReason(reason string) {
 	w.idleProbe.revision++
 	w.idleProbe.confirmed = time.Time{}
 	w.idleProbe.next = time.Time{}
+	w.idleProbe.pendingSince = time.Time{}
 	if evidence && w.log.Enabled(context.Background(), slog.LevelDebug) {
 		attrs := []slog.Attr{
 			slog.String("event", "watchdog_probe_reset"),
@@ -72,7 +77,7 @@ func (w *worker) resetIdleProbeReason(reason string) {
 	}
 }
 func (w *worker) stuckTaskEligible() bool {
-	if w.runtime != runtimeConnected || w.client == nil || !w.taskRunning() || w.awaitingContinuation || w.compacting || w.finishing || w.progress.Retrying || len(w.progress.ActiveTools) != 0 || len(w.hostRequests) != 0 {
+	if w.runtime != runtimeConnected || w.client == nil || !w.taskRunning() || w.awaitingContinuation && !w.steerFence.active || w.compacting || w.finishing || w.progress.Retrying || len(w.progress.ActiveTools) != 0 || len(w.hostRequests) != 0 {
 		return false
 	}
 	for _, c := range w.confirms {
@@ -83,12 +88,21 @@ func (w *worker) stuckTaskEligible() bool {
 	return true
 }
 
-func explicitlyIdle(raw json.RawMessage) bool {
+func rpcIdleState(raw json.RawMessage) (idle, settled, pendingNative bool) {
 	var state struct {
-		Streaming  *bool `json:"isStreaming"`
-		Compacting *bool `json:"isCompacting"`
+		Streaming    *bool `json:"isStreaming"`
+		Compacting   *bool `json:"isCompacting"`
+		Settled      *bool `json:"isSettled"`
+		PendingAsync *bool `json:"hasPendingAsyncWork"`
+		Queued       *int  `json:"queuedMessageCount"`
 	}
-	return json.Unmarshal(raw, &state) == nil && state.Streaming != nil && !*state.Streaming && state.Compacting != nil && !*state.Compacting
+	if json.Unmarshal(raw, &state) != nil {
+		return false, false, false
+	}
+	idle = state.Streaming != nil && !*state.Streaming && state.Compacting != nil && !*state.Compacting
+	settled = state.Settled != nil && *state.Settled
+	pendingNative = state.PendingAsync != nil && *state.PendingAsync || state.Queued != nil && *state.Queued > 0
+	return idle, settled, pendingNative
 }
 
 func (w *worker) probeStuckTask(now time.Time) {
@@ -115,7 +129,9 @@ func (w *worker) probeStuckTask(now time.Time) {
 		defer cancel()
 		raw, err := result.client.Call(ctx, "get_state", nil)
 		result.err = err
-		result.idle = err == nil && explicitlyIdle(raw)
+		if err == nil {
+			result.idle, result.settled, result.pendingNative = rpcIdleState(raw)
+		}
 		select {
 		case results <- result:
 		case <-w.ctx.Done():
@@ -156,9 +172,34 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		w.resetIdleProbeReason("queued_rpc_output")
 		return
 	}
+	if w.steerFence.active && result.err != nil {
+		w.retireSteeredRoot("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		return
+	}
 	if !w.stuckTaskEligible() || result.err != nil || !result.idle {
 		w.resetIdleProbeReason("probe_not_idle")
 		w.idleProbe.next = now.Add(stuckTaskQuietPeriod)
+		return
+	}
+	if w.steerFence.active && result.pendingNative {
+		// Pending native work gets a longer grace period, not an unlimited reset.
+		if w.idleProbe.cancel != nil {
+			w.idleProbe.cancel()
+			w.idleProbe.cancel = nil
+		}
+		w.idleProbe.confirmed = time.Time{}
+		w.idleProbe.next = now.Add(stuckTaskQuietPeriod)
+		if w.idleProbe.pendingSince.IsZero() {
+			w.idleProbe.pendingSince = now
+		} else if now.Sub(w.idleProbe.pendingSince) >= nativeSteerIdleLimit {
+			w.retireSteeredRoot("omp's native steering queue remained idle too long. The task outcome is uncertain and will not be replayed automatically.")
+		}
+		return
+	}
+	w.idleProbe.pendingSince = time.Time{}
+	if w.steerFence.active && result.settled && len(w.steers) == 0 && w.steerFence.terminalSeen {
+		w.steerFence.settled = true
+		w.maybeFinishSteeredRoot()
 		return
 	}
 	if w.idleProbe.cancel != nil {
@@ -174,6 +215,10 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		return
 	}
 	if now.Sub(w.idleProbe.confirmed) < stuckTaskQuietPeriod {
+		return
+	}
+	if w.steerFence.active {
+		w.retireSteeredRoot("omp is idle but steering completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
 	inboxID, generation, turn := w.active, w.binding.Generation, w.turn

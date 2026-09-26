@@ -971,7 +971,7 @@ func TestStopCancelsActiveAndQueuedAlbums(t *testing.T) {
 	member.Message.MediaGroupID = "stop-queued-album"
 	member.Message.Photo = []telegram.PhotoSize{{FileID: "photo", FileSize: 1}}
 	accept(3, member.Message)
-	accept(4, update(4, 11, "queued after album").Message)
+	accept(4, update(4, 11, "/followup queued after album").Message)
 	if len(w.queue) != 2 || len(w.albums) != 1 {
 		t.Fatalf("queued stop fixture = queue:%+v albums:%+v", w.queue, w.albums)
 	}
@@ -1465,5 +1465,135 @@ func TestAttachmentDeliveryDoesNotDeleteOutsideSpool(t *testing.T) {
 	})
 	if got, err := os.ReadFile(source); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("out-of-spool source changed or disappeared: data=%q, error=%v", got, err)
+	}
+}
+
+func pendingSteerAttachment(t *testing.T, downloadErr error) (*worker, mediaResult, previewResult) {
+	t.Helper()
+	t.Setenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER", "executing")
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 4
+	w.b.cfg.ProgressMode = "summary"
+	w.previewResult = make(chan previewResult, 1)
+	f.files = map[string][]byte{"note": []byte("retained attachment")}
+	f.downloadErr = downloadErr
+	command("/new " + t.TempDir())
+	command("wait")
+	w.dispatch()
+	waitSteerRootStart(t, w)
+	w.operationReturned(waitOperation(t, w))
+	command("correction")
+	drainWatchdogEvents(t, w)
+	u := update(4, 11, "")
+	u.Message.Document = &telegram.Document{FileID: "note", FileName: "note.txt"}
+	raw, err := json.Marshal(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.b.db.Accept(4, raw); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(incoming{id: 4, msg: u.Message})
+	acceptWorkerInput(t, w, 5, "/followup later")
+	var prepared mediaResult
+	select {
+	case prepared = <-w.mediaResults:
+	case <-time.After(5 * time.Second):
+		t.Fatal("attachment preparation did not finish")
+	}
+	allowInitialProgress(w)
+	w.flushPreview()
+	var preview previewResult
+	select {
+	case preview = <-w.previewResult:
+		if preview.err != nil {
+			t.Fatal(preview.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("progress request did not finish")
+	}
+	// Delay actor consumption of both results until Stop has retired the process.
+	w.stopActiveTask()
+	w.dispatch()
+	if w.client != nil || !w.finishing || !w.queue[0].preparing {
+		t.Fatal("Stop did not leave attachment preparation waiting on progress cleanup")
+	}
+	return w, prepared, preview
+}
+
+func TestSteeredStopPreservesAttachmentPreparation(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		name := "success"
+		var downloadErr error
+		if failed {
+			name = "download failure"
+			downloadErr = errors.New("download failed")
+		}
+		t.Run(name, func(t *testing.T) {
+			w, result, preview := pendingSteerAttachment(t, downloadErr)
+			if (result.err != nil) != failed {
+				t.Fatalf("unexpected preparation outcome: %v", result.err)
+			}
+			w.preparedMedia(result)
+			if failed {
+				if steerInboxState(t, w, 4) != "failed" || len(w.queue) != 1 || w.queue[0].id != 5 {
+					t.Fatal("failed attachment blocked the preserved follow-up")
+				}
+			} else {
+				if w.queue[0].preparing {
+					t.Fatal("released client discarded valid attachment preparation")
+				}
+				data, err := os.ReadFile(filepath.Join(result.input.Directory, "note.txt"))
+				if err != nil || string(data) != "retained attachment" {
+					t.Fatalf("preserved attachment lost its file: data=%q err=%v", data, err)
+				}
+			}
+			w.previewFinished(preview)
+			if !failed {
+				w.dispatch()
+				if w.active != 4 {
+					t.Fatal("prepared attachment did not start after lazy resume")
+				}
+				waitSteerWorker(t, w, func() bool { return !w.taskActive() })
+				if steerInboxState(t, w, 4) != "done" {
+					t.Fatal("prepared attachment did not complete")
+				}
+			}
+			w.dispatch()
+			if w.active != 5 {
+				t.Fatal("attachment blocked the subsequent follow-up")
+			}
+			waitSteerWorker(t, w, func() bool { return !w.taskActive() })
+			if steerInboxState(t, w, 5) != "done" {
+				t.Fatal("subsequent follow-up did not complete")
+			}
+		})
+	}
+}
+
+func TestReleasedRuntimeRejectsObsoleteAttachmentResults(t *testing.T) {
+	for _, obsolete := range []string{"cancelled", "old generation"} {
+		t.Run(obsolete, func(t *testing.T) {
+			w, result, preview := pendingSteerAttachment(t, nil)
+			if obsolete == "cancelled" {
+				w.cancelQueuedTask(4)
+			} else {
+				result.generation--
+			}
+			w.preparedMedia(result)
+			if _, err := os.Stat(result.input.Directory); !os.IsNotExist(err) {
+				t.Fatalf("obsolete attachment was retained: %v", err)
+			}
+			if obsolete == "old generation" {
+				if !w.queue[0].preparing || steerInboxState(t, w, 4) != "pending" {
+					t.Fatal("old generation changed the current attachment task")
+				}
+				w.cancelQueuedTask(4)
+			}
+			if len(w.queue) != 1 || w.queue[0].id != 5 || steerInboxState(t, w, 4) != "cancelled" {
+				t.Fatal("late preparation revived a cancelled attachment")
+			}
+			w.previewFinished(preview)
+		})
 	}
 }

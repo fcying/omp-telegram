@@ -61,6 +61,7 @@ func TestMain(m *testing.M) {
 		}
 		fmt.Println(`{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576,"maxReassembledFrameBytes":67108864}`)
 		input := bufio.NewReader(os.Stdin)
+		var deferredResponse map[string]any
 		for {
 			line, err := input.ReadBytes('\n')
 			if err != nil {
@@ -77,6 +78,34 @@ func TestMain(m *testing.M) {
 				continue
 			}
 			switch command["type"] {
+			case "deferred_correlation":
+				reply := map[string]any{"type": "response", "id": command["id"], "command": "deferred_correlation", "success": true, "data": map[string]any{"value": command["value"]}}
+				if deferredResponse == nil {
+					deferredResponse = reply
+					continue
+				}
+				encoded, _ := json.Marshal(reply)
+				fmt.Println(string(encoded))
+				encoded, _ = json.Marshal(deferredResponse)
+				fmt.Println(string(encoded))
+				deferredResponse = nil
+			case "shutdown_probe":
+				fmt.Printf("{\"type\":\"response\",\"command\":\"shutdown_probe\",\"id\":%q,\"success\":true}\n", command["id"])
+				release, _ := command["release"].(string)
+				marker, _ := command["marker"].(string)
+				for {
+					if _, err := os.Stat(release); err == nil {
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+				queued, err := input.ReadBytes('\n')
+				if err == nil {
+					if err := os.WriteFile(marker, queued, 0600); err != nil {
+						os.Exit(3)
+					}
+				}
+				os.Exit(0)
 			case "rejected":
 				fmt.Printf("{\"type\":\"response\",\"command\":\"rejected\",\"id\":%q,\"success\":false,\"error\":\"SECRET_REJECTION\"}\n", command["id"])
 			case "unknown":
@@ -491,6 +520,161 @@ func fixtureClient(t *testing.T) *Client {
 	}
 	t.Cleanup(func() { client.Close() })
 	return client
+}
+
+func TestCallWithIDCorrelatesOutOfOrderResponsesAndRejectsPendingCollision(t *testing.T) {
+	client := fixtureClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	firstID, secondID := client.ReserveRequestID(), client.ReserveRequestID()
+	if firstID == secondID {
+		t.Fatal("reserved request IDs collided")
+	}
+	client.writeGate <- struct{}{}
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			<-client.writeGate
+		}
+	}()
+	type callResult struct {
+		data json.RawMessage
+		err  error
+	}
+	first := make(chan callResult, 1)
+	go func() {
+		data, err := client.CallWithID(ctx, firstID, "deferred_correlation", map[string]any{"value": "first"})
+		first <- callResult{data: data, err: err}
+	}()
+	for {
+		client.mu.Lock()
+		_, registered := client.pending[firstID]
+		client.mu.Unlock()
+		if registered {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("first request was not registered before writing")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := client.CallWithID(ctx, firstID, "deferred_correlation", map[string]any{"value": "duplicate"}); err == nil {
+		t.Fatal("pending request ID collision was accepted")
+	}
+	<-client.writeGate
+	gateHeld = false
+	secondData, err := client.CallWithID(ctx, secondID, "deferred_correlation", map[string]any{"value": "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResult := <-first
+	if firstResult.err != nil {
+		t.Fatal(firstResult.err)
+	}
+	for _, check := range []struct {
+		data json.RawMessage
+		want string
+	}{{firstResult.data, "first"}, {secondData, "second"}} {
+		var decoded struct {
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(check.data, &decoded); err != nil || decoded.Value != check.want {
+			t.Fatalf("response correlation: got %s, want %q (error %v)", check.data, check.want, err)
+		}
+	}
+	client.mu.Lock()
+	remaining := len(client.pending)
+	client.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("requests left pending after responses: %d", remaining)
+	}
+}
+
+func TestTerminateNowKillsBeforeQueuedStdinCanDrain(t *testing.T) {
+	client, release, marker := shutdownProbeClient(t)
+	result := make(chan error, 1)
+	go func() { result <- client.TerminateNow() }()
+	select {
+	case <-client.stop:
+	case <-time.After(time.Second):
+		t.Fatal("immediate termination did not signal shutdown")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("hard stop waited for graceful stdin drain")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child processed queued stdin after hard stop: %v", err)
+	}
+	if err := client.TerminateNow(); err != nil {
+		t.Fatalf("repeated hard stop: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("close after hard stop: %v", err)
+	}
+}
+
+func TestCloseStillDrainsQueuedStdin(t *testing.T) {
+	client, release, marker := shutdownProbeClient(t)
+	result := make(chan error, 1)
+	go func() { result <- client.Close() }()
+	select {
+	case <-client.stop:
+	case <-time.After(time.Second):
+		t.Fatal("close did not signal shutdown")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("graceful close did not complete")
+	}
+	queued, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("queued request was not drained: %v", err)
+	}
+	var frame struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(queued, &frame); err != nil || frame.Type != "queued_after_probe" {
+		t.Fatalf("unexpected queued frame: %s (%v)", queued, err)
+	}
+}
+
+func shutdownProbeClient(t *testing.T) (*Client, string, string) {
+	t.Helper()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := Start(context.Background(), Config{Binary: binary}, testRPCLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	release := filepath.Join(t.TempDir(), "release")
+	marker := filepath.Join(t.TempDir(), "consumed")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Call(ctx, "shutdown_probe", map[string]any{"release": release, "marker": marker}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(ctx, map[string]any{"type": "queued_after_probe", "id": client.ReserveRequestID()}); err != nil {
+		t.Fatal(err)
+	}
+	return client, release, marker
 }
 
 func TestLatePromptResponseIsDiscarded(t *testing.T) {

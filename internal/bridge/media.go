@@ -181,7 +181,7 @@ func (w *worker) collectAlbum(in incoming) {
 		w.mark(in.id, "done")
 		return
 	}
-	if len(w.queue) >= w.b.cfg.QueueCapacity {
+	if w.pendingInputFull() {
 		w.suppressAlbum(key)
 		w.say("The queue is full. This album was not submitted.")
 		if w.mark(in.id, "cancelled") {
@@ -447,7 +447,8 @@ func removeMediaSnapshot(path string, logger *slog.Logger) {
 
 func (w *worker) preparedMedia(result mediaResult) {
 	index := -1
-	if w.client != nil && result.generation == w.binding.Generation {
+	// Preparation belongs to the logical session's queue, not its current process.
+	if result.generation == w.binding.Generation {
 		for i, q := range w.queue {
 			if q.id == result.id && q.preparing {
 				index = i
@@ -522,6 +523,11 @@ func (w *worker) hostResultFailed(client *omp.Client, err error) {
 	}
 	w.log.LogAttrs(context.Background(), slog.LevelWarn, "host tool result delivery failed", attrs...)
 	w.cancelHostRequests()
+	if w.steerFence.active {
+		w.clearFailedHostOperation()
+		w.retireSteeredRoot("A host tool result could not be delivered to omp. The task outcome is uncertain and will not be replayed automatically.")
+		return
+	}
 	if w.taskActive() {
 		w.finishUncertain("A host tool result could not be delivered to omp. The instance was closed; the task outcome is uncertain and will not be replayed automatically.")
 	} else {

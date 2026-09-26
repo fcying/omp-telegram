@@ -219,7 +219,7 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	if w.active == 0 || !w.busy {
 		t.Fatal("root task did not become active")
 	}
-	command("queued")
+	command("/followup queued")
 	if len(w.queue) != 1 {
 		t.Fatal("queued root task missing before stop")
 	}

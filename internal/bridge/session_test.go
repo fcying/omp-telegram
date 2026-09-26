@@ -98,7 +98,7 @@ func TestNameChangesTitleWithoutInterruptingTasks(t *testing.T) {
 	command("wait")
 	w.dispatch()
 	active := w.active
-	command("queued task")
+	command("/followup queued task")
 	command("/name Bugfix HAL")
 	command("/status")
 	var text string

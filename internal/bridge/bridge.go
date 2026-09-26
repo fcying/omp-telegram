@@ -226,7 +226,11 @@ type worker struct {
 	finalizedStreamBytes int
 	finalOutputTruncated bool
 	taskState
-	turn uint64
+	turn          uint64
+	steers        map[string]steerRequest
+	steerFence    steerFence
+	rootRequestID string
+	resumeFailed  bool
 	progressTransport
 	compacting             bool
 	progress               progressState
@@ -377,6 +381,8 @@ const (
 type rpcEvent struct {
 	Type                  string                       `json:"type"`
 	ID                    string                       `json:"id"`
+	Status                string                       `json:"status"`
+	SessionSettled        *bool                        `json:"sessionSettled"`
 	Method                string                       `json:"method"`
 	TargetID              string                       `json:"targetId"`
 	Arguments             json.RawMessage              `json:"arguments"`
@@ -414,6 +420,7 @@ const (
 var botCommands = []telegram.BotCommand{
 	{Command: "new", Description: "New session: /new <name or project path>"},
 	{Command: "stop", Description: "Stop task and clear queue"},
+	{Command: "followup", Description: "Queue a prompt after the current task"},
 	{Command: "queue", Description: "Show and cancel pending bridge tasks"},
 	{Command: "resume", Description: "Choose or pin an omp session in this working directory"},
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
@@ -1086,6 +1093,7 @@ func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
 	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true}
+	w.rootRequestID = ""
 	w.turn++
 }
 
@@ -1094,6 +1102,7 @@ func (w *worker) clearTask() {
 	w.activeReplyTo = 0
 	w.awaitingContinuation = false
 	w.busy = false
+	w.rootRequestID = ""
 }
 
 func (w *worker) awaitTaskContinuation() { w.awaitingContinuation = true }
@@ -1130,7 +1139,7 @@ func (w *worker) sessionControlBusy() bool {
 }
 
 func (w *worker) canDispatch() bool {
-	return !w.sessionControlBusy() && len(w.queue) != 0
+	return !w.resumeFailed && !w.steerFence.active && !w.sessionControlBusy() && len(w.queue) != 0
 }
 
 func (w *worker) canReleaseRuntime() bool {
@@ -1213,6 +1222,7 @@ func (w *worker) beginRuntimeStart() { w.runtime = runtimeStarting }
 func (w *worker) runtimeStarted(client *omp.Client) {
 	w.client = client
 	w.runtime = runtimeConnected
+	w.resumeFailed = false
 }
 
 func (w *worker) runtimeStopped() {
@@ -1242,7 +1252,14 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.runtimeStopped()
 	if client != nil {
 		clientID := client.ID()
-		client.Close()
+		if w.steerFence.active {
+			if err := client.TerminateNow(); err != nil {
+				w.b.fail(err)
+				w.cancel()
+			}
+		} else {
+			client.Close()
+		}
 		if releaseSlot {
 			<-w.b.slots
 		}
@@ -1257,8 +1274,12 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 		}
 		w.log.LogAttrs(context.Background(), slog.LevelInfo, "runtime released", attrs...)
 	}
+	if w.steerFence.active {
+		w.settleOutstandingSteers()
+	}
 	w.previewID = 0
 	w.previewStopToken = ""
+	w.cancelSteerProbe()
 }
 
 func (w *worker) releaseRuntime(releaseSlot bool) {
@@ -1352,6 +1373,7 @@ func (w *worker) run() {
 		w.flushPreview()
 		w.expire()
 		w.probeStuckTask(now)
+		w.steeredTick(now)
 		w.releaseIdleRuntime(now)
 		return w.evictIfIdle(now)
 	}
@@ -1484,6 +1506,8 @@ func (w *worker) run() {
 			w.doctorFinished(result)
 		case result := <-w.idleProbe.results:
 			w.idleProbeFinished(result, time.Now())
+		case result := <-w.steerFence.probeResults:
+			w.steeredQuiescenceFinished(result)
 		case <-tick.C:
 			if onTick() {
 				return
@@ -1514,7 +1538,15 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 		w.log.LogAttrs(context.Background(), slog.LevelDebug, "rpc request failed", attrs...)
 	}
+	if result.kind == "steer" {
+		w.steerOperationFinished(result)
+		return
+	}
 	if result.kind == "prompt" {
+		if w.steerFence.active && result.err != nil {
+			w.retireSteeredRoot("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.")
+			return
+		}
 		if errors.Is(result.err, omp.ErrRequestTooLarge) {
 			w.finishCancelled("Prompt exceeds the omp RPC frame limit. No task was submitted.")
 			return
@@ -1529,7 +1561,11 @@ func (w *worker) operationFinished(result operationResult) {
 			AgentInvoked *bool `json:"agentInvoked"`
 		}
 		if json.Unmarshal(result.data, &response) == nil && response.AgentInvoked != nil && !*response.AgentInvoked {
-			w.finishTerminal(rpcEvent{})
+			if w.steerFence.active {
+				w.deferSteeredTerminal(rpcEvent{})
+			} else {
+				w.finishTerminal(rpcEvent{})
+			}
 		}
 		return
 	}
@@ -1674,6 +1710,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 			}
 		}
 	}
+	w.clearSteerFence()
 }
 
 func (w *worker) closeLogicalSession() bool {
@@ -1722,6 +1759,10 @@ func (w *worker) failed() {
 	if clientID != 0 && w.rpcExitPendingClientID != clientID {
 		w.logRuntimeEvent(slog.LevelWarn, "runtime_exit", "failure", "runtime exited", w.sessionID)
 	}
+	if w.steerFence.active {
+		w.retireSteeredRoot("omp exited while steering. The task outcome is uncertain and will not be replayed automatically.")
+		return
+	}
 	w.rpcExitPendingClientID = 0
 	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
 	w.closeLogicalSession()
@@ -1764,10 +1805,18 @@ func (w *worker) clearQueue() {
 
 func (w *worker) stop() {
 	w.clearQueue()
+	if w.steerFence.active {
+		w.stopSteeredRoot()
+		return
+	}
 	w.requestAbort("Abort requested and queued prompts cleared.")
 }
 
 func (w *worker) stopActiveTask() {
+	if w.steerFence.active {
+		w.stopSteeredRoot()
+		return
+	}
 	w.requestAbort("Abort requested for the current task. Queued prompts will continue.")
 }
 
@@ -2210,7 +2259,7 @@ func (w *worker) handle(in incoming) {
 			w.mark(in.id, "done")
 			return
 		}
-		if len(w.queue) >= w.b.cfg.QueueCapacity {
+		if w.pendingInputFull() {
 			w.say("The queue is full. This message was not submitted.")
 			if w.mark(in.id, "cancelled") {
 				w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
@@ -2221,7 +2270,7 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	if !strings.HasPrefix(text, "/") {
-		w.enqueuePrompt(in, text)
+		w.routePrompt(in, text)
 		return
 	}
 	fields := strings.Fields(text)
@@ -2231,7 +2280,7 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	if !knownBridgeCommand(cmd) {
-		w.enqueuePrompt(in, text)
+		w.routePrompt(in, text)
 		return
 	}
 	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
@@ -2241,6 +2290,15 @@ func (w *worker) handle(in incoming) {
 			prompt += " " + arg
 		}
 		w.enqueueReviewPrompt(in, prompt)
+		return
+	}
+	if cmd == "/followup" {
+		if arg == "" {
+			w.say("Usage: /followup <message>")
+			w.mark(in.id, "done")
+			return
+		}
+		w.enqueuePrompt(in, arg)
 		return
 	}
 	if !w.mark(in.id, "submitted") {
@@ -2434,7 +2492,12 @@ func (w *worker) dispatch() {
 		return
 	}
 	client, err := w.ensureRuntime()
-	if err != nil || w.queue[0].preparing {
+	if err != nil {
+		w.resumeFailed = true
+		w.say(err.Error())
+		return
+	}
+	if w.queue[0].preparing {
 		return
 	}
 	q := w.queue[0]
@@ -2475,8 +2538,10 @@ func (w *worker) dispatch() {
 	if len(q.images) > 0 {
 		fields["images"] = q.images
 	}
+	requestID := client.ReserveRequestID()
+	w.rootRequestID = requestID
 	w.startOperation("prompt", client, func(ctx context.Context) (json.RawMessage, error) {
-		return client.Call(ctx, "prompt", fields)
+		return client.CallWithID(ctx, requestID, "prompt", fields)
 	}, q.id, "")
 }
 
@@ -2494,7 +2559,7 @@ func (w *worker) enqueuePreparedPrompt(in incoming, prompt, displayText string) 
 		w.mark(in.id, "done")
 		return
 	}
-	if len(w.queue) >= w.b.cfg.QueueCapacity {
+	if w.pendingInputFull() {
 		w.say("The queue is full. This message was not submitted.")
 		if w.mark(in.id, "cancelled") {
 			w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
@@ -2672,6 +2737,10 @@ func taskReplies(text, finalNotice string, truncated bool) []string {
 
 func (w *worker) assistantBudgetExceeded() {
 	w.logRuntimeEvent(slog.LevelWarn, "assistant_output_overflow", "resource_limit", "assistant output exceeded bridge budget", w.sessionID)
+	if w.steerFence.active {
+		w.retireSteeredRoot("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
+		return
+	}
 	w.finishUncertain("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
 	w.closeLogicalSession()
 }
@@ -2996,6 +3065,7 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		w.newSteeredRun()
 		if !w.taskActive() {
 			return
 		}
@@ -3038,11 +3108,29 @@ func (w *worker) event(raw []byte) {
 		} else if len(w.finalAssistantTexts) > 0 {
 			w.preview = strings.Join(w.finalAssistantTexts, "\n\n")
 		}
+		if w.steerFence.active {
+			w.deferSteeredTerminal(e)
+			return
+		}
 		w.finishTerminal(e)
 	case "prompt_result":
+		if w.steerResult(e) {
+			return
+		}
+		if e.ID != "" && e.ID != w.rootRequestID {
+			return
+		}
+		if w.steerFence.active {
+			if e.AgentInvoked != nil && !*e.AgentInvoked {
+				w.deferSteeredTerminal(e)
+			}
+			return
+		}
 		if e.AgentInvoked != nil && !*e.AgentInvoked {
 			w.finishTerminal(e)
 		}
+	case "session_settled":
+		w.probeSteeredQuiescence()
 	case "response":
 		if !e.Success {
 			w.say("The omp request failed. Use /status to check the session state.")

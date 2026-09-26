@@ -48,7 +48,7 @@ flowchart LR
 
 ### 并发模型
 
-- 每个对话使用 actor 风格的 worker. 普通文字, 附件和 `/review` 都作为独立 prompt 进入 bridge 延后队列, 串行执行. bridge 只在当前任务结束后提交下一条 prompt.
+- 每个对话使用 actor 风格的 worker. 空闲时普通文字开启独立 root prompt; root 运行中收到的文字成为已跟踪的 OMP steer, 不创建新 root. `/followup <message>`, 附件和 `/review` 作为独立 prompt 进入 bridge 延后队列. 活跃 root 拥有最终回复; 不同对话可以并行.
 - 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
 - 命令识别使用已注册的 bridge 命令及隐藏的 `/start` 别名. 仅当 `@bot` 前是单段 Telegram 命令名 (1-32 位 ASCII 字母、数字或下划线), 且目标是同类字符组成的 5-32 位用户名形状时才识别定向. `/opt/user@host/file` 等路径仍是普通 prompt. 发给其他 bot 的命令在重启前已 pending 时也会标为 ignored; 启动时取消 pending 的斜杠 prompt, 不自动重放.
 - `/queue` 只读取当前 worker 内存中的 `queue`、`active` 和 `busy`. 它是当前对话范围的 viewer; Cancel 按钮定位 bridge pending inbox ID, 绝不中止 active task 或管理 OMP native queue. 队列只存在于 runtime: worker shutdown 会取消剩余 pending inbox, 不会恢复 queue entry.
@@ -61,11 +61,19 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 
 ### Prompt 和 interrupt 语义
 
-bridge 使用公开 RPC v2, 不依赖协议扩展. 调用 `prompt` 前, 先将该输入设为 active terminal-result owner. 成功的 acknowledgement 不需要路由分类; `agentInvoked=false` 通过正常完成流程结束本地命令, 其他已接受的 prompt 则等待终结事件. prompt 请求失败或无法确认时, 该输入以 uncertain 结束, 同时关闭该 OMP client 并取消 bridge 队列, 不重试. 不能将该 client 当作 idle 后继续复用, 否则未确认的工作可能接管后续输入的结果归属. `/stop` 先清 bridge 延后 prompt, 再发送不带清队列选项的普通 `abort` 请求. Worker 提交的 task 和 control RPC 共用 FIFO 队列, 因此本地清队列立即生效, 但 `abort` 不会越过尚未确认的 `prompt`. 重启或执行结果不确定后, 包括 `/review` 在内的待执行任务都不会自动重放.
+bridge 使用公开 RPC v2. 根任务在发送前持久化 inbox; 接受和 `agentInvoked=false` 保持原有终态处理. 根任务提交失败或无法确认时关闭 client, 取消 bridge 队列, 不重放. 对于运行中的文字, worker 先验证 frame 大小, 预留 RPC request ID, 将 steer inbox 持久化为 `submitted`, 按当前 root/client/generation/turn 登记请求, 然后发送带 `streamingBehavior: "steer"` 的 `prompt`. 按 request ID 关联 `prompt_result` 和 settlement 证据要求 OMP >= 18.3.2. steer 不拥有最终回复, 不创建独立 progress, 也不进入 bridge 队列. `/followup` 则创建排入 bridge 队列的独立 root; 附件及 `/review` 保持排队. 排队根任务与未决 steer 总数受 `worker.queue_capacity` 限制.
+
+仅当观察到 terminal `agent_end`, 所有 steer 请求的终态 (`completed`, `aborted`, `error`; 本地命令可由 `agentInvoked=false` 结算), 且本轮 session 已 settled 后, 才能完成 root. `sessionSettled=false` 会清除之前的 true 证据; 没有 request ID 的 `session_settled` 只触发 `get_state.isSettled` 探针, 不能自行释放 fence. 消费已排队事件后, 按 client, generation, root, turn 和 revision 校验探针结果. 新 `agent_start` 清除暂存的旧 terminal, 本地命令回复则保留它. 连续确认 idle 却缺少结果时, 退役旧 runtime, 将未决 steer 和 root 记为 `uncertain`, 不重放. worker shutdown 和意外退出同样结算未决 submitted steer.
+
+结算证据按接收顺序处理: 任意已关联 steer 的 `sessionSettled=false` 都使先前 true 失效, 即使该请求 admission 更早. 只有最新 admission 的 true 结果能建立 settled 证据; 否则需要通过 `get_state` 确认当前 quiescence.
 
 `handoff` 或 `compact` 请求出错时会关闭该 client, 只有 omp 明确拒绝时才继续复用; timeout、取消或结果无法确认都会让后续请求 lazy resume. `abort` 被明确拒绝时会保留 client; 结果无法确认时会关闭 client, 将 active task 以 `uncertain` 结算且不重放, 然后在新 runtime 上继续排队任务. `set_model`, `set_thinking_level` 和 `set_fast_mode` 仅在 RPC 明确拒绝时保留 client; 错误结果不确定或无法确认时, 会在排队 prompt 执行前关闭它. 原生 cycle-role 选择继续遵循 `SetModelRole` 的 fail-closed 行为. worker 在 RPC 进行中观察到 client 退出时, 会等待该 RPC 的结果再应用退出策略; 因此 model-role 失败只释放 runtime, 并保留供 lazy resume 使用的逻辑 binding. `host_tool_result` 写入失败时, bridge 将 active task 以 `uncertain` 结算并关闭该 client.
 
-Progress Stop 只中止 active task. `/queue` Cancel 只移除选中的 bridge pending task, `/stop` 才会中止 active task 并清空全部 bridge pending task.
+没有 steer fence 时, Progress Stop 对活动任务发送普通 `abort` 并保留 bridge 队列; `/stop` 还会清空 bridge 队列. 有 steer fence 时, 普通 `abort` 无法保证清除 OMP 原生 steer 队列. 两种 Stop 都先使旧进程失效并立即终止进程组 (不等待关闭 stdin 后排空请求), 再将 root 和未决 steer 记为 `uncertain`; Progress Stop 保留 bridge follow-up, `/stop` 清空它们. 只有持久化结算后, 保留的 follow-up 才能在重新恢复的 runtime 执行. 强制终止无法撤销工具副作用, 也可能使 OMP session 无法恢复. `/queue` 只取消选中的 bridge pending task, 不管理原生 steer.
+
+steered root 退役时清除旧 runtime 的 compaction/session-operation 状态, 不等待已终止进程的结束事件. 附件准备属于保留的逻辑 session 队列: 即使 client 已释放, generation 和 pending inbox ID 匹配的结果仍可生效. 已取消任务及旧 generation 的结果继续丢弃, 并清理对应临时文件.
+
+OMP RPC 当前无法在中止活动 run 的同时原子清除已 accepted 的 native steer/follow-up prompt, 并为每个被清除的请求返回关联的 terminal result. Bridge 不依赖该能力保证正确性: 上述 fail-closed 退役机制就是当前安全路径. 未来的原子 abort-and-clear RPC 必须阻止排队请求继续执行, 中止活动 run, 为被清除的 prompt 返回按 request ID 关联的 `prompt_result(status="aborted")`, 并确认队列为空且 session settled. 这项可选优化可用正常 cancellation 替代 runtime 退役, 保持进程可复用, 避免 lazy resume 开销及强制终止后的恢复风险; 单独清空队列并不足够.
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存错误 metadata 用于分类结果; uncertain 回复只可能包含经过长度限制和脱敏的 `errorMessage` 摘要, 不会原样转发 metadata.
 
@@ -75,7 +83,9 @@ RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出�
 
 缺失终结信号走独立的保守恢复路径, 绝不当作成功. 活跃 busy 根任务必须至少 30 秒无活动, 且没有 compact/handoff、retry、运行中工具、host request 或原生 UI 等待. 后台 `get_state` 请求超时为 5 秒, 不阻塞 actor 处理控制命令. `isStreaming` 和 `isCompacting` 都必须明确为 `false`; 缺失/null/格式错误字段及请求错误会丢弃确认. 两次确认至少相隔 30 秒. 所有事件 (包括未知或格式错误事件) 和普通 RPC 活动都会使探测失效. 结果按 client 身份、generation、turn、active input 和活动 revision 隔离, 已排队事件优先于探测结果. 确认缺失完成后, 复用原有 uncertain 结果原子事务和进度清理, 再先关闭旧 client, 后派发队列; 保留逻辑 session claim 和排队输入, 按需 resume, 不重放旧任务. 终态、turn 变化、runtime 释放和 shutdown 都会取消待处理 typing 请求, 请求仍有 4 秒超时.
 
-`awaitingContinuation` 记录明确的 `agent_end isTerminal=false`, 阻止 watchdog 探测及恢复. 原生异步工作可合法地连续几分钟不处于 streaming 状态. `agent_start`、任务结算、新根任务派发和 runtime teardown 清除此状态; 无关事件和状态查询不会清除. 在原生未提供 pending async work 信号前, 故意不自动恢复缺失的续接, 避免杀死合法后台工作.
+`awaitingContinuation` 记录明确的 `agent_end isTerminal=false`, 阻止普通 root 的 watchdog 探测. 原生异步工作可合法地连续几分钟不处于 streaming 状态. `agent_start`, 任务结算, 新根任务派发和 runtime teardown 清除此状态; 无关事件和状态查询不会清除. 普通 root 保留这种保守抑制, 不把缺失续接直接视为失败.
+
+steer fence 是普通 `awaitingContinuation` watchdog 抑制的例外. 正在 streaming, compact, 执行工具, 等待原生 UI 或 retry 时不按 idle 恢复. 明确 idle 且 `hasPendingAsyncWork=true` 或 `queuedMessageCount` 大于零时, 从首次确认起给予 5 分钟宽限期, 同类 idle-pending probe 不会重置期限. 活动, 不再符合探测条件, 非 idle 结果或 pending 消失都会清除连续 pending 计时. 到期后再次确认当前仍 idle-pending, 就立即终止旧进程, 将 root 和未决 steer 标为 `uncertain`, 保留 bridge follow-up 且不重放. 这为原生队列卡死提供有限恢复, 但也可能中断完全静默且持续 pending 达 5 分钟的合法异步工作.
 
 Actor 生命周期日志为 `agent_start`、`agent_end`、`prompt_result`、自动 compact 边界及失败请求记录 client、active input、busy、turn 和 generation. Terminal 标记区分 absent/true/false. 仅记录元数据, 不记录原始事件、prompt、输出、provider 诊断或凭据.
 
@@ -181,6 +191,8 @@ Telegram update
 `Accept` 为每个 update 执行一个原子事务. offset 不会先于输入持久化推进, 重复 update 不覆盖原记录.
 
 普通根任务在 OMP 接受 prompt 前, 持久化记录原始 Telegram message ID. 完成要求该输入处于 submitted, 并在同一事务中提交全部最终文本分段、其持久化 reply target 和终态 inbox 状态. 正常终结输出为 `done`; provider/model error 为 `uncertain`; 明确的 OMP abort 为 `cancelled`. 任一步失败整体回滚. `say()` 仍是通知接口, 不用于完成任务. 控制命令的完成状态单独处理. 工具附件可在任务执行期间入队, 不追溯纳入最终文本事务.
+
+steer 输入在发送第一个 RPC byte 之前从 `pending` 转为 `submitted`; `FinishSubmitted` 只允许单行 `submitted` 转入 `done`, `cancelled`, `failed` 或 `uncertain`. steer 不生成最终回复 outbox. 崩溃恢复将未结算 submitted steer 转为 `uncertain`, 绝不重放; OMP session history 仍由 OMP 管理.
 
 收到的消息如果 reply 了另一条 Telegram 消息, bridge 会在调用 `prompt` 前构造只用于输入的独立上下文: 非空 Telegram `quote.text` 优先, 否则只读取一层被回复文字、photo/document metadata 和 caption、caption-only 内容或 unsupported 标记. 完整引用块最多 3000 个 UTF-16 code units, 超限时追加 `...[truncated]`. sender 只标记为 `From: bot` 或 `From: user`. 当前消息位于 `[Current user message]` 下方且不会被截断. Bridge 不递归跟随 `ReplyToMessage`, 不下载或重新导入被回复附件, 也不改变现有输出 `reply_to` target. Queue preview 显示当前用户文字, 不显示这个 synthetic wrapper.
 

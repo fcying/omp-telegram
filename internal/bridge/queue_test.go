@@ -135,9 +135,9 @@ func TestQueueViewerCancelsOnlySelectedPendingTask(t *testing.T) {
 	if active == 0 || !w.busy {
 		t.Fatal("active task did not start")
 	}
-	command("first queued task")
+	command("/followup first queued task")
 	first := w.queue[0].id
-	command("second queued task")
+	command("/followup second queued task")
 	second := w.queue[1].id
 
 	command("/queue")
@@ -186,7 +186,7 @@ func TestQueueCancelReportsTaskAlreadyDispatched(t *testing.T) {
 	queueReady(t, w, command)
 	command("active task")
 	w.dispatch()
-	command("queued task")
+	command("/followup queued task")
 	queuedID := w.queue[0].id
 	command("/queue")
 	menu := latestQueueMenu(t, f)
@@ -302,8 +302,8 @@ func TestQueueCloseAfterCancelCanRetryKeyboardRemoval(t *testing.T) {
 	w.b.cfg.QueueCapacity = 2
 	command("missing-terminal")
 	w.dispatch()
-	command("pending one")
-	command("pending two")
+	command("/followup pending one")
+	command("/followup pending two")
 	command("/queue")
 	menu := latestQueueMenu(t, f)
 	clickQueue(w, 7, menu.messageID, queueCancelData(t, menu, "pending one"))

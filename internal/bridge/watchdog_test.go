@@ -9,11 +9,13 @@ import (
 
 func TestIdleProbeRequiresExplicitFalseState(t *testing.T) {
 	for _, raw := range []string{`{}`, `null`, `{"isStreaming":false}`, `{"isStreaming":null,"isCompacting":false}`, `{"isStreaming":false,"isCompacting":null}`, `{"isStreaming":true,"isCompacting":false}`, `{"isStreaming":false,"isCompacting":true}`, `{"isStreaming":"false","isCompacting":false}`} {
-		if explicitlyIdle([]byte(raw)) {
+		idle, _, _ := rpcIdleState([]byte(raw))
+		if idle {
 			t.Fatalf("unconfirmed state accepted as idle: %s", raw)
 		}
 	}
-	if !explicitlyIdle([]byte(`{"isStreaming":false,"isCompacting":false}`)) {
+	idle, _, _ := rpcIdleState([]byte(`{"isStreaming":false,"isCompacting":false}`))
+	if !idle {
 		t.Fatal("explicit idle state rejected")
 	}
 }
@@ -88,7 +90,7 @@ func TestMissingTerminalRecoveryRetiresClientAndPreservesQueue(t *testing.T) {
 	w.dispatch()
 	drainWatchdogEvents(t, w)
 	active, oldClient, binding, claim := w.active, w.client, w.binding, w.claimedSession
-	command("next task")
+	command("/followup next task")
 	queuedID := w.queue[0].id
 	now := time.Now()
 	w.lastActivity = now.Add(-stuckTaskQuietPeriod)
@@ -146,7 +148,8 @@ func TestNonTerminalAgentEndBlocksMissingCompletionWatchdog(t *testing.T) {
 	drainWatchdogEvents(t, w)
 	active, client := w.active, w.client
 	raw, err := client.Call(w.ctx, "get_state", nil)
-	if err != nil || !explicitlyIdle(raw) {
+	idle, _, _ := rpcIdleState(raw)
+	if err != nil || !idle {
 		t.Fatalf("fixture did not enter native async idle: %v", err)
 	}
 	now := time.Now().Add(5 * time.Minute)
