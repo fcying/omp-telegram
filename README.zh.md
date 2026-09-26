@@ -276,11 +276,13 @@ RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资�
 
 - `off` - 关闭 progress 消息和 typing action.
 - `summary` - 显示 assistant 输出、活动工具名和任务状态.
-- `verbose` - 在同一条可编辑消息中额外显示最近 12 次已完成工具调用的结果状态和耗时.
+- `verbose` - 在同一条可编辑消息中额外显示有界的原始工具参数、阶段更新、最终结果和最近 5 次已完成工具调用的状态.
 
 新任务的 progress 会延迟约三秒, 因此短任务通常只发送最终回复. 活跃任务带有 **Stop** 按钮. 它只中止当前任务; `/stop` 还会清除对话中已经排队的任务, 按钮则让这些任务在取消完成后继续执行.
 
-可编辑状态消息在 `Output` 显示 assistant 文本, 在 `Tools` 显示活动工具. `verbose` 还会在 `Recent tools` 显示最近最多 12 次工具调用的完成状态和耗时, 更早的调用会统计省略数量, 以适应 Telegram 消息长度限制. 不转发工具参数、部分结果、最终结果、reasoning、命令文本、stdout 或 stderr; OMP 原始工具输出可能包含凭据或私人文件. 同一条消息在编辑更新时保留 **Stop** 按钮. 不再单独发送重复 assistant 文本的 Activity 消息. 任务最终回复与实时进度保持独立.
+可编辑状态消息在 `Output` 显示 assistant 文本, 在 `Tools` 显示活动工具. `verbose` 还会显示工具参数和运行时最新的部分更新, 完成后显示最终结果 (没有最终结果时保留最近的部分更新), 并在 `Recent tools` 显示最近最多 5 次已完成工具调用, 更早的调用统计省略数量. 工具数据来自 OMP 的 `args`/`arguments`、`partialResult` 和 `result` JSON 字段, 不转发整条 RPC frame. 每个字段最多显示 100 个 UTF-16 单位, 工具详情总长度也受限; 大块输出不会完整投递. 不转发 reasoning 和无关 RPC 字段. 同一条消息在编辑更新时保留 **Stop** 按钮. 不再单独发送重复 assistant 文本的 Activity 消息. 任务最终回复与实时进度保持独立.
+
+**隐私风险:** `verbose` 中的工具参数和结果可能包含文件路径、命令、源码、stdout、stderr、凭据或私人文件. bridge 在这个显式启用的模式下不会对工具数据脱敏. 群组 topic 中能阅读消息的人即使无权操作 bot, 也能在 progress 可见时看到这些内容; 后续删除无法撤回已被看到或保存的信息. `summary` 不显示工具参数、更新、结果及已完成的工具历史, 但仍会发送 assistant 输出和活动工具名; `off` 关闭实时 progress, 但不关闭最终回复.
 
 新数据库使用 schema 13, 不创建 Activity 表. 现有 schema 11 和 12 数据库自动升级到 13; 迁移会删除短暂开发版的 `activity_messages` 表, 即使表中仍有记录. 其他表和 session 数据保持不变, 但仅由这些记录标识的旧 Activity 消息之后无法自动删除.
 

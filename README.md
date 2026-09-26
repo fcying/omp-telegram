@@ -276,11 +276,13 @@ Supported values:
 
 - `off` disables progress messages and typing actions.
 - `summary` shows assistant output, active tool names, and task state.
-- `verbose` adds the 12 most recent completed tool calls, their outcomes, and elapsed times to the same editable message.
+- `verbose` adds bounded raw tool arguments, intermediate updates, final results, and the 5 most recent completed tool outcomes to the same editable message.
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
-The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows up to 12 completed tool calls under `Recent tools`, counting earlier calls as omitted to fit Telegram's message limit. Tool arguments, partial results, final results, reasoning, commands, stdout, and stderr are not forwarded; OMP's raw tool output can contain credentials or private files. The same message retains its **Stop** button through edits. No separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
+The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows tool arguments and the latest partial update while a tool runs, then its final result (or last partial update if no result arrived) and up to 5 completed tool calls under `Recent tools`. Earlier calls are counted as omitted. Tool data is taken from OMP's `args`/`arguments`, `partialResult`, and `result` fields as JSON, not whole RPC frames. Each field is truncated to 100 UTF-16 units and total tool-detail text is bounded; large output is not delivered in full. Reasoning and unrelated RPC fields are not forwarded. The same message retains its **Stop** button through edits. No separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
+
+**Privacy:** `verbose` can expose file paths, commands, source text, stdout, stderr, credentials, or private files contained in tool arguments and results. The bridge does not redact tool data in this opt-in mode. Anyone who can read a group topic can see progress while it is visible, even without permission to command the bot; later deletion cannot retract what readers saw or saved. Use `summary` to omit tool arguments, updates, results, and completed-tool history, or `off` to suppress live progress; `summary` still sends assistant output and active tool names, and `off` does not suppress the final reply.
 
 New databases use schema 13 without an Activity table. Existing schema 11 and 12 databases upgrade automatically to 13; the migration drops the short-lived development `activity_messages` table even if it contains records. Other tables and session data remain intact, but old Activity messages represented only by those records can no longer be deleted automatically.
 

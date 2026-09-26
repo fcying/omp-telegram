@@ -1713,10 +1713,11 @@ func TestTailUTF16(t *testing.T) {
 func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
 	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "off"}}), taskState: taskState{busy: true}})
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"checking bridge"}}`))
-	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read","args":{"path":"private"}}`))
+	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"read-1","partialResult":"private output"}`))
 	w.flushPreview()
 	w.typing()
-	if w.preview != "checking bridge" || len(w.progress.ActiveTools) != 1 {
+	if w.preview != "checking bridge" || len(w.progress.ActiveTools) != 1 || w.progress.ActiveTools["read-1"].Args != "" || w.progress.ActiveTools["read-1"].Detail != "" {
 		t.Fatal("off mode stopped internal progress tracking")
 	}
 	if w.previewBusy || w.previewID != 0 || w.lastPreview != "" {
@@ -1736,7 +1737,8 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 	if got := w.progressStatus(); got != "Running tools..." {
 		t.Fatalf("concurrent tool status = %q", got)
 	}
-	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"read-1"}`))
+	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"read-1","partialResult":"SECRET partial"}`))
+	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"read-1","result":"SECRET final"}`))
 	if len(w.progress.ActiveTools) != 1 || w.progress.ActiveTools["bash-1"].Name != "bash" {
 		t.Fatal("ending one tool removed a concurrent tool")
 	}
@@ -1749,7 +1751,7 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 	if len(w.progress.RecentTools) != 0 || w.progress.EarlierTools != 0 {
 		t.Fatalf("summary recorded completed tools: %+v", w.progress)
 	}
-	for _, hidden := range []string{"Recent tools:", "read: completed", "PRIVATE", "SECRET path", "SECRET result", "toolCallId"} {
+	for _, hidden := range []string{"Recent tools:", "read: completed", "PRIVATE", "SECRET path", "SECRET partial", "SECRET final", "toolCallId"} {
 		if strings.Contains(progress, hidden) {
 			t.Fatalf("summary progress leaked %q: %q", hidden, progress)
 		}
@@ -1757,12 +1759,12 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 	w.b.cfg.ProgressMode = "verbose"
 	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"bash-1","isError":true,"result":"SECRET result"}`))
 	verbose := w.renderProgress()
-	for _, want := range []string{"Status: Running\n\nRecent tools:\n- bash: failed (", "Output:\nchecking bridge"} {
+	for _, want := range []string{"Status: Running\n\nRecent tools:\n- bash: failed (", "Result: `\"SECRET result\"`", "Output:\nchecking bridge"} {
 		if !strings.Contains(verbose, want) {
 			t.Fatalf("verbose progress missing %q: %q", want, verbose)
 		}
 	}
-	for _, hidden := range []string{"read: completed", "SECRET result", "PRIVATE"} {
+	for _, hidden := range []string{"read: completed", "PRIVATE"} {
 		if strings.Contains(verbose, hidden) {
 			t.Fatalf("verbose progress leaked %q: %q", hidden, verbose)
 		}
@@ -1770,6 +1772,50 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 	w.b.cfg.ProgressMode = "summary"
 	if got := w.renderProgress(); strings.Contains(got, "Recent tools:") || strings.Contains(got, "bash: failed") || !strings.Contains(got, "Status: Running\n\nOutput:") {
 		t.Fatalf("summary showed verbose tool history: %q", got)
+	}
+}
+
+func TestVerboseToolDetailsStayWithCallAndTruncate(t *testing.T) {
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), taskState: taskState{active: 10, busy: true}})
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read","args":{"path":"a.txt"}}`))
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"bash-1","toolName":"bash","args":{"command":"echo hello"}}`))
+	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"read-1","partialResult":"reading first"}`))
+	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"bash-1","partialResult":"running second"}`))
+	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"unknown","partialResult":"unrelated"}`))
+	progress := w.renderProgress()
+	for _, want := range []string{"- bash: running\n  Args: `{\"command\":\"echo hello\"}`\n  Update: `\"running second\"`", "- read: running\n  Args: `{\"path\":\"a.txt\"}`\n  Update: `\"reading first\"`"} {
+		if !strings.Contains(progress, want) {
+			t.Fatalf("concurrent tool detail missing %q: %q", want, progress)
+		}
+	}
+	if strings.Contains(progress, "unrelated") {
+		t.Fatalf("unknown tool update became visible: %q", progress)
+	}
+	w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":"read-1","result":%q}`, strings.Repeat("😀", 200))))
+	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"bash-1"}`))
+	progress = w.renderProgress()
+	for _, want := range []string{"- read: completed (", "Result: `\"😀", "…", "- bash: completed (", "Update: `\"running second\"`"} {
+		if !strings.Contains(progress, want) {
+			t.Fatalf("completed tool detail missing %q: %q", want, progress)
+		}
+	}
+	if strings.Contains(progress, "reading first") || utf16Length(progress) > maxProgressUnits {
+		t.Fatalf("stale or unbounded tool detail: %q", progress)
+	}
+}
+
+func TestVerboseToolPayloadRendersLiterally(t *testing.T) {
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), taskState: taskState{active: 10, busy: true}})
+	w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":"bash-1","toolName":"bash","args":{"command":%q}}`, "echo **secret** `tick` <tag>")))
+	w.event([]byte("{\"type\":\"tool_execution_update\",\"toolCallId\":\"bash-1\",\"partialResult\":{\n\"content\":\"**secret** <tag>\"}}"))
+	got := telegram.ConvertMarkdown(w.renderProgress())
+	for _, want := range []string{"<code>{\"command\":\"echo **secret** `tick` &lt;tag&gt;\"}</code>", "<pre>{\n\"content\":\"**secret** &lt;tag&gt;\"}</pre>"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("raw tool data changed by Telegram formatting: missing %q in %q", want, got)
+		}
+	}
+	if strings.Contains(got, "<b>secret</b>") || strings.Contains(got, "<i>secret</i>") {
+		t.Fatalf("tool data was interpreted as Markdown: %q", got)
 	}
 }
 
@@ -1854,9 +1900,12 @@ func TestAgentStartPreservesRetryState(t *testing.T) {
 }
 
 func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
-	w := testWorker(t, &worker{taskState: taskState{active: 0, busy: true}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), taskState: taskState{active: 10, busy: true}})
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"telegram_send"}`))
-	w.event([]byte(`{"type":"host_tool_call","id":"host-1","toolCallId":"tool-1","toolName":"telegram_send"}`))
+	w.event([]byte(`{"type":"host_tool_call","id":"host-1","toolCallId":"tool-1","toolName":"telegram_send","arguments":{"path":"out.png"}}`))
+	if progress := w.renderProgress(); !strings.Contains(progress, `{"path":"out.png"}`) || !strings.Contains(progress, "Args: `") {
+		t.Fatalf("host tool arguments missing from active progress: %q", progress)
+	}
 	w.event([]byte(`{"type":"host_tool_cancel","targetId":"host-1"}`))
 	if _, ok := w.progress.ActiveTools["tool-1"]; !ok {
 		t.Fatal("host tool event ended progress before tool_execution_end")
@@ -1864,6 +1913,9 @@ func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
 	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"tool-1"}`))
 	if len(w.progress.ActiveTools) != 0 {
 		t.Fatal("tool_execution_end did not clear active host tool")
+	}
+	if progress := w.renderProgress(); !strings.Contains(progress, `{"path":"out.png"}`) || !strings.Contains(progress, "telegram_send: completed") {
+		t.Fatalf("host tool arguments missing from completed progress: %q", progress)
 	}
 }
 
@@ -1879,22 +1931,32 @@ func TestProgressStatusPriorityAndBounds(t *testing.T) {
 	if !strings.Contains(progress, "Status: Retrying automatically...") || len(utf16.Encode([]rune(progress))) > maxProgressUnits {
 		t.Fatalf("retry priority or progress bound failed: %d UTF-16 units", len(utf16.Encode([]rune(progress))))
 	}
-	for i := range maxRecentTools + 2 {
+	for i := range 7 {
 		id := fmt.Sprintf("tool-%d", i)
-		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":%q,"toolName":%q}`, id, id)))
-		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"isError":%t,"result":{"content":[{"type":"text","text":"PRIVATE RESULT"}]}}`, id, i == maxRecentTools+1)))
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":%q,"toolName":%q,"args":{"path":%q}}`, id, id, fmt.Sprintf("private-%d", i))))
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"isError":%t,"result":{"content":[{"type":"text","text":"PRIVATE RESULT"}]}}`, id, i == 6)))
 	}
+	w.startProgressTool("stuck", "long-running")
 	progress = w.renderProgress()
-	for _, want := range []string{"2 earlier omitted", "tool-2: completed", "tool-13: failed"} {
+	for _, want := range []string{"Tools:\n- long-running: running", "2 earlier omitted", "tool-2: completed", "tool-3: completed", "tool-4: completed", "tool-5: completed", "tool-6: failed", `{"path":"private-6"}`, "PRIVATE RESULT"} {
 		if !strings.Contains(progress, want) {
 			t.Fatalf("tool history missing %q: %q", want, progress)
 		}
 	}
-	if strings.Index(progress, "tool-2: completed") >= strings.Index(progress, "tool-13: failed") {
+	if strings.Index(progress, "tool-2: completed") >= strings.Index(progress, "tool-6: failed") {
 		t.Fatalf("recent tool history reordered: %q", progress)
 	}
-	if strings.Contains(progress, "tool-1: completed") || strings.Contains(progress, "PRIVATE RESULT") || utf16Length(progress) > maxProgressUnits {
+	if strings.Contains(progress, "tool-1: completed") || strings.Count(progress, ": completed (") != 4 || utf16Length(progress) > maxProgressUnits {
 		t.Fatalf("unbounded or sensitive tool history: %q", progress)
+	}
+	for i := range maxActiveTools {
+		id := fmt.Sprintf("heavy-%d", i)
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":%q,"toolName":%q,"args":{"command":%q}}`, id, id, strings.Repeat("`", 120))))
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_update","toolCallId":%q,"partialResult":%q}`, id, strings.Repeat("`", 120))))
+	}
+	progress = w.renderProgress()
+	if utf16Length(progress) > maxProgressUnits || !strings.Contains(progress, "Output:") {
+		t.Fatalf("literal tool payloads displaced the assistant output or exceeded Telegram budget: %d UTF-16 units", utf16Length(progress))
 	}
 }
 

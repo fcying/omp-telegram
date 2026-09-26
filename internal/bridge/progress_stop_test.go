@@ -169,7 +169,29 @@ func TestToolHistoryEditsProgressWithSameStopButton(t *testing.T) {
 	if !strings.HasPrefix(stop, "stop-7-") {
 		t.Fatalf("initial Stop callback = %q", stop)
 	}
+	f.mu.Lock()
+	initialText, _ := f.messages[before]["text"].(string)
+	f.mu.Unlock()
+	if !strings.Contains(initialText, `Args: <code>{"path":"SECRET path"}</code>`) {
+		t.Fatalf("initial progress omitted tool arguments: %q", initialText)
+	}
 	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"read-1","partialResult":{"content":[{"type":"text","text":"SECRET partial"}]}}`))
+	w.flushPreview()
+	select {
+	case result := <-w.previewResult:
+		if result.err != nil || result.id != initial.id || result.created {
+			t.Fatalf("partial progress edit failed: %+v", result)
+		}
+		w.previewFinished(result)
+	case <-time.After(5 * time.Second):
+		t.Fatal("partial tool update did not edit progress")
+	}
+	f.mu.Lock()
+	partialText, _ := f.messages[before+1]["text"].(string)
+	f.mu.Unlock()
+	if !strings.Contains(partialText, "Update: <code>") || !strings.Contains(partialText, "SECRET partial") || strings.Contains(partialText, "SECRET result") || f.button(before+1) != stop {
+		t.Fatalf("partial progress lost tool update or Stop callback: %q", partialText)
+	}
 	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"read-1","toolName":"read","result":{"content":[{"type":"text","text":"SECRET result"}]}}`))
 	w.flushPreview()
 	select {
@@ -182,18 +204,18 @@ func TestToolHistoryEditsProgressWithSameStopButton(t *testing.T) {
 		t.Fatal("tool completion did not edit progress")
 	}
 	f.mu.Lock()
-	if len(f.messages) != before+2 {
+	if len(f.messages) != before+3 {
 		f.mu.Unlock()
 		t.Fatalf("tool activity created another message: %d new requests", f.messageCount()-before)
 	}
-	edit := f.messages[before+1]
+	edit := f.messages[before+2]
 	text, _ := edit["text"].(string)
 	messageID := edit["message_id"]
 	f.mu.Unlock()
-	if messageID != float64(initial.id) || !strings.Contains(text, "Status: Running") || !strings.Contains(text, "Recent tools:\n- read: completed (") || !strings.Contains(text, "Output:\nChecking source") || strings.Contains(text, "SECRET") {
-		t.Fatalf("edited verbose progress is missing details or leaked result: id=%v, text=%q", messageID, text)
+	if messageID != float64(initial.id) || !strings.Contains(text, "Status: Running") || !strings.Contains(text, "Recent tools:\n- read: completed (") || !strings.Contains(text, `Args: <code>{"path":"SECRET path"}</code>`) || !strings.Contains(text, "Result: <code>") || !strings.Contains(text, "SECRET result") || strings.Contains(text, "SECRET partial") || !strings.Contains(text, "Output:\nChecking source") {
+		t.Fatalf("edited verbose progress is missing tool results: id=%v, text=%q", messageID, text)
 	}
-	if got := f.button(before + 1); got != stop {
+	if got := f.button(before + 2); got != stop {
 		t.Fatalf("progress edit replaced Stop callback: %q", got)
 	}
 }

@@ -108,9 +108,9 @@ RPC lifecycle 以 `event=rpc_lifecycle` 记录, `rpc_event` 只能取白名单�
 
 Bot ID 仍用于内部会话身份和数据库校验, 但每个 daemon 只服务一个 bot, 因此日志中不重复记录. Chat 和 thread ID 不是凭据, 但可以关联具体对话; 应限制日志访问权限, 公开日志前将其替换为一致的占位符.
 
-实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 的可编辑状态视图显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 在同一条消息中额外显示最近的工具完成记录, 不发送第二条 Activity 消息. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 修正匹配的活跃工具名. 不渲染 reasoning、原始 frame、工具参数/结果、命令文本、stdout 或 stderr. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 只对该活跃根任务发送原生 `abort`; 不同于 `/stop`, 保留 bridge 延后 prompt, 在取消完成后按顺序调度; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
+实时进度是内存中的尽力而为视图, 复用现有的一条消息 preview 通道. `telegram.progress_mode=off` 抑制 Telegram Send/Edit 和 typing, 仍持续处理 text delta 以支持最终结果 fallback. `summary` 的可编辑状态视图显示 assistant 输出、以 tool call ID 标识的活动工具名和状态; `verbose` 在同一条消息中额外显示有界的原始工具参数、部分更新、最终结果和最近的工具完成记录, 不发送第二条 Activity 消息. retry、compaction 和并发工具均来自明确事件. 包括 host tool 在内, `tool_execution_end` 是唯一 completion source; host callback 修正匹配的活跃工具名, 也可能补充参数. 不渲染 reasoning 和整条 RPC frame; 命令文本、stdout 和 stderr 可能出现在 verbose 工具数据中. 每个活跃根任务 progress 带有 Stop 按钮, 由 owner、worker generation、活跃 inbox ID 和 turn 共同约束. 合法点击消费并移除按钮, 只对该活跃根任务发送原生 `abort`; 不同于 `/stop`, 保留 bridge 延后 prompt, 在取消完成后按顺序调度; stale 按钮只移除, 不 abort. 程序任务结算、worker replacement 和 shutdown 均通过有界清理队列使按钮失效. 初次 Send 失败会抑制该 turn 的 progress 以避免重复消息; Edit 失败可继续重试. progress 尽可能回复根输入; Telegram 拒绝 reply 时退化为普通消息, 不改变任务状态.
 
-assistant text delta 更新可编辑 preview 的 `Output`; 已完成的 assistant 文本仍可用于持久化最终回复. 仅 `verbose` 在当前根任务的内存中保留最近 12 次已完成工具调用的工具名、结果状态 (`completed` 或 `failed`) 和四舍五入后的耗时, 更早的调用只统计数量. 只有匹配的 `tool_execution_end` 才记录结果; 忽略部分工具更新及原始结果. 工具历史复用已有单条 preview 及其 Stop 按钮, 不发送第二条 Activity 消息. preview 和持久化最终回复继续独立投递、清理.
+assistant text delta 更新可编辑 preview 的 `Output`; 已完成的 assistant 文本仍可用于持久化最终回复. 仅 `verbose` 在活动工具中保留最多 100 个 UTF-16 单位的原始 JSON 参数以及最新的部分更新或最终结果. 最近 5 次已完成工具调用保留这些有界字段、结果状态 (`completed` 或 `failed`) 和四舍五入后的耗时, 更早的调用只统计数量. 工具详情还有总长度预算; 活动工具独立显示, 仍可识别正在运行的工具. 只有匹配的 `tool_execution_end` 才记录完成状态; 部分更新仅改变活动工具的预览. 工具历史复用已有单条 preview 及其 Stop 按钮, 不发送第二条 Activity 消息. `verbose` 不对工具数据脱敏, 可能向 topic 所有读者暴露凭据或私人文件. preview 和持久化最终回复继续独立投递、清理.
 
 开发版 schema 12 曾持久化旧 Activity 消息 ID. 迁移至 schema 13 时, 这些 ID 随表一起删除; Telegram 中仍存在的旧 Activity 消息之后无法自动清理. 旧版发送已被接受但无法取得消息 ID 时同样无法自动清理.
 
@@ -377,7 +377,7 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 - Linux RPC/ACP 启动使用父死亡 SIGTERM. Linux 将此信号关联到创建子进程的 OS 线程, 因此线程锁定到 `Wait` 完成, 每个存活原生子进程占一个锁定线程.
 - 父死亡信号不是整个进程树 containment. 忽略信号, 后代残留, 脱离进程组或清除父死亡设置的程序, 仍需要部署层边界. 项目不强制 systemd/supervisor 配置.
 - 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `storage.data_dir/attachments/outbox/` 私有快照后入队. outbox state 持久化为任意终态后 best-effort 删除快照, 包括交付失败; workspace 源文件保持不变.
-- Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
+- Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不记录整条 RPC frame、provider header 或 system prompt, 也不把它们作为状态字段. `verbose` 显式允许有界的工具参数/结果数据: bridge 不记录或持久化它们, 但其中可能包含对 topic 读者可见的凭据及其他私人内容.
 
 以下是两种互斥配置, 不能在同一个 TOML 文件中重复定义该 table:
 

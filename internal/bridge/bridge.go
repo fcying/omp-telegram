@@ -303,8 +303,10 @@ type previewResult struct {
 
 const (
 	maxActiveTools       = 6
-	maxRecentTools       = 12
+	maxRecentTools       = 5
 	maxToolNameUnits     = 64
+	maxToolDetailUnits   = 100
+	maxToolDetailsUnits  = 1600
 	maxPreviewUnits      = 2200
 	maxProgressUnits     = 3500
 	progressInitialDelay = 3 * time.Second
@@ -321,15 +323,21 @@ type progressState struct {
 }
 
 type progressTool struct {
-	ID        string
-	Name      string
-	StartedAt time.Time
+	ID         string
+	Name       string
+	Args       string
+	Detail     string
+	DetailKind string
+	StartedAt  time.Time
 }
 
 type progressToolResult struct {
-	Name     string
-	Duration time.Duration
-	Failed   bool
+	Name       string
+	Args       string
+	Detail     string
+	DetailKind string
+	Duration   time.Duration
+	Failed     bool
 }
 
 type operationResult struct {
@@ -2966,6 +2974,7 @@ func (w *worker) event(raw []byte) {
 	switch e.Type {
 	case "host_tool_call":
 		w.renameProgressTool(e.ToolCallID, e.ToolName)
+		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 		w.hostSend(e)
 	case "host_tool_cancel":
 		if cancel, ok := w.hostRequests[e.TargetID]; ok {
@@ -2974,7 +2983,11 @@ func (w *worker) event(raw []byte) {
 		}
 	case "tool_execution_start":
 		w.startProgressTool(e.ToolCallID, e.ToolName)
+		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
+	case "tool_execution_update":
+		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 	case "tool_execution_end":
+		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 		w.endProgressTool(e.ToolCallID, e.IsError)
 	case "message_update":
 		if e.AssistantMessageEvent.Type == "text_delta" {
@@ -3121,6 +3134,63 @@ func (w *worker) startProgressTool(id, name string) {
 	w.progress.ActiveTools[id] = progressTool{ID: id, Name: clipUTF16(name, maxToolNameUnits), StartedAt: time.Now()}
 }
 
+func progressToolPayload(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	units, cut := 0, 0
+	for i, r := range string(raw) {
+		units += utf16.RuneLen(r)
+		if units > maxToolDetailUnits {
+			return string(raw[:cut]) + "…"
+		}
+		if units < maxToolDetailUnits {
+			cut = i + utf8.RuneLen(r)
+		}
+	}
+	return string(raw)
+}
+
+func (w *worker) recordProgressToolPayload(id, eventType string, raw []byte) {
+	if w.b == nil || w.b.cfg.ProgressMode != "verbose" {
+		return
+	}
+	tool, ok := w.progress.ActiveTools[id]
+	if !ok {
+		return
+	}
+	var payload struct {
+		Args          json.RawMessage `json:"args"`
+		Arguments     json.RawMessage `json:"arguments"`
+		PartialResult json.RawMessage `json:"partialResult"`
+		Result        json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return
+	}
+	switch eventType {
+	case "tool_execution_start", "host_tool_call":
+		args := payload.Args
+		if len(args) == 0 {
+			args = payload.Arguments
+		}
+		if len(args) != 0 {
+			tool.Args = progressToolPayload(args)
+		}
+	case "tool_execution_update":
+		if len(payload.PartialResult) != 0 {
+			tool.Detail = progressToolPayload(payload.PartialResult)
+			tool.DetailKind = "Update"
+		}
+	case "tool_execution_end":
+		if len(payload.Result) != 0 {
+			tool.Detail = progressToolPayload(payload.Result)
+			tool.DetailKind = "Result"
+		}
+	}
+	w.progress.ActiveTools[id] = tool
+}
+
 func (w *worker) renameProgressTool(id, name string) bool {
 	if id == "" || name == "" {
 		return false
@@ -3143,7 +3213,7 @@ func (w *worker) endProgressTool(id string, failed bool) {
 	if w.b == nil || w.b.cfg.ProgressMode != "verbose" {
 		return
 	}
-	result := progressToolResult{Name: tool.Name, Duration: time.Since(tool.StartedAt).Round(time.Second), Failed: failed}
+	result := progressToolResult{Name: tool.Name, Args: tool.Args, Detail: tool.Detail, DetailKind: tool.DetailKind, Duration: time.Since(tool.StartedAt).Round(time.Second), Failed: failed}
 	if len(w.progress.RecentTools) < maxRecentTools {
 		w.progress.RecentTools = append(w.progress.RecentTools, result)
 		return
@@ -3187,6 +3257,36 @@ func (w *worker) progressStatus() string {
 	}
 }
 
+func progressToolLiteral(detail string) string {
+	marker := "`"
+	multiline := strings.ContainsRune(detail, '\n')
+	if multiline {
+		marker = "```"
+	}
+	for strings.Contains(detail, marker) {
+		marker += "`"
+	}
+	if multiline {
+		return "\n" + marker + "\n" + detail + "\n" + marker
+	}
+	return marker + detail + marker
+}
+
+func appendProgressToolDetail(lines []string, label, detail string, budget *int) []string {
+	if detail == "" || *budget == 0 {
+		return lines
+	}
+	limit := min(*budget, maxToolDetailUnits)
+	visible := clipUTF16(detail, limit)
+	line := "  " + label + ": " + progressToolLiteral(visible)
+	cost := utf16Length(line) + 1
+	if cost > *budget {
+		return lines
+	}
+	*budget -= cost
+	return append(lines, line)
+}
+
 func (w *worker) renderProgress() string {
 	if !w.taskRunning() {
 		return ""
@@ -3195,6 +3295,8 @@ func (w *worker) renderProgress() string {
 	if status := w.progressStatus(); status != "" {
 		sections = append(sections, "Status: "+status)
 	}
+	verbose := w.b != nil && w.b.cfg.ProgressMode == "verbose"
+	detailBudget := maxToolDetailsUnits
 	active := sortedProgressTools(w.progress.ActiveTools)
 	if len(active) > 0 {
 		lines := []string{"Tools:"}
@@ -3204,10 +3306,14 @@ func (w *worker) renderProgress() string {
 				break
 			}
 			lines = append(lines, progressToolLine(tool))
+			if verbose {
+				lines = appendProgressToolDetail(lines, "Args", tool.Args, &detailBudget)
+				lines = appendProgressToolDetail(lines, tool.DetailKind, tool.Detail, &detailBudget)
+			}
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
-	if w.b != nil && w.b.cfg.ProgressMode == "verbose" && len(w.progress.RecentTools) > 0 {
+	if verbose && len(w.progress.RecentTools) > 0 {
 		lines := []string{"Recent tools:"}
 		if w.progress.EarlierTools > 0 {
 			lines = append(lines, fmt.Sprintf("- %d earlier omitted", w.progress.EarlierTools))
@@ -3219,6 +3325,8 @@ func (w *worker) renderProgress() string {
 				status = "failed"
 			}
 			lines = append(lines, fmt.Sprintf("- %s: %s (%s)", tool.Name, status, tool.Duration))
+			lines = appendProgressToolDetail(lines, "Args", tool.Args, &detailBudget)
+			lines = appendProgressToolDetail(lines, tool.DetailKind, tool.Detail, &detailBudget)
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}

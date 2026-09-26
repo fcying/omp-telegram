@@ -13,8 +13,9 @@ allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 #
 # off: Disable live progress and typing actions.
 # summary: Show task Status, active Tools, and assistant Output.
-# verbose: Add recent completed tools to the same editable message.
-# Raw thinking/reasoning and unfiltered tool arguments are never sent.
+# verbose: Add bounded raw tool arguments, updates, results, and recent completed calls.
+# Tool data may contain secrets visible to anyone reading the topic.
+# Thinking/reasoning and whole RPC frames are never sent.
 # Unset, empty, or invalid values fall back to summary.
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
