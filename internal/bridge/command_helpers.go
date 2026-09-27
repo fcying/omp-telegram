@@ -45,8 +45,11 @@ func knownBridgeCommand(command string) bool {
 	return false
 }
 
-func commandHelp() string {
+func commandHelp(version string) string {
 	var help strings.Builder
+	help.WriteString("omp-telegram ")
+	help.WriteString(version)
+	help.WriteString("\n\n")
 	for i, command := range botCommands {
 		if i > 0 {
 			help.WriteByte('\n')

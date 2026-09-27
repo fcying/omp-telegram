@@ -265,7 +265,7 @@ func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
 				done := make(chan error, 1)
 				go func() {
 					defer close(done)
-					done <- Run(ctx, config.Config{Token: "fake"}, db, logs)
+					done <- Run(ctx, config.Config{Token: "fake"}, db, logs, testAppVersion)
 				}()
 				defer func() {
 					cancel()
