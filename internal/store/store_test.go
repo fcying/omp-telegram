@@ -1365,6 +1365,65 @@ func TestPinnedSessionsAreScopedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestDeletePinnedSessionClearsAllScopesWithoutChangingBindings(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/one", Session: "/sessions/abcd-session.jsonl", SessionID: "abcd-session", Generation: 1}
+	second := Binding{Bot: 1, Chat: 4, Thread: 5, Workspace: "/two", Session: "/sessions/other-session.jsonl", SessionID: "other-session", Generation: 2}
+	requireStoreOK(t, s.Save(first))
+	requireStoreOK(t, s.Save(second))
+	for _, scope := range []struct {
+		bot, chat, thread int64
+		workspace         string
+	}{
+		{1, 2, 3, "/one"},
+		{1, 2, 3, "/two"},
+		{1, 4, 5, "/one"},
+		{2, 2, 3, "/one"},
+	} {
+		requireStoreOK(t, s.SetPinnedSession(scope.bot, scope.chat, scope.thread, scope.workspace, "abcd-session", true))
+	}
+	// Old rows may retain mixed case even though current pin writes normalize IDs.
+	_, err := s.DB.Exec("INSERT INTO session_favorites(bot,chat,thread,workspace,session_id) VALUES(?,?,?,?,?)", 1, 4, 5, "/two", "ABCD-SESSION")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/one", "other-session", true))
+	requireStoreOK(t, s.SetPinnedSession(2, 2, 3, "/one", "other-session", true))
+	if err := s.DeletePinnedSession(1, "AbCd-SeSsIoN"); err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range []struct {
+		bot, chat, thread int64
+		workspace         string
+		want              map[string]struct{}
+	}{
+		{1, 2, 3, "/one", map[string]struct{}{"other-session": {}}},
+		{1, 2, 3, "/two", map[string]struct{}{}},
+		{1, 4, 5, "/one", map[string]struct{}{}},
+		{1, 4, 5, "/two", map[string]struct{}{}},
+		{2, 2, 3, "/one", map[string]struct{}{"abcd-session": {}, "other-session": {}}},
+	} {
+		got, err := s.PinnedSessions(scope.bot, scope.chat, scope.thread, scope.workspace)
+		requireStoreOK(t, err)
+		if len(got) != len(scope.want) {
+			t.Fatalf("pins in scope %+v = %+v", scope, got)
+		}
+		for id := range scope.want {
+			if _, ok := got[id]; !ok {
+				t.Fatalf("pins in scope %+v = %+v", scope, got)
+			}
+		}
+	}
+	for _, original := range []Binding{first, second} {
+		got, err := s.Binding(original.Bot, original.Chat, original.Thread)
+		requireStoreOK(t, err)
+		if got != original {
+			t.Fatalf("binding changed from %+v to %+v", original, got)
+		}
+	}
+	if err := s.DeletePinnedSession(1, ""); err == nil {
+		t.Fatal("empty session ID accepted")
+	}
+}
+
 func TestPinnedSessionGenerationFence(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/one", Generation: 1}

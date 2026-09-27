@@ -47,6 +47,14 @@ type exportResult struct {
 	file                             media.File
 	err                              error
 }
+type sessionDeleteResult struct {
+	request    uint64
+	generation int64
+	epoch      uint64
+	user       int64
+	sessionID  string
+	err        error
+}
 
 func sameWorkspace(left, right string) bool {
 	a, err := filepath.EvalSymlinks(left)
@@ -84,7 +92,7 @@ func (w *worker) cancelResumeList() {
 	}
 	w.cancelExport()
 	for token, c := range w.confirms {
-		if c.action == "resume" || c.action == "export" {
+		if c.action == "resume" || c.action == "export" || c.action == "session_delete" {
 			w.dropConfirmation(token, c)
 		}
 	}
@@ -101,7 +109,7 @@ func (w *worker) persistedExportBindingMatches(result exportResult) bool {
 }
 
 func (w *worker) resumeBusy() bool {
-	return w.taskOrSessionBusy() || w.compacting || len(w.queue) != 0 || w.exportCancel != nil
+	return w.taskOrSessionBusy() || w.compacting || len(w.queue) != 0 || w.exportCancel != nil || w.deleteCancel != nil
 }
 
 func (w *worker) requestResumeList(user int64) {
@@ -179,7 +187,7 @@ func exportWorkspace(workspace string) (string, error) {
 	return cwd, nil
 }
 func (w *worker) requestSessionList(user int64, action, format string) {
-	if action != "export" && w.resumeBusy() {
+	if w.deleteCancel != nil || action != "export" && action != "delete_refresh" && w.resumeBusy() {
 		w.say("Wait for the current task and queue to finish before selecting a session.")
 		return
 	}
@@ -252,7 +260,7 @@ func (w *worker) acceptSessionList(result resumeListResult) bool {
 		}
 		return false
 	}
-	if result.action != "export" && w.resumeBusy() {
+	if result.action != "export" && result.action != "delete_refresh" && w.resumeBusy() {
 		w.say("The conversation became busy. Use /resume again when it is idle.")
 		return false
 	}
@@ -340,7 +348,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 		return
 	}
 	w.initResumePicker()
-	if w.exportCancel != nil || w.exportingSession != "" {
+	if w.exportCancel != nil || w.exportingSession != "" || w.deleteCancel != nil {
 		w.say("The omp session operation is still loading.")
 		return
 	}
@@ -560,6 +568,9 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 				pinLabel = "Unpin"
 			}
 			row = append(row, add(pinLabel, resumePickerOption{session: sessionIndex, action: "toggle_pin"}))
+			deleteButton := add("Delete", resumePickerOption{session: sessionIndex, action: "delete"})
+			deleteButton.Style = "danger"
+			row = append(row, deleteButton)
 		}
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
 	}
@@ -626,6 +637,9 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 	case "toggle_pin":
 		w.togglePinnedSession(c, option.session, messageID)
 		return
+	case "delete":
+		w.confirmSessionDelete(c, option.session, messageID)
+		return
 	case "select":
 	default:
 		w.clearKeyboard(messageID)
@@ -662,15 +676,10 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		w.say("This session is active in another conversation. Close that instance first.")
 		return
 	}
-	w.startFenced(true, selected.ID, c.workspace, true, c.generation)
+	w.startFenced(true, selected.ID, c.workspace, true, c.generation, c.epoch)
 }
 
 func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID int64) {
-	if c.epoch != w.b.bindingsEpoch.Load() || !w.persistedBindingGenerationMatches(c.generation) {
-		w.clearKeyboard(messageID)
-		w.say("The saved binding changed. Use /resume again.")
-		return
-	}
 	if sessionIndex < 0 || sessionIndex >= len(c.sessions) {
 		w.clearKeyboard(messageID)
 		return
@@ -686,8 +695,16 @@ func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID
 		w.say("omp returned an unsupported session ID.")
 		return
 	}
+	w.b.sessionMu.Lock()
+	if c.epoch != w.b.bindingsEpoch.Load() || !w.persistedBindingGenerationMatches(c.generation) {
+		w.b.sessionMu.Unlock()
+		w.clearKeyboard(messageID)
+		w.say("The saved binding changed. Use /resume again.")
+		return
+	}
 	pinned := sessionIsPinned(selected, c.pinnedSessions)
 	changed, err := w.b.db.SetPinnedSessionIfGeneration(w.b.bot.ID, w.key.chat, w.key.thread, c.generation, c.workspace, selected.ID, !pinned)
+	w.b.sessionMu.Unlock()
 	if err != nil {
 		w.clearKeyboard(messageID)
 		w.say("Failed to update pinned sessions.")

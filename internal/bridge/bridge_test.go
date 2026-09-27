@@ -229,6 +229,11 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
+		if marker := os.Getenv("OMP_TELEGRAM_FIXTURE_RPC_START_MARKER"); marker != "" {
+			if err := os.WriteFile(marker, []byte("started"), 0600); err != nil {
+				os.Exit(2)
+			}
+		}
 		out := json.NewEncoder(os.Stdout)
 		var emitMu sync.Mutex
 		emit := func(v any) {
@@ -465,6 +470,26 @@ func TestMain(m *testing.M) {
 					}
 					emit(map[string]any{"type": "command_output", "text": fmt.Sprintf("Session: %s\nTitle: fixture\nCWD: %s", sessionID, cwd)})
 					resp["data"] = map[string]any{"agentInvoked": false}
+					emit(resp)
+					continue
+				}
+				if text == "/session delete" && os.Getenv("OMP_TELEGRAM_FIXTURE_DELETE") != "" {
+					recordFixtureRPCTrace("session_delete", sessionID)
+					if gate := os.Getenv("OMP_TELEGRAM_FIXTURE_DELETE_GATE"); gate != "" {
+						waitForFixtureFile(gate)
+					}
+					if os.Getenv("OMP_TELEGRAM_FIXTURE_DELETE") != "fail" {
+						if os.Remove(session) != nil {
+							os.Exit(2)
+						}
+						emit(map[string]any{"type": "command_output", "text": "Session deleted: " + session + ". Use ACP `session/load` to switch to another session."})
+						resp["data"] = map[string]any{"agentInvoked": false}
+						if os.Getenv("OMP_TELEGRAM_FIXTURE_DELETE") == "deleted_bad_ack" {
+							resp["success"] = false
+						}
+					} else {
+						resp["success"] = false
+					}
 					emit(resp)
 					continue
 				}
