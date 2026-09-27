@@ -1941,21 +1941,22 @@ func TestProgressStatusPriorityAndBounds(t *testing.T) {
 	if !strings.Contains(progress, "Status: Retrying automatically...") || len(utf16.Encode([]rune(progress))) > maxProgressUnits {
 		t.Fatalf("retry priority or progress bound failed: %d UTF-16 units", len(utf16.Encode([]rune(progress))))
 	}
-	for i := range maxRecentTools + 2 {
+	const completedToolCalls = 9
+	for i := range completedToolCalls {
 		id := fmt.Sprintf("tool-%d", i)
 		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_start","toolCallId":%q,"toolName":%q}`, id, id)))
-		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"isError":%t,"result":{"content":[{"type":"text","text":"PRIVATE RESULT"}]}}`, id, i == maxRecentTools+1)))
+		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"isError":%t,"result":{"content":[{"type":"text","text":"PRIVATE RESULT"}]}}`, id, i == completedToolCalls-1)))
 	}
 	progress = w.renderProgress()
-	for _, want := range []string{"2 earlier omitted", "tool-2: completed", "tool-13: failed"} {
+	for _, want := range []string{"4 earlier omitted", "tool-4: completed", "tool-8: failed"} {
 		if !strings.Contains(progress, want) {
 			t.Fatalf("tool history missing %q: %q", want, progress)
 		}
 	}
-	if strings.Index(progress, "tool-2: completed") >= strings.Index(progress, "tool-13: failed") {
+	if strings.Index(progress, "tool-4: completed") >= strings.Index(progress, "tool-8: failed") {
 		t.Fatalf("recent tool history reordered: %q", progress)
 	}
-	if strings.Contains(progress, "tool-1: completed") || strings.Contains(progress, "PRIVATE RESULT") || utf16Length(progress) > maxProgressUnits {
+	if strings.Count(progress, "- tool-") != 5 || strings.Contains(progress, "tool-3: completed") || strings.Contains(progress, "PRIVATE RESULT") || utf16Length(progress) > maxProgressUnits {
 		t.Fatalf("unbounded or sensitive tool history: %q", progress)
 	}
 }
