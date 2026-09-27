@@ -222,7 +222,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/compact` | 空闲时经确认压缩当前 context. |
 | `/handoff [补充要求]` | 空闲且队列为空时运行 OMP 原生 handoff. |
 | `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. 原生选择对话框 (包括 commit 列表) 每页显示 8 项, 只在需要时显示翻页按钮. |
-| `/help` | 查看帮助. |
+| `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
 
 空闲时普通文字作为 root task 运行. 任务运行中, 普通文字 (包括 `/opt/tmp`, `/opt/user@host/file` 和 `/stauts` 等未知斜杠文字) 经 OMP 原生 RPC 队列 steer 同一个任务, 不产生第二条最终回复. 需要独立后续任务时使用 `/followup <message>`. 附件和 `/review` 在任务运行时仍走 bridge 队列; 第一版 steer 只支持纯文字. 只有列出的 bridge 命令 (以及 `/start`) 走控制路径. 明确发给其他 bot 的有效 `/command@bot` token 会被忽略. 不同对话可以并行工作, 受 worker 配置上限影响.
 

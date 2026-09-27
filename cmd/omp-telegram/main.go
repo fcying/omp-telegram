@@ -104,7 +104,7 @@ func run() int {
 		"database_retention_days", c.DatabaseRetentionDays,
 		"log_level", c.LogLevel,
 		"log_format", c.LogFormat)
-	if err := bridge.Run(ctx, c, db, logs); err != nil {
+	if err := bridge.Run(ctx, c, db, logs, displayVersion()); err != nil {
 		// The owning bridge boundary has already recorded the specific failure.
 		logger.Info("daemon stopped", "event", "daemon_stop", "result", "failed")
 		return 1

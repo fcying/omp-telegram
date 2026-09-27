@@ -32,6 +32,7 @@ import (
 
 type Bridge struct {
 	cfg            config.Config
+	version        string
 	db             *store.Store
 	tg             *telegram.Client
 	bot            telegram.User
@@ -444,7 +445,7 @@ var botCommands = []telegram.BotCommand{
 
 const pendingInputBatchSize = 256
 
-func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry) (runErr error) {
+func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.Registry, version string) (runErr error) {
 	if logs == nil {
 		return errors.New("logging registry required")
 	}
@@ -481,7 +482,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit), forgetRequests: make(chan bindingForgetRequest, 16)}
+	b := &Bridge{cfg: cfg, version: version, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit), forgetRequests: make(chan bindingForgetRequest, 16)}
 	defer func() {
 		cancel()
 		b.wg.Wait()
@@ -2347,7 +2348,7 @@ func (w *worker) handle(in incoming) {
 	defer w.mark(in.id, "done")
 	switch cmd {
 	case "/help", "/start":
-		w.say(commandHelp())
+		w.say(commandHelp(w.b.version))
 	case "/new":
 		workspace, err := w.newWorkspace(arg)
 		if err != nil {

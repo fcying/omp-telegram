@@ -222,7 +222,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/compact` | Compact the current context while idle, after confirmation. |
 | `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue. |
 | `/review [arguments]` | Run OMP's native `/review` command as a queued task. Native selection dialogs, including commit lists, show eight options per page and display navigation only when needed. |
-| `/help` | Show help. |
+| `/help` | Show help and the running bridge version (the same version as `-v`). |
 
 Idle ordinary text runs as a root task. While a task is running, text (including unknown slash-prefixed text such as `/opt/tmp`, `/opt/user@host/file`, or `/stauts`) steers that same task via OMP's native RPC queue; it does not create a second final reply. Use `/followup <message>` to queue a separate root task. Attachments and `/review` continue to use the bridge queue, including while a task is running; the initial steering implementation is text-only. Only the listed bridge commands (plus `/start`) are handled as controls. A syntactically valid `/command@bot` token addressed to a different bot is ignored. Different conversations can run concurrently up to the configured worker capacity.
 

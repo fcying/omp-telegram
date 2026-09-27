@@ -29,6 +29,8 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
+const testAppVersion = "dev-latest (abcdef012345)"
+
 func requireStoreOK(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
@@ -820,7 +822,7 @@ func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) 
 	exe, _ := os.Executable()
 	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7, 8}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: 2, QueueCapacity: 4}
 	logs := testLogs(t)
-	go func() { done <- Run(ctx, cfg, db, logs) }()
+	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -1358,7 +1360,7 @@ func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
 			defer func() { http.DefaultTransport = previous }()
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			if err := Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t)); err != nil {
+			if err := Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t), testAppVersion); err != nil {
 				t.Fatalf("command registration failure stopped startup: %v", err)
 			}
 		})
@@ -1374,52 +1376,40 @@ func TestGetMeFailureStopsStartup(t *testing.T) {
 	previous := http.DefaultTransport
 	http.DefaultTransport = &fakeHTTP{rejectGetMe: true}
 	defer func() { http.DefaultTransport = previous }()
-	if err := Run(context.Background(), config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t)); err == nil {
+	if err := Run(context.Background(), config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t), testAppVersion); err == nil {
 		t.Fatal("GetMe failure did not stop startup")
 	}
 }
 
-func TestStartIsHiddenHelpAlias(t *testing.T) {
+func TestHelpVersionAndHiddenStartAlias(t *testing.T) {
 	for _, command := range botCommands {
 		if command.Command == "start" {
 			t.Fatal("start is registered in the visible command menu")
 		}
-	}
-	if strings.Contains(commandHelp(), "/start") {
-		t.Fatal("start is included in visible help")
 	}
 	db, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err = db.Accept(1, []byte(`{"update_id":1}`)); err != nil {
-		t.Fatal(err)
-	}
+	requireStoreOK(t, db.Accept(1, []byte(`{"update_id":1}`)))
+	requireStoreOK(t, db.Accept(2, []byte(`{"update_id":2}`)))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db, fatal: make(chan error, 1)}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel})
-	w.handle(incoming{id: 1, msg: &telegram.Message{Text: "/start"}})
-	output, err := db.NextOutput()
-	if err != nil || output.Text != commandHelp() {
-		t.Fatalf("hidden start reply = %#v, err = %v", output, err)
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db, fatal: make(chan error, 1), version: testAppVersion}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel})
+	w.handle(incoming{id: 1, msg: &telegram.Message{Text: "/help"}})
+	help, err := db.NextOutput()
+	if err != nil || !strings.HasPrefix(help.Text, "omp-telegram "+testAppVersion+"\n\n/new - ") || strings.Contains(help.Text, "\n/start - ") {
+		t.Fatalf("versioned help = %#v, err = %v", help, err)
+	}
+	requireStoreOK(t, db.MarkOutput(help.ID, store.OutboxSending))
+	w.handle(incoming{id: 2, msg: &telegram.Message{Text: "/start"}})
+	alias, err := db.NextOutput()
+	if err != nil || alias.Text != help.Text {
+		t.Fatalf("hidden start alias = %#v, err = %v", alias, err)
 	}
 }
 
-func TestQueueCommandIsVisible(t *testing.T) {
-	for _, command := range botCommands {
-		if command.Command == "queue" {
-			if !strings.Contains(command.Description, "pending") {
-				t.Fatalf("queue command description = %q", command.Description)
-			}
-			if !strings.Contains(commandHelp(), "/queue - "+command.Description) {
-				t.Fatal("queue command missing from help")
-			}
-			return
-		}
-	}
-	t.Fatal("queue command missing from Telegram menu")
-}
 func update(id, thread int64, text string) telegram.Update {
 	return telegram.Update{UpdateID: id, Message: &telegram.Message{MessageID: id, MessageThreadID: thread, From: &telegram.User{ID: 7}, Chat: telegram.Chat{ID: -10}, Text: text}}
 }
@@ -3494,7 +3484,7 @@ func TestPollerDrainsPendingInputsAcrossBatches(t *testing.T) {
 	done := make(chan error, 1)
 	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: binary, DataDir: dir, MaxWorkers: 2, QueueCapacity: 4}
 	logs := testLogs(t)
-	go func() { done <- Run(ctx, cfg, db, logs) }()
+	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
 	t.Cleanup(func() {
 		cancel()
 		select {

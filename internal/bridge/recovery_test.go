@@ -69,7 +69,7 @@ func (d *recoveryDaemon) start() {
 	d.done = make(chan error, 1)
 	cfg, db, done := d.cfg, d.db, d.done
 	logs := testLogs(d.t)
-	go func() { done <- Run(ctx, cfg, db, logs) }()
+	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
 }
 
 func (d *recoveryDaemon) stop() {
