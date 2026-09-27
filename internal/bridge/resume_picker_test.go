@@ -54,9 +54,15 @@ func runResumeListFixture() {
 		case "session/list":
 			matches := make([]resumeFixtureSession, 0)
 			for _, s := range sessions {
-				if s.CWD == request.Params.CWD {
-					matches = append(matches, s)
+				if s.CWD != request.Params.CWD {
+					continue
 				}
+				if os.Getenv("OMP_TELEGRAM_FIXTURE_DELETE") != "" {
+					if _, err := os.Stat(filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), s.ID+".jsonl")); err != nil {
+						continue
+					}
+				}
+				matches = append(matches, s)
 			}
 			start := 0
 			if request.Params.Cursor != "" {
@@ -203,10 +209,11 @@ func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 func resumeButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 	t.Helper()
 	buttons := pickerButtons(t, f)
+	text, _ := pickerView(t, f)
 	filtered := buttons[:0]
 	for _, button := range buttons {
 		label, _ := button["text"].(string)
-		if label == "Pin" || label == "Unpin" {
+		if label == "Pin" || label == "Unpin" || label == "Delete" && strings.HasPrefix(text, "Saved omp sessions") {
 			continue
 		}
 		filtered = append(filtered, button)
@@ -235,7 +242,7 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	requirePickerFooter(t, rows, "Next", "Cancel")
 	for i := range 8 {
 		listed := strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) && strings.Contains(text, "ID: "+sessions[i].ID)
-		paired := len(rows[i]) == 2 && strings.Contains(rows[i][0]["text"].(string), sessions[i].Title) && rows[i][1]["text"] == "Pin"
+		paired := len(rows[i]) == 3 && strings.Contains(rows[i][0]["text"].(string), sessions[i].Title) && rows[i][1]["text"] == "Pin" && rows[i][2]["text"] == "Delete" && rows[i][2]["style"] == "danger"
 		if !listed || !paired {
 			t.Fatalf("session %d lost identity or adjacent pin action: %s; %v", i, text, rows[i])
 		}
@@ -280,7 +287,7 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	text, rows := pickerView(t, f)
 	buttons := pickerButtons(t, f)
 	listed := strings.Contains(text, "1. "+sessions[1].Title+" [pinned]")
-	paired := len(rows[0]) == 2 && strings.Contains(buttons[0]["text"].(string), sessions[1].Title) && buttons[1]["text"] == "Unpin"
+	paired := len(rows[0]) == 3 && strings.Contains(buttons[0]["text"].(string), sessions[1].Title) && buttons[1]["text"] == "Unpin"
 	if !listed || !paired {
 		t.Fatalf("pinned session was not first with adjacent unpin: %s; %v", text, rows[0])
 	}
@@ -299,7 +306,7 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	if !strings.Contains(text, "1. "+sessions[0].Title) || buttons[1]["text"] != "Pin" {
 		t.Fatalf("native order was not restored after unpin: %s; %v", text, buttons[:2])
 	}
-	if len(rows[2]) != 2 || rows[2][1]["text"] != "Pin" {
+	if len(rows[2]) != 3 || rows[2][1]["text"] != "Pin" || rows[2][2]["text"] != "Delete" {
 		t.Fatal("third session pin button missing")
 	}
 	pinData := rows[2][1]["callback_data"].(string)

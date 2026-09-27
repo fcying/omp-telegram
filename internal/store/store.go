@@ -601,6 +601,15 @@ func (s *Store) SetPinnedSession(bot, chat, thread int64, workspace, sessionID s
 	return err
 }
 
+// DeletePinnedSession clears a native session's favorites for one bot in every scope.
+func (s *Store) DeletePinnedSession(bot int64, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("invalid pinned session")
+	}
+	_, err := s.DB.Exec("DELETE FROM session_favorites WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID)
+	return err
+}
+
 // SetPinnedSessionIfGeneration changes a favorite only while the conversation
 // still has the picker generation that produced the action.
 func (s *Store) SetPinnedSessionIfGeneration(bot, chat, thread, generation int64, workspace, sessionID string, pinned bool) (bool, error) {

@@ -19,7 +19,9 @@
 | [`internal/bridge`](../internal/bridge/bridge.go) | worker actor, 命令, prompt 队列, 预览, 最终回复和 host tool |
 | [`internal/bridge/recovery.go`](../internal/bridge/recovery.go) | 启动恢复和关闭状态持久化 |
 | [`internal/bridge/resume_picker.go`](../internal/bridge/resume_picker.go) | 原生 session 列表, 导出任务, 带鉴权和过期控制的选择菜单 |
+| [`internal/bridge/session_delete.go`](../internal/bridge/session_delete.go) | 删除确认, session reservation 和原生删除编排 |
 | [`internal/omp`](../internal/omp/client.go) | RPC 分帧, 请求关联, 事件, 原生 session metadata, ACP 列表及原生导出委托 |
+| [`internal/omp/delete.go`](../internal/omp/delete.go) | 原生 RPC session 删除与文件消失校验 |
 | [`internal/telegram`](../internal/telegram/client.go) | Bot API, 附件传输, 错误脱敏及交付确定性 |
 | [`internal/media`](../internal/media/media.go) | 限定工作目录的文件处理, 图片准备和发送快照 |
 | [`internal/store`](../internal/store/store.go) | SQLite schema, 绑定, 持久化输入/输出及完成事务 |
@@ -142,7 +144,7 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 
 成功的新建/恢复实例会增加持久化 generation. 后台结果按对应的 generation, turn, 请求 token 或 client 身份校验. 会话 claim 防止同一 daemon 内两个 worker 同时打开同一个原生会话, 但不锁住工作目录供其他程序使用.
 
-closed binding 删除与 startup intent 准备使用事务 fence: start 只能为精确匹配的持久化 binding generation, 或确实没有 binding 的对话, 预留启动; deletion 只有在不存在 startup intent 时才成功. bridge 级 binding mutation epoch 会在删除后使 picker 和列表 callback 失效; worker 发现 binding row 缺失并重新创建 binding 前, 也会丢弃旧 confirmation.
+closed binding 删除与 startup intent 准备使用事务 fence: start 只能为精确匹配的持久化 binding generation, 或确实没有 binding 的对话, 预留启动; deletion 只有在不存在 startup intent 时才成功. bridge 级菜单 mutation epoch 会在 binding 或原生 session 删除后使 picker 和列表 callback 失效; worker 发现 binding row 缺失并重新创建 binding 前, 也会丢弃旧 confirmation.
 
 **关键是接受边界:** 旧运行时的迟到工作不能影响新实例, 但已经提交的 outbox 结果在 `/new` 或 `/close` 后仍可交付. generation 变化不能撤销已经接受的业务结果.
 
@@ -237,6 +239,25 @@ Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 wo
 ## 会话生命周期
 
 `/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录. Resume pin 只保存 `(bot,chat,thread,workspace,session_id)` identity metadata; pinned session 排在前面, stale pin 在 native listing 返回同一 identity 前保持隐藏. Pin 和 Unpin 是 picker 控件, 不修改原生 session 或 binding lifecycle. 显式删除 closed binding 时也会删除其 pinned metadata, 但不会触碰原生 session history.
+
+`/resume` 的 Delete 与 `/bindings` 删除不同. 首次点击校验 picker workspace 和完整原生 ID, 然后生成绑定用户和消息的红色二次确认. 最终确认再次校验 binding generation、mutation epoch、workspace、运行中 session claim、已持久化的 running binding 和待提交 resume intent. 按 session ID 持有 delete reservation, 排斥同时 resume、export 和其他 delete; resume 启动会在同一把锁下检查 reservation 并写入 startup intent. 完成、失败及 worker 关闭时都会释放 reservation. 删除超时为 30 秒, 不占用常驻 worker runtime slot.
+
+通过 picker 发起的 resume 会把菜单 epoch 传入启动流程. bridge 在 `sessionMu` 下比较 epoch、检查删除 reservation, 并在释放锁前写入 `PrepareStart`. 如果删除先完成, 即使 callback 已通过早期 UI 校验也不能恢复被删 session; 如果启动意图先提交, 删除会被拒绝. 显式 `/resume ID` 不使用 picker epoch.
+
+已知原生 session ID 的 running binding 按 identity 匹配并阻止删除. 缺少 ID 的旧 running binding 仅阻止删除其 workspace 中的 session, 不影响其他 workspace.
+
+已安装的 OMP 18.3.2 会把 `omp -p --resume ID "/session delete"` 当作模型输入, 而非本地 slash command. bridge 因此启动隔离的短生命周期原生 RPC 进程, 校验完整 session ID、canonical workspace 和实际存在的普通 session 文件, 再通过现有 `prompt` 命令执行 `/session delete`. 成功需要本地命令确认、匹配该文件的原生删除输出, 以及终止临时进程组后文件确已消失. 这个本地命令不发送 `prompt_result`. 在确认后正常关闭进程可能重新写出已删除文件, 因此确认后立即终止临时进程; bridge 不直接删除 OMP session 文件, 也不自行推导 artifact 路径. Artifact 清理由 OMP 负责. 原生删除或持久化失败无法回滚, 也不能安全地自动重试.
+
+在尝试写入变更性的 RPC prompt 前, 删除流程先为临时进程启用强停边界. 遇到拒绝响应、输出缺失或变化、协议错误、取消或超时, 都会在 stdin 正常关闭前终止进程组; 原生命令的执行状态仍可能不确定, bridge 只报告失败, 不自动重放. 识别到原生 `Failed to delete session: ...` 输出时立即失败, 不暴露其中的诊断文本. 如果历史中已有 assistant 消息, 正常关闭可能在原 JSONL 与 artifacts 已删除后重新写入 session-exit 记录.
+
+确认删除后, store 按 native ID 忽略大小写地清除这个 bot 所有对话和 workspace 的 pin metadata, 不修改 binding 或 workspace 文件. 即使此时有普通 prompt 进入队列, 仍重新请求 session 列表; 如果 binding generation/epoch 改变则不显示过期的新菜单. Pin 清理失败会与已成功的原生删除分别报告.
+
+确认原生删除后, 即使 Pin 清理失败也会推进 bridge 全局菜单 mutation epoch. 其他对话持有的旧 `/resume`、`/export` 菜单和正在返回的 session 列表会因 epoch 不匹配而失效. Pin 更新与 Pin 清理及 epoch 推进串行化, 防止已通过旧校验的 callback 在清理后重新写入已删除 session 的 Pin. 如果没有其他 binding 变更, 执行删除的对话可以用新 epoch 刷新自己的 picker.
+
+如果原生删除返回错误, 但临时进程强停后已验证的 session 文件不存在, bridge 仍报告失败并保留 Pin, 同时在释放 delete reservation 前推进菜单 epoch. 旧 picker 不能再启动已消失的 session. 文件仍存在的失败不推进 epoch; 两种情况都不会自动重放删除.
+
+如果删除在列表通过校验后、Telegram 发送过程中推进 epoch, 旧菜单仍可能出现在聊天中. 它的 callback 会被 epoch 校验拒绝; `sessionMu` 不会跨 Telegram 网络 I/O 持有.
+
 在没有 binding 的 forum topic 中首次执行 `/new` 时, bridge 会在 worker 命令路径之外, 尽力把 Telegram topic 标题异步更新为解析后 workspace 的最后一级目录名. 重命名失败不会撤销已经成功启动的 session. 后续替换 session 不会重命名 topic; `/name` 只修改 OMP 原生 session title.
 
 `/export` 使用 generation 和 binding identity 双重 fence 的 picker, 默认导出原生 session JSONL; `/export html` 使用同一个 picker 进行原生 HTML 渲染. `/export <session ID>` 和 `/export html <session ID>` 不列出 session, 会先校验原生 identity 和 workspace, 再直接导出指定 session. 因为列举是只读操作, 当前 worker 忙碌时仍可打开 picker. 选择当前 session 前必须等待 active task、compaction/finalization 和 queued prompt 结束; 其他 inactive 且未被 claim 的 session 可以并行导出. 每个进行中的 export 都会 reservation 选中的 session identity, 因此其他 conversation 在操作结束前不能 claim 或 export 同一 session. 导出文件作为 document 排入当前 conversation; 成功 export 只代表 durable outbox item 已创建, Telegram delivery 状态单独确认.`

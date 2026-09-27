@@ -207,7 +207,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List saved conversation/session bindings for this Telegram chat, with the current conversation first, pending starts next, then others by most recent use (unknown last). Each entry uses two full-width keyboard rows: a clickable session name (or workspace basename) and topic ID, then a read-only state, compact last-used age when known, and workspace. Clicking an eligible title opens a confirmation with a red Delete button; current-conversation and pending titles are disabled. An open entry must first be idle and its OMP process is closed. Workspace and native OMP history are preserved. |
 | `/bindings old` | Show older saved bindings first. Current-conversation and pending-start entries still lead; entries with known last-used times follow from oldest to newest, and unknown or future times come last. Pagination and deletion preserve this order. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Each numbered entry shows its full ID and update time; a short-title selection button and Pin/Unpin share a row. Pinned sessions for this conversation and workspace appear first. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Each entry shows its full ID and update time, with selection, Pin/Unpin, and Delete buttons. Pinned sessions for this conversation and workspace appear first. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
 | `/export` | Open a read-only picker for native OMP session export from the current workspace. The default format is the original main-session JSONL; the source is copied to the private attachment outbox, its filename is retained after sanitization, and the 50 MB document limit applies. Selecting the current session is rejected while its task or queue is active; run `/export` again after it becomes idle. |
 | `/export html` | Open the export picker for native OMP HTML rendering. The bridge first snapshots only the selected main-session JSONL into its private spool, then invokes the native exporter from that stable snapshot; companion or subagent transcripts are not included. The result is stored as `omp-session-<short-id>.html`; exporter timeout is 30 seconds and output growth is bounded by the 50 MB document limit. |
@@ -231,6 +231,10 @@ Idle ordinary text runs as a root task. While a task is running, text (including
 All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.
 
 In a group topic, all allowed users share that topic's OMP session and workspace, including its context and command effects. Telegram group membership is not restricted by the bot's user allowlist: other members who can view the topic can also see bot replies and exported files. Use a trusted group topic for sensitive work.
+
+### Delete a saved session
+
+In `/resume`, choose **Delete**, then confirm with the red **Delete** button. Only unused sessions can be deleted; close an active session or wait for its export or another deletion to finish first. OMP removes the selected session history and artifacts, and the session list refreshes. Workspace files, Telegram bindings, and topics are not deleted. This action cannot be undone.
 
 ### Session export
 

@@ -48,6 +48,7 @@ type Bridge struct {
 	sessionMu      sync.Mutex
 	sessionClaims  map[string]sessionClaim
 	exportClaims   map[*worker]string
+	deleteClaims   map[*worker]string
 	bindingsEpoch  atomic.Uint64
 	ctx            context.Context
 	workerExits    chan workerExit
@@ -268,6 +269,9 @@ type worker struct {
 	exportCancel        context.CancelFunc
 	exportRequest       uint64
 	exportingSession    string
+	deleteResults       chan sessionDeleteResult
+	deleteCancel        context.CancelFunc
+	deleteRequest       uint64
 	bindingNameResults  chan bindingNamesResult
 	bindingNameCancel   context.CancelFunc
 	bindingNameRequest  uint64
@@ -1147,7 +1151,7 @@ func (w *worker) canReleaseRuntime() bool {
 		!w.taskActive() && !w.taskOrSessionBusy() && !w.controlInProgress() &&
 		!w.compacting && !w.finishing && !w.previewBusy &&
 		len(w.queue) == 0 && len(w.hostRequests) == 0 &&
-		w.resumeCancel == nil && w.exportCancel == nil && w.startIntent == nil &&
+		w.resumeCancel == nil && w.exportCancel == nil && w.deleteCancel == nil && w.startIntent == nil &&
 		!w.hasRuntimeConfirmation()
 }
 
@@ -1164,11 +1168,11 @@ func (w *worker) canEvict() bool {
 		return false
 	}
 	return len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 && len(w.albumSuppressed) == 0 &&
-		len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil &&
+		len(w.hostRequests) == 0 && w.resumeCancel == nil && w.exportCancel == nil && w.deleteCancel == nil &&
 		w.bindingNameCancel == nil && w.doctorCancel == nil && w.startIntent == nil &&
 		len(w.confirms) == 0 && w.idleProbe.cancel == nil && w.typingCancel == nil &&
 		len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 &&
-		len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 &&
+		len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 && len(w.deleteResults) == 0 &&
 		len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 &&
 		len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
 }
@@ -1355,7 +1359,13 @@ func (w *worker) run() {
 	w.log.Info("worker started", "event", "worker_start")
 	w.initMedia()
 	w.initResumePicker()
-	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults(); w.drainExportResults() }()
+	defer func() {
+		w.cancel()
+		w.background.Wait()
+		w.drainMediaResults()
+		w.drainExportResults()
+		w.drainDeleteResults()
+	}()
 	defer func() {
 		w.teardownWorker(true)
 		w.log.Info("worker stopped", "event", "worker_stop")
@@ -1434,6 +1444,10 @@ func (w *worker) run() {
 			w.exportFinished(result)
 			w.dispatch()
 			continue
+		case result := <-w.deleteResults:
+			w.sessionDeleteFinished(result)
+			w.dispatch()
+			continue
 		case result := <-w.bindingNameResults:
 			w.bindingNamesLoaded(result)
 			w.dispatch()
@@ -1500,6 +1514,8 @@ func (w *worker) run() {
 			w.resumeListed(result)
 		case result := <-w.exportResults:
 			w.exportFinished(result)
+		case result := <-w.deleteResults:
+			w.sessionDeleteFinished(result)
 		case result := <-w.bindingNameResults:
 			w.bindingNamesLoaded(result)
 		case result := <-w.doctorResults:
@@ -1670,6 +1686,9 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.cancelResumeList()
+	if w.deleteCancel != nil {
+		w.deleteCancel()
+	}
 	w.cancelBindingNameLookup()
 	if w.doctorCancel != nil {
 		w.doctorCancel()
@@ -1980,11 +1999,11 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 }
 
 func (w *worker) start(resume bool, target, expectedCWD string, replace bool) string {
-	return w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, 0, false))
+	return w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, 0, false, 0))
 }
 
-func (w *worker) startFenced(resume bool, target, expectedCWD string, replace bool, generation int64) {
-	w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, generation, true))
+func (w *worker) startFenced(resume bool, target, expectedCWD string, replace bool, generation int64, epoch uint64) {
+	w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, generation, true, epoch))
 }
 
 func (w *worker) reportStartFailure(message string) string {
@@ -2029,7 +2048,7 @@ func (w *worker) topicRenameFinished(result topicRenameResult) {
 	w.say("The session started, but the Telegram topic title could not be updated.")
 }
 
-func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool) string {
+func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64) string {
 	if _, connected := w.runtimeClient(); connected && !replace {
 		return "An instance is already running. Use /new for a fresh session, or /close before resuming another session."
 	}
@@ -2039,8 +2058,8 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	if w.startIntent != nil && !w.restoring {
 		return "A previous session start is still uncertain. Use /close before starting another session."
 	}
-	if w.exportCancel != nil && !w.restoring {
-		return "The omp session operation is still loading. Wait for the export to finish."
+	if (w.exportCancel != nil || w.deleteCancel != nil) && !w.restoring {
+		return "The omp session operation is still loading. Wait for it to finish."
 	}
 	old, e := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if e != nil && !errors.Is(e, sql.ErrNoRows) {
@@ -2112,7 +2131,28 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 				previous.Running = false
 			}
 		}
-		if e = w.b.db.PrepareStart(previous, intent); e != nil {
+		if resume {
+			w.b.sessionMu.Lock()
+			if fenced && expectedEpoch != w.b.bindingsEpoch.Load() {
+				w.b.sessionMu.Unlock()
+				if reserved {
+					<-w.b.slots
+				}
+				return "The session list changed. Use /resume again."
+			}
+			if w.b.deleteMatchesLocked(session) {
+				w.b.sessionMu.Unlock()
+				if reserved {
+					<-w.b.slots
+				}
+				return "This session is being deleted. Try again after the operation finishes."
+			}
+		}
+		e = w.b.db.PrepareStart(previous, intent)
+		if resume {
+			w.b.sessionMu.Unlock()
+		}
+		if e != nil {
 			if reserved {
 				<-w.b.slots
 			}
@@ -3511,7 +3551,7 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	var deleteButtons []telegram.Button
 	for i, label := range options {
 		button := telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}
-		if c.action == "binding_delete" {
+		if c.action == "binding_delete" || c.action == "session_delete" {
 			if i == 0 {
 				button.Style = "danger"
 			}
@@ -3603,7 +3643,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
 	}
-	if (c.action == "resume" || c.action == "export") && (q.Message == nil || q.Message.MessageID != c.messageID) {
+	if (c.action == "resume" || c.action == "export" || c.action == "session_delete") && (q.Message == nil || q.Message.MessageID != c.messageID) {
 		delete(w.confirms, token)
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
@@ -3691,6 +3731,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	}
 	delete(w.confirms, token)
 	w.clearKeyboard(c.messageID)
+	if c.action == "session_delete" {
+		if n == 0 {
+			w.beginSessionDelete(c)
+		}
+		return callbackDone
+	}
 	if c.action == "ui" && w.exportingSession != "" {
 		w.say("Wait for the current session export to finish.")
 		return callbackDone
@@ -3923,7 +3969,7 @@ func (w *worker) clearConfirmations() {
 
 func (w *worker) clearTaskConfirmations() {
 	for token, c := range w.confirms {
-		if c.action == "queue" || c.action == "resume" || c.action == "export" {
+		if c.action == "queue" || c.action == "resume" || c.action == "export" || c.action == "session_delete" {
 			continue
 		}
 		w.dropConfirmation(token, c)

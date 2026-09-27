@@ -207,7 +207,7 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 Telegram chat 保存的 binding: 当前对话优先, pending start 其次, 其余按最近使用时间降序 (未知时间最后). 每条占两行全宽 keyboard: 第一行是可点击的原生 session name (没有时用 workspace 目录名) 和 topic ID, 第二行是只读的状态、已知时的简短最近使用时间与 workspace. 点击可删除条目的标题后进入确认页, 只有确认页的 Delete 按钮为红色; 当前对话及 pending 条目的标题禁用. open binding 必须空闲, 删除前先关闭其 OMP 进程. 保留 workspace 和 OMP 原生 history. |
 | `/bindings old` | 优先查看很久未使用的 binding. 当前对话和 pending start 仍置顶, 其余已知最近使用时间的条目按从旧到新排列, 未知或未来时间排最后. 翻页及删除后的刷新保留此顺序. |
-| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 每个编号条目显示完整 ID 和更新时间; 简短标题选择按钮与 Pin/Unpin 同行. 当前 conversation 和 workspace 的 pinned session 会排在前面. |
+| `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 每个条目显示完整 ID 和更新时间, 并提供选择、Pin/Unpin 和 Delete 按钮. 当前 conversation 和 workspace 的 pinned session 会排在前面. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
 | `/export` | 从当前 workspace 打开原生 OMP session 导出 picker. 默认导出原始 main session JSONL; 源文件会复制到私有 attachment outbox, 保留经过安全处理的原文件名, 并受 50 MB document 限制. 当前 session 在 task 或队列活跃时会直接拒绝, 空闲后需要重新执行 `/export`. |
 | `/export html` | 打开原生 OMP HTML 导出的 picker. bridge 会先把选中的 main session JSONL snapshot 到私有 spool, 再从这个稳定 snapshot 调用原生 exporter; 不包含 companion 或 subagent transcript. 结果文件名为 `omp-session-<short-id>.html`; exporter 超时为 30 秒, 输出增长受 50 MB document 限制. |
@@ -231,6 +231,10 @@ Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BO
 以上命令都可用于普通私聊和 topic. bot 菜单, 按钮和服务提示使用英语; 可以用任意语言提问, bridge 不翻译模型回复.
 
 在群组 topic 中, 所有获准使用 bot 的用户共享该 topic 的 OMP session 和 workspace, 包括上下文及命令效果. bot 的用户白名单不限制 Telegram 群成员查看消息: 能查看该 topic 的其他成员也能看到 bot 回复和导出文件. 敏感任务只应在可信的群组 topic 中运行.
+
+### 删除已保存的 session
+
+在 `/resume` 中点击 **Delete**, 再用红色 **Delete** 按钮确认. 只能删除未使用的 session; 请先关闭活动 session, 或等待导出及其他删除操作完成. OMP 会删除选中的 session history 和 artifacts, 然后刷新列表. 不会删除 workspace 文件、Telegram binding 或 topic. 删除不可撤销.
 
 ### Session 导出
 

@@ -24,13 +24,13 @@ func validSessionID(id string) bool {
 func (b *Bridge) sessionInUse(id string) bool {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
-	return b.sessionMatchesLocked(nil, id) || b.exportMatchesLocked(nil, id)
+	return b.sessionMatchesLocked(nil, id) || b.exportMatchesLocked(nil, id) || b.deleteMatchesLocked(id)
 }
 
 func (b *Bridge) sessionInUseByOther(owner *worker, id string) bool {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
-	return b.sessionMatchesLocked(owner, id) || b.exportMatchesLocked(owner, id)
+	return b.sessionMatchesLocked(owner, id) || b.exportMatchesLocked(owner, id) || b.deleteMatchesLocked(id)
 }
 
 func sessionIDsMatch(left, right string) bool {
@@ -55,11 +55,41 @@ func (b *Bridge) exportMatchesLocked(except *worker, id string) bool {
 	}
 	return false
 }
+func (b *Bridge) deleteMatchesLocked(id string) bool {
+	for _, claimedID := range b.deleteClaims {
+		if sessionIDsMatch(claimedID, id) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bridge) reserveDelete(owner *worker, id string) bool {
+	b.sessionMu.Lock()
+	defer b.sessionMu.Unlock()
+	if b.sessionMatchesLocked(nil, id) || b.exportMatchesLocked(nil, id) || b.deleteMatchesLocked(id) {
+		return false
+	}
+	if b.deleteClaims == nil {
+		b.deleteClaims = make(map[*worker]string)
+	}
+	if _, exists := b.deleteClaims[owner]; exists {
+		return false
+	}
+	b.deleteClaims[owner] = id
+	return true
+}
+
+func (b *Bridge) releaseDelete(owner *worker) {
+	b.sessionMu.Lock()
+	defer b.sessionMu.Unlock()
+	delete(b.deleteClaims, owner)
+}
 
 func (b *Bridge) reserveExport(owner *worker, id string) bool {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
-	if b.sessionMatchesLocked(owner, id) || b.exportMatchesLocked(owner, id) {
+	if b.sessionMatchesLocked(owner, id) || b.exportMatchesLocked(owner, id) || b.deleteMatchesLocked(id) {
 		return false
 	}
 	if b.exportClaims == nil {
@@ -91,7 +121,7 @@ func (w *worker) claimSession(file, id string) bool {
 	if w.b.sessionClaims == nil {
 		w.b.sessionClaims = make(map[string]sessionClaim)
 	}
-	if w.b.exportMatchesLocked(w, id) {
+	if w.b.exportMatchesLocked(w, id) || w.b.deleteMatchesLocked(id) {
 		return false
 	}
 	if claim, exists := w.b.sessionClaims[file]; exists && claim.owner != w {

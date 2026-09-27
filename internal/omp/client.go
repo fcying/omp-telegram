@@ -87,6 +87,8 @@ type Client struct {
 	ready                     chan struct{}
 	readDone, done, stop      chan struct{}
 	stopOnce                  sync.Once
+	shutdownMu                sync.Mutex // Serializes destructive arming, killing, and stdin closure.
+	destructiveShutdown       bool
 	writeGate                 chan struct{}
 	next                      atomic.Uint64
 	frameLimit                atomic.Int64
@@ -257,11 +259,26 @@ func (c *Client) Close() error {
 	return c.err
 }
 
+// armDestructiveShutdown prevents any subsequent supervisor exit from closing
+// stdin before killing the group. It is only used for mutating native commands.
+func (c *Client) armDestructiveShutdown() error {
+	c.shutdownMu.Lock()
+	defer c.shutdownMu.Unlock()
+	select {
+	case <-c.stop:
+		return c.failure()
+	default:
+	}
+	c.destructiveShutdown = true
+	return nil
+}
+
 // TerminateNow kills the process group before allowing stdin to close or drain.
 func (c *Client) TerminateNow() error {
+	c.shutdownMu.Lock()
 	select {
 	case <-c.done:
-		_ = c.Close()
+		c.shutdownMu.Unlock()
 		return nil
 	default:
 	}
@@ -270,6 +287,7 @@ func (c *Client) TerminateNow() error {
 	c.hardStopRequested.Store(true)
 	c.mu.Unlock()
 	killErr := syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
+	c.shutdownMu.Unlock()
 	_ = c.Close()
 	if killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
 		return killErr
@@ -320,7 +338,14 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 		c.fail(&classifiedError{kind: "cancelled", err: errors.New("omp: process context canceled")})
 	case <-c.stop:
 	}
+	c.shutdownMu.Lock()
+	if c.destructiveShutdown {
+		// OMP can recreate deleted history on graceful EOF, even after RPC failure.
+		c.hardStopRequested.Store(true)
+		syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
+	}
 	c.stdin.Close()
+	c.shutdownMu.Unlock()
 	if !exited {
 		timer := time.NewTimer(2 * time.Second)
 		select {

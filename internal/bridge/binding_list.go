@@ -518,7 +518,7 @@ func (w *worker) canForgetBinding() bool {
 		len(w.hostRequests) == 0 && len(w.confirms) == 0 && len(w.operations) == 0 &&
 		len(w.rpcOperations) == 0 && !w.rpcOperationActive &&
 		len(w.previewResult) == 0 && len(w.mediaResults) == 0 && len(w.sendResults) == 0 &&
-		w.resumeCancel == nil && w.exportCancel == nil && w.bindingNameCancel == nil && w.doctorCancel == nil
+		w.resumeCancel == nil && w.exportCancel == nil && w.deleteCancel == nil && w.bindingNameCancel == nil && w.doctorCancel == nil
 }
 
 func (w *worker) forgetBinding(request bindingForgetRequest) {
