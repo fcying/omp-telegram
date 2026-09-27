@@ -283,11 +283,11 @@ Supported values:
 
 - `off` disables progress messages and typing actions.
 - `summary` shows assistant output, active tool names, and task state.
-- `verbose` adds the 12 most recent completed tool calls, their outcomes, and elapsed times to the same editable message.
+- `verbose` adds the 5 most recent completed tool calls, their outcomes, and elapsed times to the same editable message.
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
-The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows up to 12 completed tool calls under `Recent tools`, counting earlier calls as omitted to fit Telegram's message limit. Tool arguments, partial results, final results, reasoning, commands, stdout, and stderr are not forwarded; OMP's raw tool output can contain credentials or private files. The same message retains its **Stop** button through edits. No separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
+The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows up to 5 completed tool calls under `Recent tools`, counting earlier calls as omitted to fit Telegram's message limit. Tool arguments, partial results, final results, reasoning, commands, stdout, and stderr are not forwarded; OMP's raw tool output can contain credentials or private files. The same message retains its **Stop** button through edits. No separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
 
 New databases use schema 13 without an Activity table. Existing schema 11 and 12 databases upgrade automatically to 13; the migration drops the short-lived development `activity_messages` table even if it contains records. Other tables and session data remain intact, but old Activity messages represented only by those records can no longer be deleted automatically.
 

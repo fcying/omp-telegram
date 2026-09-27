@@ -311,7 +311,7 @@ type previewResult struct {
 
 const (
 	maxActiveTools       = 6
-	maxRecentTools       = 12
+	maxRecentTools       = 5
 	maxToolNameUnits     = 64
 	maxPreviewUnits      = 2200
 	maxProgressUnits     = 3500
