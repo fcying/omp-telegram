@@ -280,11 +280,11 @@ Supported values:
 
 - `off` disables progress messages and typing actions.
 - `summary` shows assistant output, active tool names, and task state.
-- `verbose` adds the 5 most recent completed tool calls, their outcomes, and elapsed times to the same editable message.
+- `verbose` adds bounded tool arguments, intermediate updates, final results, and the 5 most recent completed tool outcomes to the same editable message.
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
-The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows up to 5 completed tool calls under `Recent tools`, counting earlier calls as omitted to fit Telegram's message limit. Tool arguments, partial results, final results, reasoning, commands, stdout, and stderr are not forwarded; OMP's raw tool output can contain credentials or private files. The same message retains its **Stop** button through edits. No separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
+The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows tool `Args` and the latest `Update` or `Result`, plus up to 5 completed calls under `Recent tools`. Earlier calls are counted as omitted. The same message retains its **Stop** button through edits; no separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
 
 New databases use schema 13 without an Activity table. Existing schema 11 and 12 databases upgrade automatically to 13; the migration drops the short-lived development `activity_messages` table even if it contains records. Other tables and session data remain intact, but old Activity messages represented only by those records can no longer be deleted automatically.
 
@@ -297,7 +297,7 @@ The `/queue` viewer shows no page number or buttons when the pending queue is em
 
 Progress is best-effort UI and does not affect durable final-reply delivery. Failed progress-message deletion is retried once a minute while the daemon runs; confirmed permanent Telegram rejections abandon deletion.
 
-Progress does not display model reasoning, raw tool arguments or results, command text, or process output.
+**Privacy:** `verbose` does not redact tool arguments or results. They can reveal file paths, commands, source text, process output, credentials, or private files, including to other readers of a group topic. Detail is truncated, not sanitized; deletion after a task cannot retract what was seen. Use `summary` to omit tool payloads or `off` to disable live progress. Model reasoning and whole RPC frames are never displayed.
 
 ## Attachments
 
