@@ -138,7 +138,7 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	for _, entry := range []store.Binding{
 		{Bot: 99, Chat: -10, Thread: 50, Workspace: "/recent50", Generation: 1, LastUsedAt: now - 100},
 		{Bot: 99, Chat: -10, Thread: 40, Workspace: "/unknown40", Generation: 1},
-		{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", Generation: 1, LastUsedAt: now - 10000},
+		{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", Generation: 1, LastUsedAt: now - 500},
 		{Bot: 99, Chat: -10, Thread: 30, Workspace: "/old30", Generation: 1, LastUsedAt: now - 1000},
 		{Bot: 99, Chat: -10, Thread: 60, Workspace: "/future60", Generation: 1, LastUsedAt: now + 3600},
 		{Bot: 99, Chat: -10, Thread: 20, Workspace: "/recent20", Generation: 1, LastUsedAt: now - 100},
@@ -174,8 +174,8 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	w.showBindings(7, true, 0)
 	text, rows = pickerView(t, fake)
 	oldTitles := []string{
-		"1. current · #11 [current]", "2. pending · #7", "3. old30 · #30",
-		"4. recent20 · #20", "5. recent50 · #50", "6. unknown40 · #40",
+		"1. old30 · #30", "2. current · #11 [current]", "3. recent20 · #20",
+		"4. recent50 · #50", "5. pending · #7", "6. unknown40 · #40",
 	}
 	if text != "Saved bindings (oldest first)\nPage 1/2" || len(rows) != 13 {
 		t.Fatalf("oldest-first page = %q, rows = %+v", text, rows)
@@ -190,6 +190,32 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	text, rows = pickerView(t, fake)
 	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 3 || rows[0][0]["text"] != "7. future60 · #60" {
 		t.Fatalf("oldest-first second page = %q, rows = %+v", text, rows)
+	}
+}
+
+func TestBindingsOldSortsPendingBySavedLastUse(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().Unix()
+	for _, entry := range []store.Binding{
+		{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", Generation: 1, LastUsedAt: now - 60},
+		{Bot: 99, Chat: -10, Thread: 22, Workspace: "/pending", Generation: 1, LastUsedAt: now - 7200},
+	} {
+		if err := db.Save(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.PrepareStart(store.Binding{Bot: 99, Chat: -10, Thread: 22, Generation: 1}, store.StartIntent{Bot: 99, Chat: -10, Thread: 22, Kind: "new", Workspace: "/next", Generation: 2}); err != nil {
+		t.Fatal(err)
+	}
+	w, fake := newBindingTestWorker(t, db)
+	w.showBindings(7, true, 0)
+	_, rows := pickerView(t, fake)
+	if rows[0][0]["text"] != "1. next · #22" || rows[2][0]["text"] != "2. current · #11 [current]" {
+		t.Fatalf("oldest-first with pending start = %+v", rows)
 	}
 }
 

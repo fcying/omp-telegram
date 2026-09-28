@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 13
+const schemaVersion = 14
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -226,7 +226,7 @@ func initialize(db *sql.DB) error {
 		_, e = tx.Exec(`
  CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
  CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,last_used_at INTEGER NOT NULL DEFAULT 0,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
- CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
+ CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
  CREATE TABLE session_favorites(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(bot,chat,thread,workspace,session_id));
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
@@ -349,6 +349,15 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 13
+	}
+	if version == 13 {
+		if _, e = tx.Exec("ALTER TABLE startup_intents ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"); e != nil {
+			return e
+		}
+		if _, e = tx.Exec("UPDATE startup_intents SET created_at=?", time.Now().Unix()); e != nil {
+			return e
+		}
+		version = 14
 	}
 
 	if e = backfillSessionIDs(tx); e != nil {
@@ -998,12 +1007,12 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 		}
 	}
 	where := "NOT EXISTS (SELECT 1 FROM bindings WHERE bot=? AND chat=? AND thread=?)"
-	args := []any{intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation, previous.Bot, previous.Chat, previous.Thread}
+	args := []any{intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation, time.Now().Unix(), previous.Bot, previous.Chat, previous.Thread}
 	if previous.Generation > 0 {
 		where = "EXISTS (SELECT 1 FROM bindings WHERE bot=? AND chat=? AND thread=? AND generation=?)"
 		args = append(args, previous.Generation)
 	}
-	query := "INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation) SELECT ?,?,?,?,?,?,? WHERE " + where
+	query := "INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation,created_at) SELECT ?,?,?,?,?,?,?,? WHERE " + where
 	result, err := tx.Exec(query, args...)
 	if err != nil {
 		return err
@@ -1049,6 +1058,23 @@ func (s *Store) CommitStart(b Binding) error {
 func (s *Store) CancelStart(intent StartIntent) error {
 	_, err := s.DB.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", intent.Bot, intent.Chat, intent.Thread, intent.Generation)
 	return err
+}
+
+func (s *Store) CleanupExpiredStarts(ctx context.Context, cutoff int64) (int64, error) {
+	result, err := s.DB.ExecContext(ctx, "DELETE FROM startup_intents WHERE created_at>0 AND created_at<?", cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *Store) ExpireStart(ctx context.Context, intent StartIntent, cutoff int64) (bool, error) {
+	result, err := s.DB.ExecContext(ctx, "DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=? AND created_at>0 AND created_at<?", intent.Bot, intent.Chat, intent.Thread, intent.Generation, cutoff)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count != 0, err
 }
 
 func (s *Store) PendingStarts(bot int64) ([]StartIntent, error) {

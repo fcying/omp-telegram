@@ -158,28 +158,31 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
 | `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | 最后一次已验证的 session binding, 恢复资格, 最后使用时间 metadata 和活动任务中断标记 |
-| `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
+| `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation,created_at` | 尚未提交的 `/new` 或 `/resume` 持久化转换及其保留期起点 |
 | `history` | `bot,chat,thread,workspace,session,generation` | 替换 binding 时创建的旧快照; 删除 closed binding 时清理该对话的快照. 不是会话浏览器. |
 | `session_favorites` | 主键 `(bot,chat,thread,workspace,session_id)` | `/resume` picker 的 pinned 原生 session identity, 不保存 session 内容 |
 | `inbox` | 主键 `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | update 去重、处理状态和可选的实时进度身份 |
 | `outbox` | 自增 `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count,created_at,updated_at` | 与根输入关联的 Telegram 有序投递; 明确限流重试不设上限, 独立的服务端拒绝计数限制可重试的 5xx 失败 |
 
-### Database Message Retention
+### 数据库保留策略
 
-`storage.database_retention_days` 默认值是 90. `0` 关闭自动清理; 正数按 `updated_at` 即最后一次状态转换时间保留相应天数的终态 Telegram bridge 消息记录. Bridge 会在启动时执行一次, 并在之后每 24 小时执行一次这个 best-effort janitor. 失败只记录日志, 在下一个周期重试, 不会停止 Telegram 或 omp 处理.
+`storage.database_retention_days` 默认值是 90. `0` 关闭自动清理; 正数按 `updated_at` 即最后一次状态转换时间保留相应天数的终态 Telegram bridge 消息记录. Bridge 在启动时及之后每 24 小时执行一次尽力而为的消息与附件 janitor. 这部分清理失败只记录日志, 在下一个周期重试, 不会停止 Telegram 或 omp 处理.
 
 只有明确列出的终态可以清理: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, 旧的 `sent`, `failed`, `uncertain`, `cancelled`. inbox 的 `pending`/`submitted` 以及 outbox 的 `pending`/`sending` 保持持久化. 删除使用每批 1000 行的已提交事务; 服务绝不自动执行 `VACUUM`.
 
 带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
 进度消息删除的临时失败会保留关联, daemon 正常运行期间每分钟及启动时重试. Telegram 明确永久拒绝时清除关联并停止重试.
-保留策略绝不删除 binding, history, startup intent, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+保留策略绝不删除 binding, history, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+
+未提交的 `startup_intents` 使用各自的 `created_at` 和同一 retention cutoff. 启动时先删除超期意图, 再恢复 worker 或接收 update; 清理失败会中止启动, 避免错误表示意图状态. 运行期间, 持有待启动意图的 worker 每天检查一次, 仅在其运行期已停止时, 按 `(bot,chat,thread,generation)` 和截止时间作为删除 fence 清除意图. 删除后会使旧的 binding 菜单失效. 正在执行的 OMP 启动不会被周期 janitor 删除. 此操作只移除 bridge 的未决意图, 不删除旧 binding, 工作目录或可能已创建的 OMP session; 原生启动结果仍然未知. 保留期设置为 `0` 时, 意图在显式关闭或成功提交前一直保留.
+
 Telegram 输入附件保存在 `storage.data_dir/attachments/inbox/incoming-*` 私有目录中, 不属于 SQLite. 如果所选 workspace 包含该路径, 附件也位于该 workspace 内. preparation 失败及提交前取消的任务会删除目录. daemon 运行期间, 已提交且排队中或活动任务的路径不会被清理; 任务结算时重置目录修改时间. 启动时及每日运行的 janitor 只处理修改时间早于配置保留截止时间且不在用的目录: 已准备完成的附件还要求 owner 有效, 且 `session/list` 确认 session 不存在或最后更新时间早于同一截止时间; owner 或 session 状态无法确认时保留. 带有 bridge `.preparing` 标记但没有有效 owner 的中断准备目录, 超期后会被删除; 无标记且没有有效 owner metadata 的目录保持不动. `database_retention_days = 0` 会关闭这项清理. 旧 workspace `.telegram/incoming/` 目录不会迁移或删除. 保留的 OMP session history 可能仍引用已被 retention 删除的文件路径.
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 13. 空库在同一事务中创建所有表、索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites、持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 14. 空库在同一事务中创建所有表、索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites、持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
 
-历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 现有版本 12 数据库直接升级到 13. 其他表、记录、binding 和 session 数据保持不变. 版本高于 13 的数据库仍不受支持.
+历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 版本 13 到 14 为 `startup_intents` 增加 `created_at`, 并将既有 pending 条目标记为升级时间: 原始年龄未知, 不会立即过期. 其他表、记录、binding 和 session 数据保持不变. 版本高于 14 的数据库仍不受支持.
 
 ### 输入与完成事务
 
@@ -336,7 +339,7 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 打开 `/bindings` 时, worker 对合并后的快照排序: 当前对话在前, pending start 其次, 其余按 `last_used_at` 降序. 零值和未来时间视为未知, 排在最后; 同组时间相同则按 thread ID 升序. 异步返回的原生 session name 只更新标题, 不重新排序. 列表每页六条. Pending 和当前对话的标题不带 callback data. 点击其他对话中可删除条目的标题会打开 Delete/Cancel 确认, 无论 binding 为 Open 还是 Closed. 每个列表和删除 callback 都校验授权用户、当前对话 generation、过期时间、来源消息 ID、action token、目标 binding generation 以及 Bridge 级内存 binding mutation epoch. `DeleteClosedBinding` 成功后会推进所有 worker 共享的 epoch, 即使被删除的 generation 随后复用, 旧 `/bindings` 菜单和删除确认仍会失效. 重新执行 `/bindings` 也会使旧 viewer token 失效; 旧 callback 不能翻页或清除新页面.
 
-`/bindings old` 仅把非当前、非 pending 条目中已知的 `last_used_at` 改为从旧到新排序; 当前对话和 pending 仍置顶, 零值或未来时间仍排末尾. 标题标明最久未使用优先模式. 翻页, 异步 session name 回填以及成功删除 Closed 或空闲 Open 条目后的新列表均保留该顺序.
+`/bindings old` 对所有条目按已知的 `last_used_at` 从旧到新排序, 包括当前对话和有旧 binding 的 pending start. 没有已知时间的条目 (包括首次启动的 pending start) 排在后面; 未来时间也视为未知. 时间相同时按 thread ID 升序. 标题标明最久未使用优先模式. 翻页、异步 session name 回填以及成功删除 Closed 或空闲 Open 条目后的新列表均保留该顺序.
 
 页脚只有一行 inline keyboard, 可用的翻页按钮排在 Close 前面: 首页为 Next/Close, 中间页为 Previous/Next/Close, 末页为 Previous/Close, 单页列表仅显示 Close.
 
@@ -375,7 +378,7 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 ### 启动恢复与崩溃语义
 
-未提交的启动意图表示转换尚未完成, 不表示可以再次启动一个 omp 进程. 恢复会保留已保存 binding 供显式处理, 再次尝试新转换前需要执行 `/close`, 然后执行 `/new` 或 `/resume`.
+未提交的启动意图表示转换尚未完成, 不表示可以再次启动一个 omp 进程. 恢复会保留未超期的意图与已保存 binding 供显式处理, 再次尝试新转换前需要执行 `/close`, 然后执行 `/new` 或 `/resume`. 保留期可能删除旧意图, 但不能证明原生启动失败; 再次启动前应检查 OMP history.
 
 每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的按需恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. 这是 bridge 级 two-phase commit: 先持久化意图, 再发布运行绑定; 不保证进程启动 exactly once. `/close` 会先删除待完成意图, 再关闭当前绑定.
 

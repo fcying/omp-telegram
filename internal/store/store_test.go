@@ -32,7 +32,7 @@ func requireNoActivityTable(t *testing.T, s *Store) {
 	var count int
 	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='activity_messages'").Scan(&count))
 	if count != 0 {
-		t.Fatalf("schema 13 activity_messages tables = %d, want 0", count)
+		t.Fatalf("activity_messages tables = %d, want 0", count)
 	}
 }
 
@@ -66,20 +66,20 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	}
 }
 
-func TestVersionElevenMigratesToThirteen(t *testing.T) {
+func TestVersionElevenMigratesToCurrent(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
-	_, err := s.DB.Exec("PRAGMA user_version=11")
+	_, err := s.DB.Exec("ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=11")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
 	var version int
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	if version != schemaVersion {
-		t.Fatalf("version 11 reopened as %d, want 13", version)
+		t.Fatalf("version 11 reopened as %d, want %d", version, schemaVersion)
 	}
 	requireNoActivityTable(t, s)
 	binding, err := s.Binding(1, 2, 3)
@@ -98,7 +98,7 @@ func TestVersionTwelveMigrationRollsBackOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
-	_, err := s.DB.Exec(`CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
+	_, err := s.DB.Exec(`ALTER TABLE startup_intents DROP COLUMN created_at; CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	if reopened, err := Open(dir); err == nil {
@@ -118,7 +118,7 @@ func TestVersionTwelveMigrationRollsBackOnFailure(t *testing.T) {
 	}
 }
 
-func TestVersionTwelveMigratesToThirteenWithoutOtherDataLoss(t *testing.T) {
+func TestVersionTwelveMigratesToCurrentWithoutOtherDataLoss(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
@@ -128,6 +128,7 @@ func TestVersionTwelveMigratesToThirteenWithoutOtherDataLoss(t *testing.T) {
 	_, err := s.DB.Exec(`INSERT INTO outbox(inbox_id,chat,thread,text,state) VALUES (10,2,3,'pending reply','pending');
 CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id));
 INSERT INTO activity_messages(inbox_id,chat,message_id) VALUES (10,2,91);
+ALTER TABLE startup_intents DROP COLUMN created_at;
 PRAGMA user_version=12;`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -135,7 +136,7 @@ PRAGMA user_version=12;`)
 	var version int
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	if version != schemaVersion {
-		t.Fatalf("version 12 reopened as %d, want 13", version)
+		t.Fatalf("version 12 reopened as %d, want %d", version, schemaVersion)
 	}
 	requireNoActivityTable(t, s)
 	binding, err := s.Binding(1, 2, 3)
@@ -154,6 +155,33 @@ PRAGMA user_version=12;`)
 	requireStoreOK(t, s.DB.QueryRow("SELECT text,state FROM outbox WHERE inbox_id=10").Scan(&text, &outboxState))
 	if text != "pending reply" || outboxState != string(OutboxPending) {
 		t.Fatalf("v12 migration lost pending outbox: text=%q state=%q", text, outboxState)
+	}
+}
+
+func TestVersionThirteenStartsRetentionAtMigration(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	previous := Binding{Bot: 1, Chat: 2, Thread: 3}
+	intent := StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/new", Generation: 1}
+	requireStoreOK(t, s.PrepareStart(previous, intent))
+	_, err := s.DB.Exec("ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=13")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var createdAt int64
+	requireStoreOK(t, s.DB.QueryRow("SELECT created_at FROM startup_intents WHERE bot=1 AND chat=2 AND thread=3").Scan(&createdAt))
+	if createdAt < time.Now().Add(-time.Minute).Unix() || createdAt > time.Now().Unix() {
+		t.Fatalf("legacy intent creation time = %d, want migration time", createdAt)
+	}
+	count, err := s.CleanupExpiredStarts(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if count != 0 {
+		t.Fatal("migration immediately removed legacy intent")
+	}
+	intents, err := s.PendingStarts(1)
+	requireStoreOK(t, err)
+	if len(intents) != 1 || intents[0] != intent {
+		t.Fatalf("migration lost legacy intent: %+v", intents)
 	}
 }
 
@@ -913,6 +941,53 @@ func TestStartupIntentCommitsReplacementAtomically(t *testing.T) {
 	}
 }
 
+func TestStartupIntentRetentionPreservesFreshAndPreviousBinding(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	previous := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/old", Session: "/old/session", Generation: 1, Running: true}
+	requireStoreOK(t, s.Save(previous))
+	old := StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/next", Generation: 2}
+	requireStoreOK(t, s.PrepareStart(previous, old))
+	fresh := StartIntent{Bot: 1, Chat: 2, Thread: 4, Kind: "new", Workspace: "/fresh", Generation: 1}
+	requireStoreOK(t, s.PrepareStart(Binding{Bot: 1, Chat: 2, Thread: 4}, fresh))
+	cutoff := time.Now().AddDate(0, 0, -90).Unix()
+	_, err := s.DB.Exec("UPDATE startup_intents SET created_at=? WHERE bot=1 AND chat=2 AND thread=3", cutoff-1)
+	requireStoreOK(t, err)
+	if removed, err := s.ExpireStart(context.Background(), StartIntent{Bot: 1, Chat: 2, Thread: 3, Generation: 3}, cutoff); err != nil || removed {
+		t.Fatalf("stale generation expired intent: removed=%t, error=%v", removed, err)
+	}
+	count, err := s.CleanupExpiredStarts(context.Background(), cutoff)
+	requireStoreOK(t, err)
+	if count != 1 {
+		t.Fatalf("expired start count = %d, want 1", count)
+	}
+	intents, err := s.PendingStarts(1)
+	requireStoreOK(t, err)
+	if len(intents) != 1 || intents[0] != fresh {
+		t.Fatalf("fresh intent lost or expired intent remained: %+v", intents)
+	}
+	stored, err := s.Binding(1, 2, 3)
+	requireStoreOK(t, err)
+	previous.Running = false
+	if stored != previous {
+		t.Fatalf("retention changed previous session binding: %+v", stored)
+	}
+}
+
+func TestStartupIntentExpiresOnlyAfterCutoff(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	intent := StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "resume", Workspace: "/old", Session: "/old/session", Generation: 1}
+	requireStoreOK(t, s.PrepareStart(Binding{Bot: 1, Chat: 2, Thread: 3}, intent))
+	cutoff := time.Now().AddDate(0, 0, -90).Unix()
+	_, err := s.DB.Exec("UPDATE startup_intents SET created_at=? WHERE bot=1 AND chat=2 AND thread=3", cutoff)
+	requireStoreOK(t, err)
+	if expired, err := s.ExpireStart(context.Background(), intent, cutoff); err != nil || expired {
+		t.Fatalf("intent at cutoff expired: %t, %v", expired, err)
+	}
+	if expired, err := s.ExpireStart(context.Background(), intent, cutoff+1); err != nil || !expired {
+		t.Fatalf("intent older than cutoff retained: %t, %v", expired, err)
+	}
+}
+
 func TestRunningBindingsSurviveRestartAndStayScoped(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
@@ -1237,6 +1312,7 @@ func TestVersionTenMigratesServerRetryCountIndependently(t *testing.T) {
 	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
 	requireStoreOK(t, err)
 	_, err = db.Exec(`CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',generation INTEGER NOT NULL,last_used_at INTEGER NOT NULL DEFAULT 0,running INTEGER NOT NULL DEFAULT 0,interrupted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
 CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,progress_message_id INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,inbox_id INTEGER NOT NULL DEFAULT 0,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,reply_to INTEGER NOT NULL DEFAULT 0,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL DEFAULT 0,attempt_count INTEGER NOT NULL DEFAULT 0);
 INSERT INTO outbox(id,chat,thread,text,state,next_attempt_at,attempt_count) VALUES(1,-10,11,'legacy retry','pending',123,11);
