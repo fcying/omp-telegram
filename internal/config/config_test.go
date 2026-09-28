@@ -312,6 +312,48 @@ func TestDefaultTokenDoesNotUseAnotherBotsEnvironment(t *testing.T) {
 	}
 }
 
+func TestConfiguredTelegramTokenVariableFollowsDenylist(t *testing.T) {
+	path, source := configFixture(t)
+	t.Setenv("TELEGRAM_BOT_TOKEN", "custom-bot-credential")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "bridge-bot-credential")
+	source = setTOMLField(source, "telegram", "token", `"${TELEGRAM_BOT_TOKEN}"`)
+	c, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Token != "custom-bot-credential" {
+		t.Fatal("custom Telegram token environment reference did not expand")
+	}
+	if value, ok := c.OMPEnvironment.Lookup("TELEGRAM_BOT_TOKEN"); !ok || value != "custom-bot-credential" {
+		t.Fatal("custom Telegram token variable did not follow the denylist policy")
+	}
+	if value, ok := c.OMPEnvironment.Lookup("OMP_TELEGRAM_BOT_TOKEN"); !ok || value != "bridge-bot-credential" {
+		t.Fatal("unlisted conventional token variable was filtered")
+	}
+	child := omp.ChildEnv(c.OMPEnvironment)
+	if !slices.Contains(child, "TELEGRAM_BOT_TOKEN=custom-bot-credential") || !slices.Contains(child, "OMP_TELEGRAM_BOT_TOKEN=bridge-bot-credential") {
+		t.Fatal("unlisted token variables did not follow the denylist policy")
+	}
+}
+
+func TestDeniedTelegramTokenVariableStillExpandsInBridgeConfig(t *testing.T) {
+	path, source := configFixture(t)
+	t.Setenv("CUSTOM_TELEGRAM_TOKEN", "custom-bot-credential")
+	source = setTOMLField(source, "telegram", "token", `"${CUSTOM_TELEGRAM_TOKEN}"`)
+	source = setTOMLField(source, "omp.environment", "mode", `"denylist"`)
+	source = setTOMLField(source, "omp.environment", "deny", `["CUSTOM_TELEGRAM_TOKEN"]`)
+	c, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Token != "custom-bot-credential" {
+		t.Fatal("denied child variable did not expand in the bridge configuration")
+	}
+	if _, ok := c.OMPEnvironment.Lookup("CUSTOM_TELEGRAM_TOKEN"); ok {
+		t.Fatal("denied Telegram token variable remained available to OMP")
+	}
+}
+
 func TestEnvironmentValuesCannotInjectConfiguration(t *testing.T) {
 	path, source := configFixture(t)
 	token := "secret\"\nallowed_users = [666]\n# $UNEXPANDED \\"
@@ -641,6 +683,9 @@ func TestBundledConfigFallback(t *testing.T) {
 	if c.ProgressMode != "verbose" {
 		t.Fatalf("bundled config ignored progress mode environment: %q", c.ProgressMode)
 	}
+	if _, ok := c.OMPEnvironment.Lookup("OMP_TELEGRAM_BOT_TOKEN"); ok {
+		t.Fatal("bundled config did not apply its explicit bot token deny")
+	}
 	path := filepath.Join(base, "config.toml")
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("fallback wrote a config file: %v", err)
@@ -782,25 +827,34 @@ func TestConfigurationErrorsDoNotExposePathOrExpandedValue(t *testing.T) {
 	}
 }
 
-func TestOMPEnvironmentDefaultsToDenylistWithoutBotToken(t *testing.T) {
+func TestOMPEnvironmentDefaultsToDenylistWithoutImplicitDeny(t *testing.T) {
 	path, source := configFixture(t)
 	t.Setenv("BRIDGE_TEST_PROVIDER_API_KEY", "provider-credential")
 	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "bot-credential")
-	for name, input := range map[string]string{
-		"omitted":    source,
-		"explicit":   setTOMLField(source, "omp.environment", "mode", `"denylist"`),
-		"empty deny": setTOMLField(setTOMLField(source, "omp.environment", "mode", `"denylist"`), "omp.environment", "deny", `[]`),
+	for _, tc := range []struct {
+		name, input string
+		blocked     bool
+	}{
+		{"omitted", source, false},
+		{"explicit", setTOMLField(source, "omp.environment", "mode", `"denylist"`), false},
+		{"empty deny", setTOMLField(source, "omp.environment", "deny", `[]`), false},
+		{"other deny", setTOMLField(source, "omp.environment", "deny", `["BRIDGE_TEST_OTHER"]`), false},
+		{"named deny", setTOMLField(source, "omp.environment", "deny", `["OMP_TELEGRAM_BOT_TOKEN"]`), true},
 	} {
-		t.Run(name, func(t *testing.T) {
-			c, err := loadSource(t, path, input)
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := loadSource(t, path, tc.input)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if value, ok := c.OMPEnvironment.Lookup("BRIDGE_TEST_PROVIDER_API_KEY"); !ok || value != "provider-credential" {
 				t.Fatal("denylist mode did not pass through an existing provider credential")
 			}
-			if _, ok := c.OMPEnvironment.Lookup("OMP_TELEGRAM_BOT_TOKEN"); ok {
-				t.Fatal("bot token was accessible to a child")
+			value, ok := c.OMPEnvironment.Lookup("OMP_TELEGRAM_BOT_TOKEN")
+			if ok == tc.blocked || (ok && value != "bot-credential") {
+				t.Fatalf("token lookup: %q, present %v; named deny %v", value, ok, tc.blocked)
+			}
+			if slices.Contains(omp.ChildEnv(c.OMPEnvironment), "OMP_TELEGRAM_BOT_TOKEN=bot-credential") == tc.blocked {
+				t.Fatal("child token visibility did not follow the configured denylist")
 			}
 			t.Setenv("BRIDGE_TEST_FUTURE", "future-credential")
 			if value, ok := c.OMPEnvironment.Lookup("BRIDGE_TEST_FUTURE"); !ok || value != "future-credential" {
@@ -832,7 +886,7 @@ func TestOMPDenylistedEnvironmentExcludesOnlyNamedChildVariables(t *testing.T) {
 	}
 	child := omp.ChildEnv(c.OMPEnvironment)
 	if slices.Contains(child, "BRIDGE_TEST_EXCLUDED=parent-only-credential") || slices.Contains(child, "OMP_TELEGRAM_BOT_TOKEN=bot-credential") {
-		t.Fatal("denied variable or bot token reached a child process")
+		t.Fatal("explicitly denied variable reached a child process")
 	}
 	if !slices.Contains(child, "BRIDGE_TEST_PROVIDER_API_KEY=provider-credential") {
 		t.Fatal("unlisted variable did not reach a child process")
@@ -843,6 +897,7 @@ func TestOMPAllowlistedEnvironmentAllowsOnlyNamedPresentVariables(t *testing.T) 
 	path, source := configFixture(t)
 	t.Setenv("BRIDGE_TEST_PROVIDER_API_KEY", "provider-credential")
 	t.Setenv("BRIDGE_TEST_UNLISTED", "unlisted-credential")
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "bot-credential")
 	input := setTOMLField(source, "omp.environment", "mode", `"allowlist"`)
 	input = setTOMLField(input, "omp.environment", "allow", `["BRIDGE_TEST_PROVIDER_API_KEY", "BRIDGE_TEST_MISSING"]`)
 	c, err := loadSource(t, path, input)
@@ -858,8 +913,9 @@ func TestOMPAllowlistedEnvironmentAllowsOnlyNamedPresentVariables(t *testing.T) 
 		}
 	}
 	child := omp.ChildEnv(c.OMPEnvironment)
-	if !slices.Contains(child, "BRIDGE_TEST_PROVIDER_API_KEY=provider-credential") || slices.Contains(child, "BRIDGE_TEST_UNLISTED=unlisted-credential") || slices.Contains(child, "BRIDGE_TEST_MISSING=") {
+	if !slices.Contains(child, "BRIDGE_TEST_PROVIDER_API_KEY=provider-credential") || slices.Contains(child, "BRIDGE_TEST_UNLISTED=unlisted-credential") || slices.Contains(child, "BRIDGE_TEST_MISSING=") || slices.Contains(child, "OMP_TELEGRAM_BOT_TOKEN=bot-credential") {
 		t.Fatal("allowlist child environment did not match child lookups")
+
 	}
 	input = setTOMLField(input, "omp.environment", "allow", `[]`)
 	c, err = loadSource(t, path, input)
@@ -871,6 +927,22 @@ func TestOMPAllowlistedEnvironmentAllowsOnlyNamedPresentVariables(t *testing.T) 
 	}
 	if slices.Contains(omp.ChildEnv(c.OMPEnvironment), "BRIDGE_TEST_PROVIDER_API_KEY=provider-credential") {
 		t.Fatal("empty allowlist exposed a provider credential to a child process")
+	}
+}
+func TestOMPAllowlistExplicitlyPassesBotToken(t *testing.T) {
+	path, source := configFixture(t)
+	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "bot-credential")
+	input := setTOMLField(source, "omp.environment", "mode", `"allowlist"`)
+	input = setTOMLField(input, "omp.environment", "allow", `["OMP_TELEGRAM_BOT_TOKEN"]`)
+	c, err := loadSource(t, path, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := c.OMPEnvironment.Lookup("OMP_TELEGRAM_BOT_TOKEN"); !ok || value != "bot-credential" {
+		t.Fatal("explicit token allowlist did not expose the parent token")
+	}
+	if !slices.Contains(omp.ChildEnv(c.OMPEnvironment), "OMP_TELEGRAM_BOT_TOKEN=bot-credential") {
+		t.Fatal("explicit token allowlist did not pass the token to OMP")
 	}
 }
 
@@ -891,8 +963,6 @@ func TestOMPEnvironmentRejectsInvalidPoliciesWithoutLeakingValues(t *testing.T) 
 		"empty mode":                {mode: `""`},
 		"invalid variable name":     {mode: `"allowlist"`, allow: `["BAD-NAME"]`},
 		"unexpanded variable name":  {mode: `"allowlist"`, allow: `["${BRIDGE_TEST_PROVIDER_API_KEY}"]`},
-		"token allowlist":           {mode: `"allowlist"`, allow: `["OMP_TELEGRAM_BOT_TOKEN"]`},
-		"denylist with empty allow": {mode: `"denylist"`, allow: `[]`},
 		"denylist with allow":       {mode: `"denylist"`, allow: `["BRIDGE_TEST_PROVIDER_API_KEY"]`},
 		"allowlist with empty deny": {mode: `"allowlist"`, allow: `[]`, deny: `[]`},
 		"allowlist with deny":       {mode: `"allowlist"`, allow: `[]`, deny: `["BRIDGE_TEST_PROVIDER_API_KEY"]`},

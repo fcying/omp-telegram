@@ -15,7 +15,7 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-func TestCheckDoctorOMPFiltersBotToken(t *testing.T) {
+func TestCheckDoctorOMPUsesZeroValueEnvironmentPolicy(t *testing.T) {
 	capture := filepath.Join(t.TempDir(), "child-environment")
 	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "fixture-only-not-a-credential")
 	t.Setenv("OMP_TEST_OMP_ENV", "preserved-runtime-setting")
@@ -36,8 +36,8 @@ func TestCheckDoctorOMPFiltersBotToken(t *testing.T) {
 	if err != nil {
 		t.Fatal("doctor version fixture did not record its environment")
 	}
-	if string(data) != "false\npreserved-runtime-setting\npreserved-telegram-fixture\n" {
-		t.Fatal("doctor version child inherited the bot token or lost non-secret OMP environment")
+	if string(data) != "true\npreserved-runtime-setting\npreserved-telegram-fixture\n" {
+		t.Fatal("doctor child environment did not match the zero-value policy")
 	}
 }
 

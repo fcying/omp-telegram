@@ -24,16 +24,12 @@ binary = "omp"
 args = "${OMP_TELEGRAM_ARGS}"
 # Example: args = '--config "${HOME}/.config/omp/telegram.yml"'
 [omp.environment]
-# Default denylist inherits all present and future parent variables except OMP_TELEGRAM_BOT_TOKEN.
+# deny excludes these literal parent variable names from OMP children.
 mode = "denylist"
-# In denylist mode, deny named parent variables from OMP children, not the bridge.
-# The bot token is always filtered and need not be listed.
-# If OMP requires a denied API key, authentication using that key will fail.
-# deny = ["SOME_API_KEY"]
-# Alternatively, use mode = "allowlist" with an explicit allow list of every
-# parent variable OMP needs, including provider credentials and runtime variables
-# such as PATH/HOME. Only listed, present names are passed. An empty allow list
-# is valid; deny must be absent in allowlist mode, even if empty.
+deny = ["OMP_TELEGRAM_BOT_TOKEN"]
+# Add other names to deny when OMP should not inherit them.
+# In allowlist mode, only named variables present in the parent are passed.
+# Do not configure allow and deny together, even if one list is empty.
 # allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
 
 [storage]

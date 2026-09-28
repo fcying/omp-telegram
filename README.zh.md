@@ -74,6 +74,7 @@ args = "${OMP_TELEGRAM_ARGS}"
 
 [omp.environment]
 mode = "denylist"
+deny = ["OMP_TELEGRAM_BOT_TOKEN"]
 
 [storage]
 data_dir = "."
@@ -121,10 +122,10 @@ format = "text"
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见 [Progress UI](#progress-ui). |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | OMP 额外参数. 默认读取可选的 `OMP_TELEGRAM_ARGS`; 显式空字符串禁用额外参数. |
-| `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"`, 传递服务环境中当前及未来新增的所有变量, 但始终过滤 bot token; 可选 `deny = [...]` 从 OMP 子进程移除指定变量, 变量仍留在 bridge 中 (`[]` 合法). `mode = "allowlist"` 必须提供 `allow = [...]`, 只传递列出且已存在的父进程变量 (`[]` 合法). denylist 模式不能提供 `allow`, allowlist 模式不能提供 `deny`, 即使是 `[]`. |
-| `storage.data_dir` | 数据库, lock 和待发送附件的存储目录. 默认是二进制所在目录. |
+| `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"` 会传递当前及未来新增的服务环境变量, 只排除显式列入 `deny` 的名称. 随附的 `config.toml` 设置了 `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` 只传递列出且已存在的变量. |
+| `storage.data_dir` | 数据库, lock 和输入/输出附件存储目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
-| `storage.database_retention_days` | 终态 bridge 消息 metadata 的保留天数. 默认 `90`; `0` 关闭自动清理. |
+| `storage.database_retention_days` | 终态 bridge 记录的保留期. 超期输入附件只有在 owner session 不存在或其更新时间也超过该期限时才清理; 有 bridge 标记的中断下载也可清理. session 状态无法确认时保留已准备完成的附件. 默认 `90`; `0` 关闭自动 retention 清理. |
 | `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `8`; 配置最大值 `64`. |
 | `worker.queue_capacity` | 每个对话最多等待的任务数. 默认 `16`; 配置最大值 `1024`. |
 | `worker.idle_timeout` | 保留 session 的同时释放持续空闲 OMP 进程前的时长. 默认 `30m`; `0` 或 `disabled` 关闭. |
@@ -142,19 +143,17 @@ mode = "allowlist"
 allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
 ```
 
-`allow` 中的名称是字面 POSIX 环境变量名, 不解析 `$VAR` 引用. 只有服务环境中已设置的变量会传给子进程; 缺失的变量会省略, 不会补充空值. OMP 所需的 provider 凭据必须逐一列出; 如需代理或语言环境变量, 请分别列出 `HTTPS_PROXY` 或 `LANG`. 此策略覆盖 OMP RPC、ACP session 以及模型查询、render、HTML export 和 doctor 等辅助命令. 显式 `omp.args` 配置 overlay 在 allowlist 模式下仍然有效, 但不会隐式将相应环境变量加入 `allow`. 过短的名单可能使 OMP、运行时或 provider 无法工作; 请自行列出必要的运行时变量. 这仅限制子进程继承的环境, 不限制访问 `HOME`、文件系统、同用户其他进程或 OMP 配置中的凭据; 它不是沙箱.
+`allow` 列出 OMP 所需的已存在环境变量, 包括 provider 凭据和 `PATH` 等运行时变量. 名单不完整可能导致 OMP 无法运行. 这只限制环境变量继承, 不限制文件系统或同用户进程访问.
 
-Allowlist 模式拒绝 `deny`, 即使是空数组; denylist 模式拒绝 `allow`, 即使是空数组. `allow` 中列出 `OMP_TELEGRAM_BOT_TOKEN` 会被拒绝.
-
-若要让 provider key 留在 bridge 中, 但不传给 OMP, 可改用 denylist 模式:
+若只需排除部分变量, 其余变量保持传递:
 
 ```toml
 [omp.environment]
 mode = "denylist"
-deny = ["SOME_API_KEY"]
+deny = ["OMP_TELEGRAM_BOT_TOKEN", "SOME_API_KEY"]
 ```
 
-`deny` 中的名称是字面 POSIX 环境变量名, 不解析 `$VAR` 引用. 变量仍存在于 bridge 的父进程环境中, 但不会传给 OMP 子进程, OMP 命令准备阶段的父进程变量读取也会忽略它. 如果 OMP 自己依赖被排除的 provider key, 就无法使用该 key 认证. 无论采用哪种模式或是否设置 `deny`, bot token 始终从 OMP 子进程环境中移除, 无需列出.
+`deny` 列出不传给 OMP 子进程的字面变量名; bridge 侧的 TOML `${VAR}` 仍会展开. 如果使用自定义 Telegram token 变量名且不希望 OMP 继承, 将其加入这里.
 
 修改配置或环境变量后需重启服务. 后台运行时请使用进程管理器, 明确提供环境变量, 并确保 `PATH` 同时包含 omp 及其运行时.
 
@@ -181,8 +180,6 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 ```
 
 `--check` 检查本地配置, 查找 omp 可执行文件, 并创建配置中的数据及工作目录. 它不验证 Telegram 或模型认证. 最后一条命令前台运行服务, Ctrl-C 退出.
-
-Bridge 始终从 OMP 子进程及辅助命令的环境中移除 `OMP_TELEGRAM_BOT_TOKEN`; allowlist 的 `allow` 中列出该变量会被拒绝, denylist 的 `deny` 中列出它则无额外效果. 默认情况下, 当前及未来新增的其他环境变量都会传给 OMP; 不要把 bot token 放进其他会继承的变量或 OMP 配置. 这不提供文件系统隔离或同用户进程隔离.
 
 ### 开始 session
 
@@ -316,7 +313,7 @@ Progress 不显示模型 reasoning, 原始工具参数或结果, 命令文本以
 | 发送文档 | 50 MB |
 | 发送照片 | 10 MB, JPEG 或 PNG |
 
-收到的文件保留在所选 workspace 的 `.telegram/incoming/` 下. 大图可能以预览或本地文件路径提供给模型. 相册 prompt 仅内联能够放进协商后的 RPC frame 的前几张图片; 其余图片仍可通过列出的本地路径访问. 如果去掉内联图片后 prompt 仍超限, 则在提交前拒绝该任务, 不关闭 session. 识图能力取决于模型, 文档读取能力取决于可用工具. `/stop` 不会删除已经提交给 OMP 的附件.
+收到的文件私有保存在 `<storage.data_dir>/attachments/inbox/`. 如果路径重叠, 该目录也可能位于所选 workspace 内. 目录在配置保留期内未更新后会参与清理; worker 运行期间会跳过活动任务, 正常任务结算时会刷新附件的保留时间. 服务重启后, 如果中断任务的旧附件已超过保留期, 也可能被清理. 旧版本保存在 workspace `.telegram/incoming/` 下的文件不会迁移或删除. 大图可能以预览或本地文件路径提供给模型. 相册 prompt 仅内联能够放进协商后的 RPC frame 的前几张图片; 其余图片仍可通过列出的本地路径访问. 如果去掉内联图片后 prompt 仍超限, 则在提交前拒绝该任务, 不关闭 session. 识图能力取决于模型, 文档读取能力取决于可用工具. `/stop` 不会删除已经提交给 OMP 的附件.
 
 输出附件会在加入 Telegram 交付队列前复制到私有 delivery snapshot, 因此源文件之后的变化不会改变已经排队的内容.
 
@@ -357,7 +354,7 @@ Bridge 状态保存在:
 
 `storage.data_dir` 默认是解析符号链接后的真实二进制所在目录. 相对 storage 路径使用该目录, 不使用启动目录. 需要把数据放在其他位置时请使用绝对路径.
 
-终态 Telegram bridge 记录按 `storage.database_retention_days` 保留, 默认 90 天.
+终态 Telegram bridge 记录按 `storage.database_retention_days` 保留, 默认 90 天. 输入附件目录在同一保留期内未更新后会参与清理; 正常任务结算时会刷新其保留时间, worker 运行期间会跳过活动任务. 服务启动时及运行期间每 24 小时执行清理.
 
 设置以下内容可关闭自动清理:
 
@@ -369,7 +366,7 @@ database_retention_days = 0
 Retention cleanup 不会删除:
 
 - OMP session
-- workspace
+- workspace, 包括旧版本遗留在其中的输入附件
 - 其他 OMP 数据
 
 升级前先停止服务, 备份数据目录, workspace 以及 OMP 自己的 session 存储. 只备份 bridge 数据库不等于完整备份 OMP 对话. 不要删除 SQLite 的 `-wal` 或 `-shm` 文件, 也不要在服务运行时只复制主数据库.

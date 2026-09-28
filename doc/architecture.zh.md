@@ -23,7 +23,7 @@
 | [`internal/omp`](../internal/omp/client.go) | RPC 分帧, 请求关联, 事件, 原生 session metadata, ACP 列表及原生导出委托 |
 | [`internal/omp/delete.go`](../internal/omp/delete.go) | 原生 RPC session 删除与文件消失校验 |
 | [`internal/telegram`](../internal/telegram/client.go) | Bot API, 附件传输, 错误脱敏及交付确定性 |
-| [`internal/media`](../internal/media/media.go) | 限定工作目录的文件处理, 图片准备和发送快照 |
+| [`internal/media`](../internal/media/media.go) | 文件访问限定, 输入附件存储, 图片准备和输出快照 |
 | [`internal/store`](../internal/store/store.go) | SQLite schema, 绑定, 持久化输入/输出及完成事务 |
 | [`config.go`](../config.go) | 内嵌唯一的默认配置来源 [`config.toml`](../config.toml) |
 
@@ -171,6 +171,7 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
 进度消息删除的临时失败会保留关联, daemon 正常运行期间每分钟及启动时重试. Telegram 明确永久拒绝时清除关联并停止重试.
 保留策略绝不删除 binding, history, startup intent, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+Telegram 输入附件保存在 `storage.data_dir/attachments/inbox/incoming-*` 私有目录中, 不属于 SQLite. 如果所选 workspace 包含该路径, 附件也位于该 workspace 内. preparation 失败及提交前取消的任务会删除目录. daemon 运行期间, 已提交且排队中或活动任务的路径不会被清理; 任务结算时重置目录修改时间. 启动时及每日运行的 janitor 只处理修改时间早于配置保留截止时间且不在用的目录: 已准备完成的附件还要求 owner 有效, 且 `session/list` 确认 session 不存在或最后更新时间早于同一截止时间; owner 或 session 状态无法确认时保留. 带有 bridge `.preparing` 标记但没有有效 owner 的中断准备目录, 超期后会被删除; 无标记且没有有效 owner metadata 的目录保持不动. `database_retention_days = 0` 会关闭这项清理. 旧 workspace `.telegram/incoming/` 目录不会迁移或删除. 保留的 OMP session history 可能仍引用已被 retention 删除的文件路径.
 
 ### Schema 版本
 
@@ -229,12 +230,11 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 
 ### 附件生命周期
 
-Telegram 输入附件只有在鉴权通过后才会下载, 并保留在所选 workspace 的 `.telegram/incoming/` 下. 它们属于 workspace 文件, 不会被 bridge 消息 retention 删除. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. outbox state 持久化为任意终态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后, bridge 无论交付成功或失败都会 best-effort 删除 snapshot; workspace 源文件保持不变. 如果立即删除失败, retention 和 spool janitor 可以后续清除剩余 snapshot. retention 只会在对应 outbox 行删除后删除 snapshot, janitor 也只会在这个私有 spool 内删除过期且无引用的 `attachment-*` 文件.
-任意终态 outbox state 后的 snapshot 删除都是 best-effort; 无法立即删除的 snapshot 由 retention 和 spool janitor 后续处理.
+Telegram 输入附件只有在鉴权通过后才会下载到 `storage.data_dir/attachments/inbox/incoming-*` 私有目录, 不属于 SQLite. 如果配置的数据目录与所选 workspace 路径重叠, 附件也可能位于该 workspace 内. worker 运行期间, 排队中和活动任务的路径不会被清理; 正常任务结算时会重置目录修改时间. 崩溃中断任务留下的旧文件可能在启动时参与清理. 旧 workspace `.telegram/incoming/` 目录不会迁移或删除. OMP session history 可能保留已被 retention 删除的文件路径. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. outbox state 持久化为任意终态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后, bridge 无论交付成功或失败都会 best-effort 删除 snapshot; workspace 源文件保持不变. 如果立即删除失败, retention 和 spool janitor 可以后续清除剩余 snapshot.
 
 `/export` 只使用已提交 binding 的 workspace 和原生 session identity. 它不会调用 `ensureRuntime`, 修改 binding 状态, claim session, touch `last_used_at`, 或占用普通 runtime slot. 如果 selected ID 等于 committed binding 的 `session_id`, 即使 idle release 或 `/close` 之后也直接使用已保存的 `session` path; 其他 ID 通过 OMP 原生 `omp <omp.args...> render <session-id> -q -t` 命令, 使用 configured working directory 解析, 再严格校验返回的第一条 `session  <absolute-path>` diagnostic line 及持久化 session header. 如果 `omp.args` 或 `PI_CODING_AGENT_SESSION_DIR` 指定 custom session directory, inactive session export 会直接拒绝, 因为 native render 不会接收这个 launch-global store override. bridge 不发现或模拟 OMP session storage 规则. raw 导出以只读且禁止跟随 symlink 的方式打开 absolute source, 再通过 `Fstat` 检查打开的文件, 使用有界的 `MaxDocumentBytes` 读取复制到私有 attachment outbox spool, fsync 后设置 `0400`, 并保留经过安全处理的 OMP basename 作为 Telegram filename. HTML 导出也先以相同的 no-follow 规则, 只把选中的 main session JSONL snapshot 到 bridge-owned 私有 spool, 再把这个稳定 snapshot 交给 OMP 原生 exporter; 不复制 companion 或 subagent transcript. HTML 生成期间监控 output 增长, 超过 `MaxDocumentBytes` 就终止并清理. 只导出 main session JSONL, 不创建 zip 或 subagent bundle.
 
-带非空 `media_group_id` 的 photo 和 document 消息由所属 worker 按 `(media_group_id,sender_id)` 聚合. 第一条成员消息立即占用一个 bridge queue slot, 同时作为 logical task 和 inbox owner; 后续成员在被消费后直接标记为 `done`, 不再进入队列. 首条消息后的 500 ms quiet period 会收集新成员, 从首条消息起最多等待 2 秒, 并使用 version fence 忽略旧 timer. 一个相册最多接受 10 个成员. 封存后按 Telegram message ID 排序, 使用带序号的文件名下载到同一个 incoming directory. Worker 作为一次 prompt 提交第一个非空 caption, 并仅携带能够放进协商后物理 RPC frame 的前几张 inline images; 每份原文件仍可通过列出的 workspace 路径访问. 如果纯文本已超出帧限额, pending task 会标记为 `failed`, 而不会关闭 session. 已提交任务若遇到写入前帧超限, 则以 `cancelled` 结束, 不关闭 session; 执行结果不确定的错误继续沿用原有关闭流程. 按顺序找到的第一个带 reply context 的成员提供一次上下文, 最终 reply target 是相册第一条消息. preparation 采用 all-or-nothing: 任一成员失败都会删除 directory 和 owner queue entry, 将 owner 标记为 `failed`, 并只发送一次 album 专用提示. 没有 media group 的附件继续单消息路径. Album collection 只存在于 worker 内存中; 取消、拒绝、封存或 teardown 后会在短暂窗口内抑制迟到成员, daemon 重启时取消尚未完成的 owner, 不自动重放 album state.
+带非空 `media_group_id` 的 photo 和 document 消息由所属 worker 按 `(media_group_id,sender_id)` 聚合. 第一条成员消息立即占用一个 bridge queue slot, 同时作为 logical task 和 inbox owner; 后续成员在被消费后直接标记为 `done`, 不再进入队列. 首条消息后的 500 ms quiet period 会收集新成员, 从首条消息起最多等待 2 秒, 并使用 version fence 忽略旧 timer. 一个相册最多接受 10 个成员. 封存后按 Telegram message ID 排序, 使用带序号的文件名下载到同一个 incoming directory. Worker 作为一次 prompt 提交第一个非空 caption, 并仅携带能够放进协商后物理 RPC frame 的前几张 inline images; 每份原文件仍可通过列出的 data-directory 路径访问. 如果纯文本已超出帧限额, pending task 会标记为 `failed`, 而不会关闭 session. 已提交任务若遇到写入前帧超限, 则以 `cancelled` 结束, 不关闭 session; 执行结果不确定的错误继续沿用原有关闭流程. 按顺序找到的第一个带 reply context 的成员提供一次上下文, 最终 reply target 是相册第一条消息. preparation 采用 all-or-nothing: 任一成员失败都会删除 directory 和 owner queue entry, 将 owner 标记为 `failed`, 并只发送一次 album 专用提示. 没有 media group 的附件继续单消息路径. Album collection 只存在于 worker 内存中; 取消、拒绝、封存或 teardown 后会在短暂窗口内抑制迟到成员, daemon 重启时取消尚未完成的 owner, 不自动重放 album state.
 
 ## 会话生命周期
 
@@ -405,11 +405,13 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 ## 进程与文件安全
 
 - 使用 argv 直接启动, 不经过 shell. 显式 `omp.args` 不允许覆盖桥接管理的 RPC 模式, cwd 或会话生命周期选项.
-- OMP RPC、ACP、模型查询、render、HTML export 和 doctor 探测使用 `[omp.environment]`: 默认 `mode = "denylist"`, 传递当前及未来新增的父进程环境变量, 但始终过滤 `OMP_TELEGRAM_BOT_TOKEN`. 可选 `deny = ["SOME_API_KEY"]` 从 OMP 子进程及用于准备 OMP 命令的父进程变量读取中排除指定变量, 变量仍留在 bridge 环境中; 如果 OMP 的 provider 需要被排除的 key, 则无法使用该 key 认证. 显式 `mode = "allowlist"` 改用必填的 `allow` 名单, 仅传递已列出且存在的父进程变量; `allow = []` 不传递任何变量. 两种模式即使另一种名单为空也拒绝混用. bot token 始终过滤且无需列入 `deny`: 列入 `allow` 会被拒绝, 列入 `deny` 则无额外效果. 显式 `omp.args` 配置 overlay 仍然生效, 不会因此放行其他父进程变量. 这不是沙箱: 省略 `HOME` 不会阻止访问文件系统、同用户进程或其他 token 副本.
+- OMP RPC、ACP、模型查询、render、HTML export 和 doctor 探测使用 `[omp.environment]`. 策略本身不识别凭据: 默认 `mode = "denylist"` 会传递当前及未来新增的父进程变量, 仅排除显式列入 `deny` 的名称. 随附的 `config.toml` 显式排除 `OMP_TELEGRAM_BOT_TOKEN`; 加载器不会自动增加排除项. `telegram.token` 引用的自定义变量不会按值识别, 除非另行加入 `deny`, 否则仍会传给 OMP. bridge 侧 TOML `${VAR}` 展开独立于 OMP 子进程策略. 显式 `mode = "allowlist"` 通过必填的 `allow` 只传递列出且已存在的父进程变量; `allow = []` 不传递任何变量. 两种模式即使另一种名单为空也拒绝混用. Allowlist 模式只有显式列入时才传递 token 变量. OMP 及其启动的工具可能继承传入的凭据; 仅对可信 OMP 代码和专用测试 bot 启用, 不要用同一 token 同时运行另一个 `getUpdates` polling consumer. 显式 `omp.args` 配置 overlay 仍然生效, 但不会因此允许其他无关的父进程变量. 这不是沙箱: 省略 `HOME` 不会阻止访问文件系统、同用户进程或其他 token 副本.
 - 正常关闭先关闭 stdin 并继续读取输出, 必要时升级到进程组终止. 每个子进程只有一个 `Wait` 所有者.
 - Linux RPC/ACP 启动使用父死亡 SIGTERM. Linux 将此信号关联到创建子进程的 OS 线程, 因此线程锁定到 `Wait` 完成, 每个存活原生子进程占一个锁定线程.
 - 父死亡信号不是整个进程树 containment. 忽略信号, 后代残留, 脱离进程组或清除父死亡设置的程序, 仍需要部署层边界. 项目不强制 systemd/supervisor 配置.
-- 输入附件限定在选定工作目录, 保存于 `.telegram/incoming/`. 输出文件先复制到 `storage.data_dir/attachments/outbox/` 私有快照后入队. outbox state 持久化为任意终态后 best-effort 删除快照, 包括交付失败; workspace 源文件保持不变.
+- 输入附件保存在 `storage.data_dir/attachments/inbox/` 下的私有目录; 如果路径重叠, 该目录也可能位于所选 workspace 内. 开始下载前写入 `.preparing` 标记, 将原生 session ID 和 workspace 写入 `.owner.json` 后移除标记. 清理先要求附件目录超过 retention cutoff 且不在用; 有效 owner 的目录还须通过 `session/list` 确认 session 不存在, 或其 `UpdatedAt` 早于同一 cutoff. 每轮清理按 workspace 各查询一次 session list. 当前 session claim、待处理的 resume intent、export/delete operation、workspace 不可访问、session list 失败或 `UpdatedAt` 无效时都会保留已记录 owner 的目录. owner metadata 缺失或损坏时通常保留, 仅带有 bridge 准备标记的中断下载目录可不查询 session 而删除. 无标记且没有有效 owner metadata 的目录以及旧 workspace `.telegram/incoming/` 文件保持不动. 输出文件在入队前复制到 `storage.data_dir/attachments/outbox/` 下的私有快照; outbox state 持久化为任意终态后, bridge 会 best-effort 删除快照, 包括交付失败, workspace 源文件保持不变.
+  对有效 owner 的目录, 每次删除前在 `sessionMu` 下重新检查当前 session/export/delete claim 与待执行的 resume intent, 并持锁删除目录. `/resume` 在同一把锁下持久化启动意图: 若 resume 先提交, 目录会保留; 若删除先完成, resume 随后才能开始. 带标记但没有 owner 的中断准备目录没有可认领的 session identity, 超期且不在用时直接删除. `session/list` 不持锁运行. 整轮 incoming 清理包含所有 workspace, 总超时为 30 秒; 未扫描完的目录留待下一轮 janitor.
+  `.owner.json` 和 `.preparing` 文件名保留给 metadata; 同名的单个 document 会加 `attachment-` 前缀保存. 写入 owner metadata 前会按读取端的 16 KiB 上限检查编码后的长度, 包括末尾换行.
 - Host tool 受当前对话/request 限制, 不能指定其他 Telegram 目标. 不将原始 RPC 状态, provider header, 凭据或 system prompt 写入日志或状态消息.
 
 以下是两种互斥配置, 不能在同一个 TOML 文件中重复定义该 table:
@@ -417,7 +419,7 @@ idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且�
 ```toml
 [omp.environment]
 mode = "denylist"
-deny = ["SOME_API_KEY"]
+deny = ["OMP_TELEGRAM_BOT_TOKEN", "SOME_API_KEY"]
 ```
 
 ```toml

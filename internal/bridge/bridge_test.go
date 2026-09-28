@@ -809,6 +809,10 @@ func drainControlOperations(t *testing.T, w *worker) {
 	}
 }
 func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) {
+	return setupBridgeWithDataDir(t, t.TempDir())
+}
+
+func setupBridgeWithDataDir(t *testing.T, dataDir string) (*fakeHTTP, *store.Store, func(telegram.Update)) {
 	t.Helper()
 	db, err := store.Open(t.TempDir())
 	if err != nil {
@@ -820,7 +824,7 @@ func setupBridge(t *testing.T) (*fakeHTTP, *store.Store, func(telegram.Update)) 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	exe, _ := os.Executable()
-	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7, 8}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: 2, QueueCapacity: 4}
+	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7, 8}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: dataDir, MaxWorkers: 2, QueueCapacity: 4}
 	logs := testLogs(t)
 	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
 	t.Cleanup(func() {
@@ -3066,7 +3070,8 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 	old := http.DefaultTransport
 	http.DefaultTransport = f
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{OMP: binary, WorkspaceRoot: t.TempDir()}, db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}, slots: make(chan struct{}, 1)}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)})
+	dataDir := t.TempDir()
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{OMP: binary, WorkspaceRoot: t.TempDir(), DataDir: dataDir}, db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}, slots: make(chan struct{}, 1)}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)})
 	w.resumeResults = make(chan resumeListResult, 4)
 	t.Cleanup(func() {
 		w.teardownWorker(true)

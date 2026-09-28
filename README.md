@@ -74,6 +74,7 @@ args = "${OMP_TELEGRAM_ARGS}"
 
 [omp.environment]
 mode = "denylist"
+deny = ["OMP_TELEGRAM_BOT_TOKEN"]
 
 [storage]
 data_dir = "."
@@ -121,10 +122,10 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Additional OMP arguments. Defaults to optional `OMP_TELEGRAM_ARGS`; an explicit empty string disables them. |
-| `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service environment variables except the bot token; optional `deny = [...]` keeps named variables in the bridge but removes them from OMP children (`[]` is valid). `mode = "allowlist"` requires `allow = [...]` and passes only listed, present parent variables (`[]` is valid). Do not set `allow` in denylist mode or `deny` in allowlist mode, even as `[]`. |
-| `storage.data_dir` | Database, lock, and outgoing attachment storage. Default: the executable directory. |
+| `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
+| `storage.data_dir` | Database, lock, and incoming/outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
-| `storage.database_retention_days` | How long terminal bridge message metadata is retained. Default: `90`; `0` disables automatic cleanup. |
+| `storage.database_retention_days` | How long terminal bridge records are retained. Older incoming attachments are removed only if their owner session is absent or has also been inactive for this period; interrupted downloads marked as bridge-owned can also be cleaned. Unverifiable session state keeps completed attachments. Default: `90`; `0` disables automatic retention cleanup. |
 | `worker.max_workers` | Maximum number of connected OMP processes. Default: `8`; maximum: `64`. |
 | `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`; maximum: `1024`. |
 | `worker.idle_timeout` | Time before releasing an otherwise idle OMP process while keeping its session available. Default: `30m`; `0` or `disabled` turns this off. |
@@ -142,19 +143,17 @@ mode = "allowlist"
 allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
 ```
 
-Names in `allow` are literal POSIX environment variable names, not `$VAR` references. Only variables already set in the service environment are passed; missing names are omitted, not filled with empty values. Provider credentials must be individually opted in if OMP needs them; include proxy variables such as `HTTPS_PROXY` or locale variables such as `LANG` when required. The policy applies to OMP RPC and ACP sessions and auxiliary model queries, render, HTML export, and doctor commands. Explicit `omp.args` configuration overlays still work in allowlist mode, without implicitly adding their environment variables to `allow`. A minimal list can prevent OMP, its runtime, or a provider from working; include required runtime variables yourself. This limits child process environment inheritance, not access to `HOME`, filesystem files, other same-user processes, or credentials in OMP configuration; it is not a sandbox.
+`allow` lists existing service variables OMP needs, including provider credentials and runtime variables such as `PATH`. An incomplete list can prevent OMP from working. This limits inherited environment, not filesystem or same-user process access.
 
-Allowlist mode rejects `deny`, even an empty array; denylist mode rejects `allow`, even an empty array. Listing `OMP_TELEGRAM_BOT_TOKEN` in `allow` is rejected.
-
-To keep a provider key in the bridge without passing it to OMP, use denylist mode instead:
+To exclude specific variables while passing the rest:
 
 ```toml
 [omp.environment]
 mode = "denylist"
-deny = ["SOME_API_KEY"]
+deny = ["OMP_TELEGRAM_BOT_TOKEN", "SOME_API_KEY"]
 ```
 
-`deny` names are literal POSIX environment variable names, not `$VAR` references. They remain set in the bridge but are omitted from OMP child environments and parent-variable lookups used to prepare OMP commands. If OMP itself needs a denied provider key, it cannot authenticate using that key. The bot token is always removed from OMP children regardless of mode or `deny` and need not be listed.
+`deny` lists literal variable names excluded from OMP children; bridge-side TOML `${VAR}` expansion still works. Add a custom Telegram token variable here if OMP should not inherit it.
 
 After changing configuration or its environment, restart the service. For background operation, use a process manager and explicitly provide the environment and a `PATH` containing both omp and its runtime.
 
@@ -181,8 +180,6 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 ```
 
 `--check` validates local configuration, finds the omp executable, and creates configured data and workspace directories. It does not test Telegram or model authentication. The final command runs in the foreground; Ctrl-C stops it.
-
-The bridge always removes `OMP_TELEGRAM_BOT_TOKEN` from OMP child-process environments, including auxiliary commands; listing it in allowlist `allow` is rejected, while adding it to denylist `deny` has no additional effect. By default, all other present and future environment variables remain available to OMP; do not put the bot token in another inherited variable or OMP configuration. This is not filesystem or same-user process isolation.
 
 ### Start a session
 
@@ -316,7 +313,7 @@ To receive a file, ask OMP directly, for example, "Send me the report as a file.
 | Send a document | 50 MB |
 | Send a photo | 10 MB, JPEG or PNG |
 
-Incoming files are stored under `.telegram/incoming/` in the selected workspace. Large images may be represented by a preview or a local file path. Album prompts include only the leading inline images that fit the negotiated RPC frame; omitted images remain accessible at their listed local paths. A prompt too large even without images is rejected before submission without closing the session. Image understanding depends on the selected model, and document reading depends on its available tools. Stopping a task does not delete an attachment already submitted to OMP.
+Incoming files are stored privately under `<storage.data_dir>/attachments/inbox/`. This directory can also lie inside the selected workspace if the paths overlap. Directories become eligible for cleanup after the configured period without updates; active tasks are skipped while their worker is running, and normal task settlement refreshes their age. After a restart, old files from an interrupted task may be removed if they have passed the retention period. Files left under a workspace's `.telegram/incoming/` by older versions are not migrated or deleted. Large images may be represented by a preview or a local file path. Album prompts include only the leading inline images that fit the negotiated RPC frame; omitted images remain accessible at their listed local paths. A prompt too large even without images is rejected before submission without closing the session. Image understanding depends on the selected model, and document reading depends on its available tools. Stopping a task does not delete an attachment already submitted to OMP.
 
 Outgoing attachments are copied into a private delivery snapshot before being queued for Telegram delivery, so later changes to the original file do not change the queued payload.
 
@@ -357,7 +354,7 @@ Bridge state is stored in:
 
 `storage.data_dir` defaults to the directory beside the real executable. Relative storage paths use that directory rather than the launch directory. Use absolute paths when data must stay elsewhere.
 
-Terminal Telegram bridge records are retained for `storage.database_retention_days`, which defaults to 90 days.
+Terminal Telegram bridge records are retained for `storage.database_retention_days`, which defaults to 90 days. Incoming attachment directories become eligible for cleanup after the same period without updates; normal task settlement refreshes their age. Active tasks are skipped while their worker is running. Cleanup runs at startup and every 24 hours while the service is running.
 
 Set:
 
@@ -371,7 +368,7 @@ to disable automatic cleanup.
 Retention cleanup does not remove:
 
 - OMP sessions
-- workspaces
+- workspaces, including incoming files left there by older versions
 - other OMP data
 
 Before upgrading, stop the service and back up the data directory, workspaces, and OMP's own session storage. The bridge database alone is not a complete backup of OMP conversations. Do not delete SQLite `-wal` or `-shm` files, and do not copy only the main database while the service is running.

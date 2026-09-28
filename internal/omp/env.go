@@ -6,10 +6,8 @@ import (
 	"strings"
 )
 
-const botTokenName = "OMP_TELEGRAM_BOT_TOKEN"
-
 // Environment controls which parent variables native omp children receive.
-// Its zero value inherits every variable except the bridge bot token.
+// Its zero value inherits every parent variable.
 type Environment struct {
 	allowlist bool
 	allowed   map[string]struct{}
@@ -43,7 +41,7 @@ func NewEnvironment(mode string, allow, deny []string) (Environment, error) {
 		}
 		allowed := make(map[string]struct{}, len(allow))
 		for _, name := range allow {
-			if !validEnvironmentName(name) || name == botTokenName {
+			if !validEnvironmentName(name) {
 				return Environment{}, errors.New("omp: invalid allowed environment variable")
 			}
 			allowed[name] = struct{}{}
@@ -68,17 +66,12 @@ func validEnvironmentName(name string) bool {
 }
 
 func (environment Environment) permits(name string) bool {
-	if name == botTokenName {
-		return false
-	}
-	if _, denied := environment.denied[name]; denied {
-		return false
-	}
 	if environment.allowlist {
 		_, allowed := environment.allowed[name]
 		return allowed
 	}
-	return true
+	_, denied := environment.denied[name]
+	return !denied
 }
 
 // Lookup returns a parent variable only if the policy permits it.

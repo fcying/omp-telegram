@@ -156,8 +156,8 @@ func assertChildEnvironment(t *testing.T, path string, wantConfigFiles []string)
 		t.Fatal("child environment fixture did not record its environment")
 	}
 	fields := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-	if len(fields) != 4 || fields[0] != "false" {
-		t.Fatal("child process inherited the bridge bot token")
+	if len(fields) != 4 || fields[0] != "true" {
+		t.Fatal("zero-value child environment policy did not inherit the bridge token")
 	}
 	if fields[1] != "preserved-runtime-setting" || fields[2] != "preserved-telegram-fixture" {
 		t.Fatal("child process did not preserve non-secret OMP environment")
@@ -173,7 +173,7 @@ func assertChildEnvironment(t *testing.T, path string, wantConfigFiles []string)
 	}
 }
 
-func TestOMPChildProcessesSanitizeEnvironment(t *testing.T) {
+func TestOMPChildProcessesUseZeroValueEnvironmentPolicy(t *testing.T) {
 	capture := filepath.Join(t.TempDir(), "child-environment")
 	t.Setenv("OMP_TELEGRAM_BOT_TOKEN", "fixture-only-not-a-credential")
 	t.Setenv("OMP_TEST_OMP_ENV", "preserved-runtime-setting")
@@ -370,8 +370,8 @@ func TestOMPChildProcessesUseDenylistEnvironment(t *testing.T) {
 		if err != nil {
 			t.Fatalf("native child did not record environment: %v", err)
 		}
-		if got := string(data); got != "false\npreserved-runtime-setting\n\n\n" {
-			t.Fatalf("native child received excluded variables or lost permitted variables: %q", got)
+		if got := string(data); got != "true\npreserved-runtime-setting\n\n\n" {
+			t.Fatalf("denylist lost an unlisted bot token or preserved a denied variable: %q", got)
 		}
 		if err := os.Remove(capture); err != nil {
 			t.Fatal(err)
@@ -394,6 +394,36 @@ func TestOMPChildProcessesUseDenylistEnvironment(t *testing.T) {
 	assertCaptured()
 	if got := os.Getenv("OMP_TELEGRAM_FIXTURE_FLAG"); got != "parent-secret" {
 		t.Fatal("exclusion changed the bridge parent environment")
+	}
+}
+
+func TestOMPChildProcessReceivesExplicitlyAllowlistedBotToken(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "child-environment")
+	t.Setenv("OMP_TEST_CHILD_ENV_RESULT", capture)
+	t.Setenv(botTokenName, "fixture-only-not-a-credential")
+	policy, err := NewEnvironment("allowlist", []string{"OMP_TEST_CHILD_ENV_RESULT", botTokenName}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := Start(ctx, Config{Binary: exe, Environment: policy}, testRPCLogger())
+	if err != nil {
+		t.Fatal("runtime child failed to start")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal("runtime child failed to close")
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal("runtime child did not record its environment")
+	}
+	if !strings.HasPrefix(string(data), "true\n") {
+		t.Fatal("explicitly allowlisted bot token did not reach the OMP process")
 	}
 }
 
