@@ -21,7 +21,7 @@ Use Chinese for conversations and explanations, and English for code comments, t
 - Events and callbacks from an old generation must not affect a new worker.
 - Never automatically replay tasks with uncertain execution status or promise exactly-once execution.
 - Launch processes with explicit argument arrays, not shell string concatenation. Do not enable automatic tool approval by default.
-- Authorize every message and callback. Never write tokens, authentication headers, system prompts, or raw RPC state to logs or Telegram.
+- Authorize every message and callback. Never log tokens, authentication headers, system prompts, or raw RPC state, and never send whole RPC frames, provider headers, or system prompts to Telegram. `telegram.progress_mode=verbose` is an explicit opt-in exception for bounded, unredacted tool arguments and results in live progress: those fields may contain credentials and private content, must not be logged or persisted by the bridge, and can be seen by anyone with access to the conversation.
 - Do not equate process isolation with filesystem or credential isolation. Do not delete user workspaces or historical sessions.
 
 ## Verification
