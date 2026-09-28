@@ -34,7 +34,6 @@ const (
 
 type mediaResult struct {
 	id, generation int64
-	workspace      string
 	input          media.Input
 	err            error
 	logger         *slog.Logger
@@ -247,7 +246,7 @@ func (w *worker) rejectAlbum(album *pendingAlbum) {
 		if q.cancel != nil {
 			q.cancel()
 		}
-		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		w.b.discardIncoming(q.directory, w.mediaTaskLogger(q.id))
 		w.queue = append(w.queue[:i], w.queue[i+1:]...)
 		break
 	}
@@ -387,7 +386,8 @@ func (w *worker) startMediaPreparation(id int64, messages []telegram.Message, al
 		}
 	}
 	members := append([]telegram.Message(nil), messages...)
-	workspace, generation := w.binding.Workspace, w.binding.Generation
+	dataDir, generation := w.b.cfg.DataDir, w.binding.Generation
+	owner := media.IncomingOwner{SessionID: w.sessionID, Workspace: w.binding.Workspace}
 	mediaLogger := w.mediaTaskLogger(id)
 	w.background.Add(1)
 	go func() {
@@ -398,42 +398,186 @@ func (w *worker) startMediaPreparation(id int64, messages []telegram.Message, al
 		select {
 		case w.b.mediaSlots <- struct{}{}:
 			if album {
-				prepared, err = media.PrepareAlbum(ctx, w.b.tg, workspace, members)
+				prepared, err = media.PrepareAlbum(ctx, w.b.tg, dataDir, members)
 			} else {
-				prepared, err = media.Prepare(ctx, w.b.tg, workspace, members[0])
+				prepared, err = media.Prepare(ctx, w.b.tg, dataDir, members[0])
 			}
 			<-w.b.mediaSlots
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := mediaResult{id: id, generation: generation, workspace: workspace, input: prepared, err: err, logger: mediaLogger, album: album, count: len(members)}
+		if err == nil && prepared.Directory != "" {
+			if ownerErr := media.WriteIncomingOwner(dataDir, prepared.Directory, owner); ownerErr != nil {
+				w.b.discardIncoming(prepared.Directory, mediaLogger)
+				prepared = media.Input{}
+				err = errors.New("cannot save incoming attachment session owner")
+			}
+		}
+		result := mediaResult{id: id, generation: generation, input: prepared, err: err, logger: mediaLogger, album: album, count: len(members)}
 		select {
 		case w.mediaResults <- result:
 		case <-w.ctx.Done():
-			removeIncoming(workspace, prepared.Directory, mediaLogger)
+			w.b.discardIncoming(prepared.Directory, mediaLogger)
 		}
 	}()
 }
 
-func removeIncoming(workspace, directory string, logger *slog.Logger) {
+type incomingSessionActivity struct {
+	updatedAt map[string]string
+	available bool
+}
+
+func (b *Bridge) cleanupIncomingAttachments(ctx context.Context, cutoff time.Time) (int, error) {
+	pendingStarts, err := b.db.PendingStarts(b.bot.ID)
+	if err != nil {
+		if ctx.Err() == nil {
+			b.storeLog.Warn("incoming retention state read failed", "event", "cleanup_failed", "error_kind", "persistence")
+		}
+		return 0, nil
+	}
+	pendingSessions := make([]string, 0, len(pendingStarts))
+	for _, intent := range pendingStarts {
+		if intent.Kind == "resume" && intent.Session != "" {
+			pendingSessions = append(pendingSessions, intent.Session)
+		}
+	}
+
+	byWorkspace := make(map[string]incomingSessionActivity)
+	loggedListFailure := false
+	canRemove := func(owner media.IncomingOwner) bool {
+		if b.sessionInUse(owner.SessionID) {
+			return false
+		}
+		for _, sessionID := range pendingSessions {
+			if sessionIDsMatch(owner.SessionID, sessionID) {
+				return false
+			}
+		}
+		activity, listed := byWorkspace[owner.Workspace]
+		if !listed {
+			activity = incomingSessionActivity{}
+			listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			var sessions []omp.SessionSummary
+			var listErr error
+			if b.resumeSlots == nil {
+				sessions, listErr = omp.ListSessions(listCtx, omp.Config{Binary: b.cfg.OMP, CWD: owner.Workspace, Args: b.cfg.OMPArgs, Environment: b.cfg.OMPEnvironment})
+			} else {
+				select {
+				case b.resumeSlots <- struct{}{}:
+					sessions, listErr = omp.ListSessions(listCtx, omp.Config{Binary: b.cfg.OMP, CWD: owner.Workspace, Args: b.cfg.OMPArgs, Environment: b.cfg.OMPEnvironment})
+					<-b.resumeSlots
+				case <-listCtx.Done():
+					listErr = listCtx.Err()
+				}
+			}
+			cancel()
+			if listErr == nil {
+				activity.available = true
+				activity.updatedAt = make(map[string]string, len(sessions))
+				for _, session := range sessions {
+					activity.updatedAt[strings.ToLower(session.ID)] = session.UpdatedAt
+				}
+			} else if ctx.Err() == nil && !loggedListFailure {
+				b.mediaLog.Warn("incoming attachment cleanup deferred", "event", "cleanup_failed", "error_kind", "session_list")
+				loggedListFailure = true
+			}
+			byWorkspace[owner.Workspace] = activity
+		}
+		if !activity.available {
+			return false
+		}
+		updatedAt, exists := activity.updatedAt[strings.ToLower(owner.SessionID)]
+		if !exists {
+			return true
+		}
+		lastActivity, err := time.Parse(time.RFC3339Nano, updatedAt)
+		return err == nil && !lastActivity.IsZero() && lastActivity.Before(cutoff)
+	}
+	removeEligible := func(owner media.IncomingOwner, remove func() error) (bool, error) {
+		if !canRemove(owner) {
+			return false, nil
+		}
+		b.sessionMu.Lock()
+		defer b.sessionMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if b.sessionMatchesLocked(nil, owner.SessionID) || b.exportMatchesLocked(nil, owner.SessionID) || b.deleteMatchesLocked(owner.SessionID) {
+			return false, nil
+		}
+		currentStarts, err := b.db.PendingStarts(b.bot.ID)
+		if err != nil {
+			b.storeLog.Warn("incoming retention state read failed", "event", "cleanup_failed", "error_kind", "persistence")
+			return false, nil
+		}
+		for _, intent := range currentStarts {
+			if intent.Kind == "resume" && intent.Session != "" && sessionIDsMatch(owner.SessionID, intent.Session) {
+				return false, nil
+			}
+		}
+		if err := remove(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return media.CleanupIncoming(ctx, b.cfg.DataDir, cutoff, b.incomingInUseSnapshot(), removeEligible)
+}
+
+func (b *Bridge) retainIncoming(directory string) {
 	if directory == "" {
 		return
 	}
-	rel, err := filepath.Rel(workspace, directory)
-	if err != nil || !filepath.IsLocal(rel) || !strings.HasPrefix(rel, filepath.Join(".telegram", "incoming")+string(filepath.Separator)) {
+	b.incomingMu.Lock()
+	if b.incomingInUse == nil {
+		b.incomingInUse = make(map[string]struct{})
+	}
+	b.incomingInUse[directory] = struct{}{}
+	b.incomingMu.Unlock()
+}
+
+func (b *Bridge) incomingInUseSnapshot() map[string]struct{} {
+	b.incomingMu.Lock()
+	defer b.incomingMu.Unlock()
+	paths := make(map[string]struct{}, len(b.incomingInUse))
+	for path := range b.incomingInUse {
+		paths[path] = struct{}{}
+	}
+	return paths
+}
+
+func (b *Bridge) discardIncoming(directory string, logger *slog.Logger) {
+	if directory == "" {
 		return
 	}
-	root, err := os.OpenRoot(workspace)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			logger.Warn("attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
-		}
-		return
-	}
-	defer root.Close()
-	if err := root.RemoveAll(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
+	b.incomingMu.Lock()
+	delete(b.incomingInUse, directory)
+	b.incomingMu.Unlock()
+	if err := media.RemoveIncoming(b.cfg.DataDir, directory); err != nil && !errors.Is(err, os.ErrNotExist) {
 		logger.Warn("attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
 	}
+}
+
+func (b *Bridge) finishIncoming(directory string, logger *slog.Logger) {
+	if directory == "" {
+		return
+	}
+	err := media.TouchIncoming(b.cfg.DataDir, directory, time.Now())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		logger.Warn("attachment retention timestamp update failed", "event", "cleanup_failed", "error_kind", "filesystem")
+		return
+	}
+	b.incomingMu.Lock()
+	delete(b.incomingInUse, directory)
+	b.incomingMu.Unlock()
+}
+
+func (w *worker) finishActiveIncoming() {
+	if w.activeAttachmentDir == "" {
+		return
+	}
+	directory := w.activeAttachmentDir
+	w.activeAttachmentDir = ""
+	w.b.finishIncoming(directory, w.mediaTaskLogger(w.active))
 }
 
 func removeMediaSnapshot(path string, logger *slog.Logger) {
@@ -460,7 +604,7 @@ func (w *worker) preparedMedia(result mediaResult) {
 		if result.album {
 			result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", albumPreparationResult(result.err))
 		}
-		removeIncoming(result.workspace, result.input.Directory, result.logger)
+		w.b.discardIncoming(result.input.Directory, result.logger)
 		return
 	}
 	if result.err != nil {
@@ -471,7 +615,7 @@ func (w *worker) preparedMedia(result mediaResult) {
 		if result.album {
 			result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", albumPreparationResult(result.err))
 		}
-		removeIncoming(result.workspace, result.input.Directory, result.logger)
+		w.b.discardIncoming(result.input.Directory, result.logger)
 		w.queue = append(w.queue[:index], w.queue[index+1:]...)
 		w.mark(result.id, "failed")
 		if !mediaCancellation(result.err) {
@@ -485,6 +629,7 @@ func (w *worker) preparedMedia(result mediaResult) {
 		return
 	}
 	q := &w.queue[index]
+	w.b.retainIncoming(result.input.Directory)
 	q.preparing = false
 	q.text = preparePromptText(q.reply, result.input.Text)
 	q.reply = nil
@@ -632,7 +777,7 @@ func (w *worker) drainMediaResults() {
 	for {
 		select {
 		case result := <-w.mediaResults:
-			removeIncoming(result.workspace, result.input.Directory, result.logger)
+			w.b.discardIncoming(result.input.Directory, result.logger)
 		default:
 			goto outgoing
 		}

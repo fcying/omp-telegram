@@ -51,6 +51,8 @@ type Bridge struct {
 	exportClaims   map[*worker]string
 	deleteClaims   map[*worker]string
 	bindingsEpoch  atomic.Uint64
+	incomingMu     sync.Mutex
+	incomingInUse  map[string]struct{}
 	ctx            context.Context
 	workerExits    chan workerExit
 	forgetRequests chan bindingForgetRequest
@@ -228,11 +230,12 @@ type worker struct {
 	finalizedStreamBytes int
 	finalOutputTruncated bool
 	taskState
-	turn          uint64
-	steers        map[string]steerRequest
-	steerFence    steerFence
-	rootRequestID string
-	resumeFailed  bool
+	turn                uint64
+	steers              map[string]steerRequest
+	steerFence          steerFence
+	activeAttachmentDir string
+	rootRequestID       string
+	resumeFailed        bool
 	progressTransport
 	compacting             bool
 	progress               progressState
@@ -491,11 +494,11 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		}
 	}()
 	b.reconcileProgressCleanup(ctx)
-	b.cleanupDatabase(ctx)
 	workers := map[target]*worker{}
 	if err := b.restoreWorkers(ctx, workers); err != nil {
 		return err
 	}
+	b.cleanupDatabase(ctx)
 	b.wg.Add(deliveryWorkerCount + 2)
 	if cfg.DatabaseRetentionDays > 0 {
 		b.wg.Add(1)
@@ -707,7 +710,8 @@ func (b *Bridge) cleanupDatabase(ctx context.Context) {
 	if b.cfg.DatabaseRetentionDays == 0 {
 		return
 	}
-	result, err := b.db.CleanupMessages(ctx, time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays).Unix())
+	cutoff := time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays)
+	result, err := b.db.CleanupMessages(ctx, cutoff.Unix())
 	for _, path := range result.AttachmentPaths {
 		if removeErr := removeOutboxSnapshot(filepath.Join(b.cfg.DataDir, "attachments", "outbox"), path); removeErr != nil {
 			b.storeLog.Warn("database cleanup snapshot removal failed", "event", "snapshot_cleanup_failed")
@@ -719,9 +723,18 @@ func (b *Bridge) cleanupDatabase(ctx context.Context) {
 		}
 		return
 	}
-	b.reconcileOutboxSnapshots(ctx, time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays))
-	if result.Inbox != 0 || result.Outbox != 0 {
-		b.storeLog.Info("database cleanup completed", "event", "cleanup_completed", "inbox_count", result.Inbox, "outbox_count", result.Outbox)
+	b.reconcileOutboxSnapshots(ctx, cutoff)
+	var incomingCount int
+	if b.cfg.DataDir != "" {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		incomingCount, err = b.cleanupIncomingAttachments(cleanupCtx, cutoff)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			b.storeLog.Warn("incoming attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
+		}
+	}
+	if result.Inbox != 0 || result.Outbox != 0 || incomingCount != 0 {
+		b.storeLog.Info("database cleanup completed", "event", "cleanup_completed", "inbox_count", result.Inbox, "outbox_count", result.Outbox, "incoming_count", incomingCount)
 	}
 }
 
@@ -1098,11 +1111,13 @@ func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
 	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true}
+	w.activeAttachmentDir = q.directory
 	w.rootRequestID = ""
 	w.turn++
 }
 
 func (w *worker) clearTask() {
+	w.finishActiveIncoming()
 	w.active = 0
 	w.activeReplyTo = 0
 	w.awaitingContinuation = false
@@ -1730,6 +1745,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 			}
 		}
 	}
+	w.finishActiveIncoming()
 	w.clearSteerFence()
 }
 
@@ -1807,7 +1823,7 @@ func (w *worker) cancelQueuedTask(id int64) bool {
 		if q.cancel != nil {
 			q.cancel()
 		}
-		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		w.b.discardIncoming(q.directory, w.mediaTaskLogger(q.id))
 		w.queue = append(w.queue[:i], w.queue[i+1:]...)
 		if w.mark(q.id, "cancelled") {
 			w.logQueuedTaskComplete(q.id, "cancelled")
@@ -2546,7 +2562,7 @@ func (w *worker) dispatch() {
 	w.queue[0] = queued{}
 	w.queue = w.queue[1:]
 	if !fits {
-		removeIncoming(w.binding.Workspace, q.directory, w.mediaTaskLogger(q.id))
+		w.b.discardIncoming(q.directory, w.mediaTaskLogger(q.id))
 		if w.mark(q.id, "failed") {
 			w.logQueuedTaskComplete(q.id, "failed")
 			w.say("Prompt exceeds the omp RPC frame limit. No task was submitted.")
@@ -2558,6 +2574,7 @@ func (w *worker) dispatch() {
 		q.images = q.images[:inline]
 	}
 	if !w.submit(q) {
+		w.b.discardIncoming(q.directory, w.mediaTaskLogger(q.id))
 		return
 	}
 	w.beginTask(q)

@@ -194,7 +194,7 @@ func TestDeleteSessionPreservesChildEnvironmentPolicy(t *testing.T) {
 	t.Setenv(botTokenName, "private-token")
 	t.Setenv("OMP_TEST_DELETE_SHOULD_HIDE", "private")
 	t.Setenv("OMP_TEST_DELETE_KEEP", "permitted")
-	policy, err := NewEnvironment("denylist", nil, []string{"OMP_TEST_DELETE_SHOULD_HIDE"})
+	policy, err := NewEnvironment("denylist", nil, []string{"OMP_TEST_DELETE_SHOULD_HIDE", botTokenName})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+const botTokenName = "OMP_TELEGRAM_BOT_TOKEN"
+
 func TestEnvironmentValidation(t *testing.T) {
 	for _, mode := range []string{"", "all", "inherit", "restricted", "blacklist", "whitelist"} {
 		if _, err := NewEnvironment(mode, nil, nil); err == nil {
@@ -32,8 +34,8 @@ func TestEnvironmentValidation(t *testing.T) {
 			t.Fatalf("accepted invalid allow name or exposed it in error: %q, %v", name, err)
 		}
 	}
-	if _, err := NewEnvironment("allowlist", []string{botTokenName}, nil); err == nil || strings.Contains(err.Error(), botTokenName) {
-		t.Fatalf("accepted bot token in allowlist or exposed its name in error: %v", err)
+	if _, err := NewEnvironment("allowlist", []string{botTokenName}, nil); err != nil {
+		t.Fatalf("rejected explicit bot token allowlist: %v", err)
 	}
 	if _, err := NewEnvironment("allowlist", []string{"_VALID_9"}, nil); err != nil {
 		t.Fatalf("rejected POSIX environment variable: %v", err)
@@ -71,13 +73,11 @@ func TestChildEnvironmentPolicy(t *testing.T) {
 		if value, ok := policy.Lookup("OMP_TEST_EXCLUDED"); !ok || value != "not permitted" {
 			t.Fatal("default environment did not expose a permitted parent variable")
 		}
-		if value, ok := policy.Lookup(botTokenName); ok || value != "" {
-			t.Fatal("default lookup exposed the bot token")
+		if value, ok := policy.Lookup(botTokenName); !ok || value != "secret" {
+			t.Fatal("default environment did not inherit the bridge bot token")
 		}
-		for _, entry := range entries {
-			if strings.HasPrefix(entry, botTokenName+"=") {
-				t.Fatal("default child environment exposed the bot token")
-			}
+		if !strings.Contains(strings.Join(entries, "\n"), botTokenName+"=secret") {
+			t.Fatal("default child environment did not inherit the bridge bot token")
 		}
 	}
 
@@ -98,6 +98,16 @@ func TestChildEnvironmentPolicy(t *testing.T) {
 			t.Fatalf("allowlist lookup exposed %s", name)
 		}
 	}
+	tokenAllowlist, err := NewEnvironment("allowlist", []string{botTokenName}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := tokenAllowlist.Lookup(botTokenName); !ok || value != "secret" {
+		t.Fatal("explicit token allowlist did not expose the parent token")
+	}
+	if entries := ChildEnv(tokenAllowlist); !strings.Contains(strings.Join(entries, "\n"), botTokenName+"=secret") {
+		t.Fatal("explicit token allowlist did not pass the token to the child")
+	}
 	empty, err := NewEnvironment("allowlist", []string{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +121,7 @@ func TestDenylistEnvironmentRejectsOnlySelectedVariables(t *testing.T) {
 	t.Setenv(botTokenName, "secret")
 	t.Setenv("OMP_TEST_EXCLUDED", "parent-secret")
 	t.Setenv("OMP_TEST_ALLOWED", "parent-safe")
-	deny := []string{"OMP_TEST_EXCLUDED"}
+	deny := []string{"OMP_TEST_EXCLUDED", botTokenName}
 	policy, err := NewEnvironment("denylist", nil, deny)
 	if err != nil {
 		t.Fatal(err)
@@ -123,10 +133,13 @@ func TestDenylistEnvironmentRejectsOnlySelectedVariables(t *testing.T) {
 	if value, ok := policy.Lookup("OMP_TEST_ALLOWED"); !ok || value != "parent-safe" {
 		t.Fatal("unrelated parent value lost from lookup")
 	}
+	if _, ok := policy.Lookup(botTokenName); ok {
+		t.Fatal("explicitly denied bot token exposed by lookup")
+	}
 	entries := ChildEnv(policy)
 	for _, entry := range entries {
 		if strings.HasPrefix(entry, "OMP_TEST_EXCLUDED=") || strings.HasPrefix(entry, botTokenName+"=") {
-			t.Fatal("excluded parent value exposed to child")
+			t.Fatal("explicitly denied parent value exposed to child")
 		}
 	}
 	if !strings.Contains(strings.Join(entries, "\n"), "OMP_TEST_ALLOWED=parent-safe") {

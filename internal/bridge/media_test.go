@@ -110,7 +110,8 @@ func testPNG(t *testing.T) []byte {
 }
 
 func TestNativePhotoCaptionReachesImagePrompt(t *testing.T) {
-	f, db, send := setupBridge(t)
+	dataDir := t.TempDir()
+	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	data := testPNG(t)
 	f.mu.Lock()
 	f.files = map[string][]byte{"photo": data}
@@ -123,9 +124,35 @@ func TestNativePhotoCaptionReachesImagePrompt(t *testing.T) {
 	send(u)
 	waitFor(t, func() bool { return f.has(11, "image=8x8; Telegram attachment:\n/stop") })
 	binding, _ := db.Binding(99, -10, 11)
-	files, err := filepath.Glob(filepath.Join(binding.Workspace, ".telegram", "incoming", "*", "photo.jpg"))
+	files, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "photo.jpg"))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("original image missing: %v", err)
+	}
+	ownerData, err := os.ReadFile(filepath.Join(filepath.Dir(files[0]), ".owner.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner media.IncomingOwner
+	if err := json.Unmarshal(ownerData, &owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner.SessionID != binding.SessionID || owner.Workspace != binding.Workspace {
+		t.Fatalf("attachment owner = %+v, want session %q in workspace %q", owner, binding.SessionID, binding.Workspace)
+	}
+	rootInfo, err := os.Stat(filepath.Join(dataDir, "attachments", "inbox"))
+	if err != nil || rootInfo.Mode().Perm() != 0700 {
+		t.Fatalf("incoming root permissions = %v, error %v", rootInfo, err)
+	}
+	directoryInfo, err := os.Stat(filepath.Dir(files[0]))
+	if err != nil || directoryInfo.Mode().Perm() != 0700 {
+		t.Fatalf("incoming task directory permissions = %v, error %v", directoryInfo, err)
+	}
+	fileInfo, err := os.Stat(files[0])
+	if err != nil || fileInfo.Mode().Perm() != 0600 {
+		t.Fatalf("incoming file permissions = %v, error %v", fileInfo, err)
+	}
+	if _, err := os.Stat(filepath.Join(binding.Workspace, ".telegram", "incoming")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy workspace incoming directory was created: %v", err)
 	}
 	original, err := os.ReadFile(files[0])
 	if err != nil || !bytes.Equal(original, data) {
@@ -219,7 +246,8 @@ func TestLargePhotoAlbumKeepsSessionAndOriginalPaths(t *testing.T) {
 	if photo == nil {
 		t.Fatal("could not produce an individually valid photo pair exceeding the RPC frame")
 	}
-	f, db, send := setupBridge(t)
+	dataDir := t.TempDir()
+	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	f.mu.Lock()
 	f.files = map[string][]byte{"large-a": photo, "large-b": photo}
 	f.mu.Unlock()
@@ -244,7 +272,7 @@ func TestLargePhotoAlbumKeepsSessionAndOriginalPaths(t *testing.T) {
 	waitInputDone(t, db, 2)
 	waitInputDone(t, db, 3)
 	for _, name := range []string{"001-photo.jpg", "002-photo.jpg"} {
-		paths, err := filepath.Glob(filepath.Join(before.Workspace, ".telegram", "incoming", "*", name))
+		paths, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", name))
 		if err != nil || len(paths) != 1 {
 			t.Fatalf("album original %s not retained: %v, %v", name, paths, err)
 		}
@@ -686,7 +714,7 @@ func TestAlbumPreparationFailureIsAtomic(t *testing.T) {
 	w.handle(incoming{id: 2, msg: member.Message})
 	key := albumKey{group: "album-failure", user: 7}
 	delete(w.albums, key)
-	directory := filepath.Join(w.binding.Workspace, ".telegram", "incoming", "failed")
+	directory := filepath.Join(w.b.cfg.DataDir, "attachments", "inbox", "incoming-failed")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -696,7 +724,6 @@ func TestAlbumPreparationFailureIsAtomic(t *testing.T) {
 	w.preparedMedia(mediaResult{
 		id:         2,
 		generation: w.binding.Generation,
-		workspace:  w.binding.Workspace,
 		input:      media.Input{Directory: directory},
 		err:        errors.New("download failed"),
 		logger:     w.mediaTaskLogger(2),
@@ -720,7 +747,8 @@ func TestAlbumPreparationFailureIsAtomic(t *testing.T) {
 }
 
 func TestAlbumMembersUseMessageIDOrder(t *testing.T) {
-	f, db, send := setupBridge(t)
+	dataDir := t.TempDir()
+	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	f.mu.Lock()
 	f.files = map[string][]byte{"high": []byte("high"), "low": []byte("low"), "middle": []byte("middle")}
 	f.mu.Unlock()
@@ -745,12 +773,11 @@ func TestAlbumMembersUseMessageIDOrder(t *testing.T) {
 	waitInputDone(t, db, 2)
 	waitInputDone(t, db, 3)
 	waitInputDone(t, db, 4)
-	binding, _ := db.Binding(99, -10, 11)
 	ordered := []struct {
 		name, content string
 	}{{"001-low.txt", "low"}, {"002-middle.txt", "middle"}, {"003-high.txt", "high"}}
 	for _, want := range ordered {
-		files, err := filepath.Glob(filepath.Join(binding.Workspace, ".telegram", "incoming", "*", want.name))
+		files, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", want.name))
 		if err != nil || len(files) != 1 {
 			t.Fatalf("ordered album file %s = %v, error %v", want.name, files, err)
 		}
@@ -762,7 +789,8 @@ func TestAlbumMembersUseMessageIDOrder(t *testing.T) {
 }
 
 func TestDocumentAlbumAggregatesWithoutCaption(t *testing.T) {
-	f, db, send := setupBridge(t)
+	dataDir := t.TempDir()
+	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	f.mu.Lock()
 	f.files = map[string][]byte{"document-a": []byte("first document"), "document-b": []byte("second document")}
 	f.mu.Unlock()
@@ -783,12 +811,11 @@ func TestDocumentAlbumAggregatesWithoutCaption(t *testing.T) {
 	})
 	waitInputDone(t, db, 2)
 	waitInputDone(t, db, 3)
-	binding, _ := db.Binding(99, -10, 11)
-	firstFiles, err := filepath.Glob(filepath.Join(binding.Workspace, ".telegram", "incoming", "*", "001-report.pdf"))
+	firstFiles, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "001-report.pdf"))
 	if err != nil || len(firstFiles) != 1 {
 		t.Fatalf("first album filename = %v, error %v", firstFiles, err)
 	}
-	secondFiles, err := filepath.Glob(filepath.Join(binding.Workspace, ".telegram", "incoming", "*", "002-report.pdf"))
+	secondFiles, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "002-report.pdf"))
 	if err != nil || len(secondFiles) != 1 {
 		t.Fatalf("second album filename = %v, error %v", secondFiles, err)
 	}
@@ -849,7 +876,8 @@ func TestAlbumTimerVersionFencesStaleReady(t *testing.T) {
 }
 
 func TestDocumentWithoutCaptionIsDownloadedAndDispatched(t *testing.T) {
-	f, db, send := setupBridge(t)
+	dataDir := t.TempDir()
+	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	f.mu.Lock()
 	f.files = map[string][]byte{"doc": []byte("document contents")}
 	f.mu.Unlock()
@@ -859,14 +887,51 @@ func TestDocumentWithoutCaptionIsDownloadedAndDispatched(t *testing.T) {
 	u.Message.Document = &telegram.Document{FileID: "doc", FileName: "../report.txt"}
 	send(u)
 	waitFor(t, func() bool { return f.has(11, "Attachment saved at") })
-	binding, _ := db.Binding(99, -10, 11)
-	files, err := filepath.Glob(filepath.Join(binding.Workspace, ".telegram", "incoming", "*", "report.txt"))
+	files, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "report.txt"))
 	if err != nil || len(files) != 1 {
 		t.Fatal("document not retained inside attachment directory")
 	}
 	data, err := os.ReadFile(files[0])
 	if err != nil || string(data) != "document contents" {
 		t.Fatal("downloaded document changed")
+	}
+}
+
+func TestDocumentNamedLikeIncomingMetadataIsDispatched(t *testing.T) {
+	for _, name := range []string{".owner.json", ".preparing"} {
+		t.Run(name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			f, db, send := setupBridgeWithDataDir(t, dataDir)
+			f.mu.Lock()
+			f.files = map[string][]byte{"doc": []byte("untrusted document")}
+			f.mu.Unlock()
+			send(update(1, 11, "/new "+t.TempDir()))
+			waitBinding(t, db, 11)
+			u := update(2, 11, "")
+			u.Message.Document = &telegram.Document{FileID: "doc", FileName: name}
+			send(u)
+			waitFor(t, func() bool { return f.has(11, "Attachment saved at") })
+			waitInputDone(t, db, 2)
+			files, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "attachment-"+name))
+			if err != nil || len(files) != 1 {
+				t.Fatalf("attachment with reserved name not retained: %v, %v", files, err)
+			}
+			data, err := os.ReadFile(files[0])
+			if err != nil || string(data) != "untrusted document" {
+				t.Fatalf("downloaded document = %q, error %v", data, err)
+			}
+			ownerData, err := os.ReadFile(filepath.Join(filepath.Dir(files[0]), ".owner.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var owner media.IncomingOwner
+			if err := json.Unmarshal(ownerData, &owner); err != nil || owner.SessionID == "" || owner.Workspace == "" {
+				t.Fatalf("invalid owner metadata: %+v, %v", owner, err)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(files[0]), ".preparing")); !os.IsNotExist(err) {
+				t.Fatalf("completed attachment retains preparation marker: %v", err)
+			}
+		})
 	}
 }
 
@@ -1190,6 +1255,311 @@ func TestDatabaseCleanupReconcilesOrphanedSnapshots(t *testing.T) {
 	for _, path := range []string{referenced, recent, unrelated} {
 		if _, err = os.Stat(path); err != nil {
 			t.Fatalf("retained snapshot %q: %v", path, err)
+		}
+	}
+}
+func TestDatabaseCleanupExpiresSettledIncomingOnly(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", "[]")
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dir, OMP: binary, DatabaseRetentionDays: 90}, db: db, bot: telegram.User{ID: 99}, resumeSlots: make(chan struct{}, 2)})
+	inbox := filepath.Join(dir, "attachments", "inbox")
+	active := filepath.Join(inbox, "incoming-active")
+	expired := filepath.Join(inbox, "incoming-expired")
+	for _, path := range []string{active, expired} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessionWorkspace := t.TempDir()
+	if err := media.WriteIncomingOwner(dir, expired, media.IncomingOwner{SessionID: "session-gone", Workspace: sessionWorkspace}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().AddDate(0, 0, -91)
+	for _, path := range []string{active, expired} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspaceIncoming := filepath.Join(t.TempDir(), ".telegram", "incoming")
+	if err := os.MkdirAll(workspaceIncoming, 0700); err != nil {
+		t.Fatal(err)
+	}
+	legacyFile := filepath.Join(workspaceIncoming, "legacy.txt")
+	if err := os.WriteFile(legacyFile, []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b.retainIncoming(active)
+	b.cleanupDatabase(context.Background())
+	if _, err := os.Stat(expired); !os.IsNotExist(err) {
+		t.Fatalf("expired incoming directory remains: %v", err)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("active incoming directory was removed: %v", err)
+	}
+	b.finishIncoming(active, nil)
+	info, err := os.Stat(active)
+	if err != nil || info.ModTime().Before(time.Now().AddDate(0, 0, -90)) {
+		t.Fatalf("settlement did not refresh incoming retention age: %v, %v", info, err)
+	}
+	b.cleanupDatabase(context.Background())
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("recently settled incoming directory was removed: %v", err)
+	}
+	if _, err := os.Stat(legacyFile); err != nil {
+		t.Fatalf("legacy workspace attachment was removed: %v", err)
+	}
+	disabled := filepath.Join(inbox, "incoming-retention-disabled")
+	if err := os.MkdirAll(disabled, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(disabled, old, old); err != nil {
+		t.Fatal(err)
+	}
+	b.cfg.DatabaseRetentionDays = 0
+	b.cleanupDatabase(context.Background())
+	if _, err := os.Stat(disabled); err != nil {
+		t.Fatalf("zero retention removed incoming data: %v", err)
+	}
+}
+
+func TestDatabaseCleanupUsesOwnerSessionActivityAndBatchesByWorkspace(t *testing.T) {
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceA, workspaceB := t.TempDir(), t.TempDir()
+	cutoff := time.Now().AddDate(0, 0, -90)
+	old := cutoff.Add(-time.Hour)
+	sessions := []resumeFixtureSession{
+		{ID: "stale-session", CWD: workspaceA, UpdatedAt: cutoff.Add(-time.Hour).Format(time.RFC3339Nano)},
+		{ID: "recent-session", CWD: workspaceA, UpdatedAt: cutoff.Add(time.Hour).Format(time.RFC3339Nano)},
+		{ID: "boundary-session", CWD: workspaceA, UpdatedAt: cutoff.Format(time.RFC3339Nano)},
+		{ID: "invalid-time-session", CWD: workspaceA, UpdatedAt: "not-a-time"},
+		{ID: "active-session", CWD: workspaceA, UpdatedAt: cutoff.Add(-time.Hour).Format(time.RFC3339Nano)},
+	}
+	fixture, err := json.Marshal(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(fixture))
+	tracePath := filepath.Join(t.TempDir(), "session-list-calls")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_TRACE", tracePath)
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dataDir, OMP: binary}, db: db, bot: telegram.User{ID: 99}, resumeSlots: make(chan struct{}, 2)})
+	b.sessionClaims = map[string]sessionClaim{
+		filepath.Join(workspaceA, "active.jsonl"): {owner: &worker{}, id: "active-session"},
+	}
+	inbox := filepath.Join(dataDir, "attachments", "inbox")
+	addIncoming := func(name, sessionID, workspace string, modified time.Time, withOwner bool) string {
+		t.Helper()
+		path := filepath.Join(inbox, "incoming-"+name)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if withOwner {
+			if err := media.WriteIncomingOwner(dataDir, path, media.IncomingOwner{SessionID: sessionID, Workspace: workspace}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	paths := map[string]string{
+		"stale":       addIncoming("stale", "stale-session", workspaceA, old, true),
+		"recent":      addIncoming("recent", "recent-session", workspaceA, old, true),
+		"boundary":    addIncoming("boundary", "boundary-session", workspaceA, old, true),
+		"invalid":     addIncoming("invalid", "invalid-time-session", workspaceA, old, true),
+		"active":      addIncoming("active", "active-session", workspaceA, old, true),
+		"legacy":      addIncoming("legacy", "", "", old, false),
+		"missing-one": addIncoming("missing-one", "missing-one", workspaceB, old, true),
+		"missing-two": addIncoming("missing-two", "missing-two", workspaceB, old, true),
+		"pending":     addIncoming("pending", "resume-pending", workspaceB, old, true),
+		"fresh":       addIncoming("fresh", "fresh-missing", workspaceB, time.Now(), true),
+	}
+	corrupt := addIncoming("corrupt", "", "", old, false)
+	if err := os.WriteFile(filepath.Join(corrupt, ".owner.json"), []byte("{broken"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(corrupt, old, old); err != nil {
+		t.Fatal(err)
+	}
+	paths["corrupt"] = corrupt
+	intent := store.StartIntent{Bot: 99, Chat: -10, Thread: 42, Kind: "resume", Workspace: workspaceB, Session: "resume-pending", Generation: 1}
+	if err := db.PrepareStart(store.Binding{Bot: 99, Chat: -10, Thread: 42}, intent); err != nil {
+		t.Fatal(err)
+	}
+	pendingStarts, err := db.PendingStarts(99)
+	if err != nil || len(pendingStarts) != 1 || pendingStarts[0] != intent {
+		t.Fatalf("pending resume intents = %+v, error %v", pendingStarts, err)
+	}
+	removed, err := b.cleanupIncomingAttachments(context.Background(), cutoff)
+	if err != nil || removed != 3 {
+		var removedDirs []string
+		for name, path := range paths {
+			if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+				removedDirs = append(removedDirs, name)
+			}
+		}
+		t.Fatalf("cleanup removed %d directories %v, error %v; want only stale and missing-session owners", removed, removedDirs, err)
+	}
+	for _, name := range []string{"stale", "missing-one", "missing-two"} {
+		if _, err := os.Stat(paths[name]); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("eligible attachment %q remains: %v", name, err)
+		}
+	}
+	for _, name := range []string{"recent", "boundary", "invalid", "active", "legacy", "corrupt", "pending", "fresh"} {
+		if _, err := os.Stat(paths[name]); err != nil {
+			t.Fatalf("conservatively retained attachment %q is missing: %v", name, err)
+		}
+	}
+	calls, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := make(map[string]int)
+	for _, workspace := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
+		counts[workspace]++
+	}
+	if len(counts) != 2 || counts[workspaceA] != 1 || counts[workspaceB] != 1 {
+		t.Fatalf("session/list process counts per workspace = %v", counts)
+	}
+
+	failedWorkspace := t.TempDir()
+	failed := addIncoming("list-failed", "unknown-session", failedWorkspace, old, true)
+	b.cfg.OMP = filepath.Join(t.TempDir(), "missing-omp")
+	if removed, err = b.cleanupIncomingAttachments(context.Background(), cutoff); err != nil || removed != 0 {
+		t.Fatalf("failed session lookup removed %d directories, error %v", removed, err)
+	}
+	if _, err := os.Stat(failed); err != nil {
+		t.Fatalf("attachment survived an unavailable session list incorrectly: %v", err)
+	}
+}
+
+func TestIncomingCleanupDoesNotDeleteDuringConcurrentResume(t *testing.T) {
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	cutoff := time.Now().AddDate(0, 0, -90)
+	sessionID := "abcdef01-1234-5678-90ab-cdef12345678"
+	fixture, err := json.Marshal([]resumeFixtureSession{{ID: sessionID, CWD: workspace, UpdatedAt: cutoff.Add(-time.Hour).Format(time.RFC3339Nano)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(fixture))
+	gate, release := filepath.Join(t.TempDir(), "gate"), filepath.Join(t.TempDir(), "release")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_GATE", gate)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_RELEASE", release)
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dataDir, OMP: binary}, db: db, bot: telegram.User{ID: 99}, resumeSlots: make(chan struct{}, 2)})
+	directory := filepath.Join(dataDir, "attachments", "inbox", "incoming-race")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := media.WriteIncomingOwner(dataDir, directory, media.IncomingOwner{SessionID: sessionID, Workspace: workspace}); err != nil {
+		t.Fatal(err)
+	}
+	old := cutoff.Add(-time.Hour)
+	if err := os.Chtimes(directory, old, old); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := b.cleanupIncomingAttachments(ctx, cutoff)
+		finished <- err
+	}()
+	waitFor(t, func() bool { _, err := os.Stat(gate); return err == nil })
+	previous := store.Binding{Bot: 99, Chat: -10, Thread: 42}
+	intent := store.StartIntent{Bot: 99, Chat: -10, Thread: 42, Kind: "resume", Workspace: workspace, Session: sessionID, Generation: 1}
+	b.sessionMu.Lock()
+	err = db.PrepareStart(previous, intent)
+	b.sessionMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, []byte("continue"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("incoming attachment deleted after resume intent committed: %v", err)
+	}
+}
+
+func TestIncomingCleanupDeadlineStopsBeforeNextWorkspace(t *testing.T) {
+	dataDir := t.TempDir()
+	db, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, release := filepath.Join(t.TempDir(), "gate"), filepath.Join(t.TempDir(), "release")
+	trace := filepath.Join(t.TempDir(), "session-list-calls")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_GATE", gate)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_RELEASE", release)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_TRACE", trace)
+	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: dataDir, OMP: binary}, db: db, bot: telegram.User{ID: 99}, resumeSlots: make(chan struct{}, 2)})
+	cutoff := time.Now().AddDate(0, 0, -90)
+	for _, name := range []string{"a", "b"} {
+		workspace := t.TempDir()
+		directory := filepath.Join(dataDir, "attachments", "inbox", "incoming-"+name)
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := media.WriteIncomingOwner(dataDir, directory, media.IncomingOwner{SessionID: "missing-" + name, Workspace: workspace}); err != nil {
+			t.Fatal(err)
+		}
+		old := cutoff.Add(-time.Hour)
+		if err := os.Chtimes(directory, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	removed, err := b.cleanupIncomingAttachments(ctx, cutoff)
+	if removed != 0 || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired cleanup = %d, %v; want no deletions and shared deadline", removed, err)
+	}
+	if _, err := os.Stat(gate); err != nil {
+		t.Fatalf("session/list never reached the blocked workspace: %v", err)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil || len(strings.Split(strings.TrimSpace(string(data)), "\n")) != 1 {
+		t.Fatalf("expected one session/list subprocess before budget expires: %q, %v", data, err)
+	}
+	for _, name := range []string{"a", "b"} {
+		if _, err := os.Stat(filepath.Join(dataDir, "attachments", "inbox", "incoming-"+name)); err != nil {
+			t.Fatalf("cleanup deleted attachment with unverified session: %v", err)
 		}
 	}
 }

@@ -252,7 +252,7 @@ func TestQueueCancelCleansPreparedAttachment(t *testing.T) {
 	queueReady(t, w, command)
 	command("attachment task")
 	id := w.queue[0].id
-	directory := filepath.Join(w.binding.Workspace, ".telegram", "incoming", "queued")
+	directory := filepath.Join(w.b.cfg.DataDir, "attachments", "inbox", "incoming-queued")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +432,7 @@ func TestQueueStaleMediaResultCleansCancelledTask(t *testing.T) {
 	queueReady(t, w, command)
 	command("attachment task")
 	id := w.queue[0].id
-	directory := filepath.Join(w.binding.Workspace, ".telegram", "incoming", "stale")
+	directory := filepath.Join(w.b.cfg.DataDir, "attachments", "inbox", "incoming-stale")
 	w.queue[0].preparing = true
 	w.queue[0].directory = directory
 	if err := os.MkdirAll(directory, 0700); err != nil {
@@ -450,7 +450,7 @@ func TestQueueStaleMediaResultCleansCancelledTask(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, "late.txt"), []byte("late"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	w.preparedMedia(mediaResult{id: id, generation: w.binding.Generation, workspace: w.binding.Workspace, input: media.Input{Directory: directory}, logger: w.mediaTaskLogger(id)})
+	w.preparedMedia(mediaResult{id: id, generation: w.binding.Generation, input: media.Input{Directory: directory}, logger: w.mediaTaskLogger(id)})
 	if _, err := os.Stat(directory); !os.IsNotExist(err) {
 		t.Fatalf("stale media directory remains: %v", err)
 	}

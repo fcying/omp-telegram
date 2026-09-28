@@ -51,7 +51,28 @@ func runResumeListFixture() {
 		switch request.Method {
 		case "initialize":
 			result = map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"sessionCapabilities": map[string]any{"list": map[string]any{}}}}
+			if trace := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_TRACE"); trace != "" {
+				cwd, err := os.Getwd()
+				if err != nil {
+					os.Exit(2)
+				}
+				file, err := os.OpenFile(trace, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+				if err != nil {
+					os.Exit(2)
+				}
+				_, writeErr := fmt.Fprintln(file, cwd)
+				closeErr := file.Close()
+				if writeErr != nil || closeErr != nil {
+					os.Exit(2)
+				}
+			}
 		case "session/list":
+			if marker := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_GATE"); marker != "" {
+				if err := os.WriteFile(marker, []byte("waiting"), 0600); err != nil {
+					os.Exit(2)
+				}
+				waitForFixtureFile(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_LIST_RELEASE"))
+			}
 			matches := make([]resumeFixtureSession, 0)
 			for _, s := range sessions {
 				if s.CWD != request.Params.CWD {
