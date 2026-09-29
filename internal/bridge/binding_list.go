@@ -83,17 +83,19 @@ func (w *worker) sortBindings(entries []store.BindingListEntry, oldestFirst bool
 	now := time.Now().Unix()
 	slices.SortFunc(entries, func(left, right store.BindingListEntry) int {
 		leftRank, rightRank := 2, 2
-		if left.Intent != nil {
-			leftRank = 1
-		}
-		if right.Intent != nil {
-			rightRank = 1
-		}
-		if bindingThread(left) == w.key.thread {
-			leftRank = 0
-		}
-		if bindingThread(right) == w.key.thread {
-			rightRank = 0
+		if !oldestFirst {
+			if left.Intent != nil {
+				leftRank = 1
+			}
+			if right.Intent != nil {
+				rightRank = 1
+			}
+			if bindingThread(left) == w.key.thread {
+				leftRank = 0
+			}
+			if bindingThread(right) == w.key.thread {
+				rightRank = 0
+			}
 		}
 		if leftRank != rightRank {
 			return cmp.Compare(leftRank, rightRank)

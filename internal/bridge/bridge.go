@@ -255,6 +255,8 @@ type worker struct {
 	lastActivity           time.Time
 	lastLogicalActivity    time.Time
 
+	lastIntentRetentionCheck time.Time
+
 	lastTyping          time.Time
 	typingCancel        context.CancelFunc
 	idleProbe           idleProbeState
@@ -1403,6 +1405,7 @@ func (w *worker) run() {
 	defer tick.Stop()
 	onTick := func() bool {
 		now := time.Now()
+		w.expireStartIntent(now)
 		w.typing()
 		w.flushPreview()
 		w.expire()
@@ -3975,6 +3978,27 @@ func (w *worker) queueKeyboardCleanup(messageID int64) {
 	select {
 	case w.keyboardCleanup <- messageID:
 	default:
+	}
+}
+
+func (w *worker) expireStartIntent(now time.Time) {
+	if w.startIntent == nil || w.b.cfg.DatabaseRetentionDays == 0 || w.client != nil || w.runtime != runtimeReleased || w.restoring || now.Sub(w.lastIntentRetentionCheck) < databaseJanitorInterval {
+		return
+	}
+	w.lastIntentRetentionCheck = now
+	cutoff := now.AddDate(0, 0, -w.b.cfg.DatabaseRetentionDays).Unix()
+	expired, err := w.b.db.ExpireStart(w.ctx, *w.startIntent, cutoff)
+	if err != nil {
+		if w.ctx.Err() == nil {
+			w.b.storeLog.Error("startup intent cleanup failed", "event", "cleanup_failed", "error_kind", "persistence")
+			w.b.fail(err)
+		}
+		return
+	}
+	if expired {
+		w.startIntent = nil
+		w.b.bindingsEpoch.Add(1)
+		w.log.Info("expired startup intent removed", "event", "cleanup_completed")
 	}
 }
 

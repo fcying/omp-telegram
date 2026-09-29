@@ -125,7 +125,7 @@ format = "text"
 | `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"` 会传递当前及未来新增的服务环境变量, 只排除显式列入 `deny` 的名称. 随附的 `config.toml` 设置了 `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` 只传递列出且已存在的变量. |
 | `storage.data_dir` | 数据库, lock 和输入/输出附件存储目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
-| `storage.database_retention_days` | 终态 bridge 记录的保留期. 超期输入附件只有在 owner session 不存在或其更新时间也超过该期限时才清理; 有 bridge 标记的中断下载也可清理. session 状态无法确认时保留已准备完成的附件. 默认 `90`; `0` 关闭自动 retention 清理. |
+| `storage.database_retention_days` | 终态 bridge 记录与未完成 session 启动的保留期. 超期输入附件只有在 owner session 不存在或其更新时间也超过该期限时才清理; 有 bridge 标记的中断下载也可清理. session 状态无法确认时保留已准备完成的附件. 默认 `90`; `0` 关闭自动 retention 清理. |
 | `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `8`; 配置最大值 `64`. |
 | `worker.queue_capacity` | 每个对话最多等待的任务数. 默认 `16`; 配置最大值 `1024`. |
 | `worker.idle_timeout` | 保留 session 的同时释放持续空闲 OMP 进程前的时长. 默认 `30m`; `0` 或 `disabled` 关闭. |
@@ -203,7 +203,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/queue` | 查看当前对话的运行状态和 bridge 待执行队列. 每个 pending task 都有独立 Cancel 按钮; 不会中止 active task. 队列只存在于 runtime; daemon shutdown 会取消 pending task, 不会恢复. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 Telegram chat 保存的 binding: 当前对话优先, pending start 其次, 其余按最近使用时间降序 (未知时间最后). 每条占两行全宽 keyboard: 第一行是可点击的原生 session name (没有时用 workspace 目录名) 和 topic ID, 第二行是只读的状态、已知时的简短最近使用时间与 workspace. 点击可删除条目的标题后进入确认页, 只有确认页的 Delete 按钮为红色; 当前对话及 pending 条目的标题禁用. open binding 必须空闲, 删除前先关闭其 OMP 进程. 保留 workspace 和 OMP 原生 history. |
-| `/bindings old` | 优先查看很久未使用的 binding. 当前对话和 pending start 仍置顶, 其余已知最近使用时间的条目按从旧到新排列, 未知或未来时间排最后. 翻页及删除后的刷新保留此顺序. |
+| `/bindings old` | 所有已保存的 binding (包括当前对话和 pending start) 都按最近使用时间从旧到新排列; 未知或未来时间排最后. 翻页及删除后的刷新保留此顺序. |
 | `/resume` | 从当前 workspace 的已保存 session 中选择要恢复的 session. 每个条目显示完整 ID 和更新时间, 并提供选择、Pin/Unpin 和 Delete 按钮. 当前 conversation 和 workspace 的 pinned session 会排在前面. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
 | `/export` | 从当前 workspace 打开原生 OMP session 导出 picker. 默认导出原始 main session JSONL; 源文件会复制到私有 attachment outbox, 保留经过安全处理的原文件名, 并受 50 MB document 限制. 当前 session 在 task 或队列活跃时会直接拒绝, 空闲后需要重新执行 `/export`. |
@@ -286,8 +286,6 @@ RPC 的 64 MiB 缓冲预算是独立于 64 MiB logical frame 协议上限的资�
 
 可编辑状态消息在 `Output` 显示 assistant 文本, 在 `Tools` 显示活动工具. `verbose` 还会显示工具 `Args` 和最新的 `Update` 或 `Result`, 并在 `Recent tools` 显示最近最多 5 次已完成调用, 更早的调用统计省略数量. 同一条消息在编辑更新时保留 **Stop** 按钮; 不再单独发送重复 assistant 文本的 Activity 消息. 任务最终回复与实时进度保持独立.
 
-新数据库使用 schema 13, 不创建 Activity 表. 现有 schema 11 和 12 数据库自动升级到 13; 迁移会删除短暂开发版的 `activity_messages` 表, 即使表中仍有记录. 其他表和 session 数据保持不变, 但仅由这些记录标识的旧 Activity 消息之后无法自动删除.
-
 `/queue` 只取消选中的 bridge pending task. 不管理 OMP native queue, 不调整顺序, 不提供中止 active task 的 Stop 按钮, 也不会在 daemon shutdown 后持久化或恢复 pending task.
 存在 steer fence 时, root 保持最终回复归属, 直到所有 steer 都结算且 OMP 确认 session settled. Progress Stop 保留 bridge follow-up, `/stop` 则清空. 两者在存在 steer fence 时都会立即终止旧 OMP 进程, 将 root 和未决 steer 记为 `uncertain` 且不重放, 之后才允许保留的 follow-up 在新 runtime 恢复. 已发生的工具副作用无法撤销, 强制终止也可能导致 OMP session 无法恢复.
 
@@ -333,6 +331,8 @@ Reply context 只来自当前 Update 解码出的 `ReplyToMessage` 和 `Quote`. 
 
 结果不确定的活动操作不会自动重放.
 
+如果 `/new` 或 `/resume` 启动中断, pending start 会阻止再次启动, 直到 `/close` 清除它. 启用 retention 后, 超过配置保留期的未完成启动会自动清除; 不会删除 workspace 或可能已创建的 OMP session. 结果不确定时, 再次启动前先检查 OMP history.
+
 Bridge 待执行任务 (包括 `/followup` 及定向发给本 bot 的 follow-up) 会在停机时或崩溃后的启动恢复阶段取消, 不会重放. 决定重发前先检查聊天和 workspace.
 
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
@@ -354,7 +354,7 @@ Bridge 状态保存在:
 
 `storage.data_dir` 默认是解析符号链接后的真实二进制所在目录. 相对 storage 路径使用该目录, 不使用启动目录. 需要把数据放在其他位置时请使用绝对路径.
 
-终态 Telegram bridge 记录按 `storage.database_retention_days` 保留, 默认 90 天. 输入附件目录在同一保留期内未更新后会参与清理; 正常任务结算时会刷新其保留时间, worker 运行期间会跳过活动任务. 服务启动时及运行期间每 24 小时执行清理.
+终态 Telegram bridge 记录与未完成的启动按 `storage.database_retention_days` 保留, 默认 90 天. 输入附件目录在同一保留期内未更新后会参与清理; 正常任务结算时会刷新其保留时间, worker 运行期间会跳过活动任务. 消息和附件在服务启动时及运行期间每 24 小时清理; 未完成的启动在启动时和服务运行期间定期检查.
 
 设置以下内容可关闭自动清理:
 

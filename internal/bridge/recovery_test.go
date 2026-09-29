@@ -484,6 +484,40 @@ func testRecoveryStartupIntent(t *testing.T, chat, thread int64) {
 	}
 }
 
+func TestDaemonRecoveryPrunesExpiredStartBeforeNew(t *testing.T) {
+	d := newRecoveryDaemonForChat(t, 1, -10)
+	d.command(11, "/help")
+	d.stop()
+	d.cfg.DatabaseRetentionDays = 90
+	d.cfg.OMP = filepath.Join(t.TempDir(), "missing-omp")
+	var err error
+	d.db, err = store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := store.Binding{Bot: 99, Chat: -10, Thread: 11}
+	old := store.StartIntent{Bot: 99, Chat: -10, Thread: 11, Kind: "new", Workspace: t.TempDir(), Generation: 1}
+	if err := d.db.PrepareStart(previous, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.db.DB.Exec("UPDATE startup_intents SET created_at=?", time.Now().AddDate(0, 0, -91).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.start()
+	waitFor(t, func() bool {
+		intents, err := d.db.PendingStarts(99)
+		return err == nil && len(intents) == 0
+	})
+	d.command(11, "/new "+t.TempDir())
+	intents, err := d.db.PendingStarts(99)
+	if err != nil || len(intents) != 1 || intents[0].Workspace == old.Workspace {
+		t.Fatalf("expired startup intent blocked new session: %+v, %v", intents, err)
+	}
+}
+
 func TestDaemonRecoveryPreservesPrivateChatWithoutReplayingTasks(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
 	d := newRecoveryDaemonForChat(t, 1, 7)

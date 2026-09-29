@@ -125,7 +125,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
 | `storage.data_dir` | Database, lock, and incoming/outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
-| `storage.database_retention_days` | How long terminal bridge records are retained. Older incoming attachments are removed only if their owner session is absent or has also been inactive for this period; interrupted downloads marked as bridge-owned can also be cleaned. Unverifiable session state keeps completed attachments. Default: `90`; `0` disables automatic retention cleanup. |
+| `storage.database_retention_days` | How long terminal bridge records and unfinished session starts are retained. Older incoming attachments are removed only if their owner session is absent or has also been inactive for this period; interrupted downloads marked as bridge-owned can also be cleaned. Unverifiable session state keeps completed attachments. Default: `90`; `0` disables automatic retention cleanup. |
 | `worker.max_workers` | Maximum number of connected OMP processes. Default: `8`; maximum: `64`. |
 | `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`; maximum: `1024`. |
 | `worker.idle_timeout` | Time before releasing an otherwise idle OMP process while keeping its session available. Default: `30m`; `0` or `disabled` turns this off. |
@@ -203,7 +203,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List saved conversation/session bindings for this Telegram chat, with the current conversation first, pending starts next, then others by most recent use (unknown last). Each entry uses two full-width keyboard rows: a clickable session name (or workspace basename) and topic ID, then a read-only state, compact last-used age when known, and workspace. Clicking an eligible title opens a confirmation with a red Delete button; current-conversation and pending titles are disabled. An open entry must first be idle and its OMP process is closed. Workspace and native OMP history are preserved. |
-| `/bindings old` | Show older saved bindings first. Current-conversation and pending-start entries still lead; entries with known last-used times follow from oldest to newest, and unknown or future times come last. Pagination and deletion preserve this order. |
+| `/bindings old` | Sort all saved bindings, including the current conversation and pending starts, by last use from oldest to newest. Unknown or future times come last. Pagination and deletion preserve this order. |
 | `/resume` | Choose a saved native OMP session from the current workspace. Each entry shows its full ID and update time, with selection, Pin/Unpin, and Delete buttons. Pinned sessions for this conversation and workspace appear first. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
 | `/export` | Open a read-only picker for native OMP session export from the current workspace. The default format is the original main-session JSONL; the source is copied to the private attachment outbox, its filename is retained after sanitization, and the 50 MB document limit applies. Selecting the current session is rejected while its task or queue is active; run `/export` again after it becomes idle. |
@@ -286,8 +286,6 @@ Progress for a new task is delayed for approximately three seconds, so short tas
 
 The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows tool `Args` and the latest `Update` or `Result`, plus up to 5 completed calls under `Recent tools`. Earlier calls are counted as omitted. The same message retains its **Stop** button through edits; no separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
 
-New databases use schema 13 without an Activity table. Existing schema 11 and 12 databases upgrade automatically to 13; the migration drops the short-lived development `activity_messages` table even if it contains records. Other tables and session data remain intact, but old Activity messages represented only by those records can no longer be deleted automatically.
-
 `/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
 When steering is pending, the active root remains the final-reply owner until every steer finishes and OMP confirms the session settled. Progress Stop preserves bridge follow-ups; `/stop` clears them. With a pending steer either Stop path immediately terminates the old OMP process, marks the root and unresolved steers `uncertain` without replay, then allows preserved follow-ups to resume on a fresh runtime. Already performed tool side effects cannot be undone, and a force-terminated OMP session may fail to resume.
 
@@ -333,6 +331,8 @@ Committed sessions survive daemon restarts. At startup, the bridge restores thei
 
 Uncertain in-flight operations are not automatically replayed.
 
+If a `/new` or `/resume` start is interrupted, its pending start blocks another start until `/close` clears it. With retention enabled, an unfinished start older than the configured period is automatically removed; this does not delete its workspace or any OMP session it may have created. Check OMP history before starting again if the outcome was uncertain.
+
 Pending bridge tasks, including `/followup` and follow-ups addressed to this bot, are cancelled at shutdown or during startup after a crash, never replayed. Check the conversation and workspace before deciding to resend a request.
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
@@ -354,7 +354,7 @@ Bridge state is stored in:
 
 `storage.data_dir` defaults to the directory beside the real executable. Relative storage paths use that directory rather than the launch directory. Use absolute paths when data must stay elsewhere.
 
-Terminal Telegram bridge records are retained for `storage.database_retention_days`, which defaults to 90 days. Incoming attachment directories become eligible for cleanup after the same period without updates; normal task settlement refreshes their age. Active tasks are skipped while their worker is running. Cleanup runs at startup and every 24 hours while the service is running.
+Terminal Telegram bridge records and unfinished starts are retained for `storage.database_retention_days`, which defaults to 90 days. Incoming attachment directories become eligible for cleanup after the same period without updates; normal task settlement refreshes their age. Active tasks are skipped while their worker is running. Message and attachment cleanup runs at startup and every 24 hours; unfinished starts are checked at startup and periodically while the service runs.
 
 Set:
 

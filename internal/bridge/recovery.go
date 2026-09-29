@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -105,6 +106,17 @@ func (w *worker) restoreBinding() {
 }
 
 func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker) error {
+	if b.cfg.DatabaseRetentionDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -b.cfg.DatabaseRetentionDays).Unix()
+		count, err := b.db.CleanupExpiredStarts(ctx, cutoff)
+		if err != nil {
+			b.storeLog.Error("startup intent cleanup failed", "event", "cleanup_failed", "error_kind", "persistence")
+			return err
+		}
+		if count > 0 {
+			b.storeLog.Info("expired startup intents removed", "event", "cleanup_completed", "startup_intent_count", count)
+		}
+	}
 	intents, err := b.db.PendingStarts(b.bot.ID)
 	if err != nil {
 		b.storeLog.Error("startup intent read failed", "event", "binding_read_failed", "reason", "pending_starts", "error_kind", "persistence")

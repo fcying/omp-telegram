@@ -2882,6 +2882,40 @@ func TestStartFailureRetainsStartupIntent(t *testing.T) {
 	}
 }
 
+func TestExpiredStartIntentWaitsForRuntimeToStop(t *testing.T) {
+	w, _, _ := setupWorkspaceWorker(t)
+	w.b.cfg.DatabaseRetentionDays = 90
+	w.b.cfg.OMP = filepath.Join(t.TempDir(), "missing-omp")
+	w.start(false, t.TempDir(), "", false)
+	if w.startIntent == nil {
+		t.Fatal("failed start did not retain intent")
+	}
+	cutoff := time.Now().AddDate(0, 0, -90).Unix()
+	if _, err := w.b.db.DB.Exec("UPDATE startup_intents SET created_at=? WHERE bot=? AND chat=? AND thread=?", cutoff-1, w.startIntent.Bot, w.startIntent.Chat, w.startIntent.Thread); err != nil {
+		t.Fatal(err)
+	}
+	w.b.cfg.DatabaseRetentionDays = 0
+	w.expireStartIntent(time.Now())
+	if w.startIntent == nil {
+		t.Fatal("disabled retention removed intent")
+	}
+	w.b.cfg.DatabaseRetentionDays = 90
+	w.runtime = runtimeStarting
+	w.expireStartIntent(time.Now())
+	if w.startIntent == nil {
+		t.Fatal("active runtime start lost intent")
+	}
+	w.runtime = runtimeReleased
+	w.expireStartIntent(time.Now())
+	if w.startIntent != nil {
+		t.Fatal("stopped runtime retained expired intent")
+	}
+	intents, err := w.b.db.PendingStarts(w.b.bot.ID)
+	if err != nil || len(intents) != 0 {
+		t.Fatalf("expired intent remained in database: %+v, %v", intents, err)
+	}
+}
+
 func TestFailedUICallbackMarksUpdateUncertain(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
