@@ -45,7 +45,7 @@ func TestFastPickerOwnershipCancelReplayAndBusy(t *testing.T) {
 	buttons = resumeButtons(t, f)
 	w.busy = true
 	clickKeyboard(w, 7, buttons[0]["callback_data"].(string))
-	command("/fast on")
+	command("/fast:on")
 	assertFastState(t, w, false, false)
 	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("fast mode command changed session identity")
@@ -55,8 +55,8 @@ func TestFastPickerOwnershipCancelReplayAndBusy(t *testing.T) {
 func TestFastReportsActualStateAndUnsupportedModel(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
-	command("/model fixture/fast-fallback")
-	command("/fast on")
+	command("/model:fixture/fast-fallback")
+	command("/fast:on")
 	assertFastState(t, w, true, false)
 	var text string
 	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {

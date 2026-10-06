@@ -4,9 +4,35 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"unicode"
 
 	"omp-telegram/internal/telegram"
 )
+
+// Match OMP's JavaScript whitespace: BOM is whitespace, but NEL is not.
+func slashCommandWhitespace(r rune) bool {
+	return r == '\uFEFF' || r != '\u0085' && unicode.IsSpace(r)
+}
+
+// Keep the raw separator and arguments so unknown input can remain untouched.
+func parseSlashInvocation(text, botUsername string) (command, tail string, foreign bool) {
+	end := strings.IndexFunc(text, func(r rune) bool { return r == ':' || slashCommandWhitespace(r) })
+	if end < 0 {
+		end = len(text)
+	}
+	command, foreign = parseSlashCommandToken(text[:end], botUsername)
+	return command, text[end:], foreign
+}
+
+func slashCommandArguments(tail string) string {
+	if tail == "" {
+		return ""
+	}
+	if tail[0] == ':' {
+		tail = tail[1:]
+	}
+	return strings.TrimFunc(tail, slashCommandWhitespace)
+}
 
 func parseSlashCommandToken(token, botUsername string) (string, bool) {
 	name, target, addressed := strings.Cut(token, "@")

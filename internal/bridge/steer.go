@@ -38,7 +38,7 @@ func (w *worker) pendingInputFull() bool {
 }
 
 func (w *worker) routePrompt(in incoming, text string) {
-	if w.taskActive() && w.runtime == runtimeConnected && w.client != nil {
+	if w.taskActive() && w.activeInputKind != queuedNativeCommand && w.runtime == runtimeConnected && w.client != nil {
 		w.steer(in, text)
 		return
 	}
@@ -47,6 +47,9 @@ func (w *worker) routePrompt(in incoming, text string) {
 
 func (w *worker) steer(in incoming, text string) {
 	client := w.client
+	if w.rejectUnsupportedSlash(client.CommandCatalog(), text, in.id) {
+		return
+	}
 	if w.pendingInputFull() {
 		w.say("The queue is full. This message was not submitted.")
 		w.mark(in.id, "cancelled")
@@ -189,6 +192,9 @@ func (w *worker) deferSteeredTerminal(e rpcEvent) {
 }
 
 func (w *worker) maybeFinishSteeredRoot() {
+	if w.research.root {
+		return
+	}
 	fence := &w.steerFence
 	if !fence.active || len(w.steers) != 0 || !fence.terminalSeen {
 		return
@@ -227,6 +233,9 @@ func (w *worker) clearSteerFence() {
 }
 
 func (w *worker) probeSteeredQuiescence() {
+	if w.research.root {
+		return
+	}
 	fence := &w.steerFence
 	if !fence.active || w.client == nil || fence.settled || fence.probeCancel != nil || len(w.steers) != 0 || !fence.terminalSeen {
 		return
@@ -311,6 +320,10 @@ func (w *worker) stopSteeredRoot() {
 }
 
 func (w *worker) retireSteeredRoot(notice string) {
+	if w.research.root {
+		w.retireResearch(notice)
+		return
+	}
 	w.releaseRuntimeWithReason(true, "failure")
 	w.endControlOperation()
 	w.completeSessionOperation()

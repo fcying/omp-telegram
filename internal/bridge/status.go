@@ -29,6 +29,13 @@ type statusState struct {
 	} `json:"contextUsage"`
 }
 
+type statusModeResult struct {
+	epoch     uint64
+	sessionID string
+	known     bool
+	enabled   bool
+}
+
 func formatStatus(s statusState, workspace, sessionID, home string, queued int) string {
 	if s.SessionID != "" {
 		sessionID = s.SessionID

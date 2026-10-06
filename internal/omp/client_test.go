@@ -77,6 +77,12 @@ func TestMain(m *testing.M) {
 			if fixtureModelCommand(command) {
 				continue
 			}
+			if fixtureAutoresearchCommand(command) {
+				continue
+			}
+			if fixtureCatalogCommand(command) {
+				continue
+			}
 			switch command["type"] {
 			case "deferred_correlation":
 				reply := map[string]any{"type": "response", "id": command["id"], "command": "deferred_correlation", "success": true, "data": map[string]any{"value": command["value"]}}

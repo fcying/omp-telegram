@@ -1921,18 +1921,14 @@ func TestSteeredStopPreservesAttachmentPreparation(t *testing.T) {
 			w.previewFinished(preview)
 			if !failed {
 				w.dispatch()
-				if w.active != 4 {
-					t.Fatal("prepared attachment did not start after lazy resume")
-				}
+				nativeUntil(t, w, func() bool { return w.active == 4 })
 				waitSteerWorker(t, w, func() bool { return !w.taskActive() })
 				if steerInboxState(t, w, 4) != "done" {
 					t.Fatal("prepared attachment did not complete")
 				}
 			}
 			w.dispatch()
-			if w.active != 5 {
-				t.Fatal("attachment blocked the subsequent follow-up")
-			}
+			nativeUntil(t, w, func() bool { return w.active == 5 })
 			waitSteerWorker(t, w, func() bool { return !w.taskActive() })
 			if steerInboxState(t, w, 5) != "done" {
 				t.Fatal("subsequent follow-up did not complete")

@@ -9,6 +9,10 @@ import (
 )
 
 func (w *worker) sessionDeleteAvailable(sessionID, workspace string) (bool, error) {
+	leased, err := w.b.db.ResearchSessionLeased(w.b.bot.ID, sessionID)
+	if err != nil || leased {
+		return false, err
+	}
 	bindings, err := w.b.db.RunningBindings(w.b.bot.ID)
 	if err != nil {
 		return false, err
@@ -66,7 +70,7 @@ func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageI
 		return
 	}
 	if !available {
-		w.say("This session is currently active. Close it before deleting.")
+		w.say("This session is currently active or has a retained autoresearch workspace lease. Close active sessions; for a retained lease, resume its owner and confirm autoresearch off before deleting.")
 		return
 	}
 	title := "Delete omp session?\n\nTitle: " + menuText(selected.Title, 80) + "\nID: " + selected.ID + "\n\nThis deletes the saved OMP session and its artifacts.\nThe workspace files will not be deleted."
@@ -88,7 +92,7 @@ func (w *worker) beginSessionDelete(c confirmation) {
 		return
 	}
 	if !w.b.reserveDelete(w, selected.ID) {
-		w.say("This session is currently active or being processed. Close it before deleting.")
+		w.say("This session is currently active or being processed, or has a retained autoresearch workspace lease. Resume a retained lease's owner and confirm autoresearch off before deleting.")
 		return
 	}
 	available, err := w.sessionDeleteAvailable(selected.ID, c.workspace)
@@ -97,7 +101,7 @@ func (w *worker) beginSessionDelete(c confirmation) {
 		if err != nil {
 			w.say("Failed to check the session state. No session was deleted.")
 		} else {
-			w.say("This session is currently active. Close it before deleting.")
+			w.say("This session is currently active or has a retained autoresearch workspace lease. Close active sessions; for a retained lease, resume its owner and confirm autoresearch off before deleting.")
 		}
 		return
 	}

@@ -1097,21 +1097,22 @@ func TestExportSnapshotDeliveryRemovesSnapshotAfterSuccess(t *testing.T) {
 	defer func() { http.DefaultTransport = previous }()
 	b := testBridge(t, &Bridge{cfg: config.Config{DataDir: root}, db: db, tg: newTestTelegram(t)})
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- b.deliver(ctx) }()
 	waitFor(t, func() bool {
 		var state string
 		return db.DB.QueryRow("SELECT state FROM outbox WHERE path=?", snapshot.Path).Scan(&state) == nil && state == "done"
 	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("delivery loop returned error: %v", err)
+	}
 	if _, err := os.Stat(snapshot.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("confirmed export snapshot still exists, error=%v", err)
 	}
 	if data, err := os.ReadFile(source); err != nil || string(data) != string(raw) {
 		t.Fatalf("confirmed delivery changed source, data=%q, error=%v", data, err)
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("delivery loop returned error: %v", err)
 	}
 }
 

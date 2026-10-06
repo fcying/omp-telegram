@@ -530,9 +530,7 @@ func TestSteeredStopDuringCompactionAllowsNextPrompt(t *testing.T) {
 				w.stopActiveTask()
 			}
 			w.dispatch()
-			if w.active != next {
-				t.Fatalf("old compaction blocked next prompt: active=%d compacting=%t", w.active, w.compacting)
-			}
+			nativeUntil(t, w, func() bool { return w.active == next })
 			waitSteerWorker(t, w, func() bool { return !w.taskActive() })
 			if state := steerInboxState(t, w, next); state != "done" {
 				t.Fatalf("next prompt state = %s", state)

@@ -119,6 +119,49 @@ func TestBindingDeleteOpenFromOtherTopic(t *testing.T) {
 	waitFor(t, func() bool { return fake.has(11, "No saved conversation bindings.") })
 }
 
+func TestBindingForgetPreservesResearchOwner(t *testing.T) {
+	for _, closed := range []bool{false, true} {
+		name := "open"
+		if closed {
+			name = "closed"
+		}
+		t.Run(name, func(t *testing.T) {
+			fake, db, send := setupBridge(t)
+			workspace := t.TempDir()
+			send(update(1, 22, "/new "+workspace))
+			waitFor(t, func() bool { return fake.has(22, "omp is ready.") })
+			bound, err := db.Binding(99, -10, 22)
+			requireStoreOK(t, err)
+			owner := store.WorkspaceOwner{Bot: 99, Chat: -10, Thread: 22, Session: bound.SessionID}
+			requireStoreOK(t, db.ClaimResearchWorkspace(workspace, owner))
+			if closed {
+				send(update(2, 22, "/close"))
+				waitInputDone(t, db, 2)
+				bound, err = db.Binding(99, -10, 22)
+				requireStoreOK(t, err)
+			}
+			before := fake.messageCount()
+			send(update(3, 11, "/bindings"))
+			listID, data := waitBindingAction(t, fake, before, "Saved bindings", "")
+			sendBindingCallback(t, db, send, 4, listID, data)
+			confirmID, data := waitBindingAction(t, fake, int(listID), "binding for Topic 22?", "Delete")
+			sendBindingCallback(t, db, send, 5, confirmID, data)
+			waitFor(t, func() bool { return fake.has(11, "Research workspace is still reserved.") })
+			after, err := db.Binding(99, -10, 22)
+			requireStoreOK(t, err)
+			if after != bound {
+				t.Fatalf("refused forget changed the %s owner: before=%+v after=%+v", name, bound, after)
+			}
+			if _, err := os.Stat(bound.Session); err != nil {
+				t.Fatalf("refused forget removed native history: %v", err)
+			}
+			if err := db.AdmitWorkspace(workspace, store.WorkspaceOwner{Bot: 99, Chat: -10, Thread: 33, Session: "bbbbbbbb-2222"}); !errors.Is(err, store.ErrWorkspaceOccupied) {
+				t.Fatalf("refused forget lost workspace exclusivity: %v", err)
+			}
+		})
+	}
+}
+
 func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 	fake, db, send := setupBridge(t)
 	workspace := t.TempDir()

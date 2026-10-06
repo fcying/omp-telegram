@@ -292,6 +292,16 @@ func (c *Client) SetCommands(ctx context.Context, commands []BotCommand, languag
 	}, nil, true)
 }
 
+// SetChatCommands replaces commands for one chat without changing the default scope.
+func (c *Client) SetChatCommands(ctx context.Context, chatID int64, commands []BotCommand, languageCode string) error {
+	// Replacing the same command list is idempotent, so transport retries are safe.
+	return c.call(ctx, "setMyCommands", map[string]any{
+		"commands":      commands,
+		"scope":         map[string]any{"type": "chat", "chat_id": chatID},
+		"language_code": languageCode,
+	}, nil, true)
+}
+
 func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error) {
 	var updates []Update
 	err := c.call(ctx, "getUpdates", map[string]any{

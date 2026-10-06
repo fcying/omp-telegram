@@ -29,11 +29,27 @@ func assertKeyboardClears(t *testing.T, f *fakeHTTP, messageIDs ...int) {
 func clickKeyboard(w *worker, user int64, data string) {
 	w.callback(&telegram.CallbackQuery{ID: "keyboard-callback", From: telegram.User{ID: user}, Data: data})
 	for w.controlInProgress() {
+		researchControl := w.research.control != nil
+		var events <-chan json.RawMessage
+		if researchControl && w.client != nil {
+			events = w.client.Events()
+		}
 		select {
 		case result := <-w.operations:
 			w.operationReturned(result)
+		case raw, ok := <-events:
+			if ok {
+				w.event(raw)
+			} else {
+				w.failed()
+			}
+		case result := <-w.nativeCatalog.results:
+			w.commandCatalogFinished(result)
 		case <-time.After(5 * time.Second):
 			panic("control operation did not complete")
+		}
+		if researchControl {
+			w.dispatch()
 		}
 	}
 }

@@ -19,13 +19,15 @@ import (
 func (b *Bridge) newWorker(ctx context.Context, key target, binding store.Binding, restoring bool, intent *store.StartIntent) *worker {
 	ctx, cancel := context.WithCancel(ctx)
 	workerLog := b.log.With("chat_id", key.chat, "thread_id", key.thread)
-	return &worker{
+	w := &worker{
 		b: b, log: workerLog, key: key, binding: binding, runtimeLifecycle: runtimeLifecycle{restoring: restoring}, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
 		forgetRequests: make(chan bindingForgetRequest, 1), forgetResults: make(chan bindingForgetResult, 1),
 		topicRenameResults: make(chan topicRenameResult, 1), operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
 	}
+	b.registerCommandMenuWorker(w)
+	return w
 }
 
 func (b *Bridge) runWorker(w *worker) {
@@ -84,8 +86,30 @@ func savedSessionAvailable(session, workspace string) bool {
 func (w *worker) restoreBinding() {
 	w.restoring = false
 	if !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
+		owner, ownerErr := w.currentWorkspaceOwner()
+		if ownerErr == nil {
+			leased, err := w.b.db.ResearchWorkspaceOwned(owner)
+			if err != nil {
+				w.b.fail(err)
+				w.cancel()
+				return
+			}
+			if leased {
+				w.resumeFailed = true
+				w.say("The saved autoresearch owner is unavailable. Its workspace lease and session history were retained. Restore the saved session file and working directory, then use /autoresearch off or Stop to confirm disable; no work will be replayed.")
+				return
+			}
+		}
 		sessionID := w.sessionID
 		if w.persistClosed() {
+			w.b.sessionMu.Lock()
+			err := w.b.db.CloseWorkspaceUsers(w.workspaceOwner(w.binding.SessionID))
+			w.b.sessionMu.Unlock()
+			if err != nil {
+				w.b.fail(err)
+				w.cancel()
+				return
+			}
 			w.releaseSession()
 			w.logRuntimeEvent(slog.LevelInfo, "restore_runtime_skipped", "session_file_unavailable", "startup restore skipped", sessionID)
 			w.say("The saved omp session file or working directory is unavailable, so startup restore was skipped. Use /new to start a new session.")
@@ -125,6 +149,11 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 	bindings, err := b.db.RunningBindings(b.bot.ID)
 	if err != nil {
 		b.storeLog.Error("session binding read failed", "event", "binding_read_failed", "reason", "running_bindings", "error_kind", "persistence")
+		return err
+	}
+	// Restore all durable logical users before launching any worker. Runtime
+	// slots and chat filtering must not let another topic claim their worktree.
+	if err := b.restoreWorkspaceUsers(ctx, bindings, intents); err != nil {
 		return err
 	}
 	// Snapshot before polling starts: saved prompts must not restart with their bindings.
@@ -215,7 +244,7 @@ func deferredPrompt(message *telegram.Message, botUsername string) bool {
 	if !strings.HasPrefix(text, "/") {
 		return true
 	}
-	command, foreign := parseSlashCommandToken(strings.Fields(text)[0], botUsername)
+	command, _, foreign := parseSlashInvocation(text, botUsername)
 	if foreign {
 		return false
 	}

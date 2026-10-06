@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,8 +26,9 @@ type bindingNamesResult struct {
 }
 
 const (
-	bindingPageSize = 6
-	queuePageSize   = 6
+	bindingPageSize            = 6
+	queuePageSize              = 6
+	bindingResearchLeaseNotice = "Research workspace is still reserved. Confirm /autoresearch off in the original conversation before forgetting this binding; resume its owning session there if needed."
 )
 
 func (w *worker) conversationGeneration() int64 {
@@ -536,6 +538,16 @@ func (w *worker) forgetBinding(request bindingForgetRequest) {
 		request.reply(bindingForgetResult{status: "Binding is busy. Try again when its task and queue are idle."})
 		return
 	}
+	leased, err := w.b.db.ResearchTopicLeased(w.b.bot.ID, w.key.chat, w.key.thread)
+	if err != nil {
+		w.b.storeLog.Error("binding lease check failed", "event", "binding_read_failed", "reason", "research_lease", "error_kind", "persistence")
+		request.reply(bindingForgetResult{status: "Failed to check the saved binding's research reservation."})
+		return
+	}
+	if leased {
+		request.reply(bindingForgetResult{status: bindingResearchLeaseNotice})
+		return
+	}
 	w.exitMu.Lock()
 	if w.exitRequested || len(w.input) != 0 {
 		w.exitMu.Unlock()
@@ -556,6 +568,10 @@ func (w *worker) forgetBinding(request bindingForgetRequest) {
 		return
 	}
 	ok, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, request.generation)
+	if errors.Is(err, store.ErrWorkspaceOccupied) {
+		request.reply(bindingForgetResult{status: bindingResearchLeaseNotice})
+		return
+	}
 	if err != nil {
 		w.b.storeLog.Error("binding deletion failed", "event", "binding_delete_failed", "reason", "transaction", "error_kind", "persistence")
 		request.reply(bindingForgetResult{status: "Failed to delete the saved binding."})
@@ -645,6 +661,11 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 			return callbackDone
 		}
 		ok, err := w.b.db.DeleteClosedBinding(c.deleteBot, c.deleteChat, c.deleteThread, c.deleteGeneration)
+		if errors.Is(err, store.ErrWorkspaceOccupied) {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Research workspace is reserved")
+			w.say(bindingResearchLeaseNotice)
+			return callbackDone
+		}
 		if err != nil {
 			w.b.storeLog.Error("binding deletion failed", "event", "binding_delete_failed", "reason", "transaction", "error_kind", "persistence")
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Delete failed")
