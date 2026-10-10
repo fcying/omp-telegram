@@ -23,7 +23,7 @@ func TestHandoffResultPreservesSessionAndReleasesQueue(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			send(update(2, 11, "/handoff "+scenario.instructions))
+			send(update(2, 11, "/handoff:"+scenario.instructions))
 			waitFor(t, func() bool { return f.has(11, scenario.result) })
 			waitInputDone(t, db, 2)
 			send(update(3, 11, "after handoff"))
@@ -104,7 +104,7 @@ func TestHandoffRequiresIdleInstanceAndEmptyQueue(t *testing.T) {
 	command("/new " + t.TempDir())
 	w.b.cfg.QueueCapacity = 1
 	command("queued work")
-	command("/handoff preserve queued work")
+	command("/handoff:preserve queued work")
 	if w.busy || w.compacting || len(w.queue) != 1 {
 		t.Fatal("handoff overtook the prompt queue")
 	}
@@ -112,7 +112,7 @@ func TestHandoffRequiresIdleInstanceAndEmptyQueue(t *testing.T) {
 	command("wait")
 	w.dispatch()
 	active := w.active
-	command("/handoff")
+	command("/handoff:focus")
 	if w.compacting || !w.busy || w.active != active {
 		t.Fatal("handoff interrupted the active prompt")
 	}

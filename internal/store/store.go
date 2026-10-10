@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 14
+const schemaVersion = 16
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -358,6 +358,21 @@ func initialize(db *sql.DB) error {
 			return e
 		}
 		version = 14
+	}
+	if version == 0 || version == 14 {
+		if _, e = tx.Exec(workspaceLeaseSchema); e != nil {
+			return e
+		}
+		version = 16
+	}
+	if version == 15 {
+		if _, e = tx.Exec(`ALTER TABLE workspace_leases RENAME TO workspace_leases_v15;
+CREATE TABLE workspace_leases(root TEXT NOT NULL,bot INTEGER NOT NULL,chat INTEGER NOT NULL,thread INTEGER NOT NULL,session TEXT NOT NULL,PRIMARY KEY(root,bot,chat,thread,session));
+INSERT INTO workspace_leases SELECT root,bot,chat,thread,session FROM workspace_leases_v15;
+DROP TABLE workspace_leases_v15;`); e != nil {
+			return e
+		}
+		version = 16
 	}
 
 	if e = backfillSessionIDs(tx); e != nil {
@@ -755,6 +770,15 @@ func (s *Store) DeleteClosedBinding(bot, chat, thread, generation int64) (bool, 
 	if changed != 1 {
 		return false, nil
 	}
+	// Keep the original workspace source until every research lease is released.
+	// The deferred rollback restores the binding when deletion is refused.
+	var leased bool
+	if err = tx.QueryRow("SELECT EXISTS(SELECT 1 FROM workspace_leases WHERE bot=? AND chat=? AND thread=?)", bot, chat, thread).Scan(&leased); err != nil {
+		return false, err
+	}
+	if leased {
+		return false, ErrWorkspaceOccupied
+	}
 	if _, err = tx.Exec("DELETE FROM history WHERE bot=? AND chat=? AND thread=?", bot, chat, thread); err != nil {
 		return false, err
 	}
@@ -985,6 +1009,10 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 	return count, paths, nil
 }
 func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
+	return s.PrepareWorkspaceStart(previous, intent, "", WorkspaceOwner{})
+}
+
+func (s *Store) PrepareWorkspaceStart(previous Binding, intent StartIntent, root string, owner WorkspaceOwner) error {
 	if previous.Generation < 0 || (intent.Kind != "new" && intent.Kind != "resume") || intent.Generation != previous.Generation+1 || intent.Bot != previous.Bot || intent.Chat != previous.Chat || intent.Thread != previous.Thread {
 		return errors.New("invalid startup intent")
 	}
@@ -993,6 +1021,11 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 		return err
 	}
 	defer tx.Rollback()
+	if root != "" {
+		if err := admitWorkspace(tx, root, owner); err != nil {
+			return err
+		}
+	}
 	if previous.Running {
 		result, err := tx.Exec("UPDATE bindings SET running=0 WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=1", previous.Bot, previous.Chat, previous.Thread, previous.Generation)
 		if err != nil {
@@ -1027,11 +1060,24 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 	return tx.Commit()
 }
 func (s *Store) CommitStart(b Binding) error {
+	return s.CommitWorkspaceStart(b, "")
+}
+
+func (s *Store) CommitWorkspaceStart(b Binding, root string) error {
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if root != "" {
+		owner := WorkspaceOwner{Bot: b.Bot, Chat: b.Chat, Thread: b.Thread, Session: b.SessionID}
+		if err = admitWorkspace(tx, root, owner); err != nil {
+			return err
+		}
+		if _, err = tx.Exec("DELETE FROM workspace_users WHERE bot=? AND chat=? AND thread=? AND NOT(root=? AND session=?)", b.Bot, b.Chat, b.Thread, root, b.SessionID); err != nil {
+			return err
+		}
+	}
 	var generation int64
 	if err = tx.QueryRow("SELECT generation FROM startup_intents WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread).Scan(&generation); err != nil {
 		return err
@@ -1056,25 +1102,48 @@ func (s *Store) CommitStart(b Binding) error {
 }
 
 func (s *Store) CancelStart(intent StartIntent) error {
-	_, err := s.DB.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", intent.Bot, intent.Chat, intent.Thread, intent.Generation)
+	_, err := s.retireStartupIntents(context.Background(), "i.bot=? AND i.chat=? AND i.thread=? AND i.generation=?", intent.Bot, intent.Chat, intent.Thread, intent.Generation)
 	return err
 }
 
 func (s *Store) CleanupExpiredStarts(ctx context.Context, cutoff int64) (int64, error) {
-	result, err := s.DB.ExecContext(ctx, "DELETE FROM startup_intents WHERE created_at>0 AND created_at<?", cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+	return s.retireStartupIntents(ctx, "i.created_at>0 AND i.created_at<?", cutoff)
 }
 
 func (s *Store) ExpireStart(ctx context.Context, intent StartIntent, cutoff int64) (bool, error) {
-	result, err := s.DB.ExecContext(ctx, "DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=? AND created_at>0 AND created_at<?", intent.Bot, intent.Chat, intent.Thread, intent.Generation, cutoff)
+	count, err := s.retireStartupIntents(ctx, "i.bot=? AND i.chat=? AND i.thread=? AND i.generation=? AND i.created_at>0 AND i.created_at<?", intent.Bot, intent.Chat, intent.Thread, intent.Generation, cutoff)
+	return count != 0, err
+}
+
+// retireStartupIntents removes only admissions belonging to matched intents.
+// Keep a running binding's normal registration and every research lease; a
+// stale generation or fresh timestamp must not remove either intent or user.
+func (s *Store) retireStartupIntents(ctx context.Context, predicate string, args ...any) (int64, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return 0, err
+	}
+	defer tx.Rollback()
+	query := `DELETE FROM workspace_users AS u
+	WHERE EXISTS(SELECT 1 FROM startup_intents AS i
+	 WHERE i.bot=u.bot AND i.chat=u.chat AND i.thread=u.thread AND (` + predicate + `))
+	AND NOT EXISTS(SELECT 1 FROM bindings AS b
+	 WHERE b.bot=u.bot AND b.chat=u.chat AND b.thread=u.thread AND b.running=1 AND lower(b.session_id)=lower(u.session))`
+	if _, err = tx.ExecContext(ctx, query, args...); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, "DELETE FROM startup_intents WHERE rowid IN (SELECT i.rowid FROM startup_intents AS i WHERE "+predicate+")", args...)
+	if err != nil {
+		return 0, err
 	}
 	count, err := result.RowsAffected()
-	return count != 0, err
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Store) PendingStarts(bot int64) ([]StartIntent, error) {
@@ -1098,6 +1167,30 @@ func (s *Store) Enqueue(chat, thread int64, text string) error {
 	now := time.Now().Unix()
 	_, e := s.DB.Exec("INSERT INTO outbox(chat,thread,text,state,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,'pending',?,?,?,0)", chat, thread, text, now, now, now)
 	return e
+}
+
+// AppendInboxReplies durably delivers a research round without completing its owner.
+// A failed transaction leaves both the submitted input and its output unchanged.
+func (s *Store) AppendInboxReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var replyTo int64
+	if err := tx.QueryRowContext(ctx, "SELECT reply_to FROM inbox WHERE id=? AND state='submitted'", id).Scan(&replyTo); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("input is not submitted")
+		}
+		return err
+	}
+	now := time.Now().Unix()
+	for _, reply := range replies {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, replyTo, now, now, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // CompleteInboxWithReplies commits the complete final result and input completion together.

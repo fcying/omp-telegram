@@ -85,12 +85,24 @@ func testWorker(t *testing.T, w *worker) *worker {
 
 func waitOperation(t *testing.T, w *worker) operationResult {
 	t.Helper()
-	select {
-	case result := <-w.operations:
-		return result
-	case <-time.After(5 * time.Second):
-		t.Fatal("operation did not complete")
-		return operationResult{}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case result := <-w.operations:
+			if result.kind == "research_admission" {
+				w.operationReturned(result)
+				w.dispatch()
+				continue
+			}
+			return result
+		case result := <-w.nativeCatalog.results:
+			w.commandCatalogFinished(result)
+			w.dispatch()
+		case <-timer.C:
+			t.Fatal("operation did not complete")
+			return operationResult{}
+		}
 	}
 }
 
@@ -303,6 +315,100 @@ func TestMain(m *testing.M) {
 		rootPrompts := 0
 		uiReplies := 0
 		uiValue := ""
+		nativeMode := os.Getenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS")
+		var nativeCommands []map[string]any
+		var heldNativeDiscovery map[string]any
+		var heldNativeLocalID string
+		if nativeMode != "" {
+			nativeCommands = []map[string]any{{"name": "native_local", "source": "builtin"}, {"name": "native_agent", "source": "file"}, {"name": "status", "source": "builtin"}, {"name": "move", "source": "builtin"}, {"name": "wt", "aliases": []string{"worktree"}, "source": "builtin"}, {"name": "session", "source": "builtin"}}
+			nativeCommands = append(nativeCommands, map[string]any{"name": "plugin:command", "source": "file"}, map[string]any{"name": "foo", "source": "file"}, map[string]any{"name": "foo:bar", "source": "file"}, map[string]any{"name": "extension_switch", "aliases": []string{"extension_alias", "extension:session"}, "source": "extension"})
+		} else {
+			nativeCommands = []map[string]any{}
+		}
+		autoresearchFixture := strings.HasPrefix(nativeMode, "autoresearch")
+		autoresearchEnabled := os.Getenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE") == "on"
+		autoresearchState := session + ".autoresearch"
+		if saved, err := os.ReadFile(autoresearchState); err == nil {
+			autoresearchEnabled = string(saved) == "on"
+		}
+		var autoresearchRootID string
+		autoresearchEntriesMode := ""
+		var heldResearchEntries map[string]any
+		var getStateUpdate map[string]any
+		getStateUpdateRemaining := 0
+		researchPending := false
+		researchStateIncomplete := false
+		researchControlHold := ""
+		researchControlHoldNth := 0
+		var heldResearchControl map[string]any
+		holdResearchControl := func(phase string) bool {
+			if researchControlHold != phase || researchControlHoldNth == 0 {
+				return false
+			}
+			researchControlHoldNth--
+			if researchControlHoldNth != 0 {
+				return false
+			}
+			recordFixtureRPCTrace("research_control_waiting", phase)
+			return true
+		}
+		if autoresearchFixture {
+			nativeCommands = append(nativeCommands, map[string]any{"name": "autoresearch", "aliases": []string{"research_alias"}, "source": "extension"})
+		}
+		setAutoresearch := func(enabled bool) {
+			autoresearchEnabled = enabled
+			mode := "off"
+			if enabled {
+				mode = "on"
+			}
+			if err := os.WriteFile(autoresearchState, []byte(mode), 0600); err != nil {
+				os.Exit(2)
+			}
+			recordFixtureRPCTrace("autoresearch_mode", mode)
+		}
+		applyCatalogUpdate := func(update map[string]any) {
+			if update["remove"] == true {
+				nativeCommands = []map[string]any{}
+			}
+			if name, ok := update["removeName"].(string); ok {
+				for i, command := range nativeCommands {
+					if command["name"] == name {
+						nativeCommands = append(nativeCommands[:i], nativeCommands[i+1:]...)
+						break
+					}
+				}
+			}
+			if name, ok := update["addName"].(string); ok {
+				nativeCommands = append(nativeCommands, map[string]any{"name": name, "source": "file"})
+			}
+			if name, ok := update["sourceName"].(string); ok {
+				for _, command := range nativeCommands {
+					if command["name"] == name {
+						if source, present := update["source"]; present {
+							command["source"] = source
+						} else {
+							delete(command, "source")
+						}
+					}
+				}
+			}
+			if update["newSession"] == true {
+				sessionID = "11111111-2222-4333-8444-555555555555"
+				session = filepath.Join(root, sessionID+".jsonl")
+				cwd, err := os.Getwd()
+				if err != nil {
+					os.Exit(2)
+				}
+				data, _ := json.Marshal(map[string]string{"type": "session", "id": sessionID, "cwd": cwd})
+				if os.WriteFile(session, data, 0600) != nil {
+					os.Exit(2)
+				}
+				emit(map[string]any{"type": "session_info_update", "sessionId": sessionID})
+			}
+			if update["skipUpdate"] != true {
+				emit(map[string]any{"type": "available_commands_update", "commands": nativeCommands})
+			}
+		}
 		scan := bufio.NewScanner(os.Stdin)
 		scan.Buffer(make([]byte, 64<<10), (1<<20)+1)
 		for scan.Scan() {
@@ -313,6 +419,161 @@ func TestMain(m *testing.M) {
 			typ, _ := cmd["type"].(string)
 			resp := map[string]any{"type": "response", "id": cmd["id"], "command": typ, "success": true}
 			switch typ {
+			case "get_entries":
+				recordFixtureRPCTrace("get_entries", "")
+				if nativeMode == "autoresearch-entries-error" || autoresearchEntriesMode == "error" {
+					resp["success"], resp["error"] = false, "PRIVATE_AUTORESEARCH_ENTRIES_ERROR"
+				} else if autoresearchEntriesMode == "malformed" {
+					resp["data"] = map[string]any{"entries": "invalid", "leafId": "missing"}
+				} else {
+					mode := "off"
+					if autoresearchEnabled {
+						mode = "on"
+					}
+					resp["data"] = map[string]any{"entries": []any{
+						map[string]any{"id": "root", "parentId": nil, "type": "message"},
+						map[string]any{"id": "control", "parentId": "root", "type": "custom", "customType": "autoresearch-control", "data": map[string]any{"mode": mode}},
+						map[string]any{"id": "other-branch", "parentId": "root", "type": "custom", "customType": "autoresearch-control", "data": map[string]any{"mode": map[bool]string{true: "off", false: "on"}[autoresearchEnabled]}},
+					}, "leafId": "control"}
+				}
+				if autoresearchEntriesMode == "hold" {
+					heldResearchEntries = resp
+					recordFixtureRPCTrace("entries_waiting", "")
+					continue
+				}
+			case "fixture_research_control_event":
+				if event, ok := cmd["event"].(map[string]any); ok {
+					emit(event)
+				}
+			case "fixture_research_control_hold":
+				researchControlHold, _ = cmd["phase"].(string)
+				researchControlHoldNth = 1
+				if nth, ok := cmd["nth"].(float64); ok {
+					researchControlHoldNth = int(nth)
+				}
+			case "fixture_research_control_release":
+				if heldResearchControl != nil {
+					for _, key := range []string{"status", "agentInvoked", "sessionSettled"} {
+						if value, ok := cmd[key]; ok {
+							if value == "missing" {
+								delete(heldResearchControl, key)
+							} else {
+								heldResearchControl[key] = value
+							}
+						}
+					}
+					emit(heldResearchControl)
+					heldResearchControl = nil
+				}
+			case "fixture_autoresearch_metadata":
+				if mode, ok := cmd["mode"].(string); ok {
+					setAutoresearch(mode == "on")
+				}
+				autoresearchEntriesMode, _ = cmd["entriesMode"].(string)
+				if pending, ok := cmd["pending"].(bool); ok {
+					researchPending = pending
+				}
+				if incomplete, ok := cmd["incomplete"].(bool); ok {
+					researchStateIncomplete = incomplete
+				}
+				if active, ok := cmd["streaming"].(bool); ok {
+					streaming.Store(active)
+				}
+			case "fixture_get_state_update":
+				// Count only subsequent get_state calls in this fixture process.
+				getStateUpdateRemaining = 1
+				if nth, present := cmd["nth"]; present {
+					number, ok := nth.(float64)
+					if !ok || number < 1 || number != float64(int(number)) {
+						os.Exit(2)
+					}
+					getStateUpdateRemaining = int(number)
+				}
+				cmd["skipUpdate"] = false
+				getStateUpdate = cmd
+			case "fixture_autoresearch_release_entries":
+				if heldResearchEntries != nil {
+					emit(heldResearchEntries)
+					heldResearchEntries = nil
+				}
+				autoresearchEntriesMode = ""
+			case "fixture_autoresearch_settled":
+				emit(map[string]any{"type": "session_settled"})
+			case "fixture_autoresearch_continue":
+				if !autoresearchEnabled || streaming.Load() {
+					os.Exit(2)
+				}
+				streaming.Store(true)
+				emit(map[string]any{"type": "agent_start"})
+			case "fixture_autoresearch_round":
+				text, _ := cmd["text"].(string)
+				if mode, ok := cmd["mode"].(string); ok {
+					setAutoresearch(mode == "on")
+				}
+				streaming.Store(false)
+				emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text}})
+				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
+				if autoresearchRootID != "" {
+					emit(map[string]any{"type": "prompt_result", "id": autoresearchRootID, "status": "completed", "agentInvoked": true, "sessionSettled": true})
+					autoresearchRootID = ""
+				}
+				recordFixtureRPCTrace("autoresearch_round", text)
+				emit(map[string]any{"type": "session_settled"})
+			case "fixture_autoresearch_notify":
+				emit(map[string]any{"type": "extension_ui_request", "method": "notify", "message": cmd["message"], "notifyType": "info"})
+			case "get_available_commands":
+				recordFixtureRPCTrace("catalog_query", "")
+				switch nativeMode {
+				case "hold", "autoresearch-hold":
+					heldNativeDiscovery = resp
+					recordFixtureRPCTrace("catalog_waiting", "")
+					continue
+				case "hold-reject":
+					heldNativeDiscovery = resp
+					recordFixtureRPCTrace("catalog_waiting", "")
+					continue
+				case "unsupported":
+					resp["success"], resp["error"] = false, "Unknown command: get_available_commands"
+				case "fail":
+					resp["success"], resp["error"] = false, "fixture command discovery failed"
+				default:
+					resp["data"] = map[string]any{"commands": nativeCommands}
+				}
+			case "fixture_catalog_exit":
+				os.Exit(0)
+			case "fixture_catalog_update":
+				applyCatalogUpdate(cmd)
+				if heldNativeDiscovery != nil && (nativeMode == "hold-reject" || cmd["releaseQuery"] == true) {
+					heldNativeDiscovery["success"], heldNativeDiscovery["error"] = false, "old session discovery rejected"
+					emit(heldNativeDiscovery)
+					heldNativeDiscovery = nil
+				}
+			case "fixture_catalog_unsupported":
+				if heldNativeDiscovery == nil {
+					os.Exit(2)
+				}
+				nativeMode = "unsupported"
+				heldNativeDiscovery["success"], heldNativeDiscovery["error"] = false, "Unknown command: get_available_commands"
+				emit(heldNativeDiscovery)
+				heldNativeDiscovery = nil
+			case "fixture_finish_local":
+				status, provided := cmd["status"].(string)
+				if !provided {
+					status = "completed"
+				}
+				result := map[string]any{"type": "prompt_result", "id": heldNativeLocalID, "agentInvoked": false, "sessionSettled": true}
+				if status != "" {
+					result["status"] = status
+				}
+				if status == "error" {
+					result["error"] = map[string]any{"message": "PRIVATE_NATIVE_ERROR", "retryable": false}
+				}
+				emit(result)
+				heldNativeLocalID = ""
+			case "fixture_finish_root":
+				streaming.Store(false)
+				emit(map[string]any{"type": "command_output", "text": "PRIVATE_LATE_NATIVE_OUTPUT"})
+				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "root completed"}}}}})
 			case "extension_ui_response":
 				uiReplies++
 				uiValue, _ = cmd["value"].(string)
@@ -326,9 +587,29 @@ func TestMain(m *testing.M) {
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				continue
 			case "get_state":
+				if getStateUpdateRemaining > 0 {
+					getStateUpdateRemaining--
+					if getStateUpdateRemaining == 0 {
+						recordFixtureRPCTrace("get_state_update", "")
+						applyCatalogUpdate(getStateUpdate)
+						getStateUpdate = nil
+					}
+				}
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies, "fixtureUIValue": uiValue}
 				resp["data"].(map[string]any)["isStreaming"] = streaming.Load()
 				resp["data"].(map[string]any)["isCompacting"] = false
+				if autoresearchFixture {
+					resp["data"].(map[string]any)["isSettled"] = !streaming.Load()
+					resp["data"].(map[string]any)["hasPendingAsyncWork"] = researchPending
+					resp["data"].(map[string]any)["queuedMessageCount"] = 0
+					if researchStateIncomplete {
+						delete(resp["data"].(map[string]any), "hasPendingAsyncWork")
+					}
+				}
+				if holdResearchControl("get_state") {
+					heldResearchControl = resp
+					continue
+				}
 			case "set_session_name":
 				name, _ := cmd["name"].(string)
 				if strings.TrimSpace(name) == "" || modelID == "reject-name" {
@@ -415,6 +696,80 @@ func TestMain(m *testing.M) {
 			case "prompt":
 				text, _ := cmd["message"].(string)
 				recordFixtureRPCTrace(typ, text)
+				if autoresearchFixture && (text == "/autoresearch" || strings.HasPrefix(text, "/autoresearch ")) {
+					args := strings.TrimSpace(strings.TrimPrefix(text, "/autoresearch"))
+					if nativeMode == "autoresearch-off-error" && args == "off" {
+						resp["success"], resp["error"] = false, "PRIVATE_AUTORESEARCH_OFF_ERROR"
+						emit(resp)
+						continue
+					}
+					if nativeMode == "autoresearch-refuse" {
+						emit(resp)
+						emit(map[string]any{"type": "extension_ui_request", "method": "notify", "message": "Research startup refused", "notifyType": "error"})
+						emit(map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "completed", "agentInvoked": false, "sessionSettled": true})
+						continue
+					}
+					if nativeMode == "autoresearch-start-error" {
+						emit(resp)
+						emit(map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "error", "agentInvoked": false, "sessionSettled": true, "error": map[string]any{"message": "PRIVATE_AUTORESEARCH_START_ERROR"}})
+						continue
+					}
+					local := args == "" || args == "off" || args == "clear" || strings.HasPrefix(args, "clear ")
+					if args == "" {
+						setAutoresearch(!autoresearchEnabled)
+					} else {
+						setAutoresearch(!local)
+						if strings.HasPrefix(args, "clear") {
+							recordFixtureRPCTrace("autoresearch_clear", args)
+						}
+					}
+					if local && holdResearchControl("prompt") {
+						heldResearchControl = resp
+					} else {
+						emit(resp)
+					}
+					notice := "Research fixture enabled"
+					if !autoresearchEnabled {
+						notice = "Research fixture disabled"
+					}
+					emit(map[string]any{"type": "extension_ui_request", "method": "notify", "message": notice, "notifyType": "info"})
+					if local {
+						result := map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "completed", "agentInvoked": false, "sessionSettled": true}
+						if holdResearchControl("result") {
+							heldResearchControl = result
+						} else {
+							emit(result)
+						}
+					} else {
+						rootPrompts++
+						autoresearchRootID, _ = cmd["id"].(string)
+						streaming.Store(true)
+						start := map[string]any{"type": "agent_start"}
+						if holdResearchControl("agent_start") {
+							heldResearchControl = start
+						} else {
+							emit(start)
+						}
+					}
+					continue
+				}
+				if nativeMode != "" && strings.HasPrefix(text, "/") {
+					name, _, _ := strings.Cut(strings.TrimPrefix(text, "/"), " ")
+					mutatesSession := name == "extension_switch" || name == "extension_alias" || name == "extension:session"
+					for _, command := range nativeCommands {
+						if command["name"] == name && command["source"] == "extension" {
+							mutatesSession = true
+						}
+					}
+					if mutatesSession {
+						sessionID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+						recordFixtureRPCTrace("extension_session_mutation", sessionID)
+						emit(map[string]any{"type": "session_info_update", "sessionId": sessionID})
+						resp["data"] = map[string]any{"agentInvoked": false}
+						emit(resp)
+						continue
+					}
+				}
 				if behavior, ok := cmd["streamingBehavior"]; ok {
 					if behavior != "steer" || !streaming.Load() {
 						os.Exit(2)
@@ -445,6 +800,10 @@ func TestMain(m *testing.M) {
 						continue
 					}
 					emit(resp)
+					if autoresearchFixture && autoresearchEnabled {
+						emit(map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "completed", "agentInvoked": true, "sessionSettled": false})
+						continue
+					}
 					emit(map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "completed", "sessionSettled": true})
 					streaming.Store(false)
 					emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "answer: " + text}}}}})
@@ -465,7 +824,7 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
-				if text == "/session info" {
+				if text == "/session info" || nativeMode != "" && text == "/session:info" {
 					cwd, err := os.Getwd()
 					if err != nil {
 						os.Exit(2)
@@ -495,6 +854,38 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
+				if nativeMode != "" && (text == "/session pin" || text == "/session:pin") {
+					resp["data"] = map[string]any{"agentInvoked": false}
+					emit(resp)
+					continue
+				}
+				if nativeMode != "" && (text == "/plugin:command" || strings.HasPrefix(text, "/plugin:command ") || text == "/foo:bar" || text == "/foo") {
+					resp["data"] = map[string]any{"agentInvoked": false}
+					emit(resp)
+					continue
+				}
+				if nativeMode != "" && (text == "/native_local" || strings.HasPrefix(text, "/native_local ")) {
+					if nativeMode == "missing-agent-invoked" {
+						emit(resp)
+						streaming.Store(true)
+						emit(map[string]any{"type": "agent_start"})
+					} else if nativeMode == "delayed-local" {
+						heldNativeLocalID, _ = cmd["id"].(string)
+						emit(resp)
+					} else {
+						emit(map[string]any{"type": "command_output", "text": "PRIVATE_NATIVE_OUTPUT"})
+						resp["data"] = map[string]any{"agentInvoked": false}
+						emit(resp)
+					}
+					continue
+				}
+				if nativeMode != "" && text == "/native_agent" {
+					resp["data"] = map[string]any{"agentInvoked": true}
+					emit(resp)
+					streaming.Store(true)
+					emit(map[string]any{"type": "agent_start"})
+					continue
+				}
 				if (text == "/review" || strings.HasPrefix(text, "/review ")) && strings.Contains(text, replyContextStart) {
 					text = "native review: " + text
 				}
@@ -515,6 +906,10 @@ func TestMain(m *testing.M) {
 				emit(resp)
 				streaming.Store(true)
 				emit(map[string]any{"type": "agent_start"})
+				if autoresearchFixture && autoresearchEnabled {
+					autoresearchRootID, _ = cmd["id"].(string)
+					continue
+				}
 				if text == "missing-terminal" || text == "nonterminal-only" {
 					if text == "nonterminal-only" {
 						emit(map[string]any{"type": "agent_end", "isTerminal": false})
@@ -631,6 +1026,7 @@ type fakeHTTP struct {
 	rejectCommands        bool
 	rejectAllCommands     bool
 	rejectLanguage        string
+	commandRequests       chan map[string]any
 	rejectGetMe           bool
 	files                 map[string][]byte
 	failProgress          bool
@@ -685,6 +1081,13 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		result = telegram.User{ID: 99, Username: "fixture_bot", IsBot: true}
 	case "setMyCommands":
+		if f.commandRequests != nil {
+			select {
+			case f.commandRequests <- req:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}
 		if f.rejectCommands && (f.rejectAllCommands || req["language_code"] == f.rejectLanguage) {
 			return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"ok":false,"error_code":400,"description":"command registration rejected"}`)), Header: make(http.Header), Request: r}, nil
 		}
@@ -1467,6 +1870,15 @@ func TestTopicsQueueStopAndResume(t *testing.T) {
 	waitFor(t, func() bool {
 		var state string
 		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=13").Scan(&state) == nil && state == "cancelled"
+	})
+	// Queue cancellation precedes abort completion. While the root is still
+	// active, ordinary text steers it instead of starting an independent task.
+	waitFor(t, func() bool {
+		var state string
+		if err := db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil {
+			return false
+		}
+		return state == "done" || state == "cancelled" || state == "uncertain"
 	})
 	send(update(15, 11, "after stop"))
 	waitFor(t, func() bool { return f.has(11, "answer: after stop") })
@@ -3207,6 +3619,14 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 		}
 		w.handle(incoming{id: id, msg: u.Message})
 		drainControlOperations(t, w)
+		if os.Getenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS") == "" && w.nativeCatalog.cancel != nil {
+			select {
+			case result := <-w.nativeCatalog.results:
+				w.commandCatalogFinished(result)
+			case <-time.After(5 * time.Second):
+				t.Fatal("fixture command discovery did not complete")
+			}
+		}
 	}
 }
 

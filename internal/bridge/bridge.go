@@ -56,6 +56,7 @@ type Bridge struct {
 	ctx            context.Context
 	workerExits    chan workerExit
 	forgetRequests chan bindingForgetRequest
+	commandMenus   commandMenuState
 }
 type incoming struct {
 	id       int64
@@ -102,18 +103,22 @@ func updateSender(u telegram.Update) (*telegram.Message, int64) {
 }
 
 type queued struct {
-	id          int64
-	user        int64
-	replyTo     int64
-	text        string
-	displayText string
-	reply       *telegram.Message
-	images      []media.Image
-	albumKey    albumKey
-	album       bool
-	preparing   bool
-	cancel      context.CancelFunc
-	directory   string
+	id            int64
+	user          int64
+	replyTo       int64
+	text          string
+	displayText   string
+	kind          queuedInputKind
+	nativeName    string
+	nativeSession string
+	bridgeReview  bool // Explicit /review, not raw followup or attachment text.
+	reply         *telegram.Message
+	images        []media.Image
+	albumKey      albumKey
+	album         bool
+	preparing     bool
+	cancel        context.CancelFunc
+	directory     string
 }
 
 type albumKey struct {
@@ -163,6 +168,7 @@ type confirmation struct {
 	deleteRunning        bool
 	page                 int
 	uiSelectMenu         bool
+	autoresearchText     string
 }
 type runtimeState uint8
 
@@ -177,6 +183,7 @@ type taskState struct {
 	owner                 int64
 	awaitingContinuation  bool
 	busy                  bool
+	activeInputKind       queuedInputKind
 }
 
 type controlOperation uint8
@@ -235,6 +242,8 @@ type worker struct {
 	steerFence          steerFence
 	activeAttachmentDir string
 	rootRequestID       string
+	nativeCatalog       nativeCommandCatalog
+	research            autoresearchState
 	resumeFailed        bool
 	progressTransport
 	compacting             bool
@@ -502,6 +511,11 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		if err := b.cancelPendingPrompts("shutdown"); err != nil && runErr == nil {
 			runErr = err
 		}
+	}()
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.runCommandMenus(ctx)
 	}()
 	b.reconcileProgressCleanup(ctx)
 	workers := map[target]*worker{}
@@ -1120,10 +1134,11 @@ func (w *worker) taskActive() bool { return w.active != 0 }
 func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
-	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true}
+	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true, activeInputKind: q.kind}
 	w.activeAttachmentDir = q.directory
 	w.rootRequestID = ""
 	w.turn++
+	w.beginResearchTask(q)
 }
 
 func (w *worker) clearTask() {
@@ -1133,13 +1148,17 @@ func (w *worker) clearTask() {
 	w.awaitingContinuation = false
 	w.busy = false
 	w.rootRequestID = ""
+	w.activeInputKind = queuedPrompt
+	w.research.root, w.research.command, w.research.roundOpen = false, false, false
 }
 
 func (w *worker) awaitTaskContinuation() { w.awaitingContinuation = true }
 
 func (w *worker) clearAwaitingContinuation() { w.awaitingContinuation = false }
 
-func (w *worker) controlInProgress() bool { return w.controlOp != controlNone }
+func (w *worker) controlInProgress() bool {
+	return w.controlOp != controlNone || w.research.control != nil
+}
 
 func (w *worker) beginControlOperation(kind controlOperation) { w.controlOp = kind }
 
@@ -1206,7 +1225,7 @@ func (w *worker) canEvict() bool {
 func (w *worker) hasRuntimeConfirmation() bool {
 	for _, c := range w.confirms {
 		switch c.action {
-		case "model", "thinking", "fast", "compact", "ui", "new":
+		case "model", "thinking", "fast", "compact", "ui", "new", "autoresearch_clear":
 			return true
 		}
 	}
@@ -1250,12 +1269,15 @@ func (w *worker) runtimeClient() (*omp.Client, bool) {
 func (w *worker) beginRuntimeStart() { w.runtime = runtimeStarting }
 
 func (w *worker) runtimeStarted(client *omp.Client) {
+	w.b.registerCommandMenuWorker(w)
 	w.client = client
 	w.runtime = runtimeConnected
 	w.resumeFailed = false
 }
 
 func (w *worker) runtimeStopped() {
+	w.research.known, w.research.enabled = false, false
+	w.clearCommandCatalog()
 	w.client = nil
 	w.runtime = runtimeReleased
 }
@@ -1269,6 +1291,8 @@ func (w *worker) endRuntimeResume() {
 }
 
 func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
+	w.invalidateResearchAdmission()
+	w.cancelResearchControl()
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.clearAwaitingContinuation()
@@ -1282,7 +1306,7 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.runtimeStopped()
 	if client != nil {
 		clientID := client.ID()
-		if w.steerFence.active {
+		if w.steerFence.active || w.research.root || w.research.disablePending {
 			if err := client.TerminateNow(); err != nil {
 				w.b.fail(err)
 				w.cancel()
@@ -1328,6 +1352,9 @@ func (w *worker) closeFailedStart() {
 
 func (w *worker) ensureRuntime() (*omp.Client, error) {
 	if client, ok := w.runtimeClient(); ok {
+		if err := w.admitCurrentWorkspace(); err != nil {
+			return nil, err
+		}
 		return client, nil
 	}
 	if w.runtime == runtimeStarting {
@@ -1411,6 +1438,7 @@ func (w *worker) run() {
 		w.expire()
 		w.probeStuckTask(now)
 		w.steeredTick(now)
+		w.researchControlTick(now)
 		w.releaseIdleRuntime(now)
 		return w.evictIfIdle(now)
 	}
@@ -1441,6 +1469,10 @@ func (w *worker) run() {
 			continue
 		case result := <-w.previewResult:
 			w.previewFinished(result)
+			w.dispatch()
+			continue
+		case result := <-w.nativeCatalog.results:
+			w.commandCatalogFinished(result)
 			w.dispatch()
 			continue
 		case result := <-w.operations:
@@ -1527,6 +1559,8 @@ func (w *worker) run() {
 			w.failed()
 		case result := <-w.previewResult:
 			w.previewFinished(result)
+		case result := <-w.nativeCatalog.results:
+			w.commandCatalogFinished(result)
 		case result := <-w.operations:
 			w.operationReturned(result)
 		case result := <-w.topicRenameResults:
@@ -1561,6 +1595,21 @@ func (w *worker) run() {
 }
 
 func (w *worker) operationFinished(result operationResult) {
+	if result.kind == "research_control" {
+		w.researchControlFinished(result)
+		if w.research.control == nil && w.client != nil {
+			w.resolveSlashInputs()
+		}
+		return
+	}
+	if result.kind == "research_admission" {
+		w.researchAdmissionFinished(result)
+		return
+	}
+	if result.kind == "research_settlement" {
+		w.researchSettlementFinished(result)
+		return
+	}
 	if result.generation != w.binding.Generation || result.active != 0 && result.active != w.active || result.turn != 0 && result.turn != w.turn {
 		return
 	}
@@ -1583,9 +1632,24 @@ func (w *worker) operationFinished(result operationResult) {
 	}
 	if result.kind == "steer" {
 		w.steerOperationFinished(result)
+		w.probeResearchSettlement()
 		return
 	}
-	if result.kind == "prompt" {
+	if (result.kind == "prompt" || result.kind == "native_prompt") && w.research.root && result.err == nil {
+		w.research.accepted = true
+		if c := w.research.control; c != nil && c.intent == "local" {
+			c.accepted = true
+			w.researchControlMode(c, "postmode")
+			w.touchBinding()
+			return
+		}
+		// Only the canonical research handler requires correlated local completion.
+		if w.research.command {
+			w.touchBinding()
+			return
+		}
+	}
+	if result.kind == "prompt" || result.kind == "native_prompt" {
 		if w.steerFence.active && result.err != nil {
 			w.retireSteeredRoot("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.")
 			return
@@ -1604,11 +1668,18 @@ func (w *worker) operationFinished(result operationResult) {
 			AgentInvoked *bool `json:"agentInvoked"`
 		}
 		if json.Unmarshal(result.data, &response) == nil && response.AgentInvoked != nil && !*response.AgentInvoked {
+			if result.kind == "native_prompt" {
+				w.finishLocalCommandSubmission()
+				return
+			}
 			if w.steerFence.active {
 				w.deferSteeredTerminal(rpcEvent{})
 			} else {
 				w.finishTerminal(rpcEvent{})
 			}
+		}
+		if response.AgentInvoked != nil && *response.AgentInvoked {
+			w.activeInputKind = queuedPrompt
 		}
 		return
 	}
@@ -1684,6 +1755,26 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 	case "status":
 		w.endControlOperation()
+		if mode, ok := result.meta.(*statusModeResult); ok && mode != nil {
+			catalog := w.client.CommandCatalog()
+			if mode.epoch == catalog.Epoch && mode.sessionID == catalog.SessionID {
+				if mode.known && mode.enabled {
+					if err := w.ensureResearchWorkspace(); err != nil {
+						if w.research.root {
+							w.retireResearch("Autoresearch workspace is shared or unavailable. Its outcome is uncertain and will not be replayed automatically.")
+						} else {
+							w.resumeFailed = true
+							w.say("Autoresearch workspace admission failed: " + err.Error())
+						}
+						return
+					}
+				}
+				w.research.known = mode.known
+				if mode.known {
+					w.research.enabled = mode.enabled
+				}
+			}
+		}
 		if result.err != nil {
 			w.say("Failed to read the session state.")
 			return
@@ -1694,7 +1785,7 @@ func (w *worker) operationFinished(result operationResult) {
 			return
 		}
 		home, _ := os.UserHomeDir()
-		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)))
+		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)) + w.researchStatus())
 	case "name":
 		w.endControlOperation()
 		if result.err != nil {
@@ -1709,6 +1800,7 @@ func (w *worker) operationFinished(result operationResult) {
 }
 
 func (w *worker) teardownWorker(releaseSlot bool) {
+	w.b.removeCommandMenu(w)
 	completion := w.taskCompletionAttrs(w.active, "uncertain")
 	w.stopTyping()
 	w.resetIdleProbe()
@@ -1758,6 +1850,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	}
 	w.finishActiveIncoming()
 	w.clearSteerFence()
+	w.research = autoresearchState{}
 }
 
 func (w *worker) closeLogicalSession() bool {
@@ -1773,6 +1866,13 @@ func (w *worker) closeLogicalSession() bool {
 	w.clearQueue()
 	w.teardownWorker(true)
 	w.clearTask()
+	w.b.sessionMu.Lock()
+	err := w.b.db.CloseWorkspaceUsers(w.workspaceOwner(w.sessionID))
+	w.b.sessionMu.Unlock()
+	if err != nil {
+		w.b.fail(err)
+		return false
+	}
 	attrs := []slog.Attr{
 		slog.String("event", "session_close"),
 		slog.Int64("generation", generation),
@@ -1789,6 +1889,9 @@ func (w *worker) closeLogicalSession() bool {
 }
 
 func (w *worker) failed() {
+	if w.ctx.Err() != nil {
+		return
+	}
 	if w.runtime == runtimeReleased && w.client == nil {
 		return
 	}
@@ -1806,11 +1909,15 @@ func (w *worker) failed() {
 	if clientID != 0 && w.rpcExitPendingClientID != clientID {
 		w.logRuntimeEvent(slog.LevelWarn, "runtime_exit", "failure", "runtime exited", w.sessionID)
 	}
+	w.rpcExitPendingClientID = 0
+	if w.research.root {
+		w.retireResearch("omp exited during autoresearch. The task outcome is uncertain and will not be replayed automatically.")
+		return
+	}
 	if w.steerFence.active {
 		w.retireSteeredRoot("omp exited while steering. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
-	w.rpcExitPendingClientID = 0
 	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
 	w.closeLogicalSession()
 }
@@ -1820,6 +1927,12 @@ func (w *worker) cancelQueuedTask(id int64) bool {
 			continue
 		}
 		q := w.queue[i]
+		if probe := w.research.admission; probe != nil && probe.inbox == id {
+			w.invalidateResearchAdmission()
+		}
+		if c := w.research.control; c != nil && c.intent == "route" && c.queued && c.inbox == id {
+			w.endResearchControl(c)
+		}
 		if q.album {
 			if q.preparing && q.cancel == nil {
 				count := 1
@@ -1851,7 +1964,23 @@ func (w *worker) clearQueue() {
 }
 
 func (w *worker) stop() {
+	if w.research.control != nil {
+		w.handleResearchStop()
+		w.clearQueue()
+		return
+	}
+	// A pending lookup cannot prove mode is off. Stop it on a fresh runtime
+	// rather than starting another blocking lookup behind the canceled one.
+	pendingMode := w.research.admission != nil && !w.research.admission.ready && w.researchAvailable(w.research.admission.client)
 	w.clearQueue()
+	if pendingMode {
+		w.retireResearch("Autoresearch admission was interrupted. Its task outcome is uncertain and will not be replayed automatically.")
+		w.disableResearch(0)
+		return
+	}
+	if w.handleResearchStop() {
+		return
+	}
 	if w.steerFence.active {
 		w.stopSteeredRoot()
 		return
@@ -1860,6 +1989,9 @@ func (w *worker) stop() {
 }
 
 func (w *worker) stopActiveTask() {
+	if w.handleResearchStop() {
+		return
+	}
 	if w.steerFence.active {
 		w.stopSteeredRoot()
 		return
@@ -1876,8 +2008,8 @@ func (w *worker) requestAbort(notice string) {
 		w.say("The session operation is still loading.")
 		return
 	}
-	client, err := w.ensureRuntime()
-	if err != nil {
+	client, connected := w.runtimeClient()
+	if !connected {
 		w.say("The abort request failed.")
 		return
 	}
@@ -1888,6 +2020,9 @@ func (w *worker) requestAbort(notice string) {
 }
 
 func (w *worker) startOperation(kind string, client *omp.Client, call func(context.Context) (json.RawMessage, error), active int64, message string, metadata ...any) {
+	if kind == "steer" {
+		w.invalidateResearchSettlement()
+	}
 	request := rpcOperation{
 		generation: w.binding.Generation,
 		active:     active,
@@ -2115,6 +2250,9 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		} else if !validSessionID(target) {
 			return "Usage: /resume, or /resume <omp session ID>."
 		}
+		if !w.restoring {
+			cwd = expectedCWD
+		}
 		if !w.runtimeResuming && w.b.sessionInUseByOther(w, target) {
 			return "This session is already running in another conversation. Close that instance first, or use a full session ID."
 		}
@@ -2124,6 +2262,23 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		if !filepath.IsAbs(cwd) {
 			return "Invalid working directory."
 		}
+	}
+	startupOwner := w.workspaceOwner(startupWorkspaceSession(resume, target, nextGeneration))
+	if w.runtimeResuming || w.restoring {
+		startupOwner = w.workspaceOwner(old.SessionID)
+	}
+	w.b.sessionMu.Lock()
+	workspaceRoot, refreshErr := w.b.refreshWorkspaceRootLocked(w.ctx, cwd)
+	e = refreshErr
+	if e == nil {
+		e = w.b.db.CheckWorkspaceSession(startupOwner)
+	}
+	if e == nil && workspaceRoot != "" {
+		e = w.b.db.CheckWorkspace(workspaceRoot, startupOwner)
+	}
+	w.b.sessionMu.Unlock()
+	if e != nil {
+		return "Cannot admit the physical working directory: " + e.Error()
 	}
 	reuseSlot := replace && w.runtime == runtimeConnected && w.client != nil
 	reserved := false
@@ -2159,32 +2314,34 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 				previous.Running = false
 			}
 		}
-		if resume {
-			w.b.sessionMu.Lock()
-			if fenced && expectedEpoch != w.b.bindingsEpoch.Load() {
-				w.b.sessionMu.Unlock()
-				if reserved {
-					<-w.b.slots
-				}
-				return "The session list changed. Use /resume again."
-			}
-			if w.b.deleteMatchesLocked(session) {
-				w.b.sessionMu.Unlock()
-				if reserved {
-					<-w.b.slots
-				}
-				return "This session is being deleted. Try again after the operation finishes."
-			}
-		}
-		e = w.b.db.PrepareStart(previous, intent)
-		if resume {
+		w.b.sessionMu.Lock()
+		if resume && fenced && expectedEpoch != w.b.bindingsEpoch.Load() {
 			w.b.sessionMu.Unlock()
+			if reserved {
+				<-w.b.slots
+			}
+			return "The session list changed. Use /resume again."
 		}
+		if resume && w.b.deleteMatchesLocked(session) {
+			w.b.sessionMu.Unlock()
+			if reserved {
+				<-w.b.slots
+			}
+			return "This session is being deleted. Try again after the operation finishes."
+		}
+		workspaceRoot, e = w.b.refreshWorkspaceRootLocked(w.ctx, cwd)
+		if e == nil {
+			e = w.b.db.CheckWorkspaceSession(startupOwner)
+		}
+		if e == nil {
+			e = w.b.db.PrepareWorkspaceStart(previous, intent, workspaceRoot, startupOwner)
+		}
+		w.b.sessionMu.Unlock()
 		if e != nil {
 			if reserved {
 				<-w.b.slots
 			}
-			return "Failed to save the startup intent."
+			return "Failed to save the startup intent: " + e.Error()
 		}
 		w.startIntent = &intent
 		w.binding = old
@@ -2196,6 +2353,20 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 				reserved = true
 			}
 			w.clearTask()
+		}
+	}
+	if w.restoring && workspaceRoot != "" {
+		w.b.sessionMu.Lock()
+		workspaceRoot, e = w.b.refreshWorkspaceRootLocked(w.ctx, cwd)
+		if e == nil {
+			e = w.b.db.AdmitWorkspace(workspaceRoot, startupOwner)
+		}
+		w.b.sessionMu.Unlock()
+		if e != nil {
+			if reserved {
+				<-w.b.slots
+			}
+			return e.Error()
 		}
 	}
 	w.beginRuntimeStart()
@@ -2242,21 +2413,30 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		w.closeFailedStart()
 		return "omp selected a different working directory. The instance has been closed."
 	}
-	if !w.claimSession(info.File, info.ID) {
+	if !w.claimSessionWorkspace(info.File, info.ID, info.CWD) {
 		w.closeFailedStart()
-		return "This omp session is already active in another conversation."
+		return "This omp session or physical workspace is unavailable or occupied by another conversation."
 	}
-	if _, e = w.call("set_host_tools", map[string]any{"tools": telegramSendTools}); e != nil {
+	ctx, cancel = context.WithTimeout(w.ctx, 30*time.Second)
+	_, e = c.Call(ctx, "set_host_tools", map[string]any{"tools": telegramSendTools})
+	cancel()
+	if e != nil {
 		w.closeFailedStart()
 		return "Cannot register Telegram attachment delivery. The instance has been closed."
 	}
 	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: nextGeneration, LastUsedAt: old.LastUsedAt, Running: true}
 
-	if w.runtimeResuming {
-		binding = old
-	} else {
-		e = w.b.db.CommitStart(binding)
+	w.b.sessionMu.Lock()
+	workspaceRoot, e = w.b.refreshWorkspaceRootLocked(w.ctx, info.CWD)
+	if e == nil {
+		if w.runtimeResuming {
+			binding = old
+			e = w.b.db.AdmitWorkspace(workspaceRoot, w.workspaceOwner(info.ID))
+		} else {
+			e = w.b.db.CommitWorkspaceStart(binding, workspaceRoot)
+		}
 	}
+	w.b.sessionMu.Unlock()
 	if e != nil {
 		w.b.storeLog.Error("session binding persistence failed", "event", "binding_write_failed", "reason", "commit_start", "error_kind", "persistence")
 		w.closeFailedStart()
@@ -2287,6 +2467,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		runtimeReason = "lazy"
 	}
 	w.logRuntimeEvent(slog.LevelInfo, "runtime_connected", runtimeReason, "runtime connected", info.ID)
+	w.refreshCommandCatalog(c)
 	if renameTopic {
 		w.renameNewTopic(info.CWD)
 	}
@@ -2323,6 +2504,9 @@ func (w *worker) handle(in incoming) {
 			return
 		}
 		if _, err := w.ensureRuntime(); err != nil {
+			if w.ctx.Err() != nil {
+				return
+			}
 			w.say(err.Error())
 			w.mark(in.id, "done")
 			return
@@ -2338,20 +2522,28 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	if !strings.HasPrefix(text, "/") {
+		if w.taskActive() {
+			if _, err := w.ensureRuntime(); err != nil {
+				if w.ctx.Err() == nil {
+					w.say(err.Error())
+					w.mark(in.id, store.InboxCancelled)
+				}
+				return
+			}
+		}
 		w.routePrompt(in, text)
 		return
 	}
-	fields := strings.Fields(text)
-	cmd, foreign := parseSlashCommandToken(fields[0], w.b.bot.Username)
+	cmd, tail, foreign := parseSlashInvocation(text, w.b.bot.Username)
 	if foreign {
 		w.mark(in.id, "ignored")
 		return
 	}
 	if !knownBridgeCommand(cmd) {
-		w.routePrompt(in, text)
+		w.routeSlashInput(in, text)
 		return
 	}
-	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+	arg := slashCommandArguments(tail)
 	if cmd == "/review" {
 		prompt := "/review"
 		if arg != "" {
@@ -2475,6 +2667,10 @@ func (w *worker) handle(in incoming) {
 	case "/handoff":
 		w.handoff(arg)
 	case "/compact":
+		if arg != "" {
+			w.say("Usage: /compact")
+			return
+		}
 		if w.sessionControlBusy() {
 			w.say("An idle instance is required.")
 			return
@@ -2514,17 +2710,35 @@ func (w *worker) status() {
 		if !w.lastActivity.IsZero() {
 			idle = time.Since(w.lastActivity)
 		}
-		w.say(formatReleasedStatus(w.binding.Workspace, w.sessionID, home, len(w.queue), idle))
+		w.say(formatReleasedStatus(w.binding.Workspace, w.sessionID, home, len(w.queue), idle) + w.researchStatus())
 		return
 	}
-	if _, connected := w.runtimeClient(); !connected {
+	client, connected := w.runtimeClient()
+	if !connected {
 		n, _ := w.b.db.Uncertain()
 		w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
 		return
 	}
-	w.beginControl("status", func(client *omp.Client, ctx context.Context) (json.RawMessage, error) {
+	if w.controlInProgress() {
+		w.say("The session operation is still loading.")
+		return
+	}
+	var mode *statusModeResult
+	if w.researchAvailable(client) {
+		mode = &statusModeResult{}
+	}
+	w.beginControlOperation(controlStatus)
+	w.startOperation("status", client, func(ctx context.Context) (json.RawMessage, error) {
+		if mode != nil {
+			catalog := client.CommandCatalog()
+			mode.epoch, mode.sessionID = catalog.Epoch, catalog.SessionID
+			modeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			enabled, err := client.AutoresearchMode(modeCtx)
+			cancel()
+			mode.known, mode.enabled = err == nil, enabled
+		}
 		return client.Call(ctx, "get_state", nil)
-	}, "")
+	}, 0, "", mode)
 }
 
 // promptInlineCount reserves the longest possible uint64 request ID before dispatch.
@@ -2568,6 +2782,16 @@ func (w *worker) dispatch() {
 	if w.queue[0].preparing {
 		return
 	}
+	if !w.nativeCommandDispatchReady(client) {
+		return
+	}
+	if !w.researchDispatchReady(client) {
+		return
+	}
+	if !w.queuedCommandDispatchReady(client) {
+		return
+	}
+	w.invalidateResearchAdmission()
 	q := w.queue[0]
 	inline, fits := promptInlineCount(q.text, q.images, client.FrameLimit())
 	w.queue[0] = queued{}
@@ -2609,7 +2833,11 @@ func (w *worker) dispatch() {
 	}
 	requestID := client.ReserveRequestID()
 	w.rootRequestID = requestID
-	w.startOperation("prompt", client, func(ctx context.Context) (json.RawMessage, error) {
+	kind := "prompt"
+	if q.kind == queuedNativeCommand {
+		kind = "native_prompt"
+	}
+	w.startOperation(kind, client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.CallWithID(ctx, requestID, "prompt", fields)
 	}, q.id, "")
 }
@@ -2620,10 +2848,16 @@ func (w *worker) enqueuePrompt(in incoming, text string) {
 
 func (w *worker) enqueueReviewPrompt(in incoming, review string) {
 	w.enqueuePreparedPrompt(in, prepareReviewPrompt(in.msg, review), review)
+	if last := len(w.queue) - 1; last >= 0 && w.queue[last].id == in.id {
+		w.queue[last].bridgeReview = true
+	}
 }
 
 func (w *worker) enqueuePreparedPrompt(in incoming, prompt, displayText string) {
 	if _, err := w.ensureRuntime(); err != nil {
+		if w.ctx.Err() != nil {
+			return
+		}
 		w.say(err.Error())
 		w.mark(in.id, "done")
 		return
@@ -2805,6 +3039,10 @@ func taskReplies(text, finalNotice string, truncated bool) []string {
 }
 
 func (w *worker) assistantBudgetExceeded() {
+	if w.research.root {
+		w.retireResearch("Autoresearch output exceeded the bridge resource budget. Its outcome is uncertain and it will not be replayed automatically.")
+		return
+	}
 	w.logRuntimeEvent(slog.LevelWarn, "assistant_output_overflow", "resource_limit", "assistant output exceeded bridge budget", w.sessionID)
 	if w.steerFence.active {
 		w.retireSteeredRoot("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
@@ -3101,7 +3339,18 @@ func (w *worker) event(raw []byte) {
 		return
 	}
 	w.logLifecycle(e)
+	if w.researchControlEvent(e) {
+		return
+	}
 	switch e.Type {
+	case "available_commands_update":
+		w.commandCatalogUpdated()
+	case "session_info_update":
+		// The reader invalidates the catalog before publishing session changes.
+		w.syncCommandMenu()
+		if client, ok := w.runtimeClient(); ok && client.CommandCatalog().State == omp.CatalogUnknown {
+			w.refreshCommandCatalog(client)
+		}
 	case "host_tool_call":
 		w.renameProgressTool(e.ToolCallID, e.ToolName)
 		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
@@ -3120,6 +3369,9 @@ func (w *worker) event(raw []byte) {
 		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 		w.endProgressTool(e.ToolCallID, e.IsError)
 	case "message_update":
+		if w.research.root && !w.research.roundOpen {
+			return
+		}
 		if e.AssistantMessageEvent.Type == "text_delta" {
 			delta := e.AssistantMessageEvent.Delta
 			pendingBytes := w.stream.Len() - w.finalizedStreamBytes
@@ -3139,10 +3391,16 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		if w.research.root {
+			w.invalidateResearchSettlement()
+			w.research.roundOpen = true
+			w.research.notices = 0
+		}
 		w.newSteeredRun()
 		if !w.taskActive() {
 			return
 		}
+		w.activeInputKind = queuedPrompt
 		w.clearAwaitingContinuation()
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)
@@ -3150,7 +3408,11 @@ func (w *worker) event(raw []byte) {
 		w.finalAssistantTexts = nil
 		w.finalAssistantBytes = 0
 		w.finalizedStreamBytes = w.stream.Len()
+		w.routeDeferredResearchToggle()
 	case "message_end":
+		if w.research.root && !w.research.roundOpen {
+			return
+		}
 		var m message
 		if json.Unmarshal(e.Message, &m) == nil && m.Role == "assistant" {
 			w.lastAssistant = &terminalAssistant{
@@ -3170,6 +3432,14 @@ func (w *worker) event(raw []byte) {
 			w.finalizedStreamBytes = w.stream.Len()
 		}
 	case "agent_end":
+		if w.research.root {
+			terminal := w.terminalState(e)
+			w.flushResearchRound(e)
+			if terminal != terminalDone {
+				w.retireResearch("Autoresearch ended with an interrupted or failed round. It will not be replayed automatically.")
+			}
+			return
+		}
 		if e.IsTerminal != nil && !*e.IsTerminal {
 			w.awaitTaskContinuation()
 			return
@@ -3189,9 +3459,19 @@ func (w *worker) event(raw []byte) {
 		w.finishTerminal(e)
 	case "prompt_result":
 		if w.steerResult(e) {
+			w.probeResearchSettlement()
 			return
 		}
 		if e.ID != "" && e.ID != w.rootRequestID {
+			return
+		}
+		if w.researchLocalResult(e) {
+			return
+		}
+		if w.research.root {
+			if e.Status == "aborted" || e.Status == "error" {
+				w.retireResearch("Autoresearch was interrupted or failed. Its outcome is uncertain and it will not be replayed automatically.")
+			}
 			return
 		}
 		if w.steerFence.active {
@@ -3201,9 +3481,24 @@ func (w *worker) event(raw []byte) {
 			return
 		}
 		if e.AgentInvoked != nil && !*e.AgentInvoked {
+			if w.activeInputKind == queuedNativeCommand {
+				switch e.Status {
+				case "completed":
+					w.finishLocalCommandSubmission()
+				case "aborted":
+					w.finishCancelled("Task was cancelled before completion.")
+				case "error":
+					w.finishUncertain("Native command failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically.")
+				default:
+					w.finishUncertain("Native command completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+				}
+				return
+			}
 			w.finishTerminal(e)
 		}
 	case "session_settled":
+		w.invalidateResearchSettlement()
+		w.probeResearchSettlement()
 		w.probeSteeredQuiescence()
 	case "response":
 		if !e.Success {
@@ -3211,6 +3506,9 @@ func (w *worker) event(raw []byte) {
 			w.closeLogicalSession()
 		}
 	case "extension_ui_request":
+		if w.researchNotify(e) {
+			return
+		}
 		w.ui(e)
 	}
 }
@@ -3780,6 +4078,10 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
 	}
+	if c.action == "autoresearch_clear" && !researchCallbackMessage(q, c, w.key) {
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return callbackDone
+	}
 	if (c.action == "resume" || c.action == "export" || c.action == "session_delete") && (q.Message == nil || q.Message.MessageID != c.messageID) {
 		delete(w.confirms, token)
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
@@ -3871,6 +4173,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	if c.action == "session_delete" {
 		if n == 0 {
 			w.beginSessionDelete(c)
+		}
+		return callbackDone
+	}
+	if c.action == "autoresearch_clear" {
+		if n == 0 {
+			w.confirmResearchClear(c)
 		}
 		return callbackDone
 	}

@@ -73,6 +73,7 @@ type result struct {
 type request struct {
 	command string
 	result  chan result
+	catalog *commandCatalogQuery
 }
 
 // Client owns a process group. Raw events can contain sensitive content and must not be logged.
@@ -106,6 +107,9 @@ type Client struct {
 	metadataBusy              bool
 	metadataUnavailable       bool
 	metadata                  *metadataQuery
+	commandCatalog            CommandCatalog
+	catalogUpdateRevision     uint64
+	catalogQuery              *commandCatalogQuery
 }
 
 // ValidateArgs protects the transport and session lifecycle owned by the bridge.
@@ -489,6 +493,7 @@ type envelope struct {
 	Command  string           `json:"command"`
 	Success  *bool            `json:"success"`
 	Data     json.RawMessage  `json:"data"`
+	Error    json.RawMessage  `json:"error"`
 	Terminal terminalMetadata `json:"isTerminal"`
 }
 
@@ -704,6 +709,21 @@ func (c *Client) readLoop() {
 					c.protocolFailure(errors.New("omp: RPC response command mismatch"))
 					return
 				}
+				if r.catalog != nil {
+					err := c.receiveCommandCatalogResponse(r.catalog, env)
+					if errors.Is(err, errProtocol) {
+						c.protocolFailure(errProtocol)
+					}
+					c.finishCommandCatalogQuery(r.catalog, err)
+					if errors.Is(err, errProtocol) {
+						return
+					}
+					c.logLifecycle(env, "response_queued")
+					continue
+				}
+				if env.Command == "get_state" && *env.Success {
+					c.receiveCommandCatalogSession(env.Data)
+				}
 				response := result{data: env.Data}
 				if !*env.Success {
 					response.err = &classifiedError{kind: "rejected", err: errors.New("omp: RPC command rejected")}
@@ -723,6 +743,16 @@ func (c *Client) readLoop() {
 			// already left, it cannot safely affect a later bridge operation.
 			c.logLifecycle(env, "response_ignored")
 			continue
+		}
+		if env.Type == "session_info_update" {
+			c.receiveCommandCatalogSession(frame)
+		}
+		if env.Type == "available_commands_update" {
+			if err := c.receiveCommandCatalogUpdate(frame); err != nil {
+				c.bytes.release(cap(frame))
+				c.protocolFailure(errProtocol)
+				return
+			}
 		}
 		if env.Type == "command_output" && c.captureMetadata(frame) {
 			c.bytes.release(cap(frame))

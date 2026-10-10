@@ -153,6 +153,9 @@ func TestForeignBotCommandsRemainIgnoredAfterRestart(t *testing.T) {
 		d.send(0, "/status@OtherBot"),
 		d.send(0, "/review@OtherBot foo"),
 		d.send(0, "/foo@OtherBot"),
+		d.send(0, "/status@OtherBot:arg"),
+		d.send(0, "/review@OtherBot:foo"),
+		d.send(0, "/foo@OtherBot:arg"),
 	}
 	for _, id := range ids {
 		waitFor(t, func() bool {
@@ -191,6 +194,11 @@ func TestDeferredPromptIncludesFollowup(t *testing.T) {
 		{"/status", false},
 		{"/followup@FIXTURE_BOT foo", true},
 		{"/followup@OtherBot foo", false},
+		{"/followup:foo", true},
+		{"/followup@OtherBot:foo", false},
+		{"/compact:focus", false},
+		{"/unknown:arg", true},
+		{"/opt/user@host/file", true},
 	} {
 		t.Run(input.text, func(t *testing.T) {
 			if got := deferredPrompt(&telegram.Message{Text: input.text}, "fixture_bot"); got != input.want {
@@ -864,5 +872,182 @@ func TestPendingAlbumIsCancelledOnRecovery(t *testing.T) {
 	}
 	if ownerState != "cancelled" || memberState != "done" {
 		t.Fatalf("recovered album states = owner:%q member:%q", ownerState, memberState)
+	}
+}
+
+func TestDaemonRecoveryMergedWorkspaceOwnersRemainControllable(t *testing.T) {
+	for _, owners := range []int{1, 2} {
+		name := "lease_and_normal_binding"
+		if owners == 2 {
+			name = "two_lease_owners"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS", "autoresearch")
+			t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+			trace := filepath.Join(t.TempDir(), "rpc.trace")
+			t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
+			root := t.TempDir()
+			left := filepath.Join(root, "left")
+			right := root
+			if owners == 2 {
+				right = filepath.Join(root, "right")
+			}
+			d := newRecoveryDaemon(t, 3)
+			d.command(11, "/new "+left)
+			d.command(11, "/autoresearch")
+			d.command(22, "/new "+right)
+			if owners == 2 {
+				d.command(22, "/autoresearch")
+			}
+			d.command(33, "/new "+t.TempDir())
+			a, b := d.binding(11), d.binding(22)
+			ownerA := store.WorkspaceOwner{Bot: a.Bot, Chat: a.Chat, Thread: a.Thread, Session: a.SessionID}
+			ownerB := store.WorkspaceOwner{Bot: b.Bot, Chat: b.Chat, Thread: b.Thread, Session: b.SessionID}
+			leaseTestGit(t, root, "init")
+			d.command(33, "unrelated live merge probe")
+			if researchTraceCount(trace, "prompt", "unrelated live merge probe") != 1 {
+				t.Fatal("workspace merge blocked unrelated live work")
+			}
+			d.stop()
+			d.start()
+			d.command(33, "unrelated restarted merge probe")
+			if researchTraceCount(trace, "prompt", "unrelated restarted merge probe") != 1 {
+				t.Fatal("workspace merge blocked daemon recovery or unrelated work")
+			}
+			d.command(22, "/foo blocked merged workspace")
+			if researchTraceCount(trace, "prompt", "/foo blocked merged workspace") != 0 {
+				t.Fatal("conflicting workspace admitted a native command")
+			}
+			if owners == 2 {
+				d.command(11, "/foo blocked first lease owner")
+				if researchTraceCount(trace, "prompt", "/foo blocked first lease owner") != 0 {
+					t.Fatal("merged lease owner bypassed ordinary admission")
+				}
+			}
+			d.command(11, "/autoresearch off")
+			owned, err := d.db.ResearchWorkspaceOwned(ownerA)
+			requireStoreOK(t, err)
+			if owned || researchTraceCount(trace, "prompt", "/autoresearch off") != 1 {
+				t.Fatal("exact owner could not confirm off after workspace merge")
+			}
+			if owners == 2 {
+				owned, err = d.db.ResearchWorkspaceOwned(ownerB)
+				requireStoreOK(t, err)
+				if !owned {
+					t.Fatal("first owner off discarded the second owner's lease")
+				}
+				for _, path := range []string{root, right} {
+					if err := d.db.AdmitWorkspace(path, ownerA); !errors.Is(err, store.ErrWorkspaceOccupied) {
+						t.Fatalf("first off lost second owner's historical/current protection: %v", err)
+					}
+				}
+				d.command(33, "unrelated between owner disables")
+				if researchTraceCount(trace, "prompt", "unrelated between owner disables") != 1 {
+					t.Fatal("remaining lease affected unrelated work")
+				}
+				d.command(22, "/stop")
+				waitFor(t, func() bool {
+					owned, err = d.db.ResearchWorkspaceOwned(ownerB)
+					requireStoreOK(t, err)
+					return !owned
+				})
+				if owned || researchTraceCount(trace, "prompt", "/autoresearch off") != 2 {
+					t.Fatal("Stop failed to confirm and release the final exact owner")
+				}
+			}
+			for _, before := range []store.Binding{a, b} {
+				after := d.binding(before.Thread)
+				if after.Session != before.Session || after.SessionID != before.SessionID || after.Generation != before.Generation || !after.Running {
+					t.Fatal("recovery or disable lost the durable owner identity")
+				}
+				if _, err := os.Stat(before.Session); err != nil {
+					t.Fatal("recovery or disable lost native session history", err)
+				}
+			}
+			d.command(22, "ordinary work after all owners disabled")
+			if researchTraceCount(trace, "prompt", "ordinary work after all owners disabled") != 1 {
+				t.Fatal("final off did not restore ordinary admission")
+			}
+		})
+	}
+}
+
+func TestDaemonRecoverySkipsInvalidOrdinaryWorkspaceWithoutBlockingOtherTopics(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+	trace := filepath.Join(t.TempDir(), "rpc.trace")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
+	d := newRecoveryDaemon(t, 2)
+	badRoot := t.TempDir()
+	d.command(11, "/new "+badRoot)
+	d.command(22, "/new "+t.TempDir())
+	before := d.binding(11)
+	requireStoreOK(t, os.RemoveAll(badRoot))
+	requireStoreOK(t, os.WriteFile(badRoot, []byte("not a directory"), 0600))
+	d.command(22, "unrelated live invalid-directory probe")
+	if researchTraceCount(trace, "prompt", "unrelated live invalid-directory probe") != 1 {
+		t.Fatal("invalid ordinary workspace blocked unrelated live work")
+	}
+	d.stop()
+	d.start()
+	waitFor(t, func() bool { return !d.binding(11).Running })
+	d.command(22, "unrelated invalid-directory recovery probe")
+	if researchTraceCount(trace, "prompt", "unrelated invalid-directory recovery probe") != 1 {
+		t.Fatal("invalid ordinary workspace blocked unrelated recovery work")
+	}
+	after := d.binding(11)
+	if after.Session != before.Session || after.SessionID != before.SessionID || after.Workspace != before.Workspace || after.Generation != before.Generation {
+		t.Fatal("skipping invalid ordinary binding lost durable session identity")
+	}
+	if _, err := os.Stat(before.Session); err != nil {
+		t.Fatal("skipping invalid ordinary binding lost native history", err)
+	}
+	d.command(11, "/foo invalid workspace must not execute")
+	if researchTraceCount(trace, "prompt", "/foo invalid workspace must not execute") != 0 {
+		t.Fatal("invalid closed binding executed a native command")
+	}
+}
+
+func TestDaemonRecoveryRetainsUnavailableLeaseOwnerUntilWorkspaceRepairAndOff(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS", "autoresearch")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", t.TempDir())
+	trace := filepath.Join(t.TempDir(), "rpc.trace")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
+	d := newRecoveryDaemon(t, 2)
+	root := t.TempDir()
+	d.command(11, "/new "+root)
+	d.command(11, "/autoresearch")
+	d.command(22, "/new "+t.TempDir())
+	before := d.binding(11)
+	owner := store.WorkspaceOwner{Bot: before.Bot, Chat: before.Chat, Thread: before.Thread, Session: before.SessionID}
+	d.stop()
+	requireStoreOK(t, os.RemoveAll(root))
+	requireStoreOK(t, os.WriteFile(root, []byte("not a directory"), 0600))
+	d.start()
+	d.command(22, "unrelated unavailable lease recovery probe")
+	owned, err := d.db.ResearchWorkspaceOwned(owner)
+	requireStoreOK(t, err)
+	if !owned || !d.binding(11).Running || researchTraceCount(trace, "prompt", "unrelated unavailable lease recovery probe") != 1 {
+		t.Fatal("unavailable lease owner blocked unrelated work or silently lost its recovery identity")
+	}
+	off := d.send(11, "/autoresearch off")
+	waitFor(t, func() bool {
+		var state string
+		return d.db.DB.QueryRow("SELECT state FROM inbox WHERE id=?", off).Scan(&state) == nil && state == "uncertain"
+	})
+	owned, err = d.db.ResearchWorkspaceOwned(owner)
+	requireStoreOK(t, err)
+	if !owned || researchTraceCount(trace, "prompt", "/autoresearch off") != 0 {
+		t.Fatal("unavailable workspace pretended to confirm off or lost its lease")
+	}
+	requireStoreOK(t, os.Remove(root))
+	requireStoreOK(t, os.Mkdir(root, 0700))
+	d.command(11, "/autoresearch off")
+	owned, err = d.db.ResearchWorkspaceOwned(owner)
+	requireStoreOK(t, err)
+	if owned || researchTraceCount(trace, "prompt", "/autoresearch off") != 1 {
+		t.Fatal("repaired exact owner could not recover and confirm off")
+	}
+	if after := d.binding(11); after.Session != before.Session || after.SessionID != before.SessionID || after.Generation != before.Generation {
+		t.Fatal("unavailable owner recovery replaced its durable identity")
 	}
 }

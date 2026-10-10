@@ -175,6 +175,9 @@ func (w *worker) collectAlbum(in incoming) {
 		return
 	}
 	if _, err := w.ensureRuntime(); err != nil {
+		if w.ctx.Err() != nil {
+			return
+		}
 		w.suppressAlbum(key)
 		w.say(err.Error())
 		w.mark(in.id, "done")

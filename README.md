@@ -13,16 +13,17 @@ It provides persistent Telegram conversations backed by OMP sessions, including:
 - durable final-reply delivery
 - structured logging
 
-Each ordinary private chat or topic has its own OMP session. While a task runs, ordinary text steers it; use `/followup <message>` for a separate task afterward. Attachments and `/review` keep their bridge queue behavior. Different conversations can work concurrently.
+Each ordinary private chat or topic has its own OMP session. Different conversations can work concurrently.
 
 ## Requirements
 
 - Linux on amd64 or arm64.
 - An omp installation supporting RPC protocol v2 and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
+- Git available on `PATH`, including for physical-workspace admission checks outside Git repositories.
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
 
-The bridge requires OMP >= 18.3.2 for text steering: that is the oldest version verified to provide request-ID-correlated RPC v2 `prompt_result` statuses (`completed`, `aborted`, `error`) and settlement evidence for `streamingBehavior: "steer"`. This is a newer requirement than the bridge's underlying RPC v2 requirement.
+Text steering requires OMP >= 18.3.2.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -125,7 +126,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
 | `storage.data_dir` | Database, lock, and incoming/outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
-| `storage.database_retention_days` | How long terminal bridge records and unfinished session starts are retained. Older incoming attachments are removed only if their owner session is absent or has also been inactive for this period; interrupted downloads marked as bridge-owned can also be cleaned. Unverifiable session state keeps completed attachments. Default: `90`; `0` disables automatic retention cleanup. |
+| `storage.database_retention_days` | Retention period for terminal bridge records, unfinished session starts, and eligible incoming attachments. Default: `90`; `0` disables automatic retention cleanup. See [Data and Retention](#data-and-retention). |
 | `worker.max_workers` | Maximum number of connected OMP processes. Default: `8`; maximum: `64`. |
 | `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`; maximum: `1024`. |
 | `worker.idle_timeout` | Time before releasing an otherwise idle OMP process while keeping its session available. Default: `30m`; `0` or `disabled` turns this off. |
@@ -196,18 +197,18 @@ A named workspace is created when it does not exist. Existing files are not copi
 
 | Command | What it does |
 | --- | --- |
-| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On an unbound Telegram topic, the Telegram topic title is set to the resolved workspace basename; later replacements do not rename it. |
+| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. A topic's first session sets its title to the workspace name. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
-| `/stop` | Stop the current task and clear queued tasks while keeping the session open. A released session only clears queued tasks. |
+| `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
 | `/followup <message>` | Queue a separate text prompt after the active task; if idle, run it as the next ordinary task. |
-| `/queue` | Show the current conversation's running state and pending bridge queue. Each pending task has an independent Cancel button; it never cancels the active task. The queue is runtime-only; daemon shutdown cancels pending tasks and does not restore them. |
+| `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
 | `/close` | Close the current session while preserving its files and OMP history. |
-| `/bindings` | List saved conversation/session bindings for this Telegram chat, with the current conversation first, pending starts next, then others by most recent use (unknown last). Each entry uses two full-width keyboard rows: a clickable session name (or workspace basename) and topic ID, then a read-only state, compact last-used age when known, and workspace. Clicking an eligible title opens a confirmation with a red Delete button; current-conversation and pending titles are disabled. An open entry must first be idle and its OMP process is closed. Workspace and native OMP history are preserved. |
-| `/bindings old` | Sort all saved bindings, including the current conversation and pending starts, by last use from oldest to newest. Unknown or future times come last. Pagination and deletion preserve this order. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Each entry shows its full ID and update time, with selection, Pin/Unpin, and Delete buttons. Pinned sessions for this conversation and workspace appear first. |
+| `/bindings` | List this chat's saved conversation/session bindings. Tap an eligible title to forget a closed or idle binding after confirmation; workspace files and OMP history are preserved. |
+| `/bindings old` | Show saved bindings from least recently used to most recently used. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Includes Pin/Unpin and Delete controls. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
-| `/export` | Open a read-only picker for native OMP session export from the current workspace. The default format is the original main-session JSONL; the source is copied to the private attachment outbox, its filename is retained after sanitization, and the 50 MB document limit applies. Selecting the current session is rejected while its task or queue is active; run `/export` again after it becomes idle. |
-| `/export html` | Open the export picker for native OMP HTML rendering. The bridge first snapshots only the selected main-session JSONL into its private spool, then invokes the native exporter from that stable snapshot; companion or subagent transcripts are not included. The result is stored as `omp-session-<short-id>.html`; exporter timeout is 30 seconds and output growth is bounded by the 50 MB document limit. |
+| `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
+| `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
 | `/status` | Show workspace, session, model, thinking, fast mode, context, activity, queue, and speed. |
 | `/doctor` | Run safe, asynchronous bridge diagnostics without starting or changing the OMP session. |
@@ -218,16 +219,61 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/fast [on\|off\|status]` | Choose fast mode, explicitly enable or disable it, or inspect its status. |
 | `/compact` | Compact the current context while idle, after confirmation. |
 | `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue. |
-| `/review [arguments]` | Run OMP's native `/review` command as a queued task. Native selection dialogs, including commit lists, show eight options per page and display navigation only when needed. |
+| `/review [arguments]` | Run OMP's native `/review` command as a queued task. |
+| `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
 
-Idle ordinary text runs as a root task. While a task is running, text (including unknown slash-prefixed text such as `/opt/tmp`, `/opt/user@host/file`, or `/stauts`) steers that same task via OMP's native RPC queue; it does not create a second final reply. Use `/followup <message>` to queue a separate root task. Attachments and `/review` continue to use the bridge queue, including while a task is running; the initial steering implementation is text-only. Only the listed bridge commands (plus `/start`) are handled as controls. A syntactically valid `/command@bot` token addressed to a different bot is ignored. Different conversations can run concurrently up to the configured worker capacity.
+Ordinary text starts a task when idle, or steers the active task without creating a separate final reply. Use `/followup <message>` for a separate task afterward. Attachments, `/review`, and other supported native commands run through the conversation queue. Different conversations can run concurrently up to the configured worker capacity.
 
-`/doctor` checks runtime configuration, Telegram `getMe`, SQLite health, data-directory write access, the configured OMP binary, the current workspace and saved session, runtime state, uncertain inbox/outbox records, and free disk space. It returns fixed safe summaries only; it never includes tokens, headers, prompts, raw RPC state, or full local paths. If conversation state changes while checks run, the result is discarded.
+### Native OMP commands
+
+Bridge commands take precedence over OMP commands; commands addressed to another bot are ignored. Bridge and builtin arguments may use spaces or `:`, for example `/handoff:focus` and `/fast:on`. `/compact` accepts no arguments.
+
+Other native commands depend on the current OMP session's advertised support. A queued command that becomes unavailable is cancelled, not sent as model text. Once command discovery succeeds, unrecognized slash input, including file paths and typos, is treated as ordinary text. Some local commands produce no Telegram reply; `/plan` and `/plan-review` still require upstream OMP RPC support.
+
+If OMP does not support command discovery, slash input outside the bridge's own commands is cancelled rather than forwarded to OMP. Ordinary text and bridge controls remain available. If discovery is temporarily unavailable, waiting slash input keeps its queue position; use `/queue` and **Cancel** on that item to let later tasks continue.
+
+The exact native `/autoresearch` extension has dedicated support. The following native commands are not integrated:
+
+| Command or category | Limitation and alternative |
+| --- | --- |
+| `/move` | Rejected: native workspace/session moves are not reconciled with the bridge binding. Use `/new` or `/resume`. |
+| `/wt`, `/worktree` | Rejected: native worktree creation/switching is not managed by the bridge. Prepare the worktree in OMP or a terminal, then select it with `/new` or `/resume`. |
+| `/session delete` | Rejected: use **Delete** in `/resume`, with its confirmation and in-use checks. |
+| `/plan`, `/plan-review` | Depend on upstream OMP RPC support. The bridge does not implement their planning workflow; use interactive OMP when RPC support is unavailable. |
+| Other extensions and extension aliases | Rejected, including aliases of autoresearch: generic extension session-lifecycle changes are not integrated. Use OMP directly. |
+| Commands with unidentified sources | Rejected rather than guessing whether they are safe or forwarding them as ordinary model text. |
+
+The Telegram command menu keeps bridge commands first and adds discovered executable native names and aliases. All topics in a chat share one menu; execution still checks the current session. Telegram limits each menu to 100 commands with 1-32 lowercase English letters, digits, or underscores per name. Supported commands omitted because of these limits can still be typed manually.
+
+Native menu entries appear after a runtime has discovered its commands. Before discovery, or after all contributing sessions in the chat have been explicitly closed, the menu contains only bridge commands. Menu publication is best-effort; a missing menu entry alone does not mean a supported command cannot be typed directly.
+
+Command parsing, source checks, and completion semantics are described in the [architecture document](doc/architecture.md#native-command-recognition-and-submission).
 
 All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.
 
 In a group topic, all allowed users share that topic's OMP session and workspace, including its context and command effects. Telegram group membership is not restricted by the bot's user allowlist: other members who can view the topic can also see bot replies and exported files. Use a trusted group topic for sensitive work.
+
+### Autoresearch
+
+Requires OMP to advertise its native `autoresearch` extension. Send commands directly, not through `/followup` or an attachment:
+
+- `/autoresearch <goal>` enables research and starts the native goal.
+- `/autoresearch` toggles mode. Enabling it without an existing experiment may simply ask for the next prompt; that prompt becomes the research task.
+- `/autoresearch off` disables mode and interrupts active research, preserving waiting bridge tasks. When mode is already off, an active ordinary task is left running.
+- `/autoresearch clear [--keep-tree] [--reset-tree]` requires an idle instance, an empty queue, and confirmation. Native clear removes research artifacts and may reset tracked files and delete untracked files. `--keep-tree` skips the worktree reset, not research-artifact removal.
+
+Starting research does not request extra confirmation. Native OMP may create and check out Git branches, edit files, auto-commit kept experiments, revert discarded experiments, and continue making model calls. Use a suitable workspace and account for ongoing cost.
+
+Research requires exclusive use of its physical Git worktree, or its directory outside Git. Another topic already bound there prevents enabling research or clearing it; while reserved, other topics cannot start or resume there. Separate linked worktrees do not conflict. An unconfirmed reservation survives idle release, `/close`, and service restart: resume its owning OMP session in the same conversation and confirm `/autoresearch off` to release it. Release the reservation before deleting its owning topic; `/close` does not release it, and its binding cannot be forgotten while reserved. This protects bridge-managed sessions, not external programs or arbitrary tool access to other directories.
+
+A queued research goal encountering a workspace conflict stays paused without submitting the native command. Use `/queue` to cancel an unwanted goal before retrying.
+
+If a directory or Git topology change makes existing reservations overlap, other conversations remain available but ordinary work in the conflicting workspace is refused. In each owning conversation, use `/autoresearch off` or `/stop` to confirm disable separately. If an owner's original directory or session file is unavailable, restore it first; the reservation is retained until disable can be confirmed.
+
+Each completed round is delivered durably, but a round ending alone does not finish the research task or release waiting tasks. When native OMP switches mode off naturally, for example at an experiment limit, the bridge confirms no native work remains, completes the research task, and runs waiting tasks. Ordinary text steers research; `/followup`, attachments, and other native commands remain queued. Progress Stop and `/autoresearch off` preserve that queue; `/stop` clears it. Active research is force-interrupted and marked uncertain, then native mode must be confirmed off before preserved work can run. If disabling cannot be confirmed, the runtime is closed and the queue stays paused. Stopping cannot undo file changes or other tool effects.
+
+Research is not automatically replayed after a restart. The bridge reads the OMP session's recorded control mode; OMP 18.8.2 does not expose authoritative effective research mode through RPC. Recorded-on mode can disagree with a branch-disabled native runtime. Explicitly disable research before changing Git branches or sending unrelated work. `/status` distinguishes active research from recorded enabled mode without an active research task; it cannot resolve this upstream limitation.
 
 ### Delete a saved session
 
@@ -236,6 +282,8 @@ In `/resume`, choose **Delete**, then confirm with the red **Delete** button. On
 ### Session export
 
 `/export` lists saved OMP sessions in the current workspace and sends the selected native `.jsonl` session file to Telegram. The default format is the original OMP main-session JSONL. `/export html` exports the selected session as a standalone HTML viewer instead.
+
+Both formats export only the main session, not companion or subagent transcripts, and have a 50 MB document limit.
 
 Direct forms are also supported:
 
@@ -268,9 +316,7 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 
 Voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
 
-Resource limits: the RPC client shares a 64 MiB byte budget across frame reassembly and queued events. The bridge limits accumulated assistant text before completion to 4 MiB. Exceeding either budget before a terminal event fails the runtime and leaves the task outcome uncertain; it is not replayed automatically. A completed task whose final reply exceeds the display budget stays completed: Telegram receives at most 32 messages and 1 MiB of reply text, with an explicit truncation notice. OMP's native session history is not truncated by the bridge.
-
-The 64 MiB RPC buffer budget is a resource policy separate from the 64 MiB logical-frame protocol limit: a permitted large frame can still exceed the budget when a physical chunk or queued events also occupy it. Streamed deltas and their completed `message_end` text count once toward the assistant output limit; the retained stream buffer also has its own 4 MiB cap.
+Very large replies may be truncated with an explicit notice. OMP's native session history is not truncated by the bridge.
 
 ## Progress UI
 
@@ -280,28 +326,19 @@ Supported values:
 
 - `off` disables progress messages and typing actions.
 - `summary` shows assistant output, active tool names, and task state.
-- `verbose` adds bounded tool arguments, intermediate updates, final results, and the 5 most recent completed tool outcomes to the same editable message.
+- `verbose` additionally shows recent tool arguments, updates, and results.
 
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
-The editable status message shows assistant text under `Output` and active tools under `Tools`. In `verbose`, it also shows tool `Args` and the latest `Update` or `Result`, plus up to 5 completed calls under `Recent tools`. Earlier calls are counted as omitted. The same message retains its **Stop** button through edits; no separate Activity message repeats assistant text. A task's final reply remains separate from its live progress.
+Progress and final replies are separate. Progress is best-effort UI and does not affect durable final-reply delivery.
 
-`/queue` only cancels the selected pending bridge task. It does not manage OMP's native queue, reorder work, provide an active-task Stop button, or persist pending tasks across daemon shutdown.
-When steering is pending, the active root remains the final-reply owner until every steer finishes and OMP confirms the session settled. Progress Stop preserves bridge follow-ups; `/stop` clears them. With a pending steer either Stop path immediately terminates the old OMP process, marks the root and unresolved steers `uncertain` without replay, then allows preserved follow-ups to resume on a fresh runtime. Already performed tool side effects cannot be undone, and a force-terminated OMP session may fail to resume.
-
-If steering remains explicitly idle with native pending work for five minutes of uninterrupted probe evidence, the watchdog force-stops the old process, marks the root and unresolved steers `uncertain`, and preserves bridge follow-ups without replay. Activity or a non-idle observation restarts this grace period. Legitimate async work that stays entirely silent and pending can also reach this limit.
-
-The `/queue` viewer shows no page number or buttons when the pending queue is empty; canceling the last task removes its keyboard when the message is refreshed. For `/queue` menus with pending tasks and for `/bindings` menus, Close reports `Closed` only after Telegram removes the inline keyboard. If that edit fails, the menu stays open and Close can be retried until the menu expires.
-
-Progress is best-effort UI and does not affect durable final-reply delivery. Failed progress-message deletion is retried once a minute while the daemon runs; confirmed permanent Telegram rejections abandon deletion.
+Stopping cannot undo tool side effects. When stopping requires force-terminating OMP, execution status may remain uncertain and the session may fail to resume. A prolonged idle stall with pending steering can also trigger recovery; uncertain work is never automatically replayed.
 
 **Privacy:** `verbose` does not redact tool arguments or results. They can reveal file paths, commands, source text, process output, credentials, or private files, including to other readers of a group topic. Detail is truncated, not sanitized; deletion after a task cannot retract what was seen. Use `summary` to omit tool payloads or `off` to disable live progress. Model reasoning and whole RPC frames are never displayed.
 
 ## Attachments
 
-Send photos or documents with Telegram's attachment button. Add a caption describing what OMP should do. Without a caption, OMP is asked to inspect the attachment. Photo and document albums are aggregated into one OMP task; the first message reserves one bridge queue slot and later members join it instead of creating separate prompts.
-
-Album members are ordered by Telegram message ID before download. An album accepts at most 10 members. The first non-empty caption is used once; if none is present, the prompt uses `Please inspect the attached files.`. A reply context from the first member that has one is added once, and the final response replies to the first album message. Preparation is all-or-nothing: a failed member download removes the whole incoming directory, removes the owner task, and emits one album failure notice. If collection is canceled, rejected, or sealed, later members for the same media group are consumed without recreating a task during a short suppression window.
+Send photos or documents with Telegram's attachment button. Add a caption describing what OMP should do; without one, OMP is asked to inspect the attachment. A photo or document album is handled as one task, with up to 10 files and the first non-empty caption.
 
 To receive a file, ask OMP directly, for example, "Send me the report as a file." OMP can return regular files from the current working directory. A message saying that an attachment was queued does not mean it has arrived; check the chat for the actual file.
 
@@ -311,40 +348,31 @@ To receive a file, ask OMP directly, for example, "Send me the report as a file.
 | Send a document | 50 MB |
 | Send a photo | 10 MB, JPEG or PNG |
 
-Incoming files are stored privately under `<storage.data_dir>/attachments/inbox/`. This directory can also lie inside the selected workspace if the paths overlap. Directories become eligible for cleanup after the configured period without updates; active tasks are skipped while their worker is running, and normal task settlement refreshes their age. After a restart, old files from an interrupted task may be removed if they have passed the retention period. Files left under a workspace's `.telegram/incoming/` by older versions are not migrated or deleted. Large images may be represented by a preview or a local file path. Album prompts include only the leading inline images that fit the negotiated RPC frame; omitted images remain accessible at their listed local paths. A prompt too large even without images is rejected before submission without closing the session. Image understanding depends on the selected model, and document reading depends on its available tools. Stopping a task does not delete an attachment already submitted to OMP.
-
-Outgoing attachments are copied into a private delivery snapshot before being queued for Telegram delivery, so later changes to the original file do not change the queued payload.
+Incoming files are stored privately under `<storage.data_dir>/attachments/inbox/` and are subject to retention cleanup, even if that storage lies inside your workspace. Copy files you need to keep outside the managed attachment directory. Large images may be provided as previews or local file paths; image understanding depends on the model, and document reading depends on its tools. Stopping a task does not delete an attachment already submitted to OMP.
 
 ## Telegram reply context
 
-Replying to a previous Telegram message adds one level of quoted context to ordinary text, attachments, and `/review` prompts. A non-empty Telegram quote is preferred. Otherwise the bridge uses the replied text, a photo marker, a document marker with its filename, or a caption-only message. Unsupported replied messages are represented explicitly and do not block the current prompt.
+Reply to a Telegram message to include one level of quoted context with ordinary text, attachments, or `/review`. Selected quote text takes precedence; long quotes may be truncated without truncating your current message.
 
-The context identifies the replied sender as `From: bot` or `From: user`. Replied photos and documents are described only; the bridge never downloads or re-imports historical attachments for this feature, and it does not expand a reply chain. The final Telegram response still replies to the current user message; reply context is input to OMP only.
-
-Reply context is capped at 3000 UTF-16 code units and is marked with `...[truncated]` when needed. The current user message is never truncated. `/queue` previews the current user text or attachment caption, not the synthetic OMP wrapper.
-
-Reply context is derived only from the current Update's decoded `ReplyToMessage` and `Quote`. The original update remains in `inbox.raw`; no Telegram history lookup, extra history API request, or reply-context database column is used.
+Replied photos and documents are described, not downloaded again. Reply chains are not expanded, and the final response still replies to your current message.
 
 ## Sessions and Recovery
 
-Committed sessions survive daemon restarts. At startup, the bridge restores their saved identities without launching OMP processes; the first prompt or OMP control command reconnects the original session and may take longer.
+Saved sessions survive service restarts. The first prompt or OMP control command reconnects the original session and may take longer.
 
 Uncertain in-flight operations are not automatically replayed.
 
-If a `/new` or `/resume` start is interrupted, its pending start blocks another start until `/close` clears it. With retention enabled, an unfinished start older than the configured period is automatically removed; this does not delete its workspace or any OMP session it may have created. Check OMP history before starting again if the outcome was uncertain.
+If `/new` or `/resume` is interrupted, use `/close` to clear the unfinished start before trying again. Retention may eventually clear it automatically without deleting workspace files or OMP history. Check OMP history first if the result was uncertain.
 
-Pending bridge tasks, including `/followup` and follow-ups addressed to this bot, are cancelled at shutdown or during startup after a crash, never replayed. Check the conversation and workspace before deciding to resend a request.
+Waiting tasks are cancelled at shutdown or after a crash, not restored. Check the conversation and workspace before deciding to resend a request.
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
-- If the saved OMP session file or workspace is unavailable at startup, including a fresh session with no persisted history, recovery is skipped, the binding is kept closed, and the bridge tells you to use `/new`; it never creates a replacement session. For other session-switching failures, use `/close` followed by `/new` or `/resume`.
-- `worker.idle_timeout` may release an unused OMP process without closing the session, but only after OMP has written a recoverable session file. A fresh native session may remain connected until then. The next prompt or OMP control command resumes the same session. If reconnection fails, the bridge sends one error notice and does not submit the prompt.
-- **Send `/close` before deleting a Telegram topic when possible.** If the topic is already gone, use `/bindings` from another conversation in the same chat to close and forget its idle binding.
+- If the saved session file or workspace is unavailable, the bridge reports the failure instead of creating a replacement session. Use `/close`, then `/new` or `/resume` as appropriate.
+- `worker.idle_timeout` can release an unused OMP process while keeping its session available. The next prompt or OMP control command resumes the same session; a fresh session may remain connected until OMP has saved its history.
+- **Before deleting a Telegram topic, confirm `/autoresearch off` there if it owns a research reservation, then send `/close`.** `/close` does not release that reservation, and another conversation cannot take over its ownership. If the topic is already gone, `/bindings` from another conversation in the same chat can close and forget its idle binding only if it has no research reservation; it cannot release or transfer a reservation.
 
 Each conversation has its own session, but sessions that use the same workspace share files. Separate conversations are not filesystem or credential sandboxes.
-`/bindings` lists the saved bindings for the current Telegram chat. Current-conversation and pending-start titles are disabled. A closed binding from another conversation can be forgotten after confirmation by tapping its title; an open binding can also be forgotten when it has no active task, queued work, or session operation. The bridge first closes its OMP process, then deletes the binding, bridge history snapshots, and favorites. The forget operation does not send a message to the target topic or delete the workspace or native OMP session history; previously queued outbox deliveries are retained.
-After a successful deletion, `/bindings` opens a fresh list of the remaining bindings in the selected order and on the same page. If that page no longer exists, it opens the new last page; if none remain, it reports that no bindings are saved.
-
-The `/bindings` page controls share one keyboard row: Next and Close on the first page, Previous, Next, and Close on middle pages, and Previous and Close on the last page. A single-page list shows only Close.
+To forget another conversation's closed or idle binding, open `/bindings`, tap its title, and confirm deletion. Current-conversation, unfinished-start, and research-reserved entries cannot be deleted there. This removes bridge metadata, not workspace files or native OMP history, and does not cancel already queued final replies or attachments.
 
 ## Data and Retention
 
@@ -354,7 +382,7 @@ Bridge state is stored in:
 
 `storage.data_dir` defaults to the directory beside the real executable. Relative storage paths use that directory rather than the launch directory. Use absolute paths when data must stay elsewhere.
 
-Terminal Telegram bridge records and unfinished starts are retained for `storage.database_retention_days`, which defaults to 90 days. Incoming attachment directories become eligible for cleanup after the same period without updates; normal task settlement refreshes their age. Active tasks are skipped while their worker is running. Message and attachment cleanup runs at startup and every 24 hours; unfinished starts are checked at startup and periodically while the service runs.
+`storage.database_retention_days` defaults to 90 days. It controls cleanup of terminal bridge records, unfinished starts, and eligible incoming attachments. Completed incoming attachments are kept while their owner session remains recently active or its state cannot be verified; old interrupted downloads can also be cleaned. Keep needed files in your workspace rather than relying on attachment storage.
 
 Set:
 
@@ -377,40 +405,9 @@ Authorize trusted users only. The service runs with the filesystem permissions a
 
 ## Logging
 
-Structured logging supports:
+Logs support `text` and `json`, selected by `logging.format`. `logging.level` sets the global threshold; `[logging.component_levels]` overrides it for `daemon`, `bridge`, `rpc`, `telegram`, `store`, or `media`. See the complete [configuration example](#configuration).
 
-- `text`
-- `json`
-
-Global log level:
-
-```toml
-[logging]
-level = "info"
-format = "text"
-```
-
-Optional per-component levels:
-
-```toml
-[logging.component_levels]
-bridge = "debug"
-rpc = "debug"
-telegram = "info"
-```
-
-At startup, `daemon_start` logs the effective `progress_mode`, `max_workers`, `queue_capacity`, `idle_timeout`, `database_retention_days`, `log_level`, and `log_format` at info level. It does not log the bot token, authorization lists, filesystem paths, OMP binary/arguments, or environment values. If the daemon component is configured above info, this record is filtered out.
-
-Supported components:
-
-- `daemon`
-- `bridge`
-- `rpc`
-- `telegram`
-- `store`
-- `media`
-
-Logs intentionally avoid raw prompts, model replies, Telegram credentials, raw RPC frames, API response bodies, tool arguments, workspace or session paths, stdout, and stderr. Restrict access to logs because chat and thread IDs may still identify conversations.
+Logs are written to stderr; use your process manager for storage and rotation. Prompts, model replies, credentials, tool payloads, and workspace/session paths are not logged. Chat and thread IDs may still identify conversations, so restrict log access.
 
 ## Development
 
@@ -428,28 +425,6 @@ just deploy
 - `just install` installs only the binary; configuration and data remain user-managed.
 - `just deploy` installs the binary and restarts the existing supervised daemon.
 
-## Roadmap
-
-No bridge-side feature is currently listed here.
-
-### Capabilities that upstream OMP could improve
-
-- Atomic RPC abort-and-clear, including correlated `prompt_result` events for prompts removed from the native queue.
-
 ## Architecture
 
-For implementation details and failure semantics, see:
-
-- [Architecture](doc/architecture.md)
-
-The architecture document cover:
-
-- inbox / outbox durability
-- Telegram delivery uncertainty
-- progress-message persistence
-- crash and restart recovery
-- session lifecycle
-- watchdog behavior
-- database retention
-- attachment snapshots
-- structured logging contracts
+Implementation and maintenance details belong in [Architecture](doc/architecture.md), also available in [Chinese](doc/architecture.zh.md): command routing, RPC completion, persistence, failure semantics, restart recovery, retention, and logging contracts.

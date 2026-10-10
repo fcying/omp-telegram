@@ -126,7 +126,8 @@ func TestMissingTerminalRecoveryRetiresClientAndPreservesQueue(t *testing.T) {
 		t.Fatal("old runtime survived recovery")
 	}
 	w.dispatch()
-	if w.client == oldClient || w.active != queuedID {
+	nativeUntil(t, w, func() bool { return w.active == queuedID })
+	if w.client == oldClient {
 		t.Fatal("queued task did not resume on a new client")
 	}
 	w.idleProbeFinished(stale, now.Add(time.Minute))

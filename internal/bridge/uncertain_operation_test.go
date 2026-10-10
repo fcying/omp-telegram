@@ -127,8 +127,8 @@ func TestAbortTimeoutRetiresRuntimeAndContinuesQueueOnFreshClient(t *testing.T) 
 	}
 
 	w.dispatch()
-	queuedPrompt := waitFixtureRPCTrace(t, trace, "prompt", "queued after abort")
 	queuedResult := waitOperation(t, w)
+	queuedPrompt := waitFixtureRPCTrace(t, trace, "prompt", "queued after abort")
 	if queuedResult.err != nil {
 		t.Fatal(queuedResult.err)
 	}
@@ -235,8 +235,8 @@ func TestQueuedPromptAfterUncertainModelSwitchUsesFreshClient(t *testing.T) {
 	}
 
 	w.dispatch()
-	queued := waitFixtureRPCTrace(t, trace, "prompt", "queued after model switch")
 	promptResult := waitOperation(t, w)
+	queued := waitFixtureRPCTrace(t, trace, "prompt", "queued after model switch")
 	if promptResult.err != nil {
 		t.Fatal(promptResult.err)
 	}

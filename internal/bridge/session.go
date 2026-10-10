@@ -70,6 +70,12 @@ func (b *Bridge) reserveDelete(owner *worker, id string) bool {
 	if b.sessionMatchesLocked(nil, id) || b.exportMatchesLocked(nil, id) || b.deleteMatchesLocked(id) {
 		return false
 	}
+	if b.db != nil {
+		leased, err := b.db.ResearchSessionLeased(b.bot.ID, id)
+		if err != nil || leased {
+			return false
+		}
+	}
 	if b.deleteClaims == nil {
 		b.deleteClaims = make(map[*worker]string)
 	}
@@ -112,10 +118,16 @@ func (w *worker) claimPersistedSession() bool {
 	if w.binding.Session == "" || !validSessionID(w.binding.SessionID) {
 		return false
 	}
+	// Restoring durable identity does not authorize executing workspace tasks.
+	// Conflicting or unavailable workspaces must not stop unrelated recovery.
 	return w.claimSession(w.binding.Session, w.binding.SessionID)
 }
 
 func (w *worker) claimSession(file, id string) bool {
+	return w.claimSessionWorkspace(file, id, "")
+}
+
+func (w *worker) claimSessionWorkspace(file, id, workspace string) bool {
 	w.b.sessionMu.Lock()
 	defer w.b.sessionMu.Unlock()
 	if w.b.sessionClaims == nil {
@@ -129,6 +141,16 @@ func (w *worker) claimSession(file, id string) bool {
 	}
 	for _, claim := range w.b.sessionClaims {
 		if claim.owner != w && strings.EqualFold(claim.id, id) {
+			return false
+		}
+	}
+	if workspace != "" {
+		root, err := w.b.refreshWorkspaceRootLocked(w.ctx, workspace)
+		if err != nil {
+			return false
+		}
+		owner := w.workspaceOwner(id)
+		if w.b.db.CheckWorkspaceSession(owner) != nil || w.b.db.AdmitWorkspace(root, owner) != nil {
 			return false
 		}
 	}

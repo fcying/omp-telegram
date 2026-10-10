@@ -4,6 +4,8 @@
 
 本文描述当前实现及其恢复语义.
 
+安装, 配置, 命令用法及用户可感知的限制放在[用户指南](../README.zh.md). 协议, 状态机, 持久化及恢复细节统一放在本文, 不在 README 中重复维护.
+
 ## 范围与职责
 
 桥接负责 Telegram polling, 鉴权, 对话路由, 子进程启动/关闭以及可靠消息交付. 模型执行, 工具, 配置, 凭据和原生会话历史由 omp 管理.
@@ -50,9 +52,9 @@ flowchart LR
 
 ### 并发模型
 
-- 每个对话使用 actor 风格的 worker. 空闲时普通文字开启独立 root prompt; root 运行中收到的文字成为已跟踪的 OMP steer, 不创建新 root. `/followup <message>`, 附件和 `/review` 作为独立 prompt 进入 bridge 延后队列. 活跃 root 拥有最终回复; 不同对话可以并行.
-- 命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
-- 命令识别使用已注册的 bridge 命令及隐藏的 `/start` 别名. 仅当 `@bot` 前是单段 Telegram 命令名 (1-32 位 ASCII 字母、数字或下划线), 且目标是同类字符组成的 5-32 位用户名形状时才识别定向. `/opt/user@host/file` 等路径仍是普通 prompt. 发给其他 bot 的命令在重启前已 pending 时也会标为 ignored; 启动时取消 pending 的斜杠 prompt, 不自动重放.
+- 每个对话使用 actor 风格的 worker. 空闲时普通文字开启独立 root prompt; root 运行中收到的普通文字成为已跟踪的 OMP steer, 不创建新 root. `/followup <message>`, 附件, `/review` 和其他已识别的 OMP 原生命令作为独立提交进入 bridge 延后队列. 活跃 root 拥有最终回复; 不同对话可以并行.
+- Bridge 控制命令和 callback 走 worker 控制路径, 不排在待执行 prompt 队列后面. 这不等于每个操作都完全非阻塞: 启动和部分控制 RPC 往返仍需等待.
+- 命令识别优先使用已注册的 bridge 命令及隐藏的 `/start` 别名, 然后检查当前 OMP 命令 catalog. 仅当 `@bot` 前是单段 Telegram 命令名 (1-32 位 ASCII 字母、数字或下划线), 且目标是同类字符组成的 5-32 位用户名形状时才识别定向. `/opt/user@host/file` 等路径仍是普通 prompt. 发给其他 bot 的命令在重启前已 pending 时也会标为 ignored; 启动时取消 pending 的斜杠 prompt, 不自动重放.
 - `/queue` 只读取当前 worker 内存中的 `queue`、`active` 和 `busy`. 它是当前对话范围的 viewer; Cancel 按钮定位 bridge pending inbox ID, 绝不中止 active task 或管理 OMP native queue. 队列只存在于 runtime: worker shutdown 会取消剩余 pending inbox, 不会恢复 queue entry.
 - 附件准备和上传异步且有并发上限. 尚在准备的附件保留其队列位置.
 - RPC stdout reader 不执行 Telegram HTTP 交付. 帧重组预留容量和排队的异步事件字节数共用 64 MiB credit 预算, worker 收到事件后归还 credit. 协议错误或积压超限会使 client 失败, 不允许内存无限增长. worker 对 terminal 前累计的 assistant 文本单独设置 4 MiB 上限. terminal 前任一预算溢出都会关闭 runtime, 将任务结果标记为 uncertain, 且不自动重放. terminal event 已确认后只有展示超限时会截断: 最多发送 32 条、合计 1 MiB 的 Telegram 回复文本并明确提示, 任务仍为 done.
@@ -61,9 +63,145 @@ flowchart LR
 
 Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关联响应. `Call("prompt")` 成功只代表请求被接受, 不代表任务完成. 只有 `isTerminal` 不为 `false` 的 `agent_end` 事件或本地命令完成信号才能结束任务, 非终结事件不能开始下一条排队 prompt. 终结 assistant message 的 `stopReason=error` 或非空 `errorMessage` 使输入以 `uncertain` 提交; `stopReason=aborted` 以 `cancelled` 提交; 其他有确认文本的情况以 `done` 提交. `uncertain` 和 `cancelled` 的终态结果仍可交付 partial text. uncertain 失败回复可包含有长度上限的 `errorMessage` 摘要, 但会先脱敏凭据、request ID、URL 和绝对路径; 不转发不安全详情或 provider classification. 分帧和重组都有明确边界, 不回退到 PTY/ANSI 解析.
 
+受管理的 autoresearch 是上述普通 root 完成规则的显式例外: 看似 terminal 的一轮不会结算研究 owner. 详见[受管理的 autoresearch](#受管理的-autoresearch).
+
+### 原生命令识别与提交
+
+Phase 1 使用每个 client 独立的不可变命令 catalog snapshot, 区分 `CatalogUnknown`, `CatalogReady` (包括空 catalog) 和 `CatalogUnsupported`. 公布的 alias 也参与查找. discovery 异步运行, 同一时刻最多一个 query 在途, lazy restore session 后会刷新可用性. 明确不支持 discovery 不等于 transport 失败: 未被 bridge 明确接管的斜杠输入因无法验证命令来源而取消; 非斜杠文字和 bridge 控制命令保持原有路由. transport 失败仍属于错误, 畸形 catalog 属于协议错误, 绝不作为 unsupported 或 ready-empty 回退. 当前分支 metadata 确认研究模式关闭后, unknown discovery 不阻塞普通 root; 开启的研究模式等待 discovery 后才能取得研究所有权. 不记录或持久化 catalog 名称, 描述和原始 frame; 不引入 schema 或队列持久化变更.
+
+Catalog 在一张私有 map 中保留紧凑的 unknown/builtin/extension/other 来源分类, 并为 canonical autoresearch extension 增加专用分类. 通用可执行 whitelist 为 `builtin`, `skill`, `custom`, `mcp_prompt` 和 `file`; 只有 `builtin` 启用 builtin 调用语法. 唯一 extension 例外是 canonical 名称 `autoresearch` 且来源为 `extension`. 它的 alias 仍按普通 extension 拒绝; 其他 extension 即使提供名为 `autoresearch` 的 alias 也不能获得权限. 缺失, null, 非字符串, 空字符串和未识别的 source 值归为 unknown: 名称及 alias 仍可识别, 但不可执行. Source 异常本身不拒绝整个 catalog, 也不关闭 runtime. 其他 alias 继承所属命令的来源分类; 其余元数据丢弃.
+
+名称和 alias 作为不透明字符串原样保留, 包括 Unicode format, 空白及控制字符, 不做规范化. 仍拒绝空名称, 前导 `/` 及错误的 name/alias 字段类型. Catalog 合法性与调用匹配分开: 即使当前按字面空格分隔的 parser 无法匹配 `code review` 完整名称, 该文件命令也不能使 runtime 关闭. 路由仍由既有 bridge/native 优先级和分隔符决定; 保留 entry 不代表完整名称可以调用.
+
+stdout reader 在唤醒后续 response waiter 前先应用 `available_commands_update` snapshot. worker event 只作为通知, 读取 client 的权威 snapshot; 已排队的旧 event 不能重新应用过时 catalog. discovery query 在发送前记录 reader 的 update revision 和 session scope. reader 在唤醒其 response waiter 前决定是否应用 query snapshot, 只有 revision 和 scope 都未变化时才应用. 因此较新的 reader update 优先于较旧 query 的结果. session 切换会使 catalog 失效并 fence 在途 query, 但不改变 client ID; 过时的 bridge continuation 也必须按当前 runtime/session scope 丢弃.
+
+已识别且支持的原生文字从 `/cmd@thisbot` 规范化为 `/cmd`, 保留参数, 通过现有 bridge 队列提交, 不添加 reply-context 包装, 也不使用 `streamingBehavior: "steer"`. Catalog 为 ready 时, 未识别的斜杠输入 (包括绝对路径) 保留原文和普通 prompt/steer 路由. 原生 queue entry 保留原生分类, 派发时再次验证可用性. 当前 catalog 不再公布排队命令时 (包括切换到 discovery 不受支持的状态后), 取消该 entry, 绝不降级成模型文字. 刷新失败不能作为健康的 unsupported 回退.
+
+Unsupported 的 fail-closed 检查由直接斜杠路由, pending 斜杠分类, 原始斜杠开头 queued prompt 派发 (包括 followup 和已准备附件), 以及运行中任务的 steer 路径共用. 拒绝会取消 inbox, 移除排队输入及其准备好的附件资源, 发出通用的能力限制提示, 不关闭 runtime 或改变 binding. 显式 bridge `/review` 的 queue entry 记录 bridge 接管来源; 原始 `/followup /review ...` 或附件文字不能仅靠命令名称取得该豁免. Unknown discovery 仍是独立的等待状态, 绝不作为 Unsupported 拒绝或 ready-empty 回退.
+
+Bridge 路由, 生命周期拒绝和重启分类使用 slash invocation parser. 按最早出现的 OMP 兼容空白或 `:` 分隔, 包括 JavaScript BOM 空白, 不包括 NEL. Advertised-native 识别先匹配第一个字面空格前的完整名字, 保留 `plugin:command` 和 `foo:bar` 等 extension/custom/file 名字, 并规范化有效 bot 后缀. 只有已公布的 builtin 名字和 alias 启用 colon/其他空白调用语法. 对已公布但不可执行的来源, 也识别这些分隔形式, 仅用于拒绝执行; 完整的字面空格名字仍优先于被拒绝的前缀. 未公布的名字及可执行 extension/custom/file 的非字面空格调用保持普通输入, 保留 reply context 和 prompt/steer 路由. 派发时用相同的完整名字优先识别方式重新验证, 并要求匹配保存的 native name. 名字移除, source 变更导致调用语法失效, 或新增更长的匹配名字时, 即使原来的名字仍公布也会取消排队提交. 只在命令 token 内解析 bot targeting. Bridge 参数处理移除一个分隔符并去除两侧空白; 原生命令规范化保留原始分隔符和参数字节. 未知命令绝不规范化. 因此 colon 语法不能绕过 bridge 命令优先级, confirmation, idle 检查或 session-operation 归属. `/compact` 的不受支持参数在本地拒绝.
+
+原生 queue entry 还保留原生 session ID. session 改变时即使新 session 公布同名命令也会取消该 entry; 新 client 恢复同一 session 则不会. 同一 session 内的 catalog revision 改变本身不会取消仍公布的命令. 旧 session discovery 请求的拒绝不能关闭较新的 session. Acknowledgment 缺少 `agentInvoked` 时继续保留 native 归属: 普通文字保持排队, 直到 `agentInvoked:true` 或 `agent_start` 证明 agent 正在执行. 这两个信号将 active input 切换为普通 root task 行为, 后续文字可以 steer, 最终回复仍归原始输入所有.
+
+`RefreshCommandCatalog` 返回它在 client mutex 下实际创建或 join 的 query epoch. Worker 用这个返回值区分旧 session 的结果和当前 session 的失败; 启动 discovery 前读取的 worker snapshot 不能充当 query scope token.
+
+Discovery waiter 的 deadline, 取消和请求拒绝都不证明 runtime 失败, 不论 query epoch 是否改变. Reader 已公布的可用 catalog 仍是权威 snapshot, 可以解析等待输入. Discovery 仍为 unknown 时, 斜杠输入保持 pending, worker 暂停该 client/epoch 的 discovery, 不反复 join 未返回的 query. Scope 改变可以刷新 discovery; reader 公布更新后恢复分类. 面向用户的失败提示说明可用 `/queue` 和等待斜杠项的 Cancel; 移除该项让后续任务继续, 不重新排列 FIFO. 真实 transport, protocol, process 及其他 discovery 失败仍按 runtime failure 处理. Discovery 等待中断不会回退为不受支持的 catalog, 也不能因此退役无关的健康 root.
+
+Pending 分类逐条重新读取当前 catalog, 包括研究 mode 查询返回后: stdout reader 可能已在查询期间公布更新. Catalog 为 unknown 时, 剩余输入保持 pending. 分类结束后重新读取队首, 即使拒绝前一条命令使附件变成队首, 仍不能派发尚在 preparing 的附件. 原队首的异步研究 mode 准入完成后, 最终队首校验再次读取当前 catalog 的 source, name 和 session, 再移除或提交输入. 最终校验不分类 pending 输入, 也不发起新的阻塞查询. 它同时覆盖原始斜杠开头的 queued prompt; 命令在相同 name 和 session 下仍可执行且可用时, 不会仅因 catalog revision 改变而取消.
+
+改变生命周期的 builtin `/move`, `/wt`, `/worktree` 和 `/session delete` 在输入路由时被保留为不支持的命令, 排队 prompt 派发前再次检查. 覆盖 OMP 的空白/colon 调用语法, bot 后缀及 worktree alias. Session 拒绝匹配不区分大小写且没有剩余参数的 `delete` verb; `/session info` 和 `/session pin` 保持正常原生路由. 拒绝会取消 inbox 并通知用户, 不提交 prompt, 不移动或删除 session 文件, 不创建 worktree, 不修改保存的 binding. discovery 为 unknown 或 unsupported 时也执行该策略, 因为回退成原始模型文字仍会让 OMP 派发 builtin. Session 删除仍由 `/resume` picker 的确认和 in-use 检查控制. 不实现每条命令后的 session reconciliation 或 binding migration.
+
+除 canonical autoresearch 外, 已公布的 extension 和 unknown-source 命令及 alias 在 ready 输入路由, pending discovery 分类和排队派发时拒绝. Extension handler 可以调用 `newSession`, `branch`, `navigateTree`, `switchSession` 和 `reload` 等原生 session 生命周期 API; 通用 extension 生命周期变化不会与保存的 binding 和 session claim 对齐, 未知来源不能继承执行权限. 拒绝会取消 inbox, 按来源类型发出不回显 catalog 名称, 参数或原始 source 的通用提示, 绝不回退成普通 prompt 或 steer, 不关闭当前 runtime. 派发也检查 followup 或附件产生的原始斜杠开头 queued prompt, 以及从可执行来源变为 extension 或 unknown 的变化. Discovery 为 unknown 时斜杠开头的 prompt 保持等待; 研究准入也会在其他 root 派发前检查 catalog. Bridge 控制命令优先级和 foreign-bot 忽略规则不变. 此拒绝不会在 OMP 中禁用 extension, 也不会增加 session identity migration.
+
+派发前重新验证可用性消除了 bridge 排队期间 catalog 过时的窗口, 但不是上游原子的检查并执行操作: OMP 仍可能在最后一次 snapshot 检查后、接受 prompt 前改变可用性. 同样, 同一 client 上没有 session 标记的旧 session `available_commands_update` 无法被可靠识别为过时; query fence 无法补上缺失的 session 身份. 这些属于 RPC 协议限制, bridge generation 不能提供相应保证.
+
+原生本地命令成功响应包含 `agentInvoked:false`, 或与请求关联的 `prompt_result` 包含 `agentInvoked:false` 且 `status:"completed"` 时, 即使没有 assistant 文字, 也将 bridge 提交标记为 `done`. Acknowledgment 缺少 `agentInvoked` 时保留 native 归属, 让延后的本地完成结果正确结算. 这只代表提交完成, 不证明后台操作已结束. Phase 1 保持未关联请求的原生 `command_output` 处理不变, 不将其交付到 Telegram; 本地命令可能产生输出但没有可见回复. 不添加 rich ask UI. `/plan` 和 `/plan-review` 仍需上游 RPC 实现; catalog 识别不会实现这些命令.
+
+保存的研究模式不会改变其他原生命令的 ACK-only 完成规则, 例如 `/session info`. 只有 canonical 研究命令绕过该捷径, 要求关联的本地完成结果.
+
+对于本地 `prompt_result`, `status:"error"` 沿用 root 任务的失败语义 (`uncertain`), `status:"aborted"` 记为 `cancelled`, 缺失或未知 status 记为 `uncertain`. 这些结果将通用通知与 inbox 终态原子持久化, 不暴露原始 RPC error. 不会因此关闭 runtime 或重放命令; 后续 bridge 任务可以正常继续.
+
+### 受管理的 autoresearch
+
+[`internal/bridge/autoresearch.go`](../internal/bridge/autoresearch.go) 只拥有研究操作 metadata. 实验, Git 操作, artifacts 和自主续跑由原生 extension 管理. 启动不增加 confirmation 或 approval override. 直接发送的目标和空参数 toggle 使用原生 handler; off 和 clear 依赖关联的本地完成结果, 不使用 acceptance response 或 notification 判断完成. 确认的本地启动拒绝会完成命令, 不留下虚假的研究 root.
+
+派发前 (包括 lazy restore), `Client.AutoresearchMode` 从 `get_state` 获取原生 session ID/file, 只读取该 JSONL history 的 ancestry/control metadata, 再以有效前缀最后一个 entry 的 ID 为 `since` 调用 `get_entries`. RPC 提供权威的剩余 entry 和当前 `leafId`; 文件追加顺序不用于选择当前分支. 查询后再次核对 session ID/file. 不再传输整个原生 transcript: 即使当前模型 context 已压缩, 历史仍可能超过 64 MiB RPC 重组上限. 新 session 尚无持久化文件时使用初始 entries 查询. 不持久化 metadata cache, model/tool payload 副本或第二份历史.
+
+[`internal/bridge/research_admission.go`](../internal/bridge/research_admission.go) 在现有异步 RPC lane 中查询派发所需的 mode. 证据绑定 client, generation, turn, 队首 inbox, catalog epoch/revision 和原生 session. 已取消或被替换的队首不能使用旧结果; catalog revision 变化时重新获取 mode 证据, 不重放命令. 取消队列, 退役 runtime 和显式 off 都会丢弃查询或已就绪结果. 一份证据只用于一次提交, 不复用于下一条 root. 原生 metadata 尚未返回时仍可处理 Stop 和 close.
+
+OMP 可以恢复损坏的 JSONL 记录, 而不立即重写历史. 遇到 JSON 语法错误时, 磁盘 reader 停在前一个完整 entry, 通过 RPC 获取权威的剩余 entry. 不跳到磁盘后续记录选择 cursor, 不据此假定模式为 off, 也不自行修复文件. 语法有效但 control metadata 无效的 JSON 仍然失败关闭.
+
+旧 session header 的 `version < 2`, 包括没有 version 的历史, 不能提供磁盘 entry ID 或 ancestry: OMP 会在内存中迁移, 不一定重写文件. Reader 改用初始原生 `get_entries` snapshot, 不使用磁盘 cursor, 随后执行同样的 identity, control 和 ancestry 校验. 现代历史仍要求有效 entry ID. Bridge 不自行写入迁移后的历史.
+
+Reader 从 `leafId` 沿 parent ID 查找最近的 `autoresearch-control` entry (`on`, `off` 或 `clear`), 忽略其他分支相反模式的 entry. Metadata 缺失, mode 无效, 祖先断裂, 环, 历史不可读或 session header 缺失/身份不匹配, cursor 过期, session 变化和查询失败都不能解释为模式已关闭: 取消尝试中的输入, 暂停等待工作. 这只是保存的 control flag, 不是第二份实验状态, 也不保证依赖 Git 分支的工具激活状态. Pending slash 输入必须先由 actor 完成分类, 即使 reader 已经公布 ready catalog, 也不能越过该步骤进入研究准入.
+
+已知上游限制: 这只是 control intent, 不是权威 effective state. OMP 18.8.2 可以恢复保存的 `on` entry, 同时因当前 Git 分支而关闭研究. 其 [`get_state` 实现](https://github.com/can1357/oh-my-pi/blob/v18.8.2/packages/coding-agent/src/modes/rpc/rpc-mode.ts) 不提供 effective autoresearch mode. Bridge 不应复制 OMP 的 branch/storage 重建规则, 也不从 notification/tool 推断模式. 因此 recorded-on/effective-off 仍可能创建无法自然结算的 managed root; 该 P2 需要上游提供关联当前 session 和 extension 生命周期的权威查询. 缺失字段不能解释为 off. Workspace lease 不解决这个协议限制.
+
+Discovery 分类在原队列位置转换研究目标和开启模式的 toggle, 保留原有 FIFO 顺序. 即时 off/关闭模式的 toggle 及 clear 在执行控制检查前移除自身 pending entry; clear 仍要求不存在其他排队工作. 接管研究 root 或其持久化租约时, 还会取消排队的空参数 toggle 控制, 包括尚待 catalog 分类的条目, 不移除普通工作或非空研究目标.
+
+分类期间如果控制操作替换 runtime, 立即结束本轮分类. 剩余 entry 等待新 client 的 catalog, 不通过已退役的 client 取消或分类.
+
+仅建立研究 owner 不会开放 steer. Native command 尚待确认进入 agent 执行或完成本地处理时, 到达的普通文字继续排队. 切换为普通 prompt 状态后, 文字才可 steer 同一 root, 包括研究轮次间隙.
+
+Native-command root 尚未结算且没有研究 control 正在加载时, 新接受的研究目标或 toggle 保留在队列中, 不启动另一个 routing-mode 查询. 这样当前 root 独占关联的本地完成控制; root 结算后, 派发时再为排队输入读取新的 mode 证据. 如果研究 root 转入 agent 执行, 延后的空参数 toggle 会重新进入即时控制路径, 重新校验 catalog/session 并查询 mode, 不能继续等待自主研究 root 结束. 对研究 root 或租约 owner 执行 off 时, 在退役前取消未完成的 toggle 查询和所有排队的空参数 toggle 控制, 即使尚未观察到 agent 执行. 这些 toggle 标记为 `cancelled`, 不能在 off 完成后重新解释为开启命令; 普通 prompt, 附件和非空排队目标保持原有顺序.
+
+开启模式后, 下一条普通提交成为研究 root. 自主 `agent_start`/`agent_end`, 看似 terminal 的 `prompt_result` 和短暂 settled/idle 状态都不会改变其原始 inbox, request owner, turn 和 progress association. Bridge 不重放目标, 不生成续跑 prompt. 每轮将有界回复原子追加到 outbox, 保留 owner 为 `submitted`, 然后清空该轮文本 buffer. 没有新 start 的重复 end 不会再次追加结果. 普通文字 steer 同一 root; 原生命令, 附件和 followup 继续等待. 通用完成, idle release 和 watchdog 路径不能据此认定显式研究已经完成. `/status` 区分受管理的研究, 没有 root 的已保存开启模式, 以及未确认的 disable.
+
+自然关闭使用独立完成路径. `session_settled` 只使旧证据失效, 并通过现有 RPC lane 异步查询. Round 已关闭且所有 steer 结算后, 保存模式必须为 off, `get_state` 还必须明确返回 `isStreaming=false`, `isCompacting=false`, `isSettled=true`, `hasPendingAsyncWork=false` 和 `queuedMessageCount=0`. 此时才将 root 转为 `done`, 不复制已提交的 round 回复; 在派发队列前释放已确认 off 的 lease. 查询失败或状态不完整时退役 root 为 uncertain 并暂停队列; mode-on 或 pending work 保留 owner. 结果按 client, generation, root/request, turn, catalog epoch/revision/session, settlement revision 和 steer admission 隔离, 优先消费已缓冲事件. 查询期间仍可处理 Stop 和 close.
+
+已连接实例的 `/status` 在异步 RPC lane 中读取研究 metadata 和 runtime state, 不在 worker actor 中同步等待. 因此缓慢的 `get_entries` 不会阻塞活动研究的 Stop 或 `/close` 处理. Mode cache 更新必须匹配原始 generation, turn, client, catalog epoch 和 session identity; 过时结果不能让替换后的 runtime 恢复已开启模式.
+
+[`internal/bridge/research_control.go`](../internal/bridge/research_control.go) 将路由, mode 查询, off 身份校验, 最终 idle 检查, prompt acceptance, 关联的本地完成以及控制后的 mode 查询作为 actor 拥有的阶段推进. RPC 使用现有可取消的 operation lane 返回不可变结果, 不修改 worker 状态, 不消费 `Client.Events`. `worker.event` 统一分发控制结果, catalog/session 更新, host tool, notification 和其他事件. 结果必须匹配原 client, generation, turn, catalog epoch/revision 和原生 session. 本地研究命令需要 acceptance 和关联的 `status:"completed"`, `agentInvoked:false`, `sessionSettled:true` 结果, 才查询控制后的 mode. Stop/close 可以取消这些等待并退役原 runtime; 中断 off/clear 时保留 lease 和暂停状态, 不隐式重放控制命令. 进程启动沿用现有生命周期.
+
+研究 notification 仅用于显示, 有长度上限, 使用既有 terminal-detail filter 脱敏, 经 durable outbox 交付; 每轮或本地 control 最多八条. 它们不能证明 mode 或完成. Error/abort 事件, 进程退出和资源超限会退役 runtime, 保守结算中断的 owner, 绝不重放研究.
+
+显式 `/autoresearch off` 在退役前检查研究 root 和持久化 lease 归属. 没有研究 lease 或 root 且存在当前 scope 的 recorded-off 证据时, 直接完成控制, 不提交原生 off 或 abort, 保留普通任务, runtime, binding 和延后队列. 证据过时时异步执行只读 mode 查询. 只读查询失败会将控制标记为 uncertain 并暂停后续排队工作, 但不打断普通任务或丢弃其最终回复. 空参数 toggle 仍需查询 mode; 没有研究归属时, 等待 discovery 的 control 只移除自己的队列条目.
+
+Catalog scope 失效遵循同一规则: 只读 off 或 route mode 查询失败后, 若保留原 runtime, 不吞掉 reader 更新 catalog 前已排队的普通任务事件. Actor 仍正常处理这些事件的输出与完成. Route 失败会取消尚未提交的研究命令并暂停排队工作; 过时的 mode 结果不能清除队列暂停.
+
+普通 root 没有研究归属时, 重试失败的只读 off 查询仍保持只读. 查询返回前再次到达的 off, 或在 route 查询尚未提交研究命令时到达的 off, 仅取消并替换只读查询, 不退役普通 runtime, 即使 root 已在查询期间完成. 被取消的 off 控制保持 uncertain; 尚未提交的待路由命令标记为 cancelled. 过时结果不能影响替换后的控制. 确认 recorded-off mode 后清除 disable-pending 队列暂停, 不改变 root 的 runtime, 身份或等待工作. 查询连续失败时同时保留普通任务和暂停状态.
+
+对于活动研究或持有研究 lease 的 owner, Stop/off 先使活动研究的进程组失效并立即终止, 再持久化将 root 和未决 steer 标记为 `uncertain`. 恢复的 runtime 必须 idle, settled 且没有 pending work, 才能提交原生 `/autoresearch off`; acceptance, 关联的本地完成结果 (`agentInvoked:false`, `sessionSettled:true`) 及随后确认模式关闭的查询共同允许释放 lease 和派发保留工作. 失败会关闭 runtime 并保留 disable-pending 暂停. Progress Stop/off 保留普通排队工作; `/stop` 清空队列. 旧 client/generation/turn 的结果不能修改恢复后的 worker. 终止不能撤销工具副作用, 也不保证 session 仍可恢复.
+
+空闲且仍连接的 owner 可以在原生 session 文件首次落盘前确认本地 off. 只有冷启动 resume 才要求保存文件存在. 已连接路径仍须验证原生 session ID, 精确文件路径或已有文件身份, workspace, session claim, 关联的本地完成以及随后确认模式关闭的证据, 才释放 lease.
+
+Stop 中断尚未完成的准入查询且 canonical autoresearch 可用时, 先清空队列并退役被阻塞的 runtime, 再恢复原 session 并确认本地 off. 不在旧的未返回 response 后面追加另一次 mode 查询. 原生 session 尚未落盘, 或无法确认恢复/disable 时, 保留 disable-pending 暂停及原有 lease, 报告失败, 不虚构替换 session, 不重放已取消的输入.
+
+进程退出因未返回的 RPC 而延后处理时, 处理该结果后先清除旧 client 的 exit fence, 再退役研究 runtime. 活动 RPC lane 仍须等待其结果, 但 exit fence 不得阻止替换后 runtime 的后续调用.
+
+如果停机在 deferred input 提交前取消 Git 准入探测, 错误处理会保留 pending inbox, 交由统一的停机/重启流程取消, 不将其误标为 done. 覆盖排队 text/review/followup, native/raw slash 输入, 单个附件和新 album. 真实 OMP 18.8.2 smoke 验证了 followup, native slash, photo 和 album 四条边界: 全部被取消, 没有 provider 调用, 使用隔离 profile 和模拟 Telegram.
+
+Worker context 已取消时, 同时 ready 的 client-exit 通知不再按意外退出关闭 session. 正常 worker teardown 保留已保存的 running binding, 将活动 root 标为 uncertain 和 interrupted, 并取消排队工作. 真实 OMP 18.8.2 smoke 同时观察到取消与原生进程实际退出, 随后确认 session 身份/history 保留, 活动任务 uncertain, followup 被取消且未重放, 使用本地 provider 和模拟 Telegram.
+
+Clear 要求实例空闲, 没有排队工作或未决 steer, 并经 owner, chat, topic, message, generation 和 catalog epoch 隔离的 confirmation. 保留原始 native clear 参数. Followup/附件的原始调用不能绕过控制. 原生 clear 可能 reset/clean worktree, 即使使用 `--keep-tree` 也会删除研究 artifacts; bridge 不实现自己的文件系统清理. Shutdown/restart 沿用既有恢复语义, 将在途工作标为 uncertain 并取消等待工作, 不自动恢复循环. 下一条显式 prompt 重新检查原生保存的模式.
+
+最后一次 idle `get_state` 返回后, off 和已确认 clear 在发送 control prompt 前重新校验原 client, 原生 session, catalog epoch 及可执行的 canonical autoresearch 来源. 查询期间 session 改变或来源权限撤销都会阻止提交; 失败保留原 lease, 沿用未确认控制的暂停策略. 这仍是 snapshot 校验, 不是上游原子的检查并执行事务.
+
+Workspace fencing 持久化, 与原生 session claim 分开. `workspace_users` 记录普通逻辑用户; `workspace_leases` 为一个 `(bot,chat,thread,native session ID)` 独占物理 root. 开启研究或执行已确认的 clear 前, 事务检查并拒绝已使用同一 root 的其他 topic. `/new`, 已知 CWD 的 resume, lazy runtime 启动及实际 startup metadata 均在提交任何用户工作前检查准入. 未知 ID 的 resume 可以读取原生 session metadata, 但实际 CWD 和 identity 通过检查前不能提交工作. Startup intent 与普通准入一同提交; binding 成功提交时原子替换旧普通登记. Research claim 和删除 reservation 也相互排斥.
+
+每个准入边界都在 `sessionMu` 下重新解析物理身份, 同时覆盖全部 durable running binding, workspace 已知的 pending intent, 以及没有匹配持久来源的普通登记. 使用持久 owner 的 workspace 路径替换过期的普通 root; 普通任务可以创建或移除 Git 仓库, 因此只按 worker 路径缓存不足以保证正确性. 一个 store 事务替换普通登记, 并将已有 lease 扩展到当前 canonical root, 保留全部历史 lease root. Lease 刷新还会跟随准确 owner 在 closed binding 中的 workspace, 防止新建嵌套仓库绕过占用. 只要该对话仍持有任意研究 lease, 就不能忘记其 owner binding, 从而保留原 workspace 来源. 拓扑变化导致多个 lease owner 合并时保留全部准确 owner, 不使全局刷新失败; 该 root 的普通准入检查全部 lease 并 fail closed. 来源路径不可用时保留保守登记和历史 lease, 不阻塞无关 root. 持久化失败会回滚两个表. 确认 off/clear 后, 按准确的 `(bot,chat,thread,native session ID)` 释放全部 lease alias, 不接受 session prefix, 也不依赖再次 Git 探测. 解析结果是当前快照, 不是文件系统锁.
+
+Git 使用显式只读 argv 解析物理 worktree root, 不接受进程全局 `GIT_*` 覆盖. 仅此探测固定 `LC_ALL=C` 和 `LANGUAGE=C`, 确保可以识别非仓库诊断, 不改变 OMP 的环境策略. Symlink 和子目录共享 root; linked worktree 独立; 非 Git 目录使用 canonical directory. Root 解析失败时 fail closed. 重启先为全部 running binding 和 workspace 已知的 pending intent 登记普通占用, 再启动 worker, 不受 runtime slot 限制. Idle release, worker eviction 和重启保留普通占用与排他 lease. 显式 close 或跳过不可用 binding 的恢复只移除普通占用. 排他 lease 没有 TTL, 跨 close, 不确定终止和未确认 disable 保留; 只有同一 native owner 在确认 off 或 clear 后才能释放. 不同 session 不能替代该 owner, lease 存在时拒绝删除其原生历史. 历史被外部删除后, 需恢复真实 owner 历史才能按正常流程解除, bridge 不会悄悄丢弃 lease. 这是 bridge 内部准入控制, 不隔离外部进程或工具的任意文件路径访问.
+
+恢复保存的 session claim 只建立 identity, 不授予 workspace 准入. 冲突不会中止无关 worker 启动; 所有普通执行入口仍检查准入, 包括 steer 活动 root 的新文字. 不可用的普通 binding 沿用跳过恢复并关闭的路径. 不可用的准确 lease owner 则保留 binding 和 lease, 由用户修复原目录/session 文件后重试关闭.
+
+仅准确持久 lease owner 的显式 `/autoresearch off` 或 Stop 可以绕过普通 workspace 准入, 恢复 disable-only runtime. 必须确认原生 session ID, session 文件及 workspace, 再确认 idle/settled 和关联的本地 off 完成结果, 才能释放该 owner 的 lease. 已连接 owner 的 command catalog 为 unknown 时, 复用既有异步发现队列; off 分类时只移除自身 pending entry. Disable-only 路径不能提交普通 prompt, enable, toggle 或 clear. 一个 owner 确认 off 绝不释放合并 root 上另一个 owner 的 lease.
+
+真实 OMP 18.8.2 smoke 使用隔离的 profile/environment 和本地确定性 OpenAI-compatible endpoint: 原生 `init_experiment` 触发两轮自主续跑; Progress Stop 在新进程确认原生 off 后, 保留的 followup 才完成. 覆盖真实 RPC 和 extension hook, 不涉及真实 Telegram 或生产 model provider. 该 smoke 未执行破坏性的 Git/reset 操作.
+
+另一个使用已有原生历史的恢复 smoke 覆盖了待处理 status 结果前的进程退出, off 确认后的本地和普通 RPC 完成, 以及 deferred off 替换 runtime 后继续执行排队研究目标和保留的 followup. 使用真实 OMP, 模拟 Telegram 和本地确定性模型 endpoint.
+
+自然停止 smoke 使用真实 OMP 18.8.2, 在隔离的非 Git 目录中执行 `init_experiment(max_iterations=1)`, 无破坏性的 `run_experiment` harness 和 `log_experiment(status="keep")`. 原生 off 后, 原始 root 恰好完成一次, 排队 followup 继续执行. 第二个 topic 在 lease 持有期间被拒绝, 自然 off 后可进入. 使用本地确定性 provider 和模拟 Telegram, 未执行 Git reset/commit 或真实 Telegram 交付.
+
+第二个真实 OMP smoke 使用一次性 Git 仓库. 两个普通 topic 已绑定该位置时, enable 和已确认 clear 在原生修改前被拒绝: 分支保持 `main`, untracked 标记文件仍存在, 没有发出模型请求. 关闭另一 topic 并提交 smoke 自有的无害 baseline 后, 原生 OMP 进入 `autoresearch/*`; 同一有限实验正常完成并释放 lease. 只修改一次性 Git 数据, 未调用原生 reset/clean.
+
+动态身份 smoke 在法语 locale 下, 为非 Git 的父目录和子目录启动两个真实 OMP 18.8.2 runtime, 再将父目录初始化为一次性 worktree. 两侧研究目标和已确认 clear 均被拒绝, 没有模型调用或原生 Git 修改. 关闭另一 topic 后, 本地 enable 和已确认 off 成功, 没有残留 lease. 另一个恢复 smoke 先保存原生历史, 再为活动研究旧 runtime 的 `get_entries` 设置故障: 显式 off 跳过该查询, 将原 root 退役为 uncertain, 恢复并确认原生 off 后, 保留的 followup 恰好执行一次. 两者均使用隔离 profile, 本地确定性 provider 和模拟 Telegram, 未执行原生 reset/clean 或真实 Telegram 交付.
+
+真实 OMP 18.8.6 smoke 在隔离的 agent 目录/workspace 中恢复了 78,750,537 字节的合成原生历史. 增量模式读取在五秒查询期限内确认 off, Go client 确认 canonical `autoresearch` 是可执行 extension, 原生 `/autoresearch off` 经关联的本地结果确认完成, 随后的 `/session info` 也本地完成. 未提交 provider prompt, 未修改 production 历史, 未执行 Git 操作或真实 Telegram 交付. 永久回归覆盖大历史的分支选择, 文件 snapshot 后的追加, 历史身份不匹配, 以及查询期间的 session 变化.
+
+真实 OMP 18.8.6 残尾恢复 smoke 分别恢复了保存模式为 off 和 on 的合成历史, 文件末尾均有不完整的 message 记录. 两次模式查询均成功, 且未修改损坏文件; 随后原生 off 经关联的本地结果确认完成, 再成功执行本地 `/session info`. 未提交 provider prompt 或执行真实 Telegram 操作. 回归还要求磁盘 control 记录只写入一部分时保留 RPC 补回的 on metadata, 并在 control metadata 无效, cursor 被拒绝或祖先断裂时保持失败关闭.
+
+真实 OMP 恢复 smoke 覆盖 v1 和无 version 历史的两种保存模式: 查询不修改原文件, 原生 off 经关联结果完成, 随后 `/session info` 本地完成. Workspace smoke 通过一次性父目录 `git init` 合并两个持久 lease owner: 无关本地工作成功, 两个 owner 的普通准入均被拒绝, 各自确认 off 时保留另一个 owner 的 lease, 直至后者独立关闭. 最终 smoke 同时覆盖 catalog 已失效的已连接 owner 和冷 owner. 均使用隔离 profile 和模拟 Telegram, 未提交 provider prompt 或执行原生 reset/clean.
+
+### Telegram 命令菜单
+
+Default 菜单保留 bridge 命令. 独立的 chat-scoped 菜单将这些命令与该 chat 各 worker 公布且可执行的名称及 alias 合并. `builtin`, `skill`, `custom`, `mcp_prompt` 和 `file` 来源符合条件, 另加精确的 canonical `autoresearch` extension. 排除其他 extension 及 extension alias, unknown-source 命令, 隐藏的 `/start` 和被拒绝的生命周期命令. Bridge 命令保留原有描述和优先级. 原生条目使用固定的通用描述, 不使用上游 catalog 描述.
+
+Telegram 没有 topic-specific 命令 scope. 同一 chat 的 topic 因此共享并集, 不同 chat 相互独立. 菜单条目不等于执行权限: 输入路由和派发仍校验当前 session. 原生名称必须匹配 `[a-z0-9_]{1,32}`, 不规范化名称或凭空创建 alias. 名称去重并排序后放在 bridge 条目之后, 合并列表最多 100 项. 未进入菜单的可执行命令仍可手动调用.
+
+Catalog 结果和 reader update 通知在内存中发布权威 snapshot. Session 失效时清除旧贡献; runtime 启动时注册当前 worker, 包括 `/close` 后重新打开 session. 逻辑 worker 关闭, 替换, 失败或退出时移除自身贡献, 不删除其他 topic 的条目. 单纯 idle process release 保留已发现的贡献, 直到下一次 session/catalog 更新. 指针所有权和 removal fence 拒绝已退出 worker 的迟到更新或移除.
+
+单个后台 publisher 合并 dirty chat, 在 worker actor 和 RPC reader 之外执行有超时的 `setMyCommands`, 为每个 chat scope 更新默认语言和 `zh`. 启动时同步允许的 chat scope; discovery 尚未完成时使用 bridge-only 列表, 同时保留提前到达的 catalog. 按 chat/language 缓存成功列表; 失败不缓存, 后续贡献更新可以重试. 较旧的在途发布完成后会继续发布最新的排队并集. 菜单失败不使任务失败, 也不阻塞 worker 控制处理.
+
+发布结果不确定时, 使该 chat/language 上次成功的 cache entry 失效: Telegram 可能已经应用新列表, 但响应丢失. 即使目标回到先前确认成功的列表, 也必须重新发布. 确定拒绝则保留成功 cache; 不增加 publisher 重试或退避策略.
+
+Bridge 不持久化菜单状态. 发布的命令名称对 Telegram chat 成员可见, 包括没有 bot 操作权限的成员. 日志只包含有界的 chat/language/error metadata (`telegram_chat_commands_failed`), 不记录原生名称, 描述, 参数或原始 RPC 数据.
+
 ### Prompt 和 interrupt 语义
 
 bridge 使用公开 RPC v2. 根任务在发送前持久化 inbox; 接受和 `agentInvoked=false` 保持原有终态处理. 根任务提交失败或无法确认时关闭 client, 取消 bridge 队列, 不重放. 对于运行中的文字, worker 先验证 frame 大小, 预留 RPC request ID, 将 steer inbox 持久化为 `submitted`, 按当前 root/client/generation/turn 登记请求, 然后发送带 `streamingBehavior: "steer"` 的 `prompt`. 按 request ID 关联 `prompt_result` 和 settlement 证据要求 OMP >= 18.3.2. steer 不拥有最终回复, 不创建独立 progress, 也不进入 bridge 队列. `/followup` 则创建排入 bridge 队列的独立 root; 附件及 `/review` 保持排队. 排队根任务与未决 steer 总数受 `worker.queue_capacity` 限制.
+
+OMP 18.3.2 是目前实测支持文字 steer 的最低版本, 能按 request ID 返回 RPC v2 `prompt_result` 终态 (`completed`, `aborted`, `error`) 和 settlement 证据. 这项功能的版本要求高于 bridge 原有的 RPC v2 要求.
 
 仅当观察到 terminal `agent_end`, 所有 steer 请求的终态 (`completed`, `aborted`, `error`; 本地命令可由 `agentInvoked=false` 结算), 且本轮 session 已 settled 后, 才能完成 root. `sessionSettled=false` 会清除之前的 true 证据; 没有 request ID 的 `session_settled` 只触发 `get_state.isSettled` 探针, 不能自行释放 fence. 消费已排队事件后, 按 client, generation, root, turn 和 revision 校验探针结果. 新 `agent_start` 清除暂存的旧 terminal, 本地命令回复则保留它. 连续确认 idle 却缺少结果时, 退役旧 runtime, 将未决 steer 和 root 记为 `uncertain`, 不重放. worker shutdown 和意外退出同样结算未决 submitted steer.
 
@@ -72,6 +210,8 @@ bridge 使用公开 RPC v2. 根任务在发送前持久化 inbox; 接受和 `age
 `handoff` 或 `compact` 请求出错时会关闭该 client, 只有 omp 明确拒绝时才继续复用; timeout、取消或结果无法确认都会让后续请求 lazy resume. `abort` 被明确拒绝时会保留 client; 结果无法确认时会关闭 client, 将 active task 以 `uncertain` 结算且不重放, 然后在新 runtime 上继续排队任务. `set_model`, `set_thinking_level` 和 `set_fast_mode` 仅在 RPC 明确拒绝时保留 client; 错误结果不确定或无法确认时, 会在排队 prompt 执行前关闭它. 原生 cycle-role 选择继续遵循 `SetModelRole` 的 fail-closed 行为. worker 在 RPC 进行中观察到 client 退出时, 会等待该 RPC 的结果再应用退出策略; 因此 model-role 失败只释放 runtime, 并保留供 lazy resume 使用的逻辑 binding. `host_tool_result` 写入失败时, bridge 将 active task 以 `uncertain` 结算并关闭该 client.
 
 没有 steer fence 时, Progress Stop 对活动任务发送普通 `abort` 并保留 bridge 队列; `/stop` 还会清空 bridge 队列. 有 steer fence 时, 普通 `abort` 无法保证清除 OMP 原生 steer 队列. 两种 Stop 都先使旧进程失效并立即终止进程组 (不等待关闭 stdin 后排空请求), 再将 root 和未决 steer 记为 `uncertain`; Progress Stop 保留 bridge follow-up, `/stop` 清空它们. 只有持久化结算后, 保留的 follow-up 才能在重新恢复的 runtime 执行. 强制终止无法撤销工具副作用, 也可能使 OMP session 无法恢复. `/queue` 只取消选中的 bridge pending task, 不管理原生 steer.
+
+Workspace 准入限制新增工作, 不限制中断已有 runtime. 普通 abort 直接使用当前已连接的 client, 不执行 workspace 准入或 lazy restore, 因而阻止新增工作的 Git 拓扑或路径变化不会阻止 Stop. 它保留其他 topic 的 research lease; Progress Stop 保留的 bridge 任务仍须通过正常准入才能派发. 这不改变独立的 exact-owner 研究 disable 恢复路径.
 
 steered root 退役时清除旧 runtime 的 compaction/session-operation 状态, 不等待已终止进程的结束事件. 附件准备属于保留的逻辑 session 队列: 即使 client 已释放, generation 和 pending inbox ID 匹配的结果仍可生效. 已取消任务及旧 generation 的结果继续丢弃, 并清理对应临时文件.
 
@@ -146,7 +286,7 @@ Progress 创建在新任务开始后的三秒初始延迟之后, 于正常的 1.
 
 成功的新建/恢复实例会增加持久化 generation. 后台结果按对应的 generation, turn, 请求 token 或 client 身份校验. 会话 claim 防止同一 daemon 内两个 worker 同时打开同一个原生会话, 但不锁住工作目录供其他程序使用.
 
-closed binding 删除与 startup intent 准备使用事务 fence: start 只能为精确匹配的持久化 binding generation, 或确实没有 binding 的对话, 预留启动; deletion 只有在不存在 startup intent 时才成功. bridge 级菜单 mutation epoch 会在 binding 或原生 session 删除后使 picker 和列表 callback 失效; worker 发现 binding row 缺失并重新创建 binding 前, 也会丢弃旧 confirmation.
+closed binding 删除与 startup intent 准备使用事务 fence: start 只能为精确匹配的持久化 binding generation, 或确实没有 binding 的对话, 预留启动; deletion 只有在不存在 startup intent, 且该对话没有研究 lease 时才成功. bridge 级菜单 mutation epoch 会在 binding 或原生 session 删除后使 picker 和列表 callback 失效; worker 发现 binding row 缺失并重新创建 binding 前, 也会丢弃旧 confirmation.
 
 **关键是接受边界:** 旧运行时的迟到工作不能影响新实例, 但已经提交的 outbox 结果在 `/new` 或 `/close` 后仍可交付. generation 变化不能撤销已经接受的业务结果.
 
@@ -159,6 +299,8 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
 | `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | 最后一次已验证的 session binding, 恢复资格, 最后使用时间 metadata 和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation,created_at` | 尚未提交的 `/new` 或 `/resume` 持久化转换及其保留期起点 |
+| `workspace_users` | 主键 `(root,bot,chat,thread,session)` | 普通逻辑占用持久化, 包括未连接 runtime 的 session |
+| `workspace_leases` | 主键 `(root,bot,chat,thread,session)` | 研究占用; root 合并后保留全部准确 owner, 直到各自确认原生 off/clear |
 | `history` | `bot,chat,thread,workspace,session,generation` | 替换 binding 时创建的旧快照; 删除 closed binding 时清理该对话的快照. 不是会话浏览器. |
 | `session_favorites` | 主键 `(bot,chat,thread,workspace,session_id)` | `/resume` picker 的 pinned 原生 session identity, 不保存 session 内容 |
 | `inbox` | 主键 `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | update 去重、处理状态和可选的实时进度身份 |
@@ -172,17 +314,18 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 
 带有非零 `progress_message_id` 的终态 inbox 及其关联 outbox 在 Telegram progress 删除成功, 已确认的不可重试拒绝清除关联, 或 retention cutoff 到达且没有关联的 `pending` 或 `sending` outbox 工作前, 不会被 retention 清理. 最后一种情况只清除本地关联, 不调用 Telegram Delete.
 进度消息删除的临时失败会保留关联, daemon 正常运行期间每分钟及启动时重试. Telegram 明确永久拒绝时清除关联并停止重试.
-保留策略绝不删除 binding, history, session favorites, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
+保留策略绝不删除 binding, history, session favorites, workspace users 或 lease, 工作目录, omp session 文件或其他 omp 数据. 终态 outbox 行在被删除前仍拥有其附件 snapshot. bridge 在任意终态 outbox 状态持久化后 best-effort 删除 snapshot; retention 仅在对应 outbox 行已删除且路径位于 `storage.data_dir/attachments/outbox/` 时删除残留 snapshot. 每次 janitor 运行还会移除这个私有 spool 中修改时间超过保留截止时间且没有引用的 `attachment-*` snapshot.
 
 未提交的 `startup_intents` 使用各自的 `created_at` 和同一 retention cutoff. 启动时先删除超期意图, 再恢复 worker 或接收 update; 清理失败会中止启动, 避免错误表示意图状态. 运行期间, 持有待启动意图的 worker 每天检查一次, 仅在其运行期已停止时, 按 `(bot,chat,thread,generation)` 和截止时间作为删除 fence 清除意图. 删除后会使旧的 binding 菜单失效. 正在执行的 OMP 启动不会被周期 janitor 删除. 此操作只移除 bridge 的未决意图, 不删除旧 binding, 工作目录或可能已创建的 OMP session; 原生启动结果仍然未知. 保留期设置为 `0` 时, 意图在显式关闭或成功提交前一直保留.
+取消或清理过期 intent 时, 与 intent 在同一事务中移除其失效的普通 workspace 登记, 保留仍 running 的 binding 对应原生 session 登记及全部排他研究 lease. 过时 generation 或尚未过期的 intent 不会释放占用.
 
 Telegram 输入附件保存在 `storage.data_dir/attachments/inbox/incoming-*` 私有目录中, 不属于 SQLite. 如果所选 workspace 包含该路径, 附件也位于该 workspace 内. preparation 失败及提交前取消的任务会删除目录. daemon 运行期间, 已提交且排队中或活动任务的路径不会被清理; 任务结算时重置目录修改时间. 启动时及每日运行的 janitor 只处理修改时间早于配置保留截止时间且不在用的目录: 已准备完成的附件还要求 owner 有效, 且 `session/list` 确认 session 不存在或最后更新时间早于同一截止时间; owner 或 session 状态无法确认时保留. 带有 bridge `.preparing` 标记但没有有效 owner 的中断准备目录, 超期后会被删除; 无标记且没有有效 owner metadata 的目录保持不动. `database_retention_days = 0` 会关闭这项清理. 旧 workspace `.telegram/incoming/` 目录不会迁移或删除. 保留的 OMP session history 可能仍引用已被 retention 删除的文件路径.
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 14. 空库在同一事务中创建所有表、索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`、binding 中断标记、消息时间戳、reply target、原生 session ID、inbox/outbox progress 关联、`bindings.last_used_at`、conversation 级 `/resume` favorites、持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 16. 空库在同一事务中创建所有表, 索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`, binding 中断标记, 消息时间戳, reply target, 原生 session ID, inbox/outbox progress 关联, `bindings.last_used_at`, conversation 级 `/resume` favorites, 持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
 
-历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 版本 13 到 14 为 `startup_intents` 增加 `created_at`, 并将既有 pending 条目标记为升级时间: 原始年龄未知, 不会立即过期. 其他表、记录、binding 和 session 数据保持不变. 版本高于 14 的数据库仍不受支持.
+历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 版本 13 到 14 为 `startup_intents` 增加 `created_at`, 并将既有 pending 条目标记为升级时间: 原始年龄未知, 不会立即过期. Workspace 表在版本 15 引入; 更早 schema 现在直接创建当前结构. 版本 15 到 16 在同一事务内将 lease 的 root-only 主键替换为 `(root,bot,chat,thread,session)`, 保留全部既有 owner 和历史 root. Daemon 启动在准入 worker 前, 根据 running binding 和 workspace 已知的 pending intent 重建普通占用. 既有记录和原生 session 数据保持不变. 版本高于 16 的数据库仍不受支持; 旧二进制不能打开 v16 数据库.
 
 ### 输入与完成事务
 
@@ -236,6 +379,8 @@ outbox replay 为每个最终文本分段保留持久化的 reply target. Telegr
 ### 附件生命周期
 
 Telegram 输入附件只有在鉴权通过后才会下载到 `storage.data_dir/attachments/inbox/incoming-*` 私有目录, 不属于 SQLite. 如果配置的数据目录与所选 workspace 路径重叠, 附件也可能位于该 workspace 内. worker 运行期间, 排队中和活动任务的路径不会被清理; 正常任务结算时会重置目录修改时间. 崩溃中断任务留下的旧文件可能在启动时参与清理. 旧 workspace `.telegram/incoming/` 目录不会迁移或删除. OMP session history 可能保留已被 retention 删除的文件路径. 输出 `telegram_send` 只接受当前 workspace 内的普通文件. 入队前 bridge 会把文件复制到私有的 `storage.data_dir/attachments/outbox/` snapshot, 因此交付不依赖源文件之后是否变化. outbox state 持久化为任意终态 (`done`, `failed`, `uncertain`, `cancelled` 或旧版 `sent`) 后, bridge 无论交付成功或失败都会 best-effort 删除 snapshot; workspace 源文件保持不变. 如果立即删除失败, retention 和 spool janitor 可以后续清除剩余 snapshot.
+
+Outbox 终态在 snapshot 删除之前提交. 仅观察到 `done` 不代表清理已经完成; 验证还必须观察到文件删除, 或与 delivery loop 结束同步. 这个顺序保证终态持久化失败时仍保留 snapshot, 且不改变 workspace 源文件.
 
 `/export` 只使用已提交 binding 的 workspace 和原生 session identity. 它不会调用 `ensureRuntime`, 修改 binding 状态, claim session, touch `last_used_at`, 或占用普通 runtime slot. 如果 selected ID 等于 committed binding 的 `session_id`, 即使 idle release 或 `/close` 之后也直接使用已保存的 `session` path; 其他 ID 通过 OMP 原生 `omp <omp.args...> render <session-id> -q -t` 命令, 使用 configured working directory 解析, 再严格校验返回的第一条 `session  <absolute-path>` diagnostic line 及持久化 session header. 如果 `omp.args` 或 `PI_CODING_AGENT_SESSION_DIR` 指定 custom session directory, inactive session export 会直接拒绝, 因为 native render 不会接收这个 launch-global store override. bridge 不发现或模拟 OMP session storage 规则. raw 导出以只读且禁止跟随 symlink 的方式打开 absolute source, 再通过 `Fstat` 检查打开的文件, 使用有界的 `MaxDocumentBytes` 读取复制到私有 attachment outbox spool, fsync 后设置 `0400`, 并保留经过安全处理的 OMP basename 作为 Telegram filename. HTML 导出也先以相同的 no-follow 规则, 只把选中的 main session JSONL snapshot 到 bridge-owned 私有 spool, 再把这个稳定 snapshot 交给 OMP 原生 exporter; 不复制 companion 或 subagent transcript. HTML 生成期间监控 output 增长, 超过 `MaxDocumentBytes` 就终止并清理. 只导出 main session JSONL, 不创建 zip 或 subagent bundle.
 
@@ -351,9 +496,9 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 `last_used_at` 是 Unix time, 迁移旧数据时为 0. 显式 `/new` 或 `/resume` 成功, root/review/attachment prompt 被接受, 以及 name、model、thinking、fast mode、compact、handoff 和 abort 等原生 session-changing command 成功后 touch. 启动恢复 binding、按需恢复 runtime 本身、`/status`、`/bindings`、`/help` 和 viewer 翻页不会 touch. Worker 用同一个时间戳更新数据库和内存 binding, 避免跨秒时出现 1 秒的偏差. touch 失败只记录 metadata persistence error, 不会改变已经接受的任务结果. 启动恢复保留已有 binding generation 和时间戳.
 
-`DeleteClosedBinding` 和 `PrepareStart` 都针对同一组 binding 与 intent row 使用 generation-fenced transaction. 删除只有在目标已关闭且没有 startup intent 时成功; closed binding 的启动必须先确认预期 row 仍存在, 并在同一事务中插入 intent. 因此 intent 先提交会使删除失败, 删除先提交会使 stale start 失败. 成功删除还会同时删除 bridge history snapshot, 并推进不持久化的 Bridge 级 binding mutation epoch, 使其他 worker 持有的菜单立即成为 stale. 它绝不删除 workspace、原生 session 文件或 omp 原生 history. 如果删除目标意外是当前 worker, worker 会清理内存中的 binding identity; UI 正常情况下会禁用该操作.
+`DeleteClosedBinding` 和 `PrepareStart` 都针对同一组 binding 与 intent row 使用 generation-fenced transaction. 删除只有在目标已关闭, 没有 startup intent, 且没有研究 lease 时成功; closed binding 的启动必须先确认预期 row 仍存在, 并在同一事务中插入 intent. 因此 intent 先提交会使删除失败, 删除先提交会使 stale start 失败. 删除事务按 `(bot,chat,thread)` 检查 lease, 不仅匹配当前 session ID. 仍持有 lease 时返回 `ErrWorkspaceOccupied` 并回滚删除, 保留 binding 的原 workspace, history snapshot 和 session favorite. 成功删除会同时移除 bridge history snapshot 和 session favorite, 并推进不持久化的 Bridge 级 binding mutation epoch, 使其他 worker 持有的菜单立即成为 stale. 它绝不删除 workspace, 原生 session 文件或 omp 原生 history. 如果删除目标意外是当前 worker, worker 会清理内存中的 binding identity; UI 正常情况下会禁用该操作.
 
-对于 Open binding, 确认后的请求会经 Bridge 路由到目标 worker 再删除. Worker 拒绝旧 generation、startup intent、活动任务、未处理输入、排队工作和进行中的 session 操作. 空闲时先阻止新输入, 关闭 OMP 进程并持久化 closed binding, 然后调用 `DeleteClosedBinding`; 删除失败时保留 closed binding. Forget 操作只回复发起操作的对话, 不产生目标 topic 消息; 已排队的 outbox 投递保持不变. 现有 closed binding 的事务不变.
+对于 Open binding, 确认后的请求会经 Bridge 路由到目标 worker 再删除. Worker 拒绝旧 generation, startup intent, 活动任务, 未处理输入, 排队工作和进行中的 session 操作. 关闭 runtime 前先检查保留的研究 lease, 持有占用时拒绝忘记, 不改变 open 状态或进程. 否则空闲时先阻止新输入, 关闭 OMP 进程并持久化 closed binding, 然后调用 `DeleteClosedBinding`; 删除失败时保留 closed binding. Open 和 Closed 删除路径均解释 lease 拒绝原因, 提示用户在原对话中恢复所属 session 并确认 `/autoresearch off`. Forget 操作只回复发起操作的对话, 不产生目标 topic 消息; 已排队的 outbox 投递保持不变.
 
 合法的最终选择或取消会先消费 confirmation token, 再尽力通过 `editMessageReplyMarkup` 移除 inline keyboard, 不修改消息正文. 清理失败不阻止实际操作. 翻页直接更新原菜单. OMP 原生 `select` 对话框 (包括 `/review` 的 commit 选择) 每页显示 8 项, 回复 OMP 时仍使用原始选项值; 翻页轮换 token, 不回答原生对话框, 超过 20 项的列表也不再取消. 已知的过期菜单也会清理; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启.
 
@@ -445,6 +590,10 @@ allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
 
 ## 开发与发布
 
+最低 Go 版本为 [go.mod](../go.mod) 指定的 1.26.9, 包含漏洞扫描要求的标准库安全修复. CI 的两个架构都从该文件选择 Go 工具链; 标准库安全公告要求更新补丁版本时, 应升级最低版本, 不绕过 `govulncheck`.
+
+大历史回归保留超过 64 MiB RPC 重组上限的完整夹具, 使用一分钟的测试截止时间容纳 race instrumentation 开销. 这不会延长 bridge 的五秒模式查询期限.
+
 ```sh
 just build
 just check
@@ -457,6 +606,10 @@ just deploy
 保留能防止可观察回归的测试: 原子回滚, 重启身份保持, 鉴权, 取消, 交付不确定性和进程所有权. 真实 omp smoke 使用隔离的工作目录及数据库. 注入的 Telegram 输入或模拟 callback 不能当作手机端完整验收.
 
 已有证据包括事务失败注入, 索引查询计划, 真实 omp 重启恢复, 以及注入输入配合真实 Telegram 文件传输. 父进程 SIGKILL 实验观察到配合清理的原生 omp/工具树退出, 独立夹具同时证明不配合的后代可以存活. 真实用户客户端输入/点击, 完整线上故障矩阵和长会话成功压缩仍待验收.
+
+Phase 1 原生命令 smoke 使用真实 OMP RPC 进程和模拟 Telegram 输入/交付: 公布的 `/usage` 和 `/rename`, bot 后缀规范化且不包装引用回复, 无输出本地提交完成, 原生 rename 状态变化以及同 session lazy restore 均通过. 普通 agent turn 创建了 idle release 所需的可恢复历史; 空 session 中仅执行本地命令不会创建 session 文件. 本次修改未验证真实 Telegram 客户端交互.
+
+生命周期命令拒绝 smoke 也已在真实 OMP 上通过: `/move`, 定向 `/wt@bot` 和 colon 写法 `/worktree:branch` 均被取消并提示; 原生 session identity/CWD 和 bridge 持久化 binding 保持不变, 支持的 `/usage@bot` 仍正常完成. 确定性子进程回归覆盖 session 切换后创建 query, 以及新 session 调用者 join 旧 pending query, 包括拒绝响应的 scope 和 single-flight 行为.
 
 应用版本由 [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go) 中的 `Version` 定义. `--version`/`-v` 在构建元数据可用时显示 Git revision/dirty 标记, 可通过 `-ldflags "-X main.Version=..."` 覆盖基础版本. daemon 将同一显示版本传给 `/help` 和 `/start`; 不从运行目录推断分支名. 发布构建已用正式版本和 `dev-latest` 区分渠道.
 
