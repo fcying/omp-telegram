@@ -201,6 +201,42 @@ func pickerView(t *testing.T, f *fakeHTTP) (string, [][]map[string]any) {
 	return "", nil
 }
 
+func requireFinishedSessionPicker(t *testing.T, f *fakeHTTP, messageID int64, want string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.messages) - 1; i >= 0; i-- {
+		message := f.messages[i]
+		id, _ := message["message_id"].(float64)
+		if int64(id) != messageID {
+			continue
+		}
+		text, _ := message["text"].(string)
+		if text != want {
+			continue
+		}
+		markup, _ := message["reply_markup"].(map[string]any)
+		rows, ok := markup["inline_keyboard"].([]any)
+		if !ok || len(rows) != 0 {
+			t.Fatalf("completed picker retained buttons: %v", message)
+		}
+		return
+	}
+	t.Fatalf("picker message %d was not completed with %q", messageID, want)
+}
+
+func requireNoSessionSelectionReceipt(t *testing.T, f *fakeHTTP) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, message := range f.messages {
+		text, _ := message["text"].(string)
+		if strings.HasPrefix(text, "Selected:") {
+			t.Fatalf("rejected picker choice produced a selection receipt: %q", text)
+		}
+	}
+}
+
 func requirePickerFooter(t *testing.T, rows [][]map[string]any, labels ...string) {
 	t.Helper()
 	if len(rows) == 0 {
@@ -378,6 +414,7 @@ func TestResumePickerSelectionRestoresNativeSession(t *testing.T) {
 	// A nonzero choice must select, not take the ordinary confirmation cancel path.
 	token := buttons[1]["callback_data"].(string)
 	clickResume(w, 7, token)
+	requireFinishedSessionPicker(t, f, 1, "Selected: "+sessions[1].Title+"\nID: "+sessions[1].ID)
 	if w.client == nil || w.sessionID != sessions[1].ID || w.binding.Workspace != before.Workspace || w.binding.Generation <= before.Generation {
 		t.Fatal("selection failed to restore chosen native identity and working directory")
 	}
@@ -388,6 +425,38 @@ func TestResumePickerSelectionRestoresNativeSession(t *testing.T) {
 	clickResume(w, 7, token)
 	if !sameBindingIdentity(w.binding, restored) {
 		t.Fatal("replayed selection restarted native session")
+	}
+	requireFinishedSessionPicker(t, f, 1, "Selected: "+sessions[1].Title+"\nID: "+sessions[1].ID)
+}
+
+func TestResumePickerSelectionReceiptBoundsTitle(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		title string
+		want  string
+	}{
+		{name: "whitespace", title: " native\n\t title ", want: "native title"},
+		{name: "empty", title: "\n\t", want: "Untitled"},
+		{name: "utf16-bound", title: strings.Repeat("😀", 30), want: strings.Repeat("😀", 20) + "..."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new test")
+			sessions := setResumeFixtures(t, w.binding.Workspace, 1)
+			sessions[0].Title = test.title
+			listing, err := json.Marshal(sessions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(listing))
+			command("/resume")
+			w.resumeListed(finishResumeList(t, w))
+			clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
+			requireFinishedSessionPicker(t, f, 1, "Selected: "+test.want+"\nID: "+sessions[0].ID)
+			if w.client == nil || w.sessionID != sessions[0].ID {
+				t.Fatal("receipt formatting changed the selected native session")
+			}
+		})
 	}
 }
 
@@ -440,10 +509,15 @@ func TestResumePickerRejectsInvalidCallbacks(t *testing.T) {
 				t.Fatal("picker interrupted the active task")
 			}
 			if scenario == "cancel" {
+				requireFinishedSessionPicker(t, f, 1, "Cancel")
 				clickResume(w, 7, buttons[0]["callback_data"].(string))
 				if !sameBindingIdentity(w.binding, before) || w.client != client {
 					t.Fatal("cancelled picker accepted an old selection")
 				}
+				requireFinishedSessionPicker(t, f, 1, "Cancel")
+			}
+			if scenario != "cancel" {
+				requireNoSessionSelectionReceipt(t, f)
 			}
 		})
 	}
@@ -502,6 +576,7 @@ func TestResumePickerRejectsDeletedPersistedBinding(t *testing.T) {
 		t.Fatalf("test binding deletion = %t, error %v", deleted, err)
 	}
 	clickResume(w, 7, data)
+	requireNoSessionSelectionReceipt(t, f)
 	if _, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread); err == nil {
 		t.Fatal("stale picker recreated the deleted binding")
 	}
@@ -561,6 +636,7 @@ func TestResumePickerEpochRejectsReusedGeneration(t *testing.T) {
 	requireStoreOK(t, w.b.db.Save(replacement))
 	w.b.bindingsEpoch.Add(1)
 	clickResume(w, 7, data)
+	requireNoSessionSelectionReceipt(t, f)
 	if _, exists := w.confirms[token]; exists {
 		t.Fatal("deleted-binding picker confirmation survived the epoch change")
 	}
@@ -667,6 +743,7 @@ func TestExportPickerRejectsGenerationChange(t *testing.T) {
 	data := resumeButtons(t, f)[0]["callback_data"].(string)
 	w.binding.Generation++
 	clickResume(w, 7, data)
+	requireNoSessionSelectionReceipt(t, f)
 	if len(w.confirms) != 0 || w.exportCancel != nil {
 		t.Fatal("generation-stale export picker remained actionable")
 	}

@@ -19,6 +19,7 @@ type modelSettings struct {
 type modelOperationRequest struct {
 	action    string
 	user      int64
+	messageID int64
 	role      string
 	provider  string
 	modelID   string
@@ -36,22 +37,33 @@ func (w *worker) beginModelState(action string, request modelOperationRequest) b
 	allowBusy := action == "fast_status"
 	if w.controlInProgress() {
 		w.say("The session operation is still loading.")
+		w.finishMenu(request.messageID, "The session operation is still loading.")
 		return false
 	}
 	if !allowBusy && (w.sessionControlBusy() || len(w.queue) != 0) {
 		w.say("Wait for the current task and queue to finish before changing model settings.")
+		w.finishMenu(request.messageID, "Wait for the current task and queue to finish before changing model settings.")
 		return false
 	}
 	client, err := w.ensureRuntime()
 	if err != nil {
-		w.say(err.Error())
+		text := err.Error()
+		w.say(text)
+		w.finishMenu(request.messageID, text)
 		return false
 	}
 	w.beginControlOperation(controlModel)
+	w.modelMenuID = request.messageID
 	w.startOperation("model_state", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "get_state", nil)
 	}, 0, "", request)
 	return true
+}
+
+func (w *worker) interruptModelMenu() {
+	messageID := w.modelMenuID
+	w.modelMenuID = 0
+	w.finishMenu(messageID, "Settings change interrupted. The result could not be confirmed.")
 }
 
 func modelOperationFailure(action string) string {
@@ -76,6 +88,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		return
 	}
 	if result.err != nil || result.cancelled {
+		w.endControlOperation()
 		switch result.kind {
 		case "model_set_role":
 			// SetModelRole fails closed when any native selection step is unconfirmed.
@@ -87,13 +100,14 @@ func (w *worker) modelOperationFinished(result operationResult) {
 				w.releaseRuntimeWithReason(true, "failure")
 			}
 		}
-		w.endControlOperation()
 		w.say(modelOperationFailure(request.action))
+		w.finishMenu(request.messageID, modelOperationFailure(request.action))
 		return
 	}
 	client, connected := w.runtimeClient()
 	if !connected || client.ID() != result.clientID {
 		w.endControlOperation()
+		w.finishMenu(request.messageID, modelOperationFailure(request.action))
 		return
 	}
 	switch result.kind {
@@ -102,11 +116,13 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		if json.Unmarshal(result.data, &state) != nil {
 			w.endControlOperation()
 			w.say(modelOperationFailure(request.action))
+			w.finishMenu(request.messageID, modelOperationFailure(request.action))
 			return
 		}
 		if request.action != "fast_status" && (state.IsStreaming || state.IsCompacting) {
 			w.endControlOperation()
 			w.say("Wait for the current task to finish before changing model settings.")
+			w.finishMenu(request.messageID, "Wait for the current task to finish before changing model settings.")
 			return
 		}
 		switch request.action {
@@ -146,6 +162,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		if json.Unmarshal(result.data, &roles) != nil {
 			w.endControlOperation()
 			w.say("Cannot read OMP's cycle roles for this configuration. Use /model provider/model.")
+			w.finishMenu(request.messageID, "Cannot read OMP's cycle roles for this configuration. Use /model provider/model.")
 			return
 		}
 		w.showModelPickerReady(request.user, request.current, roles)
@@ -154,17 +171,21 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
 			w.endControlOperation()
 			w.say(modelOperationFailure("model_select"))
+			w.finishMenu(request.messageID, modelOperationFailure("model_select"))
 			return
 		}
 		w.endControlOperation()
 		w.touchBinding()
-		w.say("Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + ".")
+		text := "Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + "."
+		w.say(text)
+		w.finishMenu(request.messageID, text+"\nRole: "+menuText(request.role, 120))
 	case "model_set_model":
 		var model omp.Model
 		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
 			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
 			w.say(modelOperationFailure("model_switch"))
+			w.finishMenu(request.messageID, modelOperationFailure("model_switch"))
 			return
 		}
 		w.endControlOperation()
@@ -180,6 +201,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
 			w.say("OMP did not report the resulting thinking level. The change could not be confirmed.")
+			w.finishMenu(request.messageID, "OMP did not report the resulting thinking level. The change could not be confirmed.")
 			return
 		}
 		w.endControlOperation()
@@ -189,19 +211,24 @@ func (w *worker) modelOperationFinished(result operationResult) {
 			text += " (OMP adjusted the requested " + request.requested + " level)"
 		}
 		w.say(text)
+		w.finishMenu(request.messageID, text)
 	case "model_set_fast":
 		var fast modelFastResult
 		if json.Unmarshal(result.data, &fast) != nil || fast.Enabled == nil || fast.Active == nil {
 			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
 			w.say(modelOperationFailure("fast_select"))
+			w.finishMenu(request.messageID, modelOperationFailure("fast_select"))
 			return
 		}
 		w.endControlOperation()
 		w.touchBinding()
-		w.say(fastModeText(fast.Enabled, fast.Active))
+		text := fastModeText(fast.Enabled, fast.Active)
+		w.say(text)
+		w.finishMenu(request.messageID, text)
 	default:
 		w.endControlOperation()
+		w.finishMenu(request.messageID, modelOperationFailure(request.action))
 	}
 }
 
@@ -255,9 +282,10 @@ func (w *worker) showModelPickerReady(user int64, current omp.Model, models []om
 
 func (w *worker) selectModel(c confirmation, index int) {
 	if index < 0 || index >= len(c.models) {
+		w.finishMenu(c.messageID, "The model selection is unavailable. Open /model to choose again.")
 		return
 	}
-	w.beginModelState("model_select", modelOperationRequest{action: "model_select", role: c.models[index].Role})
+	w.beginModelState("model_select", modelOperationRequest{action: "model_select", messageID: c.messageID, role: c.models[index].Role})
 }
 
 func (w *worker) switchModel(provider, id string) {
@@ -292,10 +320,11 @@ func (w *worker) showThinkingPickerReady(user int64, state modelSettings) {
 
 func (w *worker) selectThinking(c confirmation, index int) {
 	if index < 0 || index >= len(c.options) {
+		w.finishMenu(c.messageID, "The thinking selection is unavailable. Open /thinking to choose again.")
 		return
 	}
 	requested := c.options[index]
-	w.beginModelState("thinking_select", modelOperationRequest{action: "thinking_select", requested: requested})
+	w.beginModelState("thinking_select", modelOperationRequest{action: "thinking_select", messageID: c.messageID, requested: requested})
 }
 
 func fastModeText(enabled, active *bool) string {
@@ -321,6 +350,14 @@ func (w *worker) showFastPickerReady(user int64, state modelSettings) {
 	}
 	w.endControlOperation()
 	w.confirm(confirmation{action: "fast", method: "select", user: user, options: options}, "Choose fast mode\n"+fastModeText(state.FastModeEnabled, state.FastModeActive), labels)
+}
+
+func (w *worker) selectFast(c confirmation, index int) {
+	if index < 0 || index >= len(c.options) {
+		w.finishMenu(c.messageID, "The fast mode selection is unavailable. Open /fast to choose again.")
+		return
+	}
+	w.beginModelState("fast_select", modelOperationRequest{action: "fast_select", messageID: c.messageID, enabled: c.options[index] == "on"})
 }
 
 func (w *worker) switchFast(enabled bool) {

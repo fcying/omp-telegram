@@ -479,7 +479,7 @@ func TestBindingDeleteCallbackDeletesClosedBinding(t *testing.T) {
 	if len(w.confirms) != 0 {
 		t.Fatalf("delete left confirmations: %+v", w.confirms)
 	}
-	assertKeyboardClears(t, fake, int(listMessageID), int(deleteMessageID))
+	assertFinishedMenu(t, fake, int(deleteMessageID), "Confirmed")
 }
 
 func TestBindingsOldKeepsOrderAfterDeletingClosedEntry(t *testing.T) {
@@ -721,5 +721,26 @@ func TestFormatLastUsedHandlesUnknownAndFuture(t *testing.T) {
 		if got := formatLastUsed(time.Now().Add(-tc.age).Unix()); got != tc.want {
 			t.Fatalf("age %s = %q, want %q", tc.age, got, tc.want)
 		}
+	}
+}
+
+func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	closed := store.Binding{Bot: 99, Chat: -10, Thread: 22, Workspace: "/closed", Session: "/sessions/closed.jsonl", Generation: 4}
+	requireStoreOK(t, db.Save(closed))
+	w, fake := newBindingTestWorker(t, db)
+	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &closed}}, user: 7}, 0, 0)
+	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: int64(fake.messageCount())}, Data: bindingButton(t, fake, "1. closed · #22")})
+	c := onlyBindingConfirmation(t, w)
+	approve := bindingButton(t, fake, "Delete")
+	w.callback(&telegram.CallbackQuery{ID: "cancel-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Cancel")})
+	assertFinishedMenu(t, fake, int(c.messageID), "Cancel")
+	w.callback(&telegram.CallbackQuery{ID: "replay-delete", From: telegram.User{ID: 7}, Data: approve})
+	saved, err := db.Binding(closed.Bot, closed.Chat, closed.Thread)
+	requireStoreOK(t, err)
+	if !sameBindingIdentity(saved, closed) || len(w.confirms) != 0 {
+		t.Fatal("cancelled binding deletion changed the binding or remained actionable")
 	}
 }

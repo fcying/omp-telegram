@@ -632,7 +632,7 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 	}
 	if c.action == "binding_delete" {
 		delete(w.confirms, token)
-		w.clearKeyboard(c.messageID)
+		w.finishConfirmation(c, n)
 		if n != 0 {
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Canceled")
 			return callbackDone
