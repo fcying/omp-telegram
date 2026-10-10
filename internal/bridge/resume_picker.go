@@ -632,7 +632,7 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		w.showResumePage(c, c.page+1, messageID)
 		return
 	case "cancel":
-		w.clearKeyboard(messageID)
+		w.finishMenu(messageID, "Cancel")
 		return
 	case "toggle_pin":
 		w.togglePinnedSession(c, option.session, messageID)
@@ -655,15 +655,25 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		return
 	}
 	selected := c.sessions[option.session]
-	w.clearKeyboard(messageID)
 	if !sameWorkspace(selected.CWD, c.workspace) {
+		w.clearKeyboard(messageID)
 		w.say("The selected session is not in this working directory.")
 		return
 	}
 	if !validSessionID(selected.ID) {
+		w.clearKeyboard(messageID)
 		w.say("omp returned an unsupported session ID.")
 		return
 	}
+	title := menuText(selected.Title, 40)
+	if title == "" {
+		title = "Untitled"
+	}
+	receipt := fmt.Sprintf("Selected: %s\nID: %s", title, selected.ID)
+	if c.action == "export" {
+		receipt += "\nFormat: " + strings.ToUpper(c.exportFormat)
+	}
+	w.finishMenu(messageID, receipt)
 	if c.action == "export" {
 		w.beginExport(selected, c.exportFormat, c.workspace, c.generation)
 		return

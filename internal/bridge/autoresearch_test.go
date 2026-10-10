@@ -653,6 +653,11 @@ func TestAutoresearchClearRequiresIdleAuthorizedFencedConfirmation(t *testing.T)
 			}
 			w.callback(&telegram.CallbackQuery{ID: "research-clear", From: telegram.User{ID: user}, Message: message, Data: data})
 			if scenario == "approve" {
+				assertFinishedMenu(t, f, int(messageID), "Confirmed")
+			} else if scenario == "cancel" {
+				assertFinishedMenu(t, f, int(messageID), "Cancel")
+			}
+			if scenario == "approve" {
 				nativeUntil(t, w, func() bool {
 					return researchTraceCount(trace, "autoresearch_clear", "clear --force --keep-tree") == 1 && !w.controlInProgress() && !w.taskActive()
 				})

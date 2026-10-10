@@ -2,9 +2,11 @@ package bridge
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,6 +139,12 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 				index = 1
 			}
 			clickSessionButton(w, f, 7, rows[0][index]["callback_data"].(string))
+			if scenario == "cancel" {
+				text, rows := pickerView(t, f)
+				if text != "Cancel" || len(rows) != 0 {
+					t.Fatalf("cancelled delete retained its question or choices: %q; %v", text, rows)
+				}
+			}
 			if _, err := os.Stat(saved); err != nil || w.deleteCancel != nil || w.b.sessionInUse(selected.ID) {
 				t.Fatal("cancelled or stale confirmation deleted or reserved a session")
 			}
@@ -465,20 +473,29 @@ func TestSessionDeleteFencesResumeAfterPickerCallbackPassedEpochCheck(t *testing
 			close(pickerGate)
 		}
 	}()
-	f.mu.Lock()
-	clearCount := len(f.keyboardClears)
-	f.keyboardClearGate = pickerGate
-	f.mu.Unlock()
+	pickerEntered := make(chan struct{})
+	var enteredOnce sync.Once
+	http.DefaultTransport = logTestTransport(func(r *http.Request) (*http.Response, error) {
+		if filepath.Base(r.URL.Path) == "editMessageText" {
+			enteredOnce.Do(func() { close(pickerEntered) })
+			select {
+			case <-pickerGate:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}
+		return f.RoundTrip(r)
+	})
 	callbackDone := make(chan struct{})
 	go func() {
 		defer close(callbackDone)
 		peer.callback(&telegram.CallbackQuery{ID: "stale-resume", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: oldMessageID}, Data: oldButton})
 	}()
-	waitFor(t, func() bool {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return len(f.keyboardClears) > clearCount
-	})
+	select {
+	case <-pickerEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("picker callback did not reach its decision edit")
+	}
 	if err := os.WriteFile(deleteGate, nil, 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -500,9 +500,21 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 对于 Open binding, 确认后的请求会经 Bridge 路由到目标 worker 再删除. Worker 拒绝旧 generation, startup intent, 活动任务, 未处理输入, 排队工作和进行中的 session 操作. 关闭 runtime 前先检查保留的研究 lease, 持有占用时拒绝忘记, 不改变 open 状态或进程. 否则空闲时先阻止新输入, 关闭 OMP 进程并持久化 closed binding, 然后调用 `DeleteClosedBinding`; 删除失败时保留 closed binding. Open 和 Closed 删除路径均解释 lease 拒绝原因, 提示用户在原对话中恢复所属 session 并确认 `/autoresearch off`. Forget 操作只回复发起操作的对话, 不产生目标 topic 消息; 已排队的 outbox 投递保持不变.
 
-合法的最终选择或取消会先消费 confirmation token, 再尽力通过 `editMessageReplyMarkup` 移除 inline keyboard, 不修改消息正文. 清理失败不阻止实际操作. 翻页直接更新原菜单. OMP 原生 `select` 对话框 (包括 `/review` 的 commit 选择) 每页显示 8 项, 回复 OMP 时仍使用原始选项值; 翻页轮换 token, 不回答原生对话框, 超过 20 项的列表也不再取消. 已知的过期菜单也会清理; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启.
+合法的最终选择或取消会先消费 confirmation token. OMP 原生 `select` 对话框 (包括 `/review` 的 commit 选择) 将原菜单正文替换为 `Selected: <选中项>` 或 `Cancel`, 同一次编辑移除 inline keyboard. 展示的选中项有长度上限, 但回复 OMP 时仍使用原始值.
 
-定时过期处理在 worker 内使 token 失效, 随后非阻塞提交键盘清理, 不等待 Telegram. 每个 worker 只有一个清理消费者, 最多缓存 32 个 message ID; 队列满时放弃尽力而为的按钮移除, 但 token 仍然失效. 每个请求超时五秒, worker 取消时停止消费者, 因此 UI 清理阻塞不会拖住控制命令或终结事件. 用户主动选择仍保持先清按钮再执行操作的原顺序.
+当前 session 的导出阻止原生 UI 响应时, callback 会先拒绝提交, 不生成选择或确认回执. 原菜单显示导出等待原因, token 被消费, 不向 OMP 发送 UI response. 提交和取消都保持原有导出 guard 的拒绝行为.
+
+Model, thinking 和 fast 选择先显示选中项及 `Applying...`. 原消息 ID 随现有带 fencing 的 operation 传递; 只有 RPC 结果被确认后, 才改为实际 model 和所选 role, 验证后的生效 thinking level (包括 OMP 调整), 或返回的 fast setting/activity. 准入拒绝, 请求失败和无法确认的结果会把等待正文改为失败提示, 不显示成功. 取消显示 `Cancel`, 不启动设置操作. 原有持久化结果回复保持不变.
+
+Worker 为单个已准入的设置 control 保留原消息 ID, 直到终态处理. 关闭, 替换或释放 runtime 时, 会在丢弃原生调用前将仍等待中的菜单改为已中断且结果未确认. 成功和失败完成路径先清理该关联再释放 runtime, 避免后续 teardown 覆盖已终结菜单. 迟到结果仍受原有 generation/client fencing 限制.
+
+Resume 和 export 选择将原 picker 改为有长度上限的 session 标题及完整原生 ID; export 还显示 SESSION 或 HTML 格式. 这是选择回执, 不代表恢复或导出成功. 原有校验, 失败提示和完成流程仍决定实际结果. 取消显示 `Cancel`. Pin/Unpin 和翻页继续刷新列表.
+
+New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 binding Delete 确认框在确认后显示 `Confirmed` 及原请求详情, 取消后显示 `Cancel`. `Confirmed` 只记录用户决定, 不宣称操作已经成功. Queue 和 binding viewer 的 Close 行为及 progress Stop 控件保持不变.
+
+菜单编辑是有界的 best-effort UI, 正文编辑请求超时五秒. 正文编辑失败时, 把按钮移除提交给现有有界清理消费者, 不在 worker actor 内同步等待第二次 HTTP 请求. 清理阻塞或失败不阻止实际操作, 不恢复已消费 token 的可操作性; 队列溢出或关闭时可能放弃尽力而为的清理. 翻页直接更新原菜单. 原生 select 对话框每页显示 8 项; 翻页轮换 token, 不回答原生对话框, 超过 20 项的列表也不再取消. 已知过期菜单仍只清理按钮; 未授权用户和未知旧 token 不会触发清理, 避免旧分页 callback 擦掉新一页按钮. 菜单 message ID 仅保存在内存中, 不跨重启.
+
+定时过期处理在 worker 内使 token 失效, 随后非阻塞提交键盘清理, 不等待 Telegram. 每个 worker 只有一个清理消费者, 最多缓存 32 个 message ID; 队列满时放弃尽力而为的按钮移除, 但 token 仍然失效. 每次清理请求超时五秒, worker 取消时停止消费者, 因此 UI 清理阻塞不会拖住控制命令或终结事件. 用户主动选择先尝试编辑决定状态, 再执行实际操作; 正文编辑失败只提交回退清理, 不等待其完成.
 
 程序主动失效也统一使用该有界清理队列: 取消 resume 列表、原生 UI 取消、关闭或替换实例以及任务终结都会删除适用的 token, 并把已知菜单 message ID 加入清理队列. 任务终结会保留当前 generation 的独立 `/queue` viewer token, 因而与 dispatch 竞争的 callback 可以重新扫描实时 queue 并返回 `Task is no longer queued.`, 不会中止 active task. model、thinking、fast、compact、new 和原生 UI 选择属于当前运行实例的 runtime-bound confirmation, 会阻止正常空闲释放; 它们原有的过期机制仍会删除 token, 并在需要时取消当前 generation 的原生 UI. 独立的 `/resume` 菜单不依赖当前运行实例, 可以在 runtime 释放后继续有效. 明确的 runtime teardown 仍会使旧 runtime 菜单失效, `/close` 和 worker teardown 则清理全部 confirmation. 清理仍是尽力而为, worker context 已取消或队列溢出时不保证移除按钮.
 

@@ -332,7 +332,7 @@ func TestExportPickerSurvivesTaskCompletionCleanup(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.DataDir = t.TempDir()
 	command("/new test")
-	setResumeFixtures(t, w.binding.Workspace, 1)
+	sessions := setResumeFixtures(t, w.binding.Workspace, 1)
 	w.busy = true
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
@@ -343,10 +343,36 @@ func TestExportPickerSurvivesTaskCompletionCleanup(t *testing.T) {
 		t.Fatal("export picker disappeared when the task completed")
 	}
 	clickResume(w, 7, buttons[0]["callback_data"].(string))
+	requireFinishedSessionPicker(t, f, 1, "Selected: "+sessions[0].Title+"\nID: "+sessions[0].ID+"\nFormat: SESSION")
 	w.exportFinished(finishExport(t, w))
 	var documents int
 	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='document'").Scan(&documents); err != nil || documents != 1 {
 		t.Fatalf("surviving export picker enqueued %d documents, error=%v", documents, err)
+	}
+}
+
+func TestExportPickerCancelCompletesOriginalMenu(t *testing.T) {
+	for _, commandText := range []string{"/export", "/export html"} {
+		t.Run(commandText, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new test")
+			before, client := w.binding, w.client
+			setResumeFixtures(t, before.Workspace, 1)
+			command(commandText)
+			w.resumeListed(finishResumeList(t, w))
+			buttons := resumeButtons(t, f)
+			clickResume(w, 7, buttons[len(buttons)-1]["callback_data"].(string))
+			requireFinishedSessionPicker(t, f, 1, "Cancel")
+			clickResume(w, 7, buttons[0]["callback_data"].(string))
+			requireFinishedSessionPicker(t, f, 1, "Cancel")
+			if w.exportCancel != nil || w.client != client || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("cancelled export picker remained actionable or changed the session")
+			}
+			var documents int
+			if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='document'").Scan(&documents); err != nil || documents != 0 {
+				t.Fatalf("cancelled picker enqueued %d documents, error=%v", documents, err)
+			}
+		})
 	}
 }
 
@@ -960,20 +986,31 @@ func TestExportRejectsInvalidCommandArguments(t *testing.T) {
 }
 
 func TestExportPickerRejectsMissingSessionFile(t *testing.T) {
-	w, f, command := setupWorkspaceWorker(t)
-	command("/new test")
-	sessions := setResumeFixtures(t, w.binding.Workspace, 1)
-	command("/export")
-	w.resumeListed(finishResumeList(t, w))
-	path := filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), sessions[0].ID+".jsonl")
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
-	w.exportFinished(finishExport(t, w))
-	var documents int
-	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='document'").Scan(&documents); err != nil || documents != 0 {
-		t.Fatalf("disappeared session enqueued %d documents, error=%v", documents, err)
+	for _, format := range []string{"session", "html"} {
+		t.Run(format, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new test")
+			sessions := setResumeFixtures(t, w.binding.Workspace, 1)
+			commandText := "/export"
+			if format == "html" {
+				commandText += " html"
+			}
+			command(commandText)
+			w.resumeListed(finishResumeList(t, w))
+			path := filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), sessions[0].ID+".jsonl")
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
+			receipt := "Selected: " + sessions[0].Title + "\nID: " + sessions[0].ID + "\nFormat: " + strings.ToUpper(format)
+			requireFinishedSessionPicker(t, f, 1, receipt)
+			w.exportFinished(finishExport(t, w))
+			requireFinishedSessionPicker(t, f, 1, receipt)
+			var documents int
+			if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE kind='document'").Scan(&documents); err != nil || documents != 0 {
+				t.Fatalf("disappeared session enqueued %d documents, error=%v", documents, err)
+			}
+		})
 	}
 }
 
@@ -1025,6 +1062,7 @@ func TestExportPickerRejectsWrongUserAndExpiredToken(t *testing.T) {
 				}
 			}
 			clickResume(w, user, button["callback_data"].(string))
+			requireNoSessionSelectionReceipt(t, f)
 			if w.exportCancel != nil {
 				t.Fatal("invalid export callback started an export")
 			}

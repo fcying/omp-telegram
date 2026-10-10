@@ -254,6 +254,7 @@ type worker struct {
 	rpcOperationActive     bool
 	rpcOperationClientID   uint64
 	rpcExitPendingClientID uint64
+	modelMenuID            int64
 	topicRenameResults     chan topicRenameResult
 	albumEvents            chan albumEvent
 	albumVersion           uint64
@@ -1162,7 +1163,10 @@ func (w *worker) controlInProgress() bool {
 
 func (w *worker) beginControlOperation(kind controlOperation) { w.controlOp = kind }
 
-func (w *worker) endControlOperation() { w.controlOp = controlNone }
+func (w *worker) endControlOperation() {
+	w.controlOp = controlNone
+	w.modelMenuID = 0
+}
 
 func (w *worker) sessionOperationActive() bool { return w.sessionOp != sessionOperationNone }
 
@@ -1291,6 +1295,7 @@ func (w *worker) endRuntimeResume() {
 }
 
 func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
+	w.interruptModelMenu()
 	w.invalidateResearchAdmission()
 	w.cancelResearchControl()
 	w.stopTyping()
@@ -1800,6 +1805,7 @@ func (w *worker) operationFinished(result operationResult) {
 }
 
 func (w *worker) teardownWorker(releaseSlot bool) {
+	w.interruptModelMenu()
 	w.b.removeCommandMenu(w)
 	completion := w.taskCompletionAttrs(w.active, "uncertain")
 	w.stopTyping()
@@ -3969,6 +3975,7 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	} else {
 		title = parts[0]
 	}
+	c.uiTitle = title
 	var data [12]byte
 	if _, e := rand.Read(data[:]); e != nil {
 		return
@@ -4169,7 +4176,13 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	delete(w.confirms, token)
-	w.clearKeyboard(c.messageID)
+	if c.action == "ui" && w.exportingSession != "" {
+		text := "Wait for the current session export to finish."
+		w.finishMenu(c.messageID, text)
+		w.say(text)
+		return callbackDone
+	}
+	w.finishConfirmation(c, n)
 	if c.action == "session_delete" {
 		if n == 0 {
 			w.beginSessionDelete(c)
@@ -4180,10 +4193,6 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		if n == 0 {
 			w.confirmResearchClear(c)
 		}
-		return callbackDone
-	}
-	if c.action == "ui" && w.exportingSession != "" {
-		w.say("Wait for the current session export to finish.")
 		return callbackDone
 	}
 	if c.action == "ui" {
@@ -4207,6 +4216,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		w.touchBinding()
 		return callbackDone
 	}
+	if c.method == "select" && n == len(c.options) {
+		return callbackDone
+	}
 	if c.action == "model" {
 		w.selectModel(c, n)
 		return callbackDone
@@ -4216,9 +4228,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	if c.action == "fast" {
-		if n < len(c.options) {
-			w.switchFast(c.options[n] == "on")
-		}
+		w.selectFast(c, n)
 		return callbackDone
 	}
 	if n != 0 {
@@ -4252,6 +4262,41 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}, 0, "")
 	}
 	return callbackDone
+}
+
+// Menu completion records the user's choice, not the operation's success.
+func (w *worker) finishConfirmation(c confirmation, index int) {
+	cancelled := index != 0
+	if c.method == "select" {
+		cancelled = index == len(c.options)
+	}
+	text := "Cancel"
+	if !cancelled {
+		if c.method == "select" {
+			text = "Selected: " + c.options[index]
+			if c.action == "model" || c.action == "thinking" || c.action == "fast" {
+				text += "\nApplying..."
+			}
+		} else {
+			text = "Confirmed"
+			if c.uiTitle != "" {
+				text += "\n" + c.uiTitle
+			}
+		}
+	}
+	w.finishMenu(c.messageID, text)
+}
+
+func (w *worker) finishMenu(messageID int64, text string) {
+	if messageID == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	keyboard := &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}}
+	if w.b.tg.Edit(ctx, w.key.chat, messageID, truncateUTF8(text, 3700), keyboard) != nil {
+		w.queueKeyboardCleanup(messageID)
+	}
 }
 
 func (w *worker) clearKeyboard(messageID int64) {
