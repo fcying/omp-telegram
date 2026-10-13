@@ -75,6 +75,8 @@ Catalog 在一张私有 map 中保留紧凑的 unknown/builtin/extension/other �
 
 stdout reader 在唤醒后续 response waiter 前先应用 `available_commands_update` snapshot. worker event 只作为通知, 读取 client 的权威 snapshot; 已排队的旧 event 不能重新应用过时 catalog. discovery query 在发送前记录 reader 的 update revision 和 session scope. reader 在唤醒其 response waiter 前决定是否应用 query snapshot, 只有 revision 和 scope 都未变化时才应用. 因此较新的 reader update 优先于较旧 query 的结果. session 切换会使 catalog 失效并 fence 在途 query, 但不改变 client ID; 过时的 bridge continuation 也必须按当前 runtime/session scope 丢弃.
 
+Discovery 响应的 catalog state 和 name/alias 到 source 的分类均未变化时, 保留现有 snapshot 和 revision. 特别是 lazy restore 后的启动刷新, 不能仅因确认了已公布的相同 catalog 就让在途 autoresearch mode 查询失效. Discovery 结果确实变化时仍递增 revision. 主动推送的 `available_commands_update` 即使命令名称和来源未变也递增 revision, 因为原生实现可能已重新加载; session epoch 和 reader update 的 fencing 保持不变.
+
 已识别且支持的原生文字从 `/cmd@thisbot` 规范化为 `/cmd`, 保留参数, 通过现有 bridge 队列提交, 不添加 reply-context 包装, 也不使用 `streamingBehavior: "steer"`. Catalog 为 ready 时, 未识别的斜杠输入 (包括绝对路径) 保留原文和普通 prompt/steer 路由. 原生 queue entry 保留原生分类, 派发时再次验证可用性. 当前 catalog 不再公布排队命令时 (包括切换到 discovery 不受支持的状态后), 取消该 entry, 绝不降级成模型文字. 刷新失败不能作为健康的 unsupported 回退.
 
 Unsupported 的 fail-closed 检查由直接斜杠路由, pending 斜杠分类, 原始斜杠开头 queued prompt 派发 (包括 followup 和已准备附件), 以及运行中任务的 steer 路径共用. 拒绝会取消 inbox, 移除排队输入及其准备好的附件资源, 发出通用的能力限制提示, 不关闭 runtime 或改变 binding. 显式 bridge `/review` 的 queue entry 记录 bridge 接管来源; 原始 `/followup /review ...` 或附件文字不能仅靠命令名称取得该豁免. Unknown discovery 仍是独立的等待状态, 绝不作为 Unsupported 拒绝或 ready-empty 回退.
@@ -168,6 +170,8 @@ Git 使用显式只读 argv 解析物理 worktree root, 不接受进程全局 `G
 仅准确持久 lease owner 的显式 `/autoresearch off` 或 Stop 可以绕过普通 workspace 准入, 恢复 disable-only runtime. 必须确认原生 session ID, session 文件及 workspace, 再确认 idle/settled 和关联的本地 off 完成结果, 才能释放该 owner 的 lease. 已连接 owner 的 command catalog 为 unknown 时, 复用既有异步发现队列; off 分类时只移除自身 pending entry. Disable-only 路径不能提交普通 prompt, enable, toggle 或 clear. 一个 owner 确认 off 绝不释放合并 root 上另一个 owner 的 lease.
 
 真实 OMP 18.8.2 smoke 使用隔离的 profile/environment 和本地确定性 OpenAI-compatible endpoint: 原生 `init_experiment` 触发两轮自主续跑; Progress Stop 在新进程确认原生 off 后, 保留的 followup 才完成. 覆盖真实 RPC 和 extension hook, 不涉及真实 Telegram 或生产 model provider. 该 smoke 未执行破坏性的 Git/reset 操作.
+
+真实 OMP 18.10.3 两步交互 smoke 使用隔离的 agent 目录, 一次性 Git clone, 模拟 Telegram 和本地确定性模型 endpoint. 空参数 `/autoresearch` 本地完成, 交付原生“下一条消息描述目标”通知, 保留已启用模式, 没有发出模型请求. 后续普通消息进入原生 harness-setup prompt, 回复提交到 durable outbox; 显式 off 随后确认模式关闭. 此 smoke 未初始化 experiment, 未运行 benchmark 或验证优化质量, 未访问生产 provider, session 或 workspace.
 
 另一个使用已有原生历史的恢复 smoke 覆盖了待处理 status 结果前的进程退出, off 确认后的本地和普通 RPC 完成, 以及 deferred off 替换 runtime 后继续执行排队研究目标和保留的 followup. 使用真实 OMP, 模拟 Telegram 和本地确定性模型 endpoint.
 

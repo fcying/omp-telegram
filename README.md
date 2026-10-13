@@ -23,7 +23,7 @@ Each ordinary private chat or topic has its own OMP session. Different conversat
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
 
-Text steering requires OMP >= 18.3.2.
+Tested with OMP 18.10.3. See the [architecture document](doc/architecture.md) for verification scenarios and limitations.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -259,9 +259,18 @@ In a group topic, all allowed users share that topic's OMP session and workspace
 Requires OMP to advertise its native `autoresearch` extension. Send commands directly, not through `/followup` or an attachment:
 
 - `/autoresearch <goal>` enables research and starts the native goal.
-- `/autoresearch` toggles mode. Enabling it without an existing experiment may simply ask for the next prompt; that prompt becomes the research task.
+- `/autoresearch` toggles mode. When enabling a new experiment, it confirms the mode without starting a model task; your next ordinary message supplies the optimization goal, just as in the TUI.
 - `/autoresearch off` disables mode and interrupts active research, preserving waiting bridge tasks. When mode is already off, an active ordinary task is left running.
 - `/autoresearch clear [--keep-tree] [--reset-tree]` requires an idle instance, an empty queue, and confirmation. Native clear removes research artifacts and may reset tracked files and delete untracked files. `--keep-tree` skips the worktree reset, not research-artifact removal.
+
+Two-step usage, without putting the goal in the command:
+
+```text
+/autoresearch
+Reduce this project's startup time without changing its public behavior.
+```
+
+Send further constraints as ordinary messages. Native OMP owns harness setup and the optimization loop; the bridge does not require a separate goal command or copy the research state. See the [native mode instructions](https://github.com/can1357/oh-my-pi/blob/v18.10.3/packages/coding-agent/src/autoresearch/prompt-setup.md).
 
 Starting research does not request extra confirmation. Native OMP may create and check out Git branches, edit files, auto-commit kept experiments, revert discarded experiments, and continue making model calls. Use a suitable workspace and account for ongoing cost.
 

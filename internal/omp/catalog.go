@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"strings"
 )
 
@@ -277,6 +278,10 @@ func (c *Client) receiveCommandCatalogResponse(query *commandCatalogQuery, env e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.commandCatalog.Epoch == query.epoch && c.catalogUpdateRevision == query.updateRevision {
+		// Identical discovery does not invalidate in-flight mode evidence.
+		if c.commandCatalog.State == state && maps.Equal(c.commandCatalog.commands, commands) {
+			return nil
+		}
 		c.commandCatalog = CommandCatalog{
 			State: state, Revision: c.commandCatalog.Revision + 1,
 			Epoch: query.epoch, SessionID: c.commandCatalog.SessionID, commands: commands,
