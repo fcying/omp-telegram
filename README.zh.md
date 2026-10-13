@@ -23,7 +23,7 @@
 - 能访问 Telegram 和模型服务.
 - 一个 Telegram bot. 支持普通私聊, 私聊 topic 和群组 topic; 不支持没有 topic 的群组消息.
 
-文字 steer 要求 OMP >= 18.3.2.
+已在 OMP 18.10.3 测试通过. 验证场景与未验证项见[架构文档](doc/architecture.zh.md).
 
 同一个 bot token 同时只能由一个 polling 服务使用. 不能与 webhook 或其他 `getUpdates` 消费者同时运行.
 
@@ -259,9 +259,18 @@ Runtime 发现命令后才会显示原生命令菜单项. Discovery 完成前, �
 要求 OMP 公布原生 `autoresearch` extension. 请直接发送命令, 不要通过 `/followup` 或附件调用:
 
 - `/autoresearch <goal>` 开启研究模式并启动原生目标.
-- `/autoresearch` 切换模式. 没有已有实验时, 开启模式可能只提示输入下一条 prompt; 该 prompt 将成为研究任务.
+- `/autoresearch` 切换模式. 开启新实验时只确认模式已启用, 不启动模型任务; 下一条普通消息提供优化目标, 与 TUI 相同.
 - `/autoresearch off` 关闭模式并中断活动研究, 保留等待中的 bridge 任务. 模式已关闭时, 不打断正在运行的普通任务.
 - `/autoresearch clear [--keep-tree] [--reset-tree]` 要求实例空闲, 队列为空, 并经确认. 原生 clear 会删除研究 artifacts, 还可能重置 tracked 文件并删除 untracked 文件. `--keep-tree` 只跳过 worktree reset, 不阻止删除研究 artifacts.
+
+两步用法, 不必把目标写进命令参数:
+
+```text
+/autoresearch
+优化当前工程的启动时间, 保持对外行为不变.
+```
+
+后续约束继续用普通消息发送. Harness 准备和自动优化循环由原生 OMP 管理, bridge 不要求额外的目标命令, 也不复制研究状态. 参见[原生模式说明](https://github.com/can1357/oh-my-pi/blob/v18.10.3/packages/coding-agent/src/autoresearch/prompt-setup.md).
 
 启动研究不增加二次确认. 原生 OMP 可能创建并切换 Git 分支, 修改文件, 自动提交保留的实验, 回滚丢弃的实验, 并持续调用模型. 请使用适合实验的 workspace, 并注意持续费用.
 

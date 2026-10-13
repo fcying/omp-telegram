@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -83,6 +84,56 @@ func TestAutoresearchOffPreservesActiveOrdinaryOwnerAndQueue(t *testing.T) {
 			if queueState(t, w, 100) != "done" || strings.Join(researchReplies(t, w, 100), "") != "root completed" || w.client != client ||
 				researchTraceCount(trace, "prompt", "wait") != 1 || researchTraceCount(trace, "prompt", "ordinary queued work") != 1 {
 				t.Fatal("ordinary task and queued work did not finish exactly once on their original client")
+			}
+		})
+	}
+}
+
+func TestAutoresearchModeLookupAcrossDiscoveryRefresh(t *testing.T) {
+	for _, scenario := range []string{"unchanged-discovery", "changed-source", "native-update"} {
+		t.Run(scenario, func(t *testing.T) {
+			w, _, trace := researchWorker(t, "autoresearch")
+			client, binding := w.client, w.binding
+			nativeRPC(t, w, "fixture_autoresearch_metadata", map[string]any{"entriesMode": "hold"})
+			nativeInput(t, w, 100, "/autoresearch", false)
+			waitFixtureRPCTrace(t, trace, "entries_waiting", "")
+			if c := w.research.control; c == nil || c.intent != "route" || c.phase != "mode" {
+				t.Fatal("toggle did not wait for native mode confirmation")
+			}
+			switch scenario {
+			case "changed-source":
+				nativeRPC(t, w, "fixture_catalog_update", map[string]any{
+					"sourceName": "autoresearch", "source": "file", "skipUpdate": true,
+				})
+			case "native-update":
+				// An unsolicited update can reload implementations without changing names.
+				nativeRPC(t, w, "fixture_catalog_update", nil)
+				researchEventBarrier(t, w)
+			}
+			ctx, cancel := context.WithTimeout(w.ctx, 3*time.Second)
+			_, err := client.RefreshCommandCatalog(ctx)
+			cancel()
+			requireStoreOK(t, err)
+			nativeRPC(t, w, "fixture_autoresearch_release_entries", nil)
+			nativeUntil(t, w, func() bool {
+				state := queueState(t, w, 100)
+				return state == "done" || state == "cancelled"
+			})
+			if w.client != client || !sameBindingIdentity(w.binding, binding) {
+				t.Fatal("discovery refresh replaced the native session")
+			}
+			if scenario == "unchanged-discovery" {
+				if queueState(t, w, 100) != "done" || w.resumeFailed || !w.research.known || !w.research.enabled || w.taskActive() {
+					t.Fatal("unchanged discovery canceled the toggle or lost its confirmed enabled mode")
+				}
+				if researchTraceCount(trace, "prompt", "/autoresearch") != 1 {
+					t.Fatal("unchanged discovery lost or replayed the native toggle")
+				}
+				return
+			}
+			nativeUntil(t, w, func() bool { return !w.rpcOperationActive && len(w.rpcOperations) == 0 })
+			if queueState(t, w, 100) != "cancelled" || !w.resumeFailed || w.research.known || researchTraceCount(trace, "prompt", "/autoresearch") != 0 {
+				t.Fatal("changed discovery or native update admitted input under stale mode evidence")
 			}
 		})
 	}
