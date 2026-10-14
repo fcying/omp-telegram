@@ -891,6 +891,9 @@ func TestMain(m *testing.M) {
 				}
 				rootPrompts++
 				recordFixtureRPCOrder("prompt")
+				if fixtureHoldsRPC("prompt") {
+					continue
+				}
 				if text == "delayed-prompt-ack" {
 					waitForFixtureFile(os.Getenv("OMP_TELEGRAM_FIXTURE_PROMPT_ACK_GATE"))
 				}
@@ -2829,6 +2832,7 @@ func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
 func TestAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
+	before := w.binding
 	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
 	w.active, w.busy = 10, true
@@ -2837,7 +2841,7 @@ func TestAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"more"}}`))
 	var state string
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
-	if state != "uncertain" || w.client != nil || w.binding.Running {
+	if state != "uncertain" || w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
 		t.Fatalf("preterminal overflow state=%s runtime=%v binding=%+v", state, w.client, w.binding)
 	}
 	var reply string
@@ -2850,6 +2854,7 @@ func TestAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 func TestFinalizedAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
+	before := w.binding
 	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
 	w.active, w.busy = 10, true
@@ -2858,7 +2863,7 @@ func TestFinalizedAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 	w.event(message)
 	var state string
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
-	if state != "uncertain" || w.client != nil || len(w.finalAssistantTexts) != 0 {
+	if state != "uncertain" || w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) || len(w.finalAssistantTexts) != 0 {
 		t.Fatalf("finalized preterminal overflow state=%s runtime=%v cached=%d", state, w.client, len(w.finalAssistantTexts))
 	}
 }
@@ -3331,7 +3336,8 @@ func TestExpiredStartIntentWaitsForRuntimeToStop(t *testing.T) {
 func TestFailedUICallbackMarksUpdateUncertain(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
-	w.confirms["ui"] = confirmation{action: "ui", uiID: "ui-request", method: "confirm", generation: w.binding.Generation, user: 7, expires: time.Now().Add(time.Minute)}
+	before := w.binding
+	w.confirms["ui"] = confirmation{action: "ui", uiID: "ui-request", uiClientID: w.client.ID(), method: "confirm", generation: w.binding.Generation, user: 7, expires: time.Now().Add(time.Minute)}
 	_ = w.client.Close()
 	if err := w.b.db.Accept(99, []byte(`{"update_id":99}`)); err != nil {
 		t.Fatal(err)
@@ -3341,8 +3347,12 @@ func TestFailedUICallbackMarksUpdateUncertain(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=99").Scan(&state); err != nil || state != "uncertain" {
 		t.Fatalf("failed UI callback state = %q, error %v", state, err)
 	}
-	if w.client != nil {
-		t.Fatal("failed UI callback left omp running")
+	if w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("failed UI callback did not preserve the logical session")
+	}
+	command("/name recovered after UI failure")
+	if w.client == nil || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("idle UI failure did not allow lazy session recovery")
 	}
 }
 
@@ -3704,7 +3714,7 @@ func TestUnknownSlashTextRunsAsOrdinaryPrompt(t *testing.T) {
 	}
 }
 
-func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
+func TestFailedPromptAckRetiresClientAndPreservesSession(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	w.b.fatal = make(chan error, 1)
 	w.b.cfg.QueueCapacity = 4
@@ -3712,7 +3722,7 @@ func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 	if w.client == nil {
 		t.Fatal("fixture did not start")
 	}
-	client := w.client
+	client, before := w.client, w.binding
 	command("failed-prompt-ack")
 	command("/review must not run")
 	w.dispatch()
@@ -3733,8 +3743,8 @@ func TestFailedPromptAckClosesClientBeforeDispatch(t *testing.T) {
 		t.Fatal("uncertain process still running")
 	}
 	binding, err := w.b.db.Binding(99, -10, 11)
-	if err != nil || binding.Running {
-		t.Fatalf("uncertain process remains recoverable: %+v, %v", binding, err)
+	if err != nil || !binding.Running || !sameBindingIdentity(binding, before) {
+		t.Fatalf("uncertain submission changed or closed the session binding: %+v, %v", binding, err)
 	}
 	select {
 	case err := <-w.b.fatal:

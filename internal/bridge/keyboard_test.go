@@ -777,6 +777,44 @@ func TestNativeConfirmationDisplaysDecision(t *testing.T) {
 	}
 }
 
+func TestNativeUIRepliesCannotReachReplacementRuntime(t *testing.T) {
+	for _, method := range []string{"confirm", "select"} {
+		t.Run(method, func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			w.owner = 7
+			w.ui(rpcEvent{ID: "old-native-dialog", Method: method, Title: "Choose", Options: []string{"Old choice"}})
+			var token string
+			var old confirmation
+			for candidate, c := range w.confirms {
+				if c.action == "ui" {
+					token, old = candidate, c
+					break
+				}
+			}
+			if token == "" {
+				t.Fatal("native dialog was not created")
+			}
+			before := w.binding
+			w.releaseRuntimeWithReason(true, "failure")
+			command("/name replacement runtime")
+			client := w.client
+			if client == nil || client.ID() == old.uiClientID || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("runtime replacement did not preserve the session")
+			}
+			w.cancelUI(old)
+			w.callback(&telegram.CallbackQuery{ID: "old-click", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: old.messageID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}, Data: token + ":0"})
+			raw, err := w.call("get_state", nil)
+			var state struct {
+				Replies int `json:"fixtureUIReplies"`
+			}
+			if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 0 || w.client != client || !sameBindingIdentity(w.binding, before) {
+				t.Fatalf("old native UI reached or replaced the new runtime: replies=%d error=%v", state.Replies, err)
+			}
+		})
+	}
+}
+
 func TestNativeUIExportRejectionTerminatesOriginalMenu(t *testing.T) {
 	for _, method := range []string{"select", "confirm"} {
 		for _, cancel := range []bool{false, true} {

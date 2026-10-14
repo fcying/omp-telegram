@@ -176,7 +176,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		return
 	}
 	if w.steerFence.active && result.err != nil {
-		w.retireSteeredRoot("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
 	if !w.stuckTaskEligible() || result.err != nil || !result.idle {
@@ -195,7 +195,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		if w.idleProbe.pendingSince.IsZero() {
 			w.idleProbe.pendingSince = now
 		} else if now.Sub(w.idleProbe.pendingSince) >= nativeSteerIdleLimit {
-			w.retireSteeredRoot("omp's native steering queue remained idle too long. The task outcome is uncertain and will not be replayed automatically.")
+			w.retireTaskRuntime("omp's native steering queue remained idle too long. The task outcome is uncertain and will not be replayed automatically.")
 		}
 		return
 	}
@@ -221,7 +221,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		return
 	}
 	if w.steerFence.active {
-		w.retireSteeredRoot("omp is idle but steering completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("omp is idle but steering completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
 	inboxID, generation, turn := w.active, w.binding.Generation, w.turn

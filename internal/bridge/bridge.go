@@ -145,6 +145,7 @@ type albumEvent struct {
 type confirmation struct {
 	action, uiID, method string
 	uiTitle              string
+	uiClientID           uint64
 	workspace            string
 	exportFormat         string
 	options              []string
@@ -1656,7 +1657,7 @@ func (w *worker) operationFinished(result operationResult) {
 	}
 	if result.kind == "prompt" || result.kind == "native_prompt" {
 		if w.steerFence.active && result.err != nil {
-			w.retireSteeredRoot("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.")
+			w.retireTaskRuntime("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.")
 			return
 		}
 		if errors.Is(result.err, omp.ErrRequestTooLarge) {
@@ -1664,8 +1665,9 @@ func (w *worker) operationFinished(result operationResult) {
 			return
 		}
 		if result.err != nil {
-			w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
-			w.closeLogicalSession()
+			notice := "Submission failed or its outcome is uncertain. This task will not be replayed automatically. The session was kept open."
+			w.clearQueue()
+			w.retireTaskRuntime(notice)
 			return
 		}
 		w.touchBinding()
@@ -1921,11 +1923,11 @@ func (w *worker) failed() {
 		return
 	}
 	if w.steerFence.active {
-		w.retireSteeredRoot("omp exited while steering. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("omp exited while steering. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
-	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
-	w.closeLogicalSession()
+	w.clearQueue()
+	w.retireTaskRuntime("omp exited. The task outcome is uncertain and will not be replayed automatically. The session was kept open.")
 }
 func (w *worker) cancelQueuedTask(id int64) bool {
 	for i := range w.queue {
@@ -3051,11 +3053,11 @@ func (w *worker) assistantBudgetExceeded() {
 	}
 	w.logRuntimeEvent(slog.LevelWarn, "assistant_output_overflow", "resource_limit", "assistant output exceeded bridge budget", w.sessionID)
 	if w.steerFence.active {
-		w.retireSteeredRoot("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
-	w.finishUncertain("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
-	w.closeLogicalSession()
+	w.clearQueue()
+	w.retireTaskRuntime("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically. The session was kept open.")
 }
 
 func (w *worker) finish() {
@@ -3508,8 +3510,8 @@ func (w *worker) event(raw []byte) {
 		w.probeSteeredQuiescence()
 	case "response":
 		if !e.Success {
-			w.say("The omp request failed. Use /status to check the session state.")
-			w.closeLogicalSession()
+			w.clearQueue()
+			w.retireTaskRuntime("The omp request failed. The task outcome is uncertain and will not be replayed automatically. The session was kept open.")
 		}
 	case "extension_ui_request":
 		if w.researchNotify(e) {
@@ -4085,6 +4087,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
 	}
+	if c.action == "ui" && (w.client == nil || c.uiClientID != w.client.ID()) {
+		delete(w.confirms, token)
+		w.queueKeyboardCleanup(c.messageID)
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return callbackDone
+	}
 	if c.action == "autoresearch_clear" && !researchCallbackMessage(q, c, w.key) {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
 		return callbackDone
@@ -4206,10 +4214,10 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		defer cancel()
-		client, err := w.ensureRuntime()
-		if err != nil || client.Send(ctx, frame) != nil {
-			w.say("The confirmation could not be delivered to omp. Its state is uncertain and the instance has been closed.")
-			w.closeLogicalSession()
+		client, connected := w.runtimeClient()
+		if !connected || client.Send(ctx, frame) != nil {
+			w.clearQueue()
+			w.retireTaskRuntime("The confirmation could not be delivered to omp. Its state is uncertain and will not be replayed automatically. The session was kept open.")
 			return callbackUncertain
 		}
 		w.touchActivity()
@@ -4422,11 +4430,15 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 }
 
 func (w *worker) ui(e rpcEvent) {
+	client, connected := w.runtimeClient()
+	if !connected {
+		return
+	}
 	switch e.Method {
 	case "confirm", "select":
 		var msg string
 		_ = json.Unmarshal(e.Message, &msg)
-		c := confirmation{action: "ui", uiID: e.ID, method: e.Method, options: e.Options}
+		c := confirmation{action: "ui", uiID: e.ID, uiClientID: client.ID(), method: e.Method, options: e.Options}
 		if e.Method == "confirm" {
 			w.confirm(c, e.Title+"\n"+msg, []string{"Confirm", "Cancel"})
 			return
@@ -4444,7 +4456,7 @@ func (w *worker) ui(e rpcEvent) {
 		}
 		w.showUISelectPage(c, 0, 0)
 	case "input", "editor":
-		w.cancelUI(confirmation{uiID: e.ID})
+		w.cancelUI(confirmation{uiID: e.ID, uiClientID: client.ID()})
 		w.say("Input dialogs are not supported and have been canceled. Provide the information in a normal message.")
 	case "cancel":
 		for token, c := range w.confirms {
@@ -4455,7 +4467,7 @@ func (w *worker) ui(e rpcEvent) {
 	}
 }
 func (w *worker) cancelUI(c confirmation) {
-	if client, connected := w.runtimeClient(); c.uiID != "" && connected {
+	if client, connected := w.runtimeClient(); c.uiID != "" && connected && c.uiClientID == client.ID() {
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		defer cancel()
 		_ = client.Send(ctx, map[string]any{"type": "extension_ui_response", "id": c.uiID, "cancelled": true})
