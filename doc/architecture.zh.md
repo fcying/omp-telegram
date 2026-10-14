@@ -205,6 +205,12 @@ Bridge 不持久化菜单状态. 发布的命令名称对 Telegram chat 成员�
 
 bridge 使用公开 RPC v2. 根任务在发送前持久化 inbox; 接受和 `agentInvoked=false` 保持原有终态处理. 根任务提交失败或无法确认时关闭 client, 取消 bridge 队列, 不重放. 对于运行中的文字, worker 先验证 frame 大小, 预留 RPC request ID, 将 steer inbox 持久化为 `submitted`, 按当前 root/client/generation/turn 登记请求, 然后发送带 `streamingBehavior: "steer"` 的 `prompt`. 按 request ID 关联 `prompt_result` 和 settlement 证据要求 OMP >= 18.3.2. steer 不拥有最终回复, 不创建独立 progress, 也不进入 bridge 队列. `/followup` 则创建排入 bridge 队列的独立 root; 附件及 `/review` 保持排队. 排队根任务与未决 steer 总数受 `worker.queue_capacity` 限制.
 
+写入前帧超限拒绝保留原有路径. 其余没有 steer fence 的根 `prompt`/`native_prompt` 提交错误只退役 runtime. 普通进程异常退出, 任务完成前的 assistant 输出超限, 以及原生确认/选择回执失败使用同一退役流程. 它清除 control/compaction/session-operation 状态, 取消 bridge pending task, 并将存在的 active inbox 和提示原子提交为 `uncertain`. 空闲故障只发送提示, 不虚构任务结果. Running binding, 原生 session file/ID, generation 及 session/workspace claim 保留, 下一条显式请求可 lazy resume; 不重放结果不确定的任务或已取消的工作. 既有研究和 steer 路径保留原有队列保护, disable-pending 暂停和 lease 规则. 原生文件不可用时仍报告恢复失败, 包括尚未持久化 history 的新 session, 不创建替代 session.
+
+根提交等待仍保留原有的 30 秒 deadline. `/review` 打开的原生对话框会让提交持续等待用户选择, 因而未作答的 picker 可能触及该 deadline. 这是 acceptance 超时, 不是已接受模型任务的执行时限; 保留 binding 不会延长该 deadline.
+
+真实 OMP 18.10.3 smoke 使用隔离的 agent directory, 一次性 workspace/database, 模拟 Telegram 和本地确定性 provider. 活动进程终止, 注入超预算 RPC delta event, 以及实际原生 `/review` select 菜单的超大回执均保留 running binding 和精确的原生 session 身份; 根任务变为 uncertain, 等待任务取消, 新的显式 prompt 在替代进程完成且不重放旧任务. 超限场景在真实活动 turn 中注入事件, 不代表已验证 provider 自然生成的超大输出. 未验证真实 Telegram 交付.
+
 OMP 18.3.2 是目前实测支持文字 steer 的最低版本, 能按 request ID 返回 RPC v2 `prompt_result` 终态 (`completed`, `aborted`, `error`) 和 settlement 证据. 这项功能的版本要求高于 bridge 原有的 RPC v2 要求.
 
 仅当观察到 terminal `agent_end`, 所有 steer 请求的终态 (`completed`, `aborted`, `error`; 本地命令可由 `agentInvoked=false` 结算), 且本轮 session 已 settled 后, 才能完成 root. `sessionSettled=false` 会清除之前的 true 证据; 没有 request ID 的 `session_settled` 只触发 `get_state.isSettled` 探针, 不能自行释放 fence. 消费已排队事件后, 按 client, generation, root, turn 和 revision 校验探针结果. 新 `agent_start` 清除暂存的旧 terminal, 本地命令回复则保留它. 连续确认 idle 却缺少结果时, 退役旧 runtime, 将未决 steer 和 root 记为 `uncertain`, 不重放. worker shutdown 和意外退出同样结算未决 submitted steer.
@@ -388,7 +394,7 @@ Outbox 终态在 snapshot 删除之前提交. 仅观察到 `done` 不代表清�
 
 `/export` 只使用已提交 binding 的 workspace 和原生 session identity. 它不会调用 `ensureRuntime`, 修改 binding 状态, claim session, touch `last_used_at`, 或占用普通 runtime slot. 如果 selected ID 等于 committed binding 的 `session_id`, 即使 idle release 或 `/close` 之后也直接使用已保存的 `session` path; 其他 ID 通过 OMP 原生 `omp <omp.args...> render <session-id> -q -t` 命令, 使用 configured working directory 解析, 再严格校验返回的第一条 `session  <absolute-path>` diagnostic line 及持久化 session header. 如果 `omp.args` 或 `PI_CODING_AGENT_SESSION_DIR` 指定 custom session directory, inactive session export 会直接拒绝, 因为 native render 不会接收这个 launch-global store override. bridge 不发现或模拟 OMP session storage 规则. raw 导出以只读且禁止跟随 symlink 的方式打开 absolute source, 再通过 `Fstat` 检查打开的文件, 使用有界的 `MaxDocumentBytes` 读取复制到私有 attachment outbox spool, fsync 后设置 `0400`, 并保留经过安全处理的 OMP basename 作为 Telegram filename. HTML 导出也先以相同的 no-follow 规则, 只把选中的 main session JSONL snapshot 到 bridge-owned 私有 spool, 再把这个稳定 snapshot 交给 OMP 原生 exporter; 不复制 companion 或 subagent transcript. HTML 生成期间监控 output 增长, 超过 `MaxDocumentBytes` 就终止并清理. 只导出 main session JSONL, 不创建 zip 或 subagent bundle.
 
-带非空 `media_group_id` 的 photo 和 document 消息由所属 worker 按 `(media_group_id,sender_id)` 聚合. 第一条成员消息立即占用一个 bridge queue slot, 同时作为 logical task 和 inbox owner; 后续成员在被消费后直接标记为 `done`, 不再进入队列. 首条消息后的 500 ms quiet period 会收集新成员, 从首条消息起最多等待 2 秒, 并使用 version fence 忽略旧 timer. 一个相册最多接受 10 个成员. 封存后按 Telegram message ID 排序, 使用带序号的文件名下载到同一个 incoming directory. Worker 作为一次 prompt 提交第一个非空 caption, 并仅携带能够放进协商后物理 RPC frame 的前几张 inline images; 每份原文件仍可通过列出的 data-directory 路径访问. 如果纯文本已超出帧限额, pending task 会标记为 `failed`, 而不会关闭 session. 已提交任务若遇到写入前帧超限, 则以 `cancelled` 结束, 不关闭 session; 执行结果不确定的错误继续沿用原有关闭流程. 按顺序找到的第一个带 reply context 的成员提供一次上下文, 最终 reply target 是相册第一条消息. preparation 采用 all-or-nothing: 任一成员失败都会删除 directory 和 owner queue entry, 将 owner 标记为 `failed`, 并只发送一次 album 专用提示. 没有 media group 的附件继续单消息路径. Album collection 只存在于 worker 内存中; 取消、拒绝、封存或 teardown 后会在短暂窗口内抑制迟到成员, daemon 重启时取消尚未完成的 owner, 不自动重放 album state.
+带非空 `media_group_id` 的 photo 和 document 消息由所属 worker 按 `(media_group_id,sender_id)` 聚合. 第一条成员消息立即占用一个 bridge queue slot, 同时作为 logical task 和 inbox owner; 后续成员在被消费后直接标记为 `done`, 不再进入队列. 首条消息后的 500 ms quiet period 会收集新成员, 从首条消息起最多等待 2 秒, 并使用 version fence 忽略旧 timer. 一个相册最多接受 10 个成员. 封存后按 Telegram message ID 排序, 使用带序号的文件名下载到同一个 incoming directory. Worker 作为一次 prompt 提交第一个非空 caption, 并仅携带能够放进协商后物理 RPC frame 的前几张 inline images; 每份原文件仍可通过列出的 data-directory 路径访问. 如果纯文本已超出帧限额, pending task 会标记为 `failed`, 而不会关闭 session. 已提交任务若遇到写入前帧超限, 则以 `cancelled` 结束, 不关闭 session; 执行结果不确定的错误只退役 runtime, 保留逻辑 session 且不重放. 按顺序找到的第一个带 reply context 的成员提供一次上下文, 最终 reply target 是相册第一条消息. preparation 采用 all-or-nothing: 任一成员失败都会删除 directory 和 owner queue entry, 将 owner 标记为 `failed`, 并只发送一次 album 专用提示. 没有 media group 的附件继续单消息路径. Album collection 只存在于 worker 内存中; 取消、拒绝、封存或 teardown 后会在短暂窗口内抑制迟到成员, daemon 重启时取消尚未完成的 owner, 不自动重放 album state.
 
 ## 会话生命周期
 
@@ -506,6 +512,8 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 合法的最终选择或取消会先消费 confirmation token. OMP 原生 `select` 对话框 (包括 `/review` 的 commit 选择) 将原菜单正文替换为 `Selected: <选中项>` 或 `Cancel`, 同一次编辑移除 inline keyboard. 展示的选中项有长度上限, 但回复 OMP 时仍使用原始值.
 
+原生确认/选择 token 还记录来源 client ID. 选择和取消只能发给该已连接 client, 不调用 lazy resume 交付对话框回执. 即使逻辑 binding 的 generation 未改变, 已退役 client 的 token 也会过期, 不能向替代进程发送选择或取消.
+
 当前 session 的导出阻止原生 UI 响应时, callback 会先拒绝提交, 不生成选择或确认回执. 原菜单显示导出等待原因, token 被消费, 不向 OMP 发送 UI response. 提交和取消都保持原有导出 guard 的拒绝行为.
 
 Model, thinking 和 fast 选择先显示选中项及 `Applying...`. 原消息 ID 随现有带 fencing 的 operation 传递; 只有 RPC 结果被确认后, 才改为实际 model 和所选 role, 验证后的生效 thinking level (包括 OMP 调整), 或返回的 fast setting/activity. 准入拒绝, 请求失败和无法确认的结果会把等待正文改为失败提示, 不显示成功. 取消显示 `Cancel`, 不启动设置操作. 原有持久化结果回复保持不变.
@@ -551,7 +559,7 @@ New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 bind
 | daemon 正常退出 | 保留已提交的恢复资格; 活动任务标记为已中断 |
 | `/stop` | 保留实例和恢复资格, 清空等待 prompt |
 | `/close` | 删除待完成意图, 保存 `running=0`, 再关闭实例 |
-| worker 回收运行期故障实例 | 清除恢复资格, 活动任务转为不确定 |
+| 故障后退役 runtime | 保留身份和恢复资格; 活动任务转为不确定, 不重放 |
 | 启动恢复 binding 时缺失原生 session 文件或 workspace | 保存 `running=0`, 记录 info 级跳过日志并提示使用 `/new`; 绝不创建替代 session |
 | 按需恢复运行期失败 | 保留已保存身份和恢复资格; 不提交或重放 prompt |
 

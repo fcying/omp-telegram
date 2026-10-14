@@ -15,6 +15,7 @@ import (
 
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
+	"omp-telegram/internal/telegram"
 )
 
 func fixtureRPCControlFiles(t *testing.T, held string) (string, string) {
@@ -78,6 +79,155 @@ func assertRetiredOperationClient(t *testing.T, w *worker, client *omp.Client, b
 			return false
 		}
 	})
+}
+
+func TestRootSubmissionTimeoutPreservesSessionWithoutReplay(t *testing.T) {
+	for _, kind := range []string{"prompt", "native_prompt"} {
+		t.Run(kind, func(t *testing.T) {
+			_, trace := fixtureRPCControlFiles(t, "prompt")
+			w, _, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 4
+			command("/new " + t.TempDir())
+			before, client := w.binding, w.client
+			requireStoreOK(t, w.b.db.Accept(100, []byte(`{"update_id":100}`)))
+			q := queued{id: 100, user: 7, text: "/review"}
+			if !w.submit(q) {
+				t.Fatal("review submission was not persisted")
+			}
+			w.beginTask(q)
+			requestID := client.ReserveRequestID()
+			w.rootRequestID = requestID
+			w.startOperation(kind, client, func(ctx context.Context) (json.RawMessage, error) {
+				ctx, cancel := context.WithTimeout(ctx, time.Second)
+				defer cancel()
+				return client.CallWithID(ctx, requestID, "prompt", map[string]any{"message": "/review"})
+			}, 100, "")
+			waitFixtureRPCTrace(t, trace, "prompt", "/review")
+			acceptWorkerInput(t, w, 101, "/followup cancelled after unconfirmed review")
+			result := waitOperation(t, w)
+			if !errors.Is(result.err, context.DeadlineExceeded) {
+				t.Fatalf("held review error=%v, want deadline exceeded", result.err)
+			}
+			w.operationReturned(result)
+			assertRetiredOperationClient(t, w, client, before)
+			saved, err := w.b.db.Binding(99, w.key.chat, w.key.thread)
+			if err != nil || !saved.Running || !sameBindingIdentity(saved, before) {
+				t.Fatal("submission timeout closed or replaced the saved session")
+			}
+			if queueState(t, w, 100) != "uncertain" || queueState(t, w, 101) != "cancelled" || len(w.queue) != 0 || w.taskActive() {
+				t.Fatal("submission timeout lost the uncertain root or retained canceled work")
+			}
+			if info, err := os.Stat(before.Session); err != nil || !info.Mode().IsRegular() {
+				t.Fatal("submission timeout removed native history")
+			}
+			t.Setenv("OMP_TELEGRAM_FIXTURE_HOLD_RPC", "")
+			acceptWorkerInput(t, w, 102, "/review fresh after timeout")
+			w.dispatch()
+			nativeUntil(t, w, func() bool { return queueState(t, w, 102) == "done" })
+			if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("explicit review did not lazily resume the preserved session")
+			}
+			for _, entry := range fixtureRPCTrace(trace) {
+				if entry.kind == "prompt" && entry.payload == "cancelled after unconfirmed review" {
+					t.Fatal("submission timeout replayed canceled queued work")
+				}
+			}
+			if researchTraceCount(trace, "prompt", "/review") != 1 || researchTraceCount(trace, "prompt", "/review fresh after timeout") != 1 || queueState(t, w, 100) != "uncertain" {
+				t.Fatal("explicit recovery replayed or rewrote the uncertain review")
+			}
+		})
+	}
+}
+
+func TestRuntimeFailuresPreserveSessionWithoutReplay(t *testing.T) {
+	for _, failure := range []string{"idle-exit", "active-exit", "stream-overflow", "final-overflow", "failed-response", "ui-confirm", "ui-select"} {
+		t.Run(failure, func(t *testing.T) {
+			_, trace := fixtureRPCControlFiles(t, "")
+			w, _, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 4
+			command("/new " + t.TempDir())
+			before, client := w.binding, w.client
+			active := failure != "idle-exit"
+			if active {
+				requireStoreOK(t, w.b.db.Accept(100, []byte(`{"update_id":100}`)))
+				q := queued{id: 100, user: 7, text: "wait"}
+				if !w.submit(q) {
+					t.Fatal("root submission was not persisted")
+				}
+				w.beginTask(q)
+				requestID := client.ReserveRequestID()
+				w.rootRequestID = requestID
+				w.startOperation("prompt", client, func(ctx context.Context) (json.RawMessage, error) {
+					return client.CallWithID(ctx, requestID, "prompt", map[string]any{"message": "wait"})
+				}, 100, "")
+				result := waitOperation(t, w)
+				requireStoreOK(t, result.err)
+				w.operationReturned(result)
+				acceptWorkerInput(t, w, 101, "/followup cancelled after runtime failure")
+			}
+			switch failure {
+			case "idle-exit", "active-exit":
+				requireStoreOK(t, client.TerminateNow())
+				w.failed()
+			case "stream-overflow":
+				w.stream.WriteString(strings.Repeat("x", maxAssistantOutputBytes))
+				w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"overflow"}}`))
+			case "final-overflow":
+				raw, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": strings.Repeat("x", maxAssistantOutputBytes+1)}}}})
+				requireStoreOK(t, err)
+				w.event(raw)
+			case "failed-response":
+				w.event([]byte(`{"type":"response","success":false}`))
+			case "ui-confirm", "ui-select":
+				w.owner = 7
+				method := strings.TrimPrefix(failure, "ui-")
+				w.ui(rpcEvent{ID: "native-dialog", Method: method, Title: "Choose", Options: []string{strings.Repeat("x", client.FrameLimit()+1)}})
+				var token string
+				var c confirmation
+				for candidate, dialog := range w.confirms {
+					if dialog.action == "ui" {
+						token, c = candidate, dialog
+						break
+					}
+				}
+				if token == "" {
+					t.Fatal("native dialog was not created")
+				}
+				if method == "confirm" {
+					requireStoreOK(t, client.TerminateNow())
+				}
+				requireStoreOK(t, w.b.db.Accept(103, []byte(`{"update_id":103}`)))
+				w.handle(incoming{id: 103, callback: &telegram.CallbackQuery{ID: "native-click", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}, Data: token + ":0"}})
+				if queueState(t, w, 103) != "uncertain" {
+					t.Fatal("failed native reply lost callback uncertainty")
+				}
+			}
+			assertRetiredOperationClient(t, w, client, before)
+			saved, err := w.b.db.Binding(99, w.key.chat, w.key.thread)
+			if err != nil || !saved.Running || !sameBindingIdentity(saved, before) {
+				t.Fatal("runtime failure closed or replaced the saved session")
+			}
+			if info, err := os.Stat(before.Session); err != nil || !info.Mode().IsRegular() {
+				t.Fatal("runtime failure removed native history")
+			}
+			if active && (queueState(t, w, 100) != "uncertain" || queueState(t, w, 101) != "cancelled" || len(w.queue) != 0 || w.taskActive()) {
+				t.Fatal("runtime failure lost uncertainty or retained canceled work")
+			}
+			acceptWorkerInput(t, w, 102, "fresh after runtime failure")
+			w.dispatch()
+			nativeUntil(t, w, func() bool { return queueState(t, w, 102) == "done" })
+			if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("fresh input did not resume the preserved session")
+			}
+			wantRoots := 0
+			if active {
+				wantRoots = 1
+			}
+			if researchTraceCount(trace, "prompt", "wait") != wantRoots || researchTraceCount(trace, "prompt", "fresh after runtime failure") != 1 || researchTraceCount(trace, "prompt", "cancelled after runtime failure") != 0 {
+				t.Fatal("runtime recovery replayed uncertain or canceled work")
+			}
+		})
+	}
 }
 
 func TestAbortTimeoutRetiresRuntimeAndContinuesQueueOnFreshClient(t *testing.T) {

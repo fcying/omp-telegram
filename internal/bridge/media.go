@@ -673,7 +673,7 @@ func (w *worker) hostResultFailed(client *omp.Client, err error) {
 	w.cancelHostRequests()
 	if w.steerFence.active {
 		w.clearFailedHostOperation()
-		w.retireSteeredRoot("A host tool result could not be delivered to omp. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("A host tool result could not be delivered to omp. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
 	if w.taskActive() {

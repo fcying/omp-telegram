@@ -118,7 +118,7 @@ func (w *worker) steerOperationFinished(result operationResult) {
 			return
 		}
 		if state == store.InboxUncertain {
-			w.retireSteeredRoot("Steering outcome is uncertain and will not be replayed automatically.")
+			w.retireTaskRuntime("Steering outcome is uncertain and will not be replayed automatically.")
 		} else {
 			w.say("Steering failed. The current task may not include that instruction.")
 			w.maybeFinishSteeredRoot()
@@ -163,7 +163,7 @@ func (w *worker) steerResult(e rpcEvent) bool {
 	if state == store.InboxFailed {
 		w.say("Steering failed. The current task may not include that instruction.")
 	} else if state == store.InboxUncertain {
-		w.retireSteeredRoot("Steering outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("Steering outcome is uncertain and will not be replayed automatically.")
 		return true
 	}
 	w.maybeFinishSteeredRoot()
@@ -291,7 +291,7 @@ func (w *worker) steeredQuiescenceFinished(result steerProbeResult) {
 	}
 	w.cancelSteerProbe()
 	if result.err != nil {
-		w.retireSteeredRoot("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
 		return
 	}
 	if result.settled {
@@ -316,10 +316,10 @@ func (w *worker) settleOutstandingSteers() bool {
 }
 
 func (w *worker) stopSteeredRoot() {
-	w.retireSteeredRoot("Steering was interrupted. The task outcome is uncertain and will not be replayed automatically.")
+	w.retireTaskRuntime("Steering was interrupted. The task outcome is uncertain and will not be replayed automatically.")
 }
 
-func (w *worker) retireSteeredRoot(notice string) {
+func (w *worker) retireTaskRuntime(notice string) {
 	if w.research.root {
 		w.retireResearch(notice)
 		return
@@ -330,8 +330,14 @@ func (w *worker) retireSteeredRoot(notice string) {
 	if w.ctx.Err() != nil || !w.settleOutstandingSteers() {
 		return
 	}
-	if w.active != 0 && !w.finishUncertain(notice) {
-		return
+	if w.taskActive() {
+		if !w.finishUncertain(notice) {
+			return
+		}
+	} else {
+		w.cancelHostRequests()
+		w.clearTaskConfirmations()
+		w.say(notice)
 	}
 	w.clearSteerFence()
 }

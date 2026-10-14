@@ -376,6 +376,7 @@ If `/new` or `/resume` is interrupted, use `/close` to clear the unfinished star
 Waiting tasks are cancelled at shutdown or after a crash, not restored. Check the conversation and workspace before deciding to resend a request.
 
 - `/close` keeps a session closed; `/stop` leaves the session available for later prompts.
+- Prompt submission failures/timeouts, unexpected OMP exits, output-budget overflow, and native dialog reply failures leave the saved session open. For an ordinary session, the next prompt or OMP control command resumes it; uncertain tasks are never replayed.
 - If the saved session file or workspace is unavailable, the bridge reports the failure instead of creating a replacement session. Use `/close`, then `/new` or `/resume` as appropriate.
 - `worker.idle_timeout` can release an unused OMP process while keeping its session available. The next prompt or OMP control command resumes the same session; a fresh session may remain connected until OMP has saved its history.
 - **Before deleting a Telegram topic, confirm `/autoresearch off` there if it owns a research reservation, then send `/close`.** `/close` does not release that reservation, and another conversation cannot take over its ownership. If the topic is already gone, `/bindings` from another conversation in the same chat can close and forget its idle binding only if it has no research reservation; it cannot release or transfer a reservation.

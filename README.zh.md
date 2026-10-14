@@ -376,6 +376,7 @@ omp --resume /path/to/session.jsonl
 等待中的任务会在停机或崩溃后取消, 不会恢复. 决定重发前先检查聊天和 workspace.
 
 - `/close` 后 session 保持关闭; `/stop` 不会关闭 session, 后续仍可发送 prompt.
+- Prompt 提交失败/超时, OMP 异常退出, 输出超限和原生对话框回执失败均不会关闭已保存的 session. 普通 session 的下一条 prompt 或 OMP 控制命令会恢复原会话; 不重放结果不确定的任务.
 - 已保存的 session 文件或 workspace 不可用时, bridge 会报告失败, 不创建替代 session. 请执行 `/close`, 再按需使用 `/new` 或 `/resume`.
 - `worker.idle_timeout` 可以释放空闲 OMP 进程, 保留 session 供后续使用. 下一条 prompt 或 OMP 控制命令会恢复同一个 session; 新 session 在 OMP 保存 history 前可能保持连接.
 - **删除 Telegram topic 前, 如果它持有研究占用, 先在该 topic 中确认 `/autoresearch off`, 再发送 `/close`.** `/close` 不会释放研究占用, 其他对话也不能接管其 owner 身份. 如果 topic 已经删除, 同一 chat 其他对话中的 `/bindings` 只能关闭并忘记没有研究占用的空闲 binding, 不能释放或转移研究占用.
