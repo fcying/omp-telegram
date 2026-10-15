@@ -219,13 +219,23 @@ OMP 18.3.2 是目前实测支持文字 steer 的最低版本, 能按 request ID 
 
 `handoff` 或 `compact` 请求出错时会关闭该 client, 只有 omp 明确拒绝时才继续复用; timeout、取消或结果无法确认都会让后续请求 lazy resume. `abort` 被明确拒绝时会保留 client; 结果无法确认时会关闭 client, 将 active task 以 `uncertain` 结算且不重放, 然后在新 runtime 上继续排队任务. `set_model`, `set_thinking_level` 和 `set_fast_mode` 仅在 RPC 明确拒绝时保留 client; 错误结果不确定或无法确认时, 会在排队 prompt 执行前关闭它. 原生 cycle-role 选择继续遵循 `SetModelRole` 的 fail-closed 行为. worker 在 RPC 进行中观察到 client 退出时, 会等待该 RPC 的结果再应用退出策略; 因此 model-role 失败只释放 runtime, 并保留供 lazy resume 使用的逻辑 binding. `host_tool_result` 写入失败时, bridge 将 active task 以 `uncertain` 结算并关闭该 client.
 
-没有 steer fence 时, Progress Stop 对活动任务发送普通 `abort` 并保留 bridge 队列; `/stop` 还会清空 bridge 队列. 有 steer fence 时, 普通 `abort` 无法保证清除 OMP 原生 steer 队列. 两种 Stop 都先使旧进程失效并立即终止进程组 (不等待关闭 stdin 后排空请求), 再将 root 和未决 steer 记为 `uncertain`; Progress Stop 保留 bridge follow-up, `/stop` 清空它们. 只有持久化结算后, 保留的 follow-up 才能在重新恢复的 runtime 执行. 强制终止无法撤销工具副作用, 也可能使 OMP session 无法恢复. `/queue` 只取消选中的 bridge pending task, 不管理原生 steer.
+没有 steer fence 时, Progress Stop 对活动任务发送普通 `abort` 并保留 bridge 队列; `/stop` 还会清空 bridge 队列. 成功的 abort 响应不能隔离原生异步续跑. 因此, worker 在释放排队工作前立即终止旧进程组, 不等待关闭 stdin 后排空请求, 保留逻辑 session 身份和 generation, 清除 session-operation 状态, 并将仍活动的 root 以 `cancelled` 结算. 响应前已经结算的 root 不会被改写. 后续工作在替代 runtime 上 lazy resume 原 session, 旧 runtime 不能消费新 prompt 或将迟到任务事件发布给它.
+
+普通文字在 `controlAbort` 等待期间进入 bridge 队列, 作为独立 root, 不进入原生 steer 队列. Stop 期间 discovery 从 unknown 变为 ready 时, 未识别的 `queuedSlashPending` 输入也遵循这一规则: catalog 回调将它转换为独立 queued prompt, 不会 steer 旧 root. 命令和按钮各自的队列策略只作用于发起 Stop 时已经等待的工作. 一旦实际发送 abort, 成功响应会退役该 client, 即使 root 的终态事件先到达也不例外.
+
+没有活动 bridge root 时, Stop 先在异步 RPC lane 中查询原生状态, 使用既有 idle-probe deadline. 只有确认 idle, settled 且未报告原生异步工作或原生排队消息时才保留 runtime, 不发送 `abort`, 不以 history 文件是否存在作判断. 有工作或状态无法确认时继续普通 abort 和退役流程; abort 明确拒绝时保持既有失败语义. History 文件存在不代表原生进程仍有工作.
+
+补充的真实 OMP 18.10.4 smoke 确认, 空闲 Stop 保留已保存 session 的同一 client. 在活动 Stop 期间使 discovery 失效, 并在应用 abort 响应前处理真实的 unknown-to-ready catalog 回调. 未识别 slash 保持 pending, 随后在替代 client 上以精确原 session 身份执行一次并获得独立确认回复. Provider 为本地确定性服务, Telegram 为模拟输入和交付, 未验证真实 Telegram 交互.
+
+真实 OMP 18.10.4 smoke 使用隔离的 profile/history/workspace, 模拟 Telegram 和本地确定性 provider. `/stop` 和 Progress Stop 控制均覆盖新消息在 abort 完成前及完成后到达的时序. 四种场景均保留精确 session binding, 观察到旧 client 退出, 并由替代 client 为新 root 生成一份确认回复, 不重放被停止的请求. 回归 fixture 还覆盖原生 aborted 终态后的继续运行, 并验证空闲未保存 session 不被丢弃. 未验证真实 Telegram 客户端交互.
+
+有 steer fence 时, 普通 `abort` 无法保证清除 OMP 原生 steer 队列. 两种 Stop 都先使旧进程失效并立即终止进程组 (不等待关闭 stdin 后排空请求), 再将 root 和未决 steer 记为 `uncertain`; Progress Stop 保留 bridge follow-up, `/stop` 清空它们. 只有持久化结算后, 保留的 follow-up 才能在重新恢复的 runtime 执行. 强制终止无法撤销工具副作用, 也可能使 OMP session 无法恢复. `/queue` 只取消选中的 bridge pending task, 不管理原生 steer.
 
 Workspace 准入限制新增工作, 不限制中断已有 runtime. 普通 abort 直接使用当前已连接的 client, 不执行 workspace 准入或 lazy restore, 因而阻止新增工作的 Git 拓扑或路径变化不会阻止 Stop. 它保留其他 topic 的 research lease; Progress Stop 保留的 bridge 任务仍须通过正常准入才能派发. 这不改变独立的 exact-owner 研究 disable 恢复路径.
 
 steered root 退役时清除旧 runtime 的 compaction/session-operation 状态, 不等待已终止进程的结束事件. 附件准备属于保留的逻辑 session 队列: 即使 client 已释放, generation 和 pending inbox ID 匹配的结果仍可生效. 已取消任务及旧 generation 的结果继续丢弃, 并清理对应临时文件.
 
-OMP RPC 当前无法在中止活动 run 的同时原子清除已 accepted 的 native steer/follow-up prompt, 并为每个被清除的请求返回关联的 terminal result. Bridge 不依赖该能力保证正确性: 上述 fail-closed 退役机制就是当前安全路径. 未来的原子 abort-and-clear RPC 必须阻止排队请求继续执行, 中止活动 run, 为被清除的 prompt 返回按 request ID 关联的 `prompt_result(status="aborted")`, 并确认队列为空且 session settled. 这项可选优化可用正常 cancellation 替代 runtime 退役, 保持进程可复用, 避免 lazy resume 开销及强制终止后的恢复风险; 单独清空队列并不足够.
+OMP 18.10.4 已提供 `abort_and_restore_queue`, 在 abort 前原子撤回原生排队的用户输入. 真实隔离 RPC smoke 确认, 该路径为排队 prompt 返回关联的 `aborted` 结果. 另一个单项 `remove_queued_message` smoke 返回 `removed:true`, 被移除文字未进入 provider 请求, 但对应的 accepted prompt 在活动 root 完成后却收到 `prompt_result(status="completed")`. 因此队列移除不能当作权威的逐 prompt 取消确认. 这两个命令也不替代上述迟到回调隔离要求. Bridge 继续采用 fail-closed runtime 退役; 未来的可复用取消路径需要为被移除 prompt 返回真实且按请求 ID 关联的终态, 并提供阻止旧工作影响后续任务的屏障.
 
 RPC v2 可能压缩大型终结 frame, 并省略已通过 `message_end` 发出的 message. Worker 缓存最后一条 assistant message 的 `stopReason` 和 `errorMessage`, 以及每一条 assistant `message_end` 的 finalized text; 终结 `agent_end` 自带的 assistant message 优先, 只有缺失 assistant message 时才使用缓存. 缓存在 `agent_start`, 终态完成和 shutdown 时清理. 缓存错误 metadata 用于分类结果; uncertain 回复只可能包含经过长度限制和脱敏的 `errorMessage` 摘要, 不会原样转发 metadata.
 
@@ -557,7 +567,7 @@ New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 bind
 | --- | --- |
 | 成功启动/恢复 | 发布原生身份, 删除意图并设置 `running=1` |
 | daemon 正常退出 | 保留已提交的恢复资格; 活动任务标记为已中断 |
-| `/stop` | 保留实例和恢复资格, 清空等待 prompt |
+| `/stop` | 保留 session 身份和恢复资格; 退役被停止的 runtime, 清空等待 prompt |
 | `/close` | 删除待完成意图, 保存 `running=0`, 再关闭实例 |
 | 故障后退役 runtime | 保留身份和恢复资格; 活动任务转为不确定, 不重放 |
 | 启动恢复 binding 时缺失原生 session 文件或 workspace | 保存 `running=0`, 记录 info 级跳过日志并提示使用 `/new`; 绝不创建替代 session |

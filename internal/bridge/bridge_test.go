@@ -598,13 +598,21 @@ func TestMain(m *testing.M) {
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies, "fixtureUIValue": uiValue}
 				resp["data"].(map[string]any)["isStreaming"] = streaming.Load()
 				resp["data"].(map[string]any)["isCompacting"] = false
+				resp["data"].(map[string]any)["isSettled"] = !streaming.Load()
+				resp["data"].(map[string]any)["hasPendingAsyncWork"] = false
+				resp["data"].(map[string]any)["queuedMessageCount"] = 0
 				if autoresearchFixture {
-					resp["data"].(map[string]any)["isSettled"] = !streaming.Load()
 					resp["data"].(map[string]any)["hasPendingAsyncWork"] = researchPending
-					resp["data"].(map[string]any)["queuedMessageCount"] = 0
 					if researchStateIncomplete {
 						delete(resp["data"].(map[string]any), "hasPendingAsyncWork")
 					}
+				}
+				switch os.Getenv("OMP_TELEGRAM_FIXTURE_ABORT_STATE") {
+				case "pending":
+					resp["data"].(map[string]any)["hasPendingAsyncWork"] = true
+					resp["data"].(map[string]any)["isSettled"] = false
+				case "unknown":
+					delete(resp["data"].(map[string]any), "isSettled")
 				}
 				if holdResearchControl("get_state") {
 					heldResearchControl = resp
@@ -689,7 +697,13 @@ func TestMain(m *testing.M) {
 				}
 				streaming.Store(false)
 				emit(resp)
-				emit(map[string]any{"type": "agent_end", "messages": []any{}})
+				if os.Getenv("OMP_TELEGRAM_FIXTURE_ABORT_CONTINUES") == "1" {
+					emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "stopReason": "aborted"}}})
+					streaming.Store(true)
+					emit(map[string]any{"type": "agent_start"})
+				} else {
+					emit(map[string]any{"type": "agent_end", "messages": []any{}})
+				}
 				continue
 			case "cycle_model":
 				os.Exit(2)
@@ -904,6 +918,11 @@ func TestMain(m *testing.M) {
 					continue
 				}
 				if streaming.Load() {
+					if os.Getenv("OMP_TELEGRAM_FIXTURE_ABORT_CONTINUES") == "1" {
+						resp["data"] = map[string]any{"agentInvoked": false}
+						emit(resp)
+						continue
+					}
 					os.Exit(2)
 				}
 				emit(resp)

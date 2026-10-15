@@ -472,6 +472,62 @@ func TestNativeCommandReceivedUpdateClassifiesBeforeQueryFinishes(t *testing.T) 
 	waitFixtureRPCTrace(t, trace, "prompt", "/native_local")
 }
 
+func TestPendingSlashDiscoveryDuringAbortRunsOnReplacementClient(t *testing.T) {
+	w, _, trace := nativeWorker(t, "hold")
+	nativeInput(t, w, 100, "wait", false)
+	nativeUntil(t, w, func() bool { return w.taskRunning() && !w.rpcOperationActive })
+	client, before := w.client, w.binding
+	root := waitFixtureRPCTrace(t, trace, "prompt", "wait")
+	w.stopActiveTask()
+	abort := waitOperation(t, w)
+	requireStoreOK(t, abort.err)
+	if w.controlOp != controlAbort || client.CommandCatalog().State != omp.CatalogUnknown {
+		t.Fatal("Stop did not remain pending with unknown command discovery")
+	}
+	nativeInput(t, w, 101, "/unknown", false)
+	if queueState(t, w, 101) != "pending" {
+		t.Fatal("slash input did not wait for command discovery")
+	}
+	nativeRPC(t, w, "fixture_catalog_update", map[string]any{"releaseQuery": true})
+	var discovery commandCatalogResult
+	select {
+	case discovery = <-w.nativeCatalog.results:
+	case <-time.After(3 * time.Second):
+		t.Fatal("command discovery did not return during Stop")
+	}
+	if client.CommandCatalog().State != omp.CatalogReady || w.controlOp != controlAbort || !w.taskActive() {
+		t.Fatal("command discovery did not become ready while the old root was stopping")
+	}
+	w.commandCatalogFinished(discovery)
+	if queueState(t, w, 101) != "pending" {
+		t.Fatal("command discovery submitted the new slash input as steering during Stop")
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS", "enabled")
+	w.operationReturned(abort)
+	w.dispatch()
+	nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" })
+	if w.client == nil || w.client == client || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("pending slash input did not resume the same session on a replacement client")
+	}
+	var replies int
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=101").Scan(&replies))
+	if replies != 1 {
+		t.Fatal("pending slash input did not receive its own final reply")
+	}
+	count := 0
+	for _, entry := range fixtureRPCTrace(trace) {
+		if entry.kind == "prompt" && entry.payload == "/unknown" {
+			count++
+			if entry.pid == root.pid {
+				t.Fatal("pending slash input ran on the stopped runtime")
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("pending slash input executed %d times, want once", count)
+	}
+}
+
 func TestDeferredAutoresearchGoalKeepsOwnershipBeforeFollowup(t *testing.T) {
 	w, _, trace := nativeWorker(t, "autoresearch-hold")
 	waitFixtureRPCTrace(t, trace, "catalog_waiting", "")

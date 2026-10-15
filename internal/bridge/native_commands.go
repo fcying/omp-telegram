@@ -374,7 +374,7 @@ func (w *worker) resolveSlashInputs() {
 			i++
 			continue
 		}
-		if w.taskActive() && w.activeInputKind != queuedNativeCommand {
+		if w.controlOp != controlAbort && w.taskActive() && w.activeInputKind != queuedNativeCommand {
 			in := incoming{id: q.id, msg: q.reply}
 			text := q.text
 			w.queue = append(w.queue[:i], w.queue[i+1:]...)

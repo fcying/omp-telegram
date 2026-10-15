@@ -579,8 +579,13 @@ func TestWorkspaceConflictDoesNotBlockOrdinaryAbort(t *testing.T) {
 			if queueState(t, w, 101) != wantQueueState || researchTraceCount(trace, "prompt", "queued before conflict") != 0 {
 				t.Fatal("stop lost its queue policy or submitted queued work into the conflict")
 			}
-			if w.client != client || !sameBindingIdentity(binding, w.binding) {
-				t.Fatal("abort replaced the existing runtime or logical session")
+			if !sameBindingIdentity(binding, w.binding) || !w.binding.Running {
+				t.Fatal("abort changed the logical session or its recovery eligibility")
+			}
+			select {
+			case <-client.Done():
+			default:
+				t.Fatal("workspace conflict prevented termination of the stopped runtime")
 			}
 			owned, err := w.b.db.ResearchWorkspaceOwned(other.workspaceOwner(other.sessionID))
 			requireStoreOK(t, err)

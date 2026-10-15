@@ -302,12 +302,156 @@ func TestAbortTimeoutRetiresRuntimeAndContinuesQueueOnFreshClient(t *testing.T) 
 	}
 }
 
+func TestSuccessfulAbortRetiresRuntimeBeforeFollowingPrompts(t *testing.T) {
+	for _, control := range []string{"command", "progress"} {
+		for _, timing := range []string{"before-completion", "after-completion"} {
+			t.Run(control+"/"+timing, func(t *testing.T) {
+				_, trace := fixtureRPCControlFiles(t, "")
+				t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_CONTINUES", "1")
+				w, _, command := setupWorkspaceWorker(t)
+				w.b.cfg.QueueCapacity = 4
+				command("/new " + t.TempDir())
+				before, client := w.binding, w.client
+				command("wait")
+				w.dispatch()
+				root := waitOperation(t, w)
+				requireStoreOK(t, root.err)
+				w.operationReturned(root)
+				command("/followup queued before stop")
+				if control == "command" {
+					w.stop()
+				} else {
+					w.stopActiveTask()
+				}
+				if timing == "after-completion" {
+					nativeUntil(t, w, func() bool { return queueState(t, w, 2) != "submitted" && !w.controlInProgress() })
+				}
+				acceptWorkerInput(t, w, 100, "fresh message after stop")
+				w.dispatch()
+				nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" || queueState(t, w, 100) == "uncertain" })
+				if queueState(t, w, 100) != "done" {
+					t.Fatalf("message after Stop state = %s, want done", queueState(t, w, 100))
+				}
+				var replies int
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=100 AND text=?", "answer: fresh message after stop").Scan(&replies))
+				if replies != 1 || queueState(t, w, 2) != "cancelled" {
+					t.Fatal("Stop consumed the fresh message as steering or failed to cancel the old root")
+				}
+				if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {
+					t.Fatal("message after Stop did not resume the same session on a fresh runtime")
+				}
+				select {
+				case <-client.Done():
+				default:
+					t.Fatal("old runtime was still alive after the new task completed")
+				}
+				wantQueued := "cancelled"
+				if control == "progress" {
+					wantQueued = "done"
+				}
+				if queueState(t, w, 3) != wantQueued {
+					t.Fatal("Stop changed its existing bridge queue policy")
+				}
+				if researchTraceCount(trace, "prompt", "wait") != 1 || researchTraceCount(trace, "prompt", "fresh message after stop") != 1 {
+					t.Fatal("Stop replayed work or did not submit the fresh message exactly once")
+				}
+			})
+		}
+	}
+}
+
+func TestIdleAbortPreservesUnsavedSession(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	before, client := w.binding, w.client
+	requireStoreOK(t, os.Remove(before.Session))
+	command("/stop")
+	if w.client != client || !sameBindingIdentity(w.binding, before) || w.controlInProgress() {
+		t.Fatal("idle Stop discarded the only copy of an unsaved native session")
+	}
+}
+
+func TestIdleAbortUsesNativeWorkStateInsteadOfSavedHistory(t *testing.T) {
+	for _, state := range []string{"idle", "pending", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_STATE", state)
+			w, _, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 1
+			command("/new " + t.TempDir())
+			client, before := w.client, w.binding
+			if !w.sessionDurable() {
+				t.Fatal("fixture did not create saved native history")
+			}
+			command("/stop")
+			if !w.binding.Running || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("idle Stop changed the saved session identity")
+			}
+			if state == "idle" {
+				if w.client != client {
+					t.Fatal("idle Stop restarted a quiescent saved session")
+				}
+			} else {
+				assertRetiredOperationClient(t, w, client, before)
+			}
+			t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_STATE", "idle")
+			command("after idle stop")
+			w.dispatch()
+			nativeUntil(t, w, func() bool { return queueState(t, w, 3) == "done" })
+			if !sameBindingIdentity(w.binding, before) {
+				t.Fatal("next prompt did not retain the idle session")
+			}
+		})
+	}
+}
+
+func TestAbortRetiresUnsavedRootAfterEarlyTerminal(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_CONTINUES", "1")
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 1
+	command("/new " + t.TempDir())
+	before, client := w.binding, w.client
+	command("wait")
+	w.dispatch()
+	root := waitOperation(t, w)
+	requireStoreOK(t, root.err)
+	w.operationReturned(root)
+	requireStoreOK(t, os.Remove(before.Session))
+	w.stopActiveTask()
+	abort := waitOperation(t, w)
+	requireStoreOK(t, abort.err)
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for w.taskActive() {
+		select {
+		case raw := <-client.Events():
+			w.event(raw)
+		case <-timer.C:
+			t.Fatal("native abort did not settle the root before its queued callback")
+		}
+	}
+	w.operationReturned(abort)
+	if w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("early terminal bypassed retirement of an active unsaved session")
+	}
+	select {
+	case <-client.Done():
+	default:
+		t.Fatal("stopped runtime remained alive after the early terminal")
+	}
+}
+
 func TestRejectedAbortKeepsRuntime(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_HOLD_RPC", "")
 	t.Setenv("OMP_TELEGRAM_FIXTURE_REJECT_RPC", "abort")
 	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 1
 	command("/new " + t.TempDir())
 	client := w.client
+	command("wait")
+	w.dispatch()
+	root := waitOperation(t, w)
+	requireStoreOK(t, root.err)
+	w.operationReturned(root)
 	command("/stop")
 	if w.client != client || w.runtime != runtimeConnected || w.controlInProgress() {
 		t.Fatal("explicit abort rejection invalidated the reusable runtime")

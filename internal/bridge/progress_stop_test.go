@@ -285,16 +285,15 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 		t.Fatal("progress Stop did not request one abort")
 	}
 
-	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted","errorMessage":"Request was aborted"}]}`))
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "cancelled" {
 		t.Fatalf("stopped root state = %q, error %v; want cancelled", state, err)
 	}
 	w.dispatch()
-	if w.active != 3 || !w.busy || len(w.queue) != 0 {
-		t.Fatalf("queued task did not continue after Stop: active=%d busy=%t queue=%d", w.active, w.busy, len(w.queue))
-	}
-	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "submitted" {
-		t.Fatalf("continued root state = %q, error %v; want submitted", state, err)
+	nativeUntil(t, w, func() bool { return queueState(t, w, 3) == "done" })
+	var replies int
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=3 AND text=?", "answer: queued").Scan(&replies))
+	if replies != 1 {
+		t.Fatal("queued task did not produce its own confirmed reply after Stop")
 	}
 }
 
