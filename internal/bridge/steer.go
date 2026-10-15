@@ -38,7 +38,7 @@ func (w *worker) pendingInputFull() bool {
 }
 
 func (w *worker) routePrompt(in incoming, text string) {
-	if w.taskActive() && w.activeInputKind != queuedNativeCommand && w.runtime == runtimeConnected && w.client != nil {
+	if w.controlOp != controlAbort && w.taskActive() && w.activeInputKind != queuedNativeCommand && w.runtime == runtimeConnected && w.client != nil {
 		w.steer(in, text)
 		return
 	}

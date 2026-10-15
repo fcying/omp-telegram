@@ -1312,7 +1312,7 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.runtimeStopped()
 	if client != nil {
 		clientID := client.ID()
-		if w.steerFence.active || w.research.root || w.research.disablePending {
+		if w.steerFence.active || w.research.root || w.research.disablePending || w.controlOp == controlAbort {
 			if err := client.TerminateNow(); err != nil {
 				w.b.fail(err)
 				w.cancel()
@@ -1756,9 +1756,17 @@ func (w *worker) operationFinished(result operationResult) {
 			w.endControlOperation()
 			w.say("The abort request failed.")
 		} else {
-			w.endControlOperation()
-			w.touchBinding()
-			w.say(result.message)
+			w.completeAbort(true, result.message)
+		}
+	case "abort_state":
+		idle, settled, pending := rpcIdleState(result.data)
+		if result.err == nil && !result.cancelled && idle && settled && !pending && !w.taskActive() {
+			w.completeAbort(false, "No active task. Queued prompts cleared.")
+		} else {
+			client := w.client
+			w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
+				return client.Call(ctx, "abort", nil)
+			}, 0, result.message)
 		}
 	case "status":
 		w.endControlOperation()
@@ -2022,9 +2030,38 @@ func (w *worker) requestAbort(notice string) {
 		return
 	}
 	w.beginControlOperation(controlAbort)
+	if !w.taskActive() {
+		w.startOperation("abort_state", client, func(ctx context.Context) (json.RawMessage, error) {
+			probeCtx, cancel := context.WithTimeout(ctx, idleProbeTimeout)
+			defer cancel()
+			return client.Call(probeCtx, "get_state", nil)
+		}, 0, notice)
+		return
+	}
 	w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "abort", nil)
 	}, 0, notice)
+}
+
+func (w *worker) completeAbort(retire bool, notice string) {
+	if retire {
+		// Abort acknowledgements do not fence native asynchronous continuations.
+		w.releaseRuntimeWithReason(true, "explicit")
+		w.completeSessionOperation()
+	}
+	w.endControlOperation()
+	if retire {
+		if w.taskActive() {
+			if !w.finishCancelled("Task was cancelled before completion.") {
+				return
+			}
+		} else {
+			w.cancelHostRequests()
+			w.clearTaskConfirmations()
+		}
+	}
+	w.touchBinding()
+	w.say(notice)
 }
 
 func (w *worker) startOperation(kind string, client *omp.Client, call func(context.Context) (json.RawMessage, error), active int64, message string, metadata ...any) {
