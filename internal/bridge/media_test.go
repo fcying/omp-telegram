@@ -647,7 +647,7 @@ func TestSuppressedAlbumsExpireOnWorkerTick(t *testing.T) {
 	w.initAlbums()
 	key := albumKey{group: "expired", user: 7}
 	w.albumSuppressed[key] = time.Now().Add(-time.Second)
-	w.expire()
+	w.expire(time.Now())
 	if _, ok := w.albumSuppressed[key]; ok {
 		t.Fatal("expired album suppression remained after worker tick")
 	}

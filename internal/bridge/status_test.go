@@ -109,7 +109,11 @@ func TestStatusHomeAbbreviationRespectsDirectoryBoundaries(t *testing.T) {
 func TestStatusCommandPublishesDetailedReply(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
+	client := w.client
 	command("/status")
+	if w.client != client || len(w.b.slots) != 1 {
+		t.Fatal("status released an already-connected runtime")
+	}
 	var text string
 	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
 		t.Fatal(err)
@@ -120,5 +124,16 @@ func TestStatusCommandPublishesDetailedReply(t *testing.T) {
 	}
 	if strings.Contains(text, "SECRET") || strings.Contains(text, "PRIVATE") {
 		t.Fatal("status command leaked native secrets")
+	}
+}
+
+func TestClosedStatusDoesNotRestartRuntime(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	command("/close")
+	before := w.binding
+	command("/status")
+	if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 || w.binding != before {
+		t.Fatal("status restarted or changed a closed session")
 	}
 }

@@ -325,6 +325,12 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 
 Voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
 
+Native plugin confirmation and selection buttons have no independent bridge-imposed expiry. OMP manages any dialog deadline specified by the plugin. This does not remove RPC submission deadlines.
+
+The bridge still waits up to 30 seconds for OMP to acknowledge a submission. If a native dialog, such as a `/review` picker, blocks that acknowledgment, it can time out while waiting for your choice: the runtime is retired, its buttons are invalidated, and the task becomes `uncertain` without automatic replay. This deadline does not limit the execution time of an already accepted model task.
+
+Waiting keeps the OMP process and a worker slot occupied and prevents idle release. Cancel the dialog or use `/stop` or `/close` to end the wait; automatic approval is never enabled. Closing or retiring the runtime clears its pending native dialogs and frees its process slot; old buttons cannot approve work on a replacement process. Telegram keyboard removal is best-effort, but the old actions are invalidated immediately.
+
 Very large replies may be truncated with an explicit notice. OMP's native session history is not truncated by the bridge.
 
 ## Progress UI
@@ -381,6 +387,8 @@ Waiting tasks are cancelled at shutdown or after a crash, not restored. Check th
 - Prompt submission failures/timeouts, unexpected OMP exits, output-budget overflow, and native dialog reply failures leave the saved session open. For an ordinary session, the next prompt or OMP control command resumes it; uncertain tasks are never replayed.
 - If the saved session file or workspace is unavailable, the bridge reports the failure instead of creating a replacement session. Use `/close`, then `/new` or `/resume` as appropriate.
 - `worker.idle_timeout` can release an unused OMP process while keeping its session available. The next prompt or OMP control command resumes the same session; a fresh session may remain connected until OMP has saved its history.
+- `/status` temporarily reconnects an available released session to read its model, context, and other status values, then releases the process when it is safe. Pending startup dialogs, new work received during the query, or unsettled native activity keep it connected. Startup metadata may briefly delay release while it is consumed.
+- If another conversation owns the same saved session, `/status` reports the conflict and directs you to query there. It does not reopen the old session or take over ownership, even if the owner's process has been idle-released.
 - **Before deleting a Telegram topic, confirm `/autoresearch off` there if it owns a research reservation, then send `/close`.** `/close` does not release that reservation, and another conversation cannot take over its ownership. If the topic is already gone, `/bindings` from another conversation in the same chat can close and forget its idle binding only if it has no research reservation; it cannot release or transfer a reservation.
 
 Each conversation has its own session, but sessions that use the same workspace share files. Separate conversations are not filesystem or credential sandboxes.

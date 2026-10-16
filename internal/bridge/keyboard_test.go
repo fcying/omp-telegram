@@ -234,6 +234,70 @@ func TestExpiredKeyboardCleanupDoesNotBlockWorker(t *testing.T) {
 	}
 }
 
+func TestNativeUIDialogSurvivesBridgeMenuExpiry(t *testing.T) {
+	for _, method := range []string{"confirm", "select"} {
+		t.Run(method, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			w.owner = 7
+			before, client := w.binding, w.client
+			options := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+			w.ui(rpcEvent{ID: "waiting-native-dialog", Method: method, Title: "Permission required", Options: options})
+			_, rows := pickerView(t, f)
+			data := rows[0][0]["callback_data"].(string)
+			token, _, _ := strings.Cut(data, ":")
+			messageID := int64(f.messageCount())
+			command("/new")
+			bridgeData := resumeButtons(t, f)[0]["callback_data"].(string)
+			bridgeToken, _, _ := strings.Cut(bridgeData, ":")
+			now := time.Now().Add(3 * time.Minute)
+			w.expire(now)
+			if _, ok := w.confirms[token]; !ok {
+				t.Fatal("bridge menu expiry removed a pending native dialog")
+			}
+			if _, ok := w.confirms[bridgeToken]; ok {
+				t.Fatal("bridge-owned confirmation no longer expires")
+			}
+			readReplies := func() (int, string) {
+				t.Helper()
+				raw, err := w.call("get_state", nil)
+				var state struct {
+					Replies int    `json:"fixtureUIReplies"`
+					Value   string `json:"fixtureUIValue"`
+				}
+				if err != nil || json.Unmarshal(raw, &state) != nil {
+					t.Fatalf("native UI state unavailable: %v", err)
+				}
+				return state.Replies, state.Value
+			}
+			if replies, _ := readReplies(); replies != 0 {
+				t.Fatal("bridge answered a native dialog without a user decision")
+			}
+			clickKeyboard(w, 7, bridgeData)
+			if w.client != client || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("expired bridge confirmation replaced the session")
+			}
+			expectedValue := ""
+			if method == "select" {
+				next := rows[uiSelectPageSize][0]["callback_data"].(string)
+				w.callback(&telegram.CallbackQuery{ID: "next-native-page", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: next})
+				_, rows = pickerView(t, f)
+				data = rows[0][0]["callback_data"].(string)
+				token, _, _ = strings.Cut(data, ":")
+				w.expire(now.Add(3 * time.Minute))
+				if _, ok := w.confirms[token]; !ok {
+					t.Fatal("pagination added a bridge deadline to the native dialog")
+				}
+				expectedValue = options[8]
+			}
+			w.callback(&telegram.CallbackQuery{ID: "delayed-native-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+			if replies, value := readReplies(); replies != 1 || value != expectedValue {
+				t.Fatalf("delayed native choice: replies=%d value=%q", replies, value)
+			}
+		})
+	}
+}
+
 func TestNativeUISelectionShowsSinglePageWithoutNavigation(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
@@ -594,30 +658,35 @@ func TestResumePickerCloseClearsKeyboard(t *testing.T) {
 }
 
 func TestNativeUICancelClearsOnlyItsKeyboardWithoutEcho(t *testing.T) {
-	w, f, command := setupWorkspaceWorker(t)
-	command("/new " + t.TempDir())
-	w.owner = 7
-	w.event([]byte(`{"type":"extension_ui_request","id":"native-select","method":"select","title":"Choose","options":["First","Second"]}`))
-	data := resumeButtons(t, f)[0]["callback_data"].(string)
-	messageID := f.messageCount()
-	command("/model")
-	modelData := resumeButtons(t, f)[0]["callback_data"].(string)
-	modelToken, _, _ := strings.Cut(modelData, ":")
-	w.event([]byte(`{"type":"extension_ui_request","method":"cancel","targetId":"native-select"}`))
-	waitKeyboardClears(t, f, messageID)
-	clickKeyboard(w, 7, data)
-	w.event([]byte(`{"type":"extension_ui_request","method":"cancel","targetId":""}`))
-	if _, exists := w.confirms[modelToken]; !exists {
-		t.Fatal("native UI cancellation invalidated an unrelated model picker")
+	for _, method := range []string{"confirm", "select"} {
+		t.Run(method, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			w.owner = 7
+			w.ui(rpcEvent{ID: "native-dialog", Method: method, Title: "Choose", Options: []string{"First", "Second"}})
+			data := resumeButtons(t, f)[0]["callback_data"].(string)
+			messageID := f.messageCount()
+			w.expire(time.Now().Add(3 * time.Minute))
+			command("/model")
+			modelData := resumeButtons(t, f)[0]["callback_data"].(string)
+			modelToken, _, _ := strings.Cut(modelData, ":")
+			w.event([]byte(`{"type":"extension_ui_request","method":"cancel","targetId":"native-dialog"}`))
+			waitKeyboardClears(t, f, messageID)
+			clickKeyboard(w, 7, data)
+			w.event([]byte(`{"type":"extension_ui_request","method":"cancel","targetId":""}`))
+			if _, exists := w.confirms[modelToken]; !exists {
+				t.Fatal("native UI cancellation invalidated an unrelated model picker")
+			}
+			raw, err := w.call("get_state", nil)
+			var state struct {
+				Replies int `json:"fixtureUIReplies"`
+			}
+			if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 0 {
+				t.Fatalf("native cancellation was echoed back as a UI response: %+v, %v", state, err)
+			}
+			assertKeyboardClears(t, f, messageID)
+		})
 	}
-	raw, err := w.call("get_state", nil)
-	var state struct {
-		Replies int `json:"fixtureUIReplies"`
-	}
-	if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 0 {
-		t.Fatalf("native cancellation was echoed back as a UI response: %+v, %v", state, err)
-	}
-	assertKeyboardClears(t, f, messageID)
 }
 
 func TestModelPickerInvalidationClearsKeyboard(t *testing.T) {

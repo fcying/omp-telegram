@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestResumeNativeIDRestoresDirectoryAcrossTopics(t *testing.T) {
@@ -25,6 +27,29 @@ func TestResumeNativeIDRestoresDirectoryAcrossTopics(t *testing.T) {
 	second.start(true, id, "", false)
 	if second.client == nil || second.binding.Session != original.Session || second.binding.Workspace != original.Workspace || second.sessionID != id {
 		t.Fatal("ID resume did not restore original native session and cwd")
+	}
+	closed := first.binding
+	for _, released := range []bool{false, true} {
+		if released {
+			second.b.cfg.IdleTimeout = time.Minute
+			second.lastActivity = time.Now().Add(-2 * time.Minute)
+			second.releaseIdleRuntime(time.Now())
+			if second.client != nil {
+				t.Fatal("second topic runtime did not release")
+			}
+		}
+		client, binding, slots := second.client, second.binding, len(first.b.slots)
+		command("/status")
+		var text string
+		if err := first.b.db.DB.QueryRow("SELECT text FROM outbox WHERE thread=? ORDER BY id DESC LIMIT 1", first.key.thread).Scan(&text); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(text, "another conversation") || !strings.Contains(text, "/status") {
+			t.Fatalf("status did not explain the other topic's ownership (released=%t): %q", released, text)
+		}
+		if first.client != nil || first.binding != closed || second.client != client || second.binding != binding || len(first.b.slots) != slots {
+			t.Fatal("status restarted the old topic or changed the owning topic")
+		}
 	}
 	first.start(true, id, "", false)
 	if first.client != nil {

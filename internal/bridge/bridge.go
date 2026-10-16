@@ -262,6 +262,7 @@ type worker struct {
 	albumSuppressed        map[albumKey]time.Time
 	background             sync.WaitGroup
 	controlOp              controlOperation
+	statusReleaseClientID  uint64
 	sessionOp              sessionOperation
 	lastActivity           time.Time
 	lastLogicalActivity    time.Time
@@ -1247,7 +1248,7 @@ func (w *worker) sessionDurable() bool {
 }
 
 func (w *worker) releaseIdleRuntime(now time.Time) {
-	if w.b.cfg.IdleTimeout <= 0 || !w.canReleaseRuntime() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout || !w.sessionDurable() {
+	if w.statusReleaseClientID != 0 || w.b.cfg.IdleTimeout <= 0 || !w.canReleaseRuntime() || w.lastActivity.IsZero() || now.Sub(w.lastActivity) < w.b.cfg.IdleTimeout || !w.sessionDurable() {
 		return
 	}
 	w.releaseRuntimeWithReason(true, "idle")
@@ -1281,8 +1282,14 @@ func (w *worker) runtimeStarted(client *omp.Client) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.statusReleaseClientID = 0
 	w.research.known, w.research.enabled = false, false
 	w.clearCommandCatalog()
+	for token, c := range w.confirms {
+		if c.action == "ui" {
+			w.dropConfirmation(token, c)
+		}
+	}
 	w.client = nil
 	w.runtime = runtimeReleased
 }
@@ -1441,7 +1448,7 @@ func (w *worker) run() {
 		w.expireStartIntent(now)
 		w.typing()
 		w.flushPreview()
-		w.expire()
+		w.expire(now)
 		w.probeStuckTask(now)
 		w.steeredTick(now)
 		w.researchControlTick(now)
@@ -1449,6 +1456,7 @@ func (w *worker) run() {
 		return w.evictIfIdle(now)
 	}
 	for {
+		w.finishPendingStatusRelease()
 		var events <-chan json.RawMessage
 		var done <-chan struct{}
 		if client, ok := w.runtimeClient(); ok && w.rpcExitPendingClientID != client.ID() {
@@ -1760,7 +1768,14 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 	case "abort_state":
 		idle, settled, pending := rpcIdleState(result.data)
-		if result.err == nil && !result.cancelled && idle && settled && !pending && !w.taskActive() {
+		for _, c := range w.confirms {
+			if c.action == "ui" {
+				pending = true
+				break
+			}
+		}
+		pending = pending || len(w.hostRequests) != 0 || w.client.BufferedOutput()
+		if result.err == nil && !result.cancelled && idle && settled && !pending && !w.taskActive() && !w.taskOrSessionBusy() && !w.compacting {
 			w.completeAbort(false, "No active task. Queued prompts cleared.")
 		} else {
 			client := w.client
@@ -1770,7 +1785,9 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 	case "status":
 		w.endControlOperation()
-		if mode, ok := result.meta.(*statusModeResult); ok && mode != nil {
+		var state statusState
+		valid := result.err == nil && !result.cancelled && json.Unmarshal(result.data, &state) == nil
+		if mode, ok := result.meta.(*statusModeResult); ok && mode != nil && mode.sessionID != "" {
 			catalog := w.client.CommandCatalog()
 			if mode.epoch == catalog.Epoch && mode.sessionID == catalog.SessionID {
 				if mode.known && mode.enabled {
@@ -1781,6 +1798,7 @@ func (w *worker) operationFinished(result operationResult) {
 							w.resumeFailed = true
 							w.say("Autoresearch workspace admission failed: " + err.Error())
 						}
+						w.releaseStatusRuntime(result, valid)
 						return
 					}
 				}
@@ -1790,17 +1808,15 @@ func (w *worker) operationFinished(result operationResult) {
 				}
 			}
 		}
-		if result.err != nil {
+		if !valid {
+			w.releaseStatusRuntime(result, false)
 			w.say("Failed to read the session state.")
 			return
 		}
-		var state statusState
-		if json.Unmarshal(result.data, &state) != nil {
-			w.say("Failed to read the session state.")
-			return
-		}
+		research := w.researchStatus()
+		w.releaseStatusRuntime(result, true)
 		home, _ := os.UserHomeDir()
-		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity)) + w.researchStatus())
+		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity), w.runtime == runtimeConnected) + research)
 	case "name":
 		w.endControlOperation()
 		if result.err != nil {
@@ -2065,6 +2081,7 @@ func (w *worker) completeAbort(retire bool, notice string) {
 }
 
 func (w *worker) startOperation(kind string, client *omp.Client, call func(context.Context) (json.RawMessage, error), active int64, message string, metadata ...any) {
+	w.statusReleaseClientID = 0
 	if kind == "steer" {
 		w.invalidateResearchSettlement()
 	}
@@ -2522,6 +2539,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	return ""
 }
 func (w *worker) handle(in incoming) {
+	w.statusReleaseClientID = 0
 	w.touchLogicalActivity()
 	if in.callback != nil {
 		if !w.mark(in.id, "submitted") {
@@ -2749,32 +2767,40 @@ func (w *worker) handoff(instructions string) {
 	w.say("Handoff requested.")
 }
 func (w *worker) status() {
-	home, _ := os.UserHomeDir()
-	if w.runtime == runtimeReleased && w.binding.Running {
-		idle := time.Duration(-1)
-		if !w.lastActivity.IsZero() {
-			idle = time.Since(w.lastActivity)
-		}
-		w.say(formatReleasedStatus(w.binding.Workspace, w.sessionID, home, len(w.queue), idle) + w.researchStatus())
-		return
-	}
-	client, connected := w.runtimeClient()
-	if !connected {
-		n, _ := w.b.db.Uncertain()
-		w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
-		return
-	}
 	if w.controlInProgress() {
 		w.say("The session operation is still loading.")
 		return
 	}
+	w.b.sessionMu.Lock()
+	occupied := w.binding.SessionID != "" && w.b.sessionMatchesLocked(w, w.binding.SessionID)
+	w.b.sessionMu.Unlock()
+	if occupied {
+		w.say("This saved session is in use by another conversation. Run /status there, or /close that instance before using /resume here.")
+		return
+	}
+	temporary := w.runtime == runtimeReleased && w.binding.Running
+	client, connected := w.runtimeClient()
+	if !connected {
+		if !temporary {
+			n, _ := w.b.db.Uncertain()
+			w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
+			return
+		}
+		var err error
+		client, err = w.ensureRuntime()
+		if err != nil {
+			w.say(err.Error())
+			return
+		}
+	}
 	var mode *statusModeResult
-	if w.researchAvailable(client) {
-		mode = &statusModeResult{}
+	queryResearch := w.researchAvailable(client)
+	if queryResearch || temporary {
+		mode = &statusModeResult{temporary: temporary}
 	}
 	w.beginControlOperation(controlStatus)
 	w.startOperation("status", client, func(ctx context.Context) (json.RawMessage, error) {
-		if mode != nil {
+		if queryResearch {
 			catalog := client.CommandCatalog()
 			mode.epoch, mode.sessionID = catalog.Epoch, catalog.SessionID
 			modeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -2784,6 +2810,10 @@ func (w *worker) status() {
 		}
 		return client.Call(ctx, "get_state", nil)
 	}, 0, "", mode)
+	if temporary {
+		// Arm before the actor can consume events; the result must not rearm it.
+		w.statusReleaseClientID = client.ID()
+	}
 }
 
 // promptInlineCount reserves the longest possible uint64 request ID before dispatch.
@@ -3381,7 +3411,23 @@ func (w *worker) event(raw []byte) {
 	w.touchActivity()
 	var e rpcEvent
 	if json.Unmarshal(raw, &e) != nil {
+		w.statusReleaseClientID = 0
 		return
+	}
+	if w.statusReleaseClientID != 0 {
+		switch e.Type {
+		case "available_commands_update", "session_info_update", "advisor_cost_changed":
+		case "extension_ui_request":
+			// Startup widget updates do not wait for a native UI response.
+			if e.Method != "setWidget" {
+				w.statusReleaseClientID = 0
+			}
+		default:
+			w.statusReleaseClientID = 0
+		}
+		if w.statusReleaseClientID != 0 && (w.client == nil || w.client.CommandCatalog().SessionID != w.binding.SessionID) {
+			w.statusReleaseClientID = 0
+		}
 	}
 	w.logLifecycle(e)
 	if w.researchControlEvent(e) {
@@ -4020,7 +4066,9 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 		return
 	}
 	token := hex.EncodeToString(data[:])
-	c.expires = time.Now().Add(2 * time.Minute)
+	if c.action != "ui" {
+		c.expires = time.Now().Add(2 * time.Minute)
+	}
 	c.generation = w.binding.Generation
 	if c.action == "binding_delete" {
 		c.generation = w.conversationGeneration()
@@ -4460,7 +4508,6 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 		return false
 	}
 	c.page, c.messageID = page, messageID
-	c.expires = time.Now().Add(2 * time.Minute)
 	w.confirms[token] = c
 	w.touchActivity()
 	return true
@@ -4511,8 +4558,8 @@ func (w *worker) cancelUI(c confirmation) {
 	}
 }
 
-// Programmatic invalidation removes the Telegram token first. Expiry and
-// explicit runtime teardown may then cancel a current-generation native UI.
+// Programmatic invalidation removes the Telegram token first. Explicit runtime
+// teardown may then cancel a current-generation native UI.
 func (w *worker) dropConfirmation(token string, c confirmation) {
 	delete(w.confirms, token)
 	if w.previewStopToken == token {
@@ -4548,8 +4595,7 @@ func (w *worker) clearRuntimeConfirmations() {
 	}
 }
 
-func (w *worker) expire() {
-	now := time.Now()
+func (w *worker) expire(now time.Time) {
 	for token, c := range w.confirms {
 		if !c.expires.IsZero() && now.After(c.expires) {
 			w.dropConfirmation(token, c)

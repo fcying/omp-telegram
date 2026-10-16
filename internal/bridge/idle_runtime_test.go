@@ -2,12 +2,14 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"omp-telegram/internal/store"
+	"omp-telegram/internal/telegram"
 )
 
 func releasedIdleWorker(t *testing.T) (*worker, *fakeHTTP, func(string), store.Binding) {
@@ -111,42 +113,293 @@ func TestIdleReleaseAfterSessionFileAppears(t *testing.T) {
 	}
 }
 
-func TestIdleReleasePreservesLogicalSessionAndStatusDoesNotWake(t *testing.T) {
-	w, _, command, before := releasedIdleWorker(t)
-	command("/status")
-	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) {
-		t.Fatal("released status woke or changed the logical session")
-	}
-	out, err := w.b.db.NextOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.Text, "OMP: released") || !strings.Contains(out.Text, "Model: unavailable while released") || !strings.Contains(out.Text, "Context: unavailable while released") {
-		t.Fatalf("released status = %q", out.Text)
-	}
-	for _, forbidden := range []string{"Running:", "Compacting:", "Speed:", "Thinking:", "Fast:"} {
-		if strings.Contains(out.Text, forbidden) {
-			t.Fatalf("released status leaked live metric %q: %q", forbidden, out.Text)
+func drainStatusOutput(t *testing.T, w *worker) {
+	t.Helper()
+	nativeRPC(t, w, "get_state", nil)
+	client := w.client
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for client.BufferedOutput() {
+		select {
+		case raw, open := <-client.Events():
+			if !open {
+				t.Fatal("native event stream closed while preparing an idle status query")
+			}
+			w.event(raw)
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("native status output did not drain")
 		}
 	}
 }
 
-func TestReleasedStatusShowsRunningBindingWithoutActivity(t *testing.T) {
-	w, _, command, before := releasedIdleWorker(t)
-	w.lastActivity = time.Time{}
-	command("/status")
-	if w.client != nil || w.runtime != runtimeReleased || !sameBindingIdentity(w.binding, before) {
-		t.Fatal("released status woke or changed the logical session")
+func TestReleasedStatusQueriesSavedSessionAndReleasesRuntime(t *testing.T) {
+	w, _, _, before := releasedIdleWorker(t)
+	w.status()
+	client := w.client
+	if client == nil || !w.controlInProgress() {
+		t.Fatal("released status did not start a temporary runtime query")
+	}
+	w.finishPendingStatusRelease()
+	result := waitOperation(t, w)
+	requireStoreOK(t, result.err)
+	drainStatusOutput(t, w)
+	w.operationReturned(result)
+	if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("status retained its temporary process or changed the logical session")
+	}
+	select {
+	case <-client.Done():
+	default:
+		t.Fatal("temporary status process remained alive")
 	}
 	out, err := w.b.db.NextOutput()
-	if err != nil {
-		t.Fatal(err)
+	requireStoreOK(t, err)
+	fields := statusFields(out.Text)
+	if fields["Model"] != "fixture/safe" || fields["Thinking"] != "medium" || fields["OMP"] != "released" {
+		t.Fatalf("status did not publish the native snapshot and final runtime state: %v", fields)
 	}
-	if !strings.Contains(out.Text, "OMP: released") || !strings.Contains(out.Text, "Idle: n/a") {
-		t.Fatalf("released status without activity = %q", out.Text)
+	var native struct {
+		Prompts int `json:"fixtureRootPrompts"`
 	}
-	if strings.Contains(out.Text, "No instance is running") {
-		t.Fatalf("released running binding was reported as absent: %q", out.Text)
+	if json.Unmarshal(result.data, &native) != nil || native.Prompts != 0 {
+		t.Fatal("status submitted or replayed model work")
+	}
+	if strings.Contains(out.Text, "SECRET") || strings.Contains(out.Text, "PRIVATE") {
+		t.Fatal("temporary status leaked non-whitelisted state")
+	}
+}
+
+func TestReleasedStatusPreservesRuntimeForIncomingPrompt(t *testing.T) {
+	w, _, _, before := releasedIdleWorker(t)
+	w.status()
+	client := w.client
+	if client == nil {
+		t.Fatal("status did not restore the saved session")
+	}
+	result := waitOperation(t, w)
+	requireStoreOK(t, result.err)
+	nativeInput(t, w, 100, "work received during status", false)
+	w.operationReturned(result)
+	if w.client != client || len(w.queue) != 1 || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("status discarded incoming work or its runtime")
+	}
+	w.dispatch()
+	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
+	if !strings.Contains(nativeOutputs(t, w), "answer: work received during status") || w.client != client {
+		t.Fatal("incoming prompt did not complete on the retained runtime")
+	}
+}
+
+func TestReleasedStatusRetainsUnsettledOrUnknownRuntime(t *testing.T) {
+	for _, state := range []string{"pending", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			w, _, command, before := releasedIdleWorker(t)
+			t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_STATE", state)
+			command("/status")
+			if w.client == nil || w.runtime != runtimeConnected || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("status discarded native work or unconfirmed settlement")
+			}
+		})
+	}
+}
+
+func TestReleasedStatusQueryFailureReleasesTemporaryRuntime(t *testing.T) {
+	w, _, _, before := releasedIdleWorker(t)
+	w.status()
+	client := w.client
+	if client == nil {
+		t.Fatal("status did not restore the saved session")
+	}
+	result := waitOperation(t, w)
+	drainStatusOutput(t, w)
+	result.err = context.DeadlineExceeded
+	w.operationReturned(result)
+	if w.client != nil || len(w.b.slots) != 0 || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("failed status query leaked a process slot or changed session identity")
+	}
+	select {
+	case <-client.Done():
+	default:
+		t.Fatal("failed temporary status process remained alive")
+	}
+}
+
+func TestReleasedStatusPreservesQueuedNativeDialog(t *testing.T) {
+	for _, readError := range []bool{false, true} {
+		name := "success"
+		if readError {
+			name = "read-error"
+		}
+		t.Run(name, func(t *testing.T) {
+			w, f, _, before := releasedIdleWorker(t)
+			w.owner = 7
+			w.status()
+			client := w.client
+			if client == nil {
+				t.Fatal("status did not restore the saved session")
+			}
+			result := waitOperation(t, w)
+			requireStoreOK(t, result.err)
+			// The response is a barrier after the native dialog entered the reader queue.
+			nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": map[string]any{
+				"type": "extension_ui_request", "id": "status-startup-dialog", "method": "select",
+				"title": "Startup permission", "options": []string{"Allow", "Deny"},
+			}})
+			if readError {
+				result.err = context.DeadlineExceeded
+			}
+			w.operationReturned(result)
+			if w.client != client || len(w.b.slots) != 1 || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("status retired the runtime with a queued native dialog")
+			}
+			nativeUntil(t, w, func() bool { return len(w.confirms) == 1 })
+			_, rows := pickerView(t, f)
+			w.callback(&telegram.CallbackQuery{
+				ID: "status-startup-dialog", From: telegram.User{ID: 7},
+				Message: &telegram.Message{MessageID: int64(f.messageCount())}, Data: rows[0][0]["callback_data"].(string),
+			})
+			raw, err := client.Call(w.ctx, "get_state", nil)
+			requireStoreOK(t, err)
+			var state struct {
+				Replies int    `json:"fixtureUIReplies"`
+				Value   string `json:"fixtureUIValue"`
+			}
+			requireStoreOK(t, json.Unmarshal(raw, &state))
+			if state.Replies != 1 || state.Value != "Allow" || len(w.confirms) != 0 {
+				t.Fatal("the preserved dialog did not deliver the authorized choice")
+			}
+			w.lastActivity = time.Now().Add(-2 * time.Minute)
+			w.releaseIdleRuntime(time.Now())
+			if w.client != nil || len(w.b.slots) != 0 || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("the completed dialog prevented later idle release")
+			}
+		})
+	}
+}
+
+func TestReleasedStatusDefersReleaseUntilMetadataDrains(t *testing.T) {
+	for _, newPrompt := range []bool{false, true} {
+		name := "metadata-only"
+		if newPrompt {
+			name = "new-prompt"
+		}
+		t.Run(name, func(t *testing.T) {
+			w, _, _, before := releasedIdleWorker(t)
+			w.status()
+			client := w.client
+			if client == nil {
+				t.Fatal("status did not restore the saved session")
+			}
+			result := waitOperation(t, w)
+			requireStoreOK(t, result.err)
+			for i := range 33 {
+				event := map[string]any{"type": "session_info_update", "sessionId": before.SessionID, "sessionFile": before.Session}
+				switch i % 3 {
+				case 1:
+					event = map[string]any{"type": "advisor_cost_changed"}
+				case 2:
+					event = map[string]any{"type": "extension_ui_request", "method": "setWidget"}
+				}
+				nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": event})
+			}
+			w.operationReturned(result)
+			if w.client != client || w.statusReleaseClientID != client.ID() {
+				t.Fatal("status did not defer cleanup while native metadata was buffered")
+			}
+			w.lastActivity = time.Now().Add(-2 * time.Minute)
+			w.releaseIdleRuntime(time.Now())
+			if w.client != client {
+				t.Fatal("idle cleanup bypassed the pending status output guard")
+			}
+			if newPrompt {
+				nativeInput(t, w, 100, "work after a deferred status release", false)
+				nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
+				w.finishPendingStatusRelease()
+				if w.client != client || !strings.Contains(nativeOutputs(t, w), "answer: work after a deferred status release") {
+					t.Fatal("deferred status cleanup retired the runtime used by new work")
+				}
+			} else {
+				drainStatusOutput(t, w)
+				w.finishPendingStatusRelease()
+				if w.client != nil || len(w.b.slots) != 0 {
+					t.Fatal("drained metadata retained the temporary status runtime")
+				}
+			}
+			if !sameBindingIdentity(w.binding, before) {
+				t.Fatal("deferred status cleanup changed the session identity")
+			}
+		})
+	}
+}
+
+func TestReleasedStatusCannotRetireNativeWorkStartedBeforeResult(t *testing.T) {
+	for _, readError := range []bool{false, true} {
+		name := "success"
+		if readError {
+			name = "read-error"
+		}
+		t.Run(name, func(t *testing.T) {
+			w, _, _, before := releasedIdleWorker(t)
+			w.status()
+			client := w.client
+			if client == nil {
+				t.Fatal("status did not restore the saved session")
+			}
+			w.finishPendingStatusRelease()
+			result := waitOperation(t, w)
+			requireStoreOK(t, result.err)
+			idle, settled, pending := rpcIdleState(result.data)
+			if !idle || !settled || pending {
+				t.Fatal("the original snapshot was not idle")
+			}
+			// Native-owned work has no bridge root. Consume its start before the old result.
+			nativeRPC(t, w, "prompt", map[string]any{"message": "wait"})
+			drainStatusOutput(t, w)
+			if readError {
+				result.err = context.DeadlineExceeded
+			}
+			w.operationReturned(result)
+			w.finishPendingStatusRelease()
+			if w.client != client || len(w.b.slots) != 1 || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("the old status result retired new native work")
+			}
+			raw, err := client.Call(w.ctx, "get_state", nil)
+			requireStoreOK(t, err)
+			var current struct {
+				Streaming bool `json:"isStreaming"`
+			}
+			requireStoreOK(t, json.Unmarshal(raw, &current))
+			if !current.Streaming {
+				t.Fatal("status interrupted the native-owned turn")
+			}
+		})
+	}
+}
+
+func TestReleasedStatusCanReleaseAfterConsumedStartupMetadata(t *testing.T) {
+	w, _, _, before := releasedIdleWorker(t)
+	w.status()
+	client := w.client
+	if client == nil {
+		t.Fatal("status did not restore the saved session")
+	}
+	w.finishPendingStatusRelease()
+	result := waitOperation(t, w)
+	requireStoreOK(t, result.err)
+	for _, event := range []map[string]any{
+		{"type": "session_info_update", "sessionId": before.SessionID, "sessionFile": before.Session},
+		{"type": "advisor_cost_changed"},
+		{"type": "extension_ui_request", "method": "setWidget"},
+	} {
+		nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": event})
+	}
+	drainStatusOutput(t, w)
+	w.operationReturned(result)
+	if w.client != nil || len(w.b.slots) != 0 || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("consumed startup metadata prevented status cleanup")
 	}
 }
 
@@ -381,7 +634,7 @@ func TestExpiredRuntimeConfirmationAllowsImmediateRelease(t *testing.T) {
 	}
 	w.confirms["expired-model"] = confirmation{action: "model", messageID: 41, expires: time.Now().Add(-time.Second)}
 	w.lastActivity = time.Now().Add(-2 * time.Minute)
-	w.expire()
+	w.expire(time.Now())
 	w.releaseIdleRuntime(time.Now())
 	if w.client != nil || w.runtime != runtimeReleased {
 		t.Fatal("expired runtime confirmation still prevented idle release")
@@ -390,6 +643,71 @@ func TestExpiredRuntimeConfirmationAllowsImmediateRelease(t *testing.T) {
 		t.Fatalf("expired confirmation remained: %#v", w.confirms)
 	}
 	waitKeyboardClears(t, f, 41)
+}
+
+func TestNativeUIDialogCleanupOnRuntimeExit(t *testing.T) {
+	for _, control := range []string{"release", "close"} {
+		for _, method := range []string{"confirm", "select"} {
+			t.Run(control+"/"+method, func(t *testing.T) {
+				w, f, command, before := releasedIdleWorker(t)
+				if _, err := w.ensureRuntime(); err != nil {
+					t.Fatal(err)
+				}
+				w.owner = 7
+				w.ui(rpcEvent{ID: "waiting-permission", Method: method, Title: "Permission required", Options: []string{"Allow"}})
+				data := resumeButtons(t, f)[0]["callback_data"].(string)
+				messageID := f.messageCount()
+				client := w.client
+				if control == "close" {
+					command("/close")
+					if w.binding.Running {
+						t.Fatal("close retained session restoration eligibility")
+					}
+				} else {
+					w.confirms["resume-independent"] = confirmation{action: "resume", generation: w.binding.Generation, user: 7}
+					w.releaseRuntimeWithReason(true, "explicit")
+					if _, exists := w.confirms["resume-independent"]; !exists {
+						t.Fatal("runtime release removed an independent resume picker")
+					}
+					if !sameBindingIdentity(w.binding, before) {
+						t.Fatal("runtime release changed the logical session")
+					}
+				}
+				if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 {
+					t.Fatal("runtime exit retained the client or occupied process slot")
+				}
+				select {
+				case <-client.Done():
+				default:
+					t.Fatal("native process remained alive after runtime exit")
+				}
+				if control == "release" {
+					if _, err := w.ensureRuntime(); err != nil {
+						t.Fatal(err)
+					}
+					w.lastActivity = time.Now().Add(-2 * time.Minute)
+					w.releaseIdleRuntime(time.Now())
+					if w.client != nil || len(w.b.slots) != 0 {
+						t.Fatal("old native dialog prevented the replacement runtime from becoming idle")
+					}
+				}
+				waitKeyboardClears(t, f, messageID)
+				if control == "close" {
+					command("/new " + before.Workspace)
+				} else if _, err := w.ensureRuntime(); err != nil {
+					t.Fatal(err)
+				}
+				clickKeyboard(w, 7, data)
+				raw, err := w.call("get_state", nil)
+				var state struct {
+					Replies int `json:"fixtureUIReplies"`
+				}
+				if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 0 {
+					t.Fatal("an old permission button reached a replacement runtime")
+				}
+			})
+		}
+	}
 }
 
 func TestExplicitTeardownInvalidatesRuntimeConfirmation(t *testing.T) {

@@ -686,9 +686,6 @@ func TestDaemonRecoveryStartsProcessesOnlyOnDemand(t *testing.T) {
 	d.start()
 	for _, b := range before {
 		d.cold(b)
-		if !d.fake.has(b.Thread, "Idle: n/a") {
-			t.Fatalf("topic %d did not report an unconnected saved session", b.Thread)
-		}
 	}
 	d.command(33, "/resume "+before[1].SessionID)
 	if _, err := d.db.Binding(99, d.chat, 33); !errors.Is(err, sql.ErrNoRows) {
@@ -731,16 +728,17 @@ func TestDaemonRecoveryRejectsChangedNativeSessionIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.start()
-	d.cold(changed)
-	previous := d.outputCount(11)
-	id := d.send(11, "cwd")
-	waitInputDone(t, d.db, id)
-	waitFor(t, func() bool { return d.fake.has(11, "omp did not restore the saved session identity") })
-	if got := d.outputCount(11); got != previous+1 {
-		t.Fatalf("identity mismatch replies = %d, want 1", got-previous)
-	}
-	if d.state(id) == "submitted" || d.binding(11) != changed || d.fake.has(11, "answer: "+changed.Workspace) {
-		t.Fatal("identity mismatch submitted a prompt or changed the saved session")
+	for _, request := range []string{"/status", "cwd"} {
+		previous := d.outputCount(11)
+		id := d.send(11, request)
+		waitInputDone(t, d.db, id)
+		waitFor(t, func() bool { return d.fake.has(11, "omp did not restore the saved session identity") })
+		if got := d.outputCount(11); got != previous+1 {
+			t.Fatalf("identity mismatch replies for %s = %d, want 1", request, got-previous)
+		}
+		if d.state(id) == "submitted" || d.binding(11) != changed || d.fake.has(11, "answer: "+changed.Workspace) {
+			t.Fatal("identity mismatch submitted a prompt or changed the saved session")
+		}
 	}
 	d.command(22, "/new "+t.TempDir())
 	if !d.binding(22).Running {
