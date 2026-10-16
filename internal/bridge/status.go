@@ -34,6 +34,7 @@ type statusModeResult struct {
 	sessionID string
 	known     bool
 	enabled   bool
+	temporary bool
 }
 
 func formatStatus(s statusState, workspace, sessionID, home string, queued int) string {
@@ -80,16 +81,71 @@ func formatStatus(s statusState, workspace, sessionID, home string, queued int) 
 		statusBool(s.IsStreaming, "yes", "no"), statusBool(s.IsCompacting, "yes", "no"), queued, speed)
 }
 
-func formatRuntimeStatus(s statusState, workspace, sessionID, home string, queued int, idle time.Duration) string {
-	return formatStatus(s, workspace, sessionID, home, queued) + "\nOMP: connected\nIdle: " + statusIdle(idle)
+func formatRuntimeStatus(s statusState, workspace, sessionID, home string, queued int, idle time.Duration, connected bool) string {
+	runtime := "released"
+	if connected {
+		runtime = "connected"
+	}
+	return formatStatus(s, workspace, sessionID, home, queued) + "\nOMP: " + runtime + "\nIdle: " + statusIdle(idle)
 }
 
-func formatReleasedStatus(workspace, sessionID, home string, queued int, idle time.Duration) string {
-	session := menuText(sessionID, 128)
-	if session == "" {
-		session = "n/a"
+func (w *worker) releaseStatusRuntime(result operationResult, valid bool) {
+	mode, ok := result.meta.(*statusModeResult)
+	if !ok || mode == nil || !mode.temporary || w.statusReleaseClientID == 0 {
+		return
 	}
-	return fmt.Sprintf("Workspace: %s\nSession: %s\nOMP: released\nModel: unavailable while released\nContext: unavailable while released\nQueued: %d\nIdle: %s", clipUTF16(statusWorkspace(workspace, home), 1024), session, queued, statusIdle(idle))
+	if !w.canReleaseRuntime() || w.statusReleaseClientID != w.client.ID() {
+		w.statusReleaseClientID = 0
+		return
+	}
+	if valid {
+		idle, settled, pending := rpcIdleState(result.data)
+		if !idle || !settled || pending {
+			w.statusReleaseClientID = 0
+			return
+		}
+	}
+	w.finishPendingStatusRelease()
+}
+
+func (w *worker) finishPendingStatusRelease() {
+	if w.statusReleaseClientID == 0 {
+		return
+	}
+	if w.controlOp == controlStatus {
+		return
+	}
+	if !w.canReleaseRuntime() || w.client.ID() != w.statusReleaseClientID || len(w.input) != 0 || !w.sessionDurable() {
+		w.statusReleaseClientID = 0
+		return
+	}
+	client := w.client
+	// Bound event handling so a busy extension cannot starve control commands.
+	for range 32 {
+		select {
+		case raw, open := <-client.Events():
+			if !open {
+				w.failed()
+				return
+			}
+			w.event(raw)
+			if w.client != client || w.statusReleaseClientID != client.ID() || !w.canReleaseRuntime() {
+				w.statusReleaseClientID = 0
+				return
+			}
+		default:
+			goto drained
+		}
+	}
+	return
+
+drained:
+	// Byte credit also covers frames not yet handed to the actor.
+	if client.BufferedOutput() {
+		return
+	}
+	w.statusReleaseClientID = 0
+	w.releaseRuntimeWithReason(true, "explicit")
 }
 
 func statusIdle(idle time.Duration) string {

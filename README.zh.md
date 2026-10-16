@@ -325,6 +325,12 @@ omp --resume /path/to/session.jsonl
 
 不支持语音/转写, 自动创建 topic, 以及任意终端或编辑器对话框. 部分确认和选择流程可以使用 Telegram 按钮, 但不是所有交互式工具审批都能远程完成. bridge 从不自动批准工具操作.
 
+原生插件的确认和选择按钮没有独立的 bridge 过期时间. 插件指定的对话框 deadline 由 OMP 管理. 这不代表取消了 RPC 提交期限.
+
+Bridge 仍只等待最多 30 秒让 OMP 确认接收提交. 如果原生对话框 (例如 `/review` 选择菜单) 阻塞了这份确认, 等待用户选择期间仍可能超时: runtime 会退役, 按钮失效, 任务变为 `uncertain`, 不会自动重放. 该期限不限制已经获接收确认的模型任务的执行时长.
+
+等待会占用 OMP 进程和一个 worker 名额, 并阻止 idle release. 可取消对话框, 或用 `/stop`, `/close` 结束等待; 不会自动批准. 关闭或退役 runtime 会清理待决原生对话框并归还进程名额, 旧按钮不能批准替代进程的工作. Telegram 按钮外观的移除是 best-effort, 但旧操作立即失效.
+
 过大的回复可能截断, 并明确提示. Bridge 不会截断 OMP 原生 session 历史.
 
 ## Progress UI
@@ -381,6 +387,8 @@ omp --resume /path/to/session.jsonl
 - Prompt 提交失败/超时, OMP 异常退出, 输出超限和原生对话框回执失败均不会关闭已保存的 session. 普通 session 的下一条 prompt 或 OMP 控制命令会恢复原会话; 不重放结果不确定的任务.
 - 已保存的 session 文件或 workspace 不可用时, bridge 会报告失败, 不创建替代 session. 请执行 `/close`, 再按需使用 `/new` 或 `/resume`.
 - `worker.idle_timeout` 可以释放空闲 OMP 进程, 保留 session 供后续使用. 下一条 prompt 或 OMP 控制命令会恢复同一个 session; 新 session 在 OMP 保存 history 前可能保持连接.
+- `/status` 会临时重连可恢复的 released session, 读取 model, context 等状态后在安全时释放进程. 待决的启动对话框, 查询期间收到的新任务, 或尚未结束的原生活动会保留连接. 启动元数据尚未消费时, 释放可能短暂延后.
+- 如果同一个已保存的 session 已被其他对话占用, `/status` 会提示占用并引导去那里查询. 不重新打开旧 session 或抢占 owner, 即使占用方的进程已因空闲释放.
 - **删除 Telegram topic 前, 如果它持有研究占用, 先在该 topic 中确认 `/autoresearch off`, 再发送 `/close`.** `/close` 不会释放研究占用, 其他对话也不能接管其 owner 身份. 如果 topic 已经删除, 同一 chat 其他对话中的 `/bindings` 只能关闭并忘记没有研究占用的空闲 binding, 不能释放或转移研究占用.
 
 每个对话有独立的 session, 但使用同一 workspace 的 session 会共享文件. 不同对话不是文件系统或凭据沙箱.

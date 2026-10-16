@@ -404,6 +404,37 @@ func TestIdleAbortUsesNativeWorkStateInsteadOfSavedHistory(t *testing.T) {
 	}
 }
 
+func TestIdleAbortRetiresPendingNativeDialog(t *testing.T) {
+	for _, method := range []string{"confirm", "select"} {
+		for _, delivery := range []string{"rendered", "buffered"} {
+			t.Run(method+"/"+delivery, func(t *testing.T) {
+				w, _, command := setupWorkspaceWorker(t)
+				command("/new " + t.TempDir())
+				before, client := w.binding, w.client
+				nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": map[string]any{
+					"type": "extension_ui_request", "id": "idle-stop-dialog", "method": method,
+					"title": "Startup permission", "message": "Allow the startup action?", "options": []string{"Allow", "Deny"},
+				}})
+				if delivery == "rendered" {
+					nativeUntil(t, w, func() bool { return len(w.confirms) == 1 })
+				}
+				if w.taskActive() {
+					t.Fatal("the startup dialog unexpectedly created a bridge task")
+				}
+				command("/stop")
+				assertRetiredOperationClient(t, w, client, before)
+				if len(w.confirms) != 0 || len(w.b.slots) != 0 {
+					t.Fatal("Stop retained a native dialog or its process slot")
+				}
+				command("/name after stopped dialog")
+				if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {
+					t.Fatal("Stop did not leave the original session available on a replacement runtime")
+				}
+			})
+		}
+	}
+}
+
 func TestAbortRetiresUnsavedRootAfterEarlyTerminal(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_CONTINUES", "1")
 	w, _, command := setupWorkspaceWorker(t)

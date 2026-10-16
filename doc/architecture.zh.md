@@ -223,7 +223,7 @@ OMP 18.3.2 是目前实测支持文字 steer 的最低版本, 能按 request ID 
 
 普通文字在 `controlAbort` 等待期间进入 bridge 队列, 作为独立 root, 不进入原生 steer 队列. Stop 期间 discovery 从 unknown 变为 ready 时, 未识别的 `queuedSlashPending` 输入也遵循这一规则: catalog 回调将它转换为独立 queued prompt, 不会 steer 旧 root. 命令和按钮各自的队列策略只作用于发起 Stop 时已经等待的工作. 一旦实际发送 abort, 成功响应会退役该 client, 即使 root 的终态事件先到达也不例外.
 
-没有活动 bridge root 时, Stop 先在异步 RPC lane 中查询原生状态, 使用既有 idle-probe deadline. 只有确认 idle, settled 且未报告原生异步工作或原生排队消息时才保留 runtime, 不发送 `abort`, 不以 history 文件是否存在作判断. 有工作或状态无法确认时继续普通 abort 和退役流程; abort 明确拒绝时保持既有失败语义. History 文件存在不代表原生进程仍有工作.
+没有活动 bridge root 时, Stop 先在异步 RPC lane 中查询原生状态, 使用既有 idle-probe deadline. 不发送 abort 的快路同时要求: 原生快照确认 idle, settled 且未报告异步工作或原生排队消息, 没有 bridge task/session operation, 没有待决原生 UI 或 host request, 且没有缓冲中的原生输出. 仅凭原生 idle/settled 标志不能证明启动对话框已经没有待决选择. 确认静止的 runtime 会保留, 不以 history 文件是否存在作判断. 存在待决对话框, 有工作或状态无法确认时继续普通 abort 和退役流程; abort 明确拒绝时保持既有失败语义. History 文件存在不代表原生进程仍有工作.
 
 补充的真实 OMP 18.10.4 smoke 确认, 空闲 Stop 保留已保存 session 的同一 client. 在活动 Stop 期间使 discovery 失效, 并在应用 abort 响应前处理真实的 unknown-to-ready catalog 回调. 未识别 slash 保持 pending, 随后在替代 client 上以精确原 session 身份执行一次并获得独立确认回复. Provider 为本地确定性服务, Telegram 为模拟输入和交付, 未验证真实 Telegram 交互.
 
@@ -522,7 +522,9 @@ Outbox 永远不指向原生 session 文件. outbox state 持久化为终态后,
 
 合法的最终选择或取消会先消费 confirmation token. OMP 原生 `select` 对话框 (包括 `/review` 的 commit 选择) 将原菜单正文替换为 `Selected: <选中项>` 或 `Cancel`, 同一次编辑移除 inline keyboard. 展示的选中项有长度上限, 但回复 OMP 时仍使用原始值.
 
-原生确认/选择 token 还记录来源 client ID. 选择和取消只能发给该已连接 client, 不调用 lazy resume 交付对话框回执. 即使逻辑 binding 的 generation 未改变, 已退役 client 的 token 也会过期, 不能向替代进程发送选择或取消.
+原生确认/选择 token 还记录来源 client ID. 选择和取消只能发给该已连接 client, 不调用 lazy resume 交付对话框回执. 即使逻辑 binding 的 generation 未改变, 已退役 client 的 token 也会失效, 不能向替代进程发送选择或取消. Bridge 不给原生 confirm/select token 设置过期时间, select 翻页后也不设置. 插件指定的对话框 deadline 由 OMP 管理, 超时或原生取消时发送 `extension_ui_request(method="cancel", targetId=...)`; bridge 随即使 token 失效, 不回传重复的取消响应. 没有原生 deadline 时, 按钮保持可用, 直到用户选择或原生/任务/runtime 生命周期使其失效. Bridge 自身菜单保留原有过期规则, RPC 提交和传输 deadline 不变.
+
+每次 runtime 停止转换都会在解除 client 关联前删除原生 `action="ui"` token, 提交按钮清理, 不再向正在退出的进程发送额外 RPC. 这避免无超时对话框留下过时权限状态, 或阻止替代 runtime 后续的 idle release. 此处仅清理原生 UI, 不移除独立的 resume/queue/export picker; 完整 worker/session teardown 仍执行其更广的清理. 进程终止会释放 OMP 的待决对话状态, 归还进程名额不等于删除逻辑 session binding 或历史.
 
 当前 session 的导出阻止原生 UI 响应时, callback 会先拒绝提交, 不生成选择或确认回执. 原菜单显示导出等待原因, token 被消费, 不向 OMP 发送 UI response. 提交和取消都保持原有导出 guard 的拒绝行为.
 
@@ -538,7 +540,7 @@ New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 bind
 
 定时过期处理在 worker 内使 token 失效, 随后非阻塞提交键盘清理, 不等待 Telegram. 每个 worker 只有一个清理消费者, 最多缓存 32 个 message ID; 队列满时放弃尽力而为的按钮移除, 但 token 仍然失效. 每次清理请求超时五秒, worker 取消时停止消费者, 因此 UI 清理阻塞不会拖住控制命令或终结事件. 用户主动选择先尝试编辑决定状态, 再执行实际操作; 正文编辑失败只提交回退清理, 不等待其完成.
 
-程序主动失效也统一使用该有界清理队列: 取消 resume 列表、原生 UI 取消、关闭或替换实例以及任务终结都会删除适用的 token, 并把已知菜单 message ID 加入清理队列. 任务终结会保留当前 generation 的独立 `/queue` viewer token, 因而与 dispatch 竞争的 callback 可以重新扫描实时 queue 并返回 `Task is no longer queued.`, 不会中止 active task. model、thinking、fast、compact、new 和原生 UI 选择属于当前运行实例的 runtime-bound confirmation, 会阻止正常空闲释放; 它们原有的过期机制仍会删除 token, 并在需要时取消当前 generation 的原生 UI. 独立的 `/resume` 菜单不依赖当前运行实例, 可以在 runtime 释放后继续有效. 明确的 runtime teardown 仍会使旧 runtime 菜单失效, `/close` 和 worker teardown 则清理全部 confirmation. 清理仍是尽力而为, worker context 已取消或队列溢出时不保证移除按钮.
+程序主动失效也统一使用该有界清理队列: 取消 resume 列表、原生 UI 取消、关闭或替换实例以及任务终结都会删除适用的 token, 并把已知菜单 message ID 加入清理队列. 任务终结会保留当前 generation 的独立 `/queue` viewer token, 因而与 dispatch 竞争的 callback 可以重新扫描实时 queue 并返回 `Task is no longer queued.`, 不会中止 active task. model、thinking、fast、compact、new 和原生 UI 选择属于当前运行实例的 runtime-bound confirmation, 会阻止正常空闲释放. Bridge 自身菜单保留原有过期机制; 原生 UI 不设置 bridge 定时器, 遵循上述生命周期. 独立的 `/resume` 菜单不依赖当前运行实例, 可以在 runtime 释放后继续有效. 明确的 runtime teardown 仍会使旧 runtime 菜单失效, `/close` 和 worker teardown 则清理全部 confirmation. 清理仍是尽力而为, worker context 已取消或队列溢出时不保证移除按钮.
 
 `/model` 在 worker 工作目录通过只读 `omp config get ... --json` 子进程读取 `cycleOrder` 和 `modelRoles`. 按参数顺序把 `--config` 文件追加到查询子进程被允许继承的父进程 `PI_CONFIG_FILES`, 由 OMP 自己合并覆盖配置; allowlist 模式下未列入 `allow` 的父进程变量视为不存在, 显式 `omp.args` overlay 仍会生效. 支持两种参数写法, 工作目录相对路径和 `~/` 展开. 包含环境列表分隔符的路径通过继承的只读文件描述符传递, 避免被拆成不同文件. 不修改配置文件或父进程环境. 不通过切换模型枚举角色, 不重复实现 selector 解析. 选择角色时发送原生本地命令 `/model @role`, 并用 `get_state` 验证成功后的模型标识; 不转发原始命令输出. 切换要求原生与 bridge 都空闲且 bridge 队列为空. 尚不支持的 `--profile`, `--smol`, `--slow`, `--plan` 覆盖项仍会禁用角色菜单, 但可手动指定模型. 原生角色命令结果不确定时使 client 失效.
 
@@ -546,7 +548,15 @@ New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 bind
 
 `/fast` 打开绑定 owner 的开关菜单; `/fast on` 和 `/fast off` 仅在空闲且队列为空时调用原生 `set_fast_mode`. 回复分别使用原生返回的 `enabled` 和 `active`, 不把请求设置等同于实际生效状态. 模型不支持或请求失败时不提示成功. `/fast status` 只读取原生状态, 任务运行中也可使用. Provider 支持与服务等级行为仍由 OMP 负责.
 
-`/status` 仅在已连接时解码 `get_state` 的安全白名单字段. 当前用户 home 下的目录缩写为 `~`, 会话标题同时保留短原生 ID. Thinking 表示实际生效等级, 不代表是否配置 auto. Fast 显示实际启用状态, 与设置不同时单独注明设置值. Context 按 OMP 返回的 `contextUsage.percent` 百分数直接显示, 仅在未返回该值时用 token 用量/窗口推算; 速度使用原生 `tokensPerSecond`. 缺失指标显示 `n/a`, 与零值区分. `Queued` 仅统计 bridge 延后 prompt. 已释放运行期只显示保留的目录/session、`OMP: released`、不可用的 model/context 和队列状态, 不声称实时原生指标. 不渲染原始模型配置, header, system prompt 或原生队列数量.
+`/status` 仅解码 `get_state` 的安全白名单字段. 当前用户 home 下的目录缩写为 `~`, 会话标题同时保留短原生 ID. Thinking 表示实际生效等级, 不代表是否配置 auto. Fast 显示实际启用状态, 与设置不同时单独注明设置值. Context 按 OMP 返回的 `contextUsage.percent` 百分数直接显示, 仅在未返回该值时用 token 用量/窗口推算; 速度使用原生 `tokensPerSecond`. 缺失指标显示 `n/a`, 与零值区分. `Queued` 仅统计 bridge 延后 prompt. `OMP` 表示查询结束后进程是否仍连接; 其他原生字段是被查询进程的状态快照, 不是释放前保留的历史快照. 不渲染原始模型配置, header, system prompt 或原生队列数量.
+
+对于符合恢复条件的 released session, `/status` 使用正常懒恢复路径, 遵守进程名额限制并校验 session 身份和 workspace, 不提交 prompt 或重放任务. 查询成功后, 只有本地生命周期静止, 已保存的 history file 仍存在, 原生输出已消费, 且原生状态确认 idle, settled 和没有待决工作时, 才释放临时进程. 查询期间收到新 prompt, 存在待决权限, 原生工作尚未结束或无法确认原生收敛状态时, 保持连接. 查询失败时, 若本地生命周期静止, history 已持久化, 且同样的原生事件检查允许释放, 也会释放临时进程. `/status` 不释放查询前已连接的进程, 不重新打开已关闭的 session. 恢复失败只报告错误, 不创建替代 session.
+
+临时 status 查询会在 actor 恢复消费输入或原生事件之前建立内存中的 client ID 释放栅栏, 查询在途时不能释放进程. 响应只能消费仍有效的栅栏, 不能重新建立在 RPC 等待期间已失效的栅栏, 因此已经消费的原生任务启动事件不会被更早的 idle 快照或失败查询掩盖. 释放前, actor 每轮最多处理 32 个已就绪原生事件, 再用 stdout byte credit 检查尚未消费或尚未读完的 frame. 原生 idle/settled 标志不能证明没有待决 UI 请求. 如果只剩启动元数据, 清理延后到后续 actor 迭代, 必要时由已有 worker tick 唤醒; 不增加 RPC 或忙等. Session/catalog 元数据, advisor cost 更新和不等待响应的启动 widget 更新不会取消清理, 在响应被处理前也同样适用. 新输入, 新 RPC operation, 其他原生事件, session 身份变化或 runtime 退役都会使栅栏失效. 因此 confirm/select 请求会进入正常 UI 路径, 保留其来源进程等待处理. 常规 idle cleanup 不能绕过延后 status 释放的待决输出门禁.
+
+临时 `/status` 的释放判断仅覆盖当前已观测的 bridge/native 状态: `isSettled` 和事件排空无法证明尚未发出事件且未被 OMP 跟踪的扩展异步回调已完成, 释放 runtime 会终止仍在该进程内等待的回调, 不代表它们已自然结束.
+
+查询原生状态前, `/status` 会用保留 binding 的原生 session ID 检查其他 worker 的逻辑 session claim. 如果该 session 已由其他对话占用, 包括原对话关闭后已在别处恢复的情况, 回复会说明占用, 引导用户去那里执行 `/status`, 或先关闭占用方再显式在这里恢复. 不启动进程, 不读取占用方的原生状态, 不改变任一 binding. 占用方 idle release 后仍持有逻辑 claim, 因此同样显示占用提示.
 
 `/doctor` 是异步的 bridge control-plane 检查. 它不调用 `ensureRuntime`, 不启动或替换 OMP 进程, 不进入 prompt queue, 也不修改 binding. 它检查配置, Telegram `getMe`, SQLite `quick_check`, data directory 的写入/删除能力, `omp --version`, 已提交的 workspace 和 session 文件, runtime 状态, 不确定的 inbox/outbox 数量以及磁盘剩余空间. 报告只使用固定的安全摘要, 不包含 token, header, prompt, 原始 RPC state 或完整本地路径. 如果 conversation 在检查期间变化, binding 和 runtime snapshot fence 会丢弃结果; 检查进行时的第二次请求会被拒绝.
  native history file 尚未持久化的 connected 或 starting binding 报告为 `WARN`; 缺少文件的 released running binding 报告为 `FAIL`, closed binding 缺少文件则报告为 `WARN`.
@@ -575,14 +585,14 @@ New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 bind
 
 ### 空闲运行期释放
 
-`worker.idle_timeout` 默认值为 `30m`; 设置为 `0` 或 `disabled` 可关闭. 设置为其他正时长后, worker 只有在已连接进程完整空闲达到该时长, 且没有活动任务、队列项(包括附件准备)、compact 或 handoff operation、结束预览、host request、会话列表请求、启动意图或 runtime-bound confirmation 时才释放进程. model、thinking、fast、compact、new 和原生 UI 选择的 runtime-bound confirmation 会阻止空闲释放, 直到被消费或过期. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 满足条件后, worker 关闭 client 并归还全局进程 slot. 不修改 binding、generation、已验证 session 文件身份、session claim、工作目录或原生历史.
+`worker.idle_timeout` 默认值为 `30m`; 设置为 `0` 或 `disabled` 可关闭. 设置为其他正时长后, worker 只有在已连接进程完整空闲达到该时长, 且没有活动任务、队列项(包括附件准备)、compact 或 handoff operation、结束预览、host request、会话列表请求、启动意图或 runtime-bound confirmation 时才释放进程. model、thinking、fast、compact、new 和原生 UI 选择的 runtime-bound confirmation 会阻止空闲释放, 直到被消费或失效. 独立的 `/resume` 菜单不阻止释放, runtime 释放后仍可继续操作. 满足条件后, worker 关闭 client 并归还全局进程 slot. 不修改 binding、generation、已验证 session 文件身份、session claim、工作目录或原生历史.
 idle release 之前, 当前 binding 的 session path 必须是绝对路径, 且已存在并指向 regular file. 新建 native session 可能已经返回 ID 并提交 binding, 但 OMP 尚未写入 history file; 这种状态保持 connected, 避免 bridge 销毁唯一可恢复的副本. 这是内存中的 release guard, 不增加数据库 durability flag.
 
-下一条普通 prompt、附件、`/review` 或需要 OMP 状态的原生控制命令会在入队或 RPC 调用前, 通过正常原生身份和工作目录校验懒恢复已保存的 session. 懒恢复失败不会提交或重放根任务. `/status`、`/help`、`/stop` 和 `/close` 不会唤醒已释放运行期; `/stop` 只清 bridge 延后 prompt, `/close` 直接清除恢复资格. 显式 `/resume ID` 替换逻辑 binding 并启动指定原生 session. actor 会先移除 client 并标记运行期 released, 再关闭它, 所以迟到的关闭事件不会进入 failure handling; 仍连接时 OMP 真正退出继续走既有 uncertain/failure 路径. 原生事件、confirmation 展示和成功的原生调用会刷新空闲计时.
+下一条普通 prompt, 附件, `/review` 或需要 OMP 状态的原生控制命令会在入队或 RPC 调用前, 通过正常原生身份和工作目录校验懒恢复已保存的 session. 懒恢复失败不会提交或重放根任务. `/help`, `/stop` 和 `/close` 不会唤醒已释放运行期; `/stop` 只清 bridge 延后 prompt, `/close` 直接清除恢复资格. 显式 `/resume ID` 替换逻辑 binding 并启动指定原生 session. actor 会先移除 client 并标记运行期 released, 再关闭它, 所以迟到的关闭事件不会进入 failure handling; 仍连接时 OMP 真正退出继续走既有 uncertain/failure 路径. 原生事件, confirmation 展示和成功的原生调用会刷新空闲计时.
 
 成功 RPC 会刷新空闲计时并使 watchdog 证据失效. 失败 RPC 只使 watchdog 证据及正在进行的探测失效, 不刷新空闲计时.
 
-重启后, daemon 在开始轮询前根据每个符合条件且 `running=1` 的 binding 已持久化的原生 session ID 重建逻辑 session claim. 它验证已保存的 session 文件和工作目录, 但不启动 OMP 进程, 也不占用 `worker.max_workers` 名额. 下一条 prompt 或原生控制命令才启动 OMP 并校验原 session 身份; 首条请求可能稍慢. `/status` 显示已保存的 session 为 released, 不启动进程. 被标记为中断的 binding 只收到独立的中断警告, 并在不改变 generation 的情况下清除标记; 显式 `/new` 和 `/resume` 仍发送 ready 消息. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 如果启动时发现已保存的 session 文件或 workspace 不可用, bridge 会保存 `running=0`, 记录 `restore_runtime_skipped`, 并提示使用 `/new`; 绝不创建替代 session. 按需重连失败仍保留已保存身份, 不提交或重放请求. OMP 新 session 可能先返回身份, 再持久化 history file.
+重启后, daemon 在开始轮询前根据每个符合条件且 `running=1` 的 binding 已持久化的原生 session ID 重建逻辑 session claim. 它验证已保存的 session 文件和工作目录, 但不启动 OMP 进程, 也不占用 `worker.max_workers` 名额. 下一条 prompt 或原生控制命令才启动 OMP 并校验原 session 身份; 首条请求可能稍慢. `/status` 也可以按需恢复已保存的 session, 通常在读取状态后释放临时进程. 被标记为中断的 binding 只收到独立的中断警告, 并在不改变 generation 的情况下清除标记; 显式 `/new` 和 `/resume` 仍发送 ready 消息. 未提交的 new/resume intent 不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 如果启动时发现已保存的 session 文件或 workspace 不可用, bridge 会保存 `running=0`, 记录 `restore_runtime_skipped`, 并提示使用 `/new`; 绝不创建替代 session. 按需重连失败仍保留已保存身份, 不提交或重放请求. OMP 新 session 可能先返回身份, 再持久化 history file.
 
 持久化的逻辑 session claim 就是 restore claim: 它在启动任何进程前依据保存的原生 session 身份重建, 并在运行期 released 或 worker 容量延迟重连期间保持.
 
