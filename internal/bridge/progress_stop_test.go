@@ -59,8 +59,9 @@ func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	}
 	w.previewFinished(result)
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"short answer"}]}]}`))
+	awaitReplyStatus(t, w)
 	output, err := w.b.db.NextOutput()
-	if err != nil || output.Text != "short answer" {
+	if err != nil || replyBody(output.Text) != "short answer" {
 		t.Fatalf("final reply = %+v, err=%v", output, err)
 	}
 	if got := f.deletedMessageIDs(); len(got) != 0 {
@@ -291,8 +292,10 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	w.dispatch()
 	nativeUntil(t, w, func() bool { return queueState(t, w, 3) == "done" })
 	var replies int
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=3 AND text=?", "answer: queued").Scan(&replies))
-	if replies != 1 {
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=3").Scan(&replies))
+	var finalText string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=3").Scan(&finalText))
+	if replies != 1 || replyBody(finalText) != "answer: queued" {
 		t.Fatal("queued task did not produce its own confirmed reply after Stop")
 	}
 }

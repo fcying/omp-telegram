@@ -193,6 +193,7 @@ func TestQueueCancelReportsTaskAlreadyDispatched(t *testing.T) {
 	data := queueCancelData(t, menu, "queued task")
 
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"active done"}]}]}`))
+	awaitReplyStatus(t, w)
 	w.dispatch()
 	if w.active != queuedID || len(w.queue) != 0 || !w.busy {
 		t.Fatalf("queued task did not become active: active=%d queue=%+v busy=%t", w.active, w.queue, w.busy)

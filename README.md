@@ -343,11 +343,15 @@ Supported values:
 - `summary` shows assistant output, active tool names, and task state.
 - `verbose` additionally shows recent tool arguments, updates, and results.
 
+Both `summary` and `verbose` show a periodically refreshed, single-line OMP status at the top of the progress message, before `Processing...` and the task state: for example, `◒ gpt-6-sol ⚡ | ◫ 24% (128k) | 85 tok/s`. The thinking symbol follows the TUI (`◒` means high), the model ID omits its provider, `⚡` means fast mode is actually active, and `◫` shows context usage as a percentage followed by the context-window capacity in parentheses. Fast mode also shows its configured setting when that differs from actual activity. Missing fields are omitted; a failed status query temporarily hides the line without interrupting the task. `/status` keeps its detailed format, including the provider, explicit thinking/fast values, and context token counts.
+
 Progress for a new task is delayed for approximately three seconds, so short tasks normally send only their final reply. Active tasks include a **Stop** button. It stops the active task; `/stop` also clears tasks already waiting in the conversation, while the button lets them continue after cancellation.
 
 Stopping an active task retires its OMP process while preserving the session. New messages received during Stop wait as separate tasks, not steering for the stopped task. The next task reconnects the same saved session and may take longer to start.
 
 Progress and final replies are separate. Progress is best-effort UI and does not affect durable final-reply delivery.
+
+Successful final text replies carry a single-line status header only on the first message, including when progress is `off`: for example, `◒ gpt-6-sol ⚡ | ◫ 24% (128k) | avg 85 tok/s`. It shows confirmed thinking/fast settings, output-inclusive context percentage with context-window capacity, and average generation speed when available. The average covers all model calls for that reply, excluding queue and tool-execution time; it is not an average of progress samples. Each autoresearch round is measured separately. Final status lookup may add up to one second; unavailable fields are omitted without discarding the confirmed answer. Cancellation, error, and control-command notices keep their existing format.
 
 Stopping cannot undo tool side effects. When stopping requires force-terminating OMP, execution status may remain uncertain and the session may fail to resume. A prolonged idle stall with pending steering can also trigger recovery; uncertain work is never automatically replayed.
 

@@ -36,7 +36,7 @@ func nativeUntil(t *testing.T, w *worker, ready func() bool) {
 	t.Helper()
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
-	for !ready() {
+	for !ready() || w.replyStatus.pending != nil {
 		var events <-chan json.RawMessage
 		if w.client != nil {
 			events = w.client.Events()

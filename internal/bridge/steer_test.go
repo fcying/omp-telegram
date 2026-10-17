@@ -86,7 +86,7 @@ func TestRunningTextSteersRootAndFollowupRunsSeparately(t *testing.T) {
 		t.Fatal("root and steer did not reach independent durable terminal states")
 	}
 	var finalText string
-	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=2 AND reply_to=2").Scan(&finalText); err != nil || finalText != "answer: correct direction" {
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=2 AND reply_to=2").Scan(&finalText); err != nil || replyBody(finalText) != "answer: correct direction" {
 		t.Fatalf("steered root final reply = %q, err=%v", finalText, err)
 	}
 	var steerReplies int
@@ -163,6 +163,7 @@ func TestSteerTerminalFenceWaitsForLatestSettlement(t *testing.T) {
 		t.Fatal("stale settlement probe released a newer steer fence")
 	}
 	w.steeredQuiescenceFinished(steerProbeResult{client: w.client, generation: w.binding.Generation, rootID: w.active, turn: w.turn, revision: w.steerFence.revision, settled: true})
+	awaitReplyStatus(t, w)
 	if w.active != 0 || steerInboxState(t, w, 2) != "done" || !w.canDispatch() {
 		t.Fatal("confirmed current settlement did not release root")
 	}
@@ -311,8 +312,10 @@ func TestSteerResultBeforeAcknowledgementStillSettlesRoot(t *testing.T) {
 	waitSteerRootStart(t, w)
 	w.operationReturned(waitOperation(t, w))
 	command("correction")
+	// Keep the mutation callback unapplied while events and terminal metadata settle.
+	ack := waitOperation(t, w)
 	deadline := time.After(5 * time.Second)
-	for w.taskActive() {
+	for w.taskActive() && w.replyStatus.pending == nil {
 		select {
 		case raw, ok := <-w.client.Events():
 			if !ok {
@@ -326,7 +329,11 @@ func TestSteerResultBeforeAcknowledgementStillSettlesRoot(t *testing.T) {
 	if got := steerInboxState(t, w, 3); got != "done" {
 		t.Fatalf("early steer result settled as %s", got)
 	}
-	w.operationReturned(waitOperation(t, w))
+	awaitReplyStatus(t, w)
+	if w.taskActive() || steerInboxState(t, w, 2) != "done" {
+		t.Fatal("early steer result did not settle the root before its acknowledgement")
+	}
+	w.operationReturned(ack)
 	if w.active != 0 || w.steerFence.active || steerInboxState(t, w, 2) != "done" {
 		t.Fatal("late ACK corrupted a settled root")
 	}

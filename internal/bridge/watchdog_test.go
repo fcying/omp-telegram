@@ -80,6 +80,7 @@ func drainWatchdogEvents(t *testing.T, w *worker) {
 			t.Fatal("buffered RPC event was not forwarded")
 		}
 	}
+	awaitReplyStatus(t, w)
 }
 
 func TestMissingTerminalRecoveryRetiresClientAndPreservesQueue(t *testing.T) {
@@ -250,6 +251,7 @@ func TestLateAgentStartDoesNotWedgeIdleQueue(t *testing.T) {
 	w.dispatch()
 	drainWatchdogEvents(t, w)
 	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}`))
+	awaitReplyStatus(t, w)
 	if w.active != 0 || w.busy {
 		t.Fatal("terminal event did not release the task")
 	}

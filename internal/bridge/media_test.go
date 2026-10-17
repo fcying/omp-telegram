@@ -322,8 +322,8 @@ func TestPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 	f.mu.Lock()
 	var answers []string
 	for _, message := range f.messages {
-		if text, ok := message["text"].(string); ok && strings.HasPrefix(text, "answer: ") {
-			answers = append(answers, text)
+		if text, ok := message["text"].(string); ok && strings.HasPrefix(replyBody(text), "answer: ") {
+			answers = append(answers, replyBody(text))
 		}
 	}
 	f.mu.Unlock()
@@ -1692,6 +1692,7 @@ func TestCompletedTaskCancelsPendingHostAttachment(t *testing.T) {
 	taskID := w.active
 	cancelled := observeHostRequestCancel(t, w, result.id)
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"completed"}]}]}`))
+	awaitReplyStatus(t, w)
 	if !*cancelled || len(w.hostRequests) != 0 {
 		t.Fatal("completed task retained pending host tool work")
 	}

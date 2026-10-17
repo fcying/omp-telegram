@@ -297,6 +297,7 @@ func TestAbortTimeoutRetiresRuntimeAndContinuesQueueOnFreshClient(t *testing.T) 
 	}
 
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"queued answer"}]}]}`))
+	awaitReplyStatus(t, w)
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "done" {
 		t.Fatalf("continued queued task state = %q, error %v; want done", state, err)
 	}
@@ -333,8 +334,10 @@ func TestSuccessfulAbortRetiresRuntimeBeforeFollowingPrompts(t *testing.T) {
 					t.Fatalf("message after Stop state = %s, want done", queueState(t, w, 100))
 				}
 				var replies int
-				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=100 AND text=?", "answer: fresh message after stop").Scan(&replies))
-				if replies != 1 || queueState(t, w, 2) != "cancelled" {
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=100").Scan(&replies))
+				var finalText string
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=100").Scan(&finalText))
+				if replies != 1 || replyBody(finalText) != "answer: fresh message after stop" || queueState(t, w, 2) != "cancelled" {
 					t.Fatal("Stop consumed the fresh message as steering or failed to cancel the old root")
 				}
 				if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {
@@ -570,6 +573,7 @@ func TestQueuedPromptAfterUncertainModelSwitchUsesFreshClient(t *testing.T) {
 		t.Fatal("queued prompt ran on the client with an uncertain model setting")
 	}
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"queued answer"}]}]}`))
+	awaitReplyStatus(t, w)
 	var state string
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "done" {
 		t.Fatalf("queued task state = %q, error %v; want done", state, err)
