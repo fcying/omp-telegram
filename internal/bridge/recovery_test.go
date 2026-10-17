@@ -45,7 +45,7 @@ func newRecoveryDaemonForChat(t *testing.T, maxWorkers int, chat int64) *recover
 	d := &recoveryDaemon{
 		t: t, root: t.TempDir(), chat: chat,
 		fake: &fakeHTTP{updates: make(chan telegram.Update, 32)},
-		cfg:  config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{chat}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: maxWorkers, QueueCapacity: 4},
+		cfg:  config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{chat}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: maxWorkers, QueueCapacity: 4, OMPArgsFingerprint: strings.Repeat("b", 64)},
 	}
 	old := http.DefaultTransport
 	http.DefaultTransport = d.fake
@@ -269,7 +269,7 @@ func TestCrashRecoveryCancelsPendingFollowupsWithoutRPCReplay(t *testing.T) {
 		t: t, root: t.TempDir(), chat: -10,
 		fake: &fakeHTTP{updates: make(chan telegram.Update, 32)},
 		cfg: config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10},
-			WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 4},
+			WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 4, OMPArgsFingerprint: strings.Repeat("a", 64)},
 	}
 	old := http.DefaultTransport
 	http.DefaultTransport = d.fake

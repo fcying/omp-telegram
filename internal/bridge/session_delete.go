@@ -74,7 +74,7 @@ func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageI
 		return
 	}
 	title := "Delete omp session?\n\nTitle: " + menuText(selected.Title, 80) + "\nID: " + selected.ID + "\n\nThis deletes the saved OMP session and its artifacts.\nThe workspace files will not be deleted."
-	w.confirm(confirmation{action: "session_delete", workspace: c.workspace, epoch: c.epoch, user: c.user, sessions: []omp.SessionSummary{selected}}, title, []string{"Delete", "Cancel"})
+	w.confirm(confirmation{action: "session_delete", workspace: c.workspace, epoch: c.epoch, user: c.user, sessions: []omp.SessionSummary{selected}, ompArgs: c.ompArgs}, title, []string{"Delete", "Cancel"})
 }
 
 func (w *worker) beginSessionDelete(c confirmation) {
@@ -112,7 +112,7 @@ func (w *worker) beginSessionDelete(c confirmation) {
 	w.deleteCancel = cancel
 	w.deleteRequest++
 	request := w.deleteRequest
-	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: c.workspace, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}
+	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: c.workspace, Args: c.ompArgs, Environment: w.b.cfg.OMPEnvironment}
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()

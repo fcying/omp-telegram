@@ -235,14 +235,15 @@ func (w *worker) prepareResearchControlRuntime() (*omp.Client, error) {
 		return nil, errors.New("the active instance limit has been reached")
 	}
 	w.beginRuntimeStart()
+	launchArgs := w.b.selectedArgsSnapshot()
 	client, err := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: w.binding.Workspace,
-		Resume: w.binding.Session, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
+		Resume: w.binding.Session, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
 	if err != nil {
 		<-w.b.slots
 		w.runtimeStopped()
 		return nil, err
 	}
-	w.runtimeStarted(client)
+	w.runtimeStarted(client, launchArgs)
 	return client, nil
 }
 

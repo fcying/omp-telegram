@@ -27,6 +27,9 @@ type resumeListResult struct {
 	generation, user          int64
 	epoch                     uint64
 	cwd, action, exportFormat string
+	args                      []string
+	argsPresetIndex           int
+	argsFingerprint           string
 	sessions                  []omp.SessionSummary
 	err                       error
 }
@@ -145,8 +148,9 @@ func (w *worker) requestDirectExport(user int64, format, sessionID string) {
 		w.say(err.Error())
 		return
 	}
+	args := w.b.selectedArgsSnapshot()
 	w.cancelResumeList()
-	w.beginExport(omp.SessionSummary{ID: sessionID, CWD: cwd}, format, cwd, binding.Generation)
+	w.beginExportWithArgs(omp.SessionSummary{ID: sessionID, CWD: cwd}, format, cwd, binding.Generation, args)
 }
 
 func parseExportArgs(arg string) (format, sessionID string, ok bool) {
@@ -216,7 +220,8 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 	w.resumeCancel = cancel
 	request, generation := w.resumeRequest, binding.Generation
 	epoch := w.b.bindingsEpoch.Load()
-	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}
+	argsPresetIndex, argsFingerprint, args := w.b.selectedArgsPresetSnapshot()
+	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: args, Environment: w.b.cfg.OMPEnvironment}
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -229,7 +234,7 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := resumeListResult{request: request, generation: generation, epoch: epoch, user: user, cwd: cwd, action: action, exportFormat: format, sessions: sessions, err: err}
+		result := resumeListResult{request: request, generation: generation, epoch: epoch, user: user, cwd: cwd, action: action, exportFormat: format, args: args, argsPresetIndex: argsPresetIndex, argsFingerprint: argsFingerprint, sessions: sessions, err: err}
 		select {
 		case w.resumeResults <- result:
 		case <-w.ctx.Done():
@@ -303,7 +308,7 @@ func (w *worker) resumeListed(result resumeListResult) {
 	nativeSessions := append([]omp.SessionSummary(nil), result.sessions...)
 	sessions := append([]omp.SessionSummary(nil), nativeSessions...)
 	sortPinnedSessions(sessions, pinned)
-	w.showResumePage(confirmation{action: "resume", method: "select", workspace: result.cwd, user: result.user, generation: result.generation, epoch: result.epoch, sessions: sessions, nativeSessions: nativeSessions, pinnedSessions: pinned}, 0, 0)
+	w.showResumePage(confirmation{action: "resume", method: "select", workspace: result.cwd, user: result.user, generation: result.generation, epoch: result.epoch, sessions: sessions, nativeSessions: nativeSessions, pinnedSessions: pinned, ompArgs: result.args, argsPresetIndex: result.argsPresetIndex, argsFingerprint: result.argsFingerprint}, 0, 0)
 }
 
 func (w *worker) exportListed(result resumeListResult) {
@@ -311,7 +316,7 @@ func (w *worker) exportListed(result resumeListResult) {
 		w.say("omp has no saved sessions in this working directory.")
 		return
 	}
-	w.showResumePage(confirmation{action: "export", method: "select", workspace: result.cwd, exportFormat: result.exportFormat, user: result.user, generation: result.generation, epoch: result.epoch, sessions: result.sessions}, 0, 0)
+	w.showResumePage(confirmation{action: "export", method: "select", workspace: result.cwd, exportFormat: result.exportFormat, user: result.user, generation: result.generation, epoch: result.epoch, sessions: result.sessions, ompArgs: result.args}, 0, 0)
 }
 
 func menuText(text string, limit int) string {
@@ -343,6 +348,10 @@ func (w *worker) exportCurrentBusy(sessionID string) bool {
 }
 
 func (w *worker) beginExport(session omp.SessionSummary, format, workspace string, generation int64) {
+	w.beginExportWithArgs(session, format, workspace, generation, w.b.selectedArgsSnapshot())
+}
+
+func (w *worker) beginExportWithArgs(session omp.SessionSummary, format, workspace string, generation int64, args []string) {
 	if format != "session" && format != "html" {
 		w.say("Usage: /export [html] [session-id].")
 		return
@@ -363,7 +372,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 		w.say("Wait for the current task and queue to finish before exporting.")
 		return
 	}
-	if !currentExact && omp.HasCustomSessionDir(w.b.cfg.OMPArgs, w.b.cfg.OMPEnvironment) {
+	if !currentExact && omp.HasCustomSessionDir(args, w.b.cfg.OMPEnvironment) {
 		w.say("Cannot export an inactive session when omp uses a custom session directory.")
 		return
 	}
@@ -388,7 +397,7 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 	}
 	bindingSession := committed.Session
 	bindingSessionID := committed.SessionID
-	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: workspace, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}
+	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: workspace, Args: args, Environment: w.b.cfg.OMPEnvironment}
 	environment := cfg.Environment
 	spool := filepath.Join(w.b.cfg.DataDir, "attachments", "outbox")
 	w.background.Add(1)
@@ -544,15 +553,16 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		if title == "" {
 			title = "Untitled"
 		}
-		marker := ""
+		currentMarker := ""
 		if w.bindingSessionSelected(session.ID) {
-			marker = " [current]"
+			currentMarker = "* "
 		}
+		pinnedMarker := ""
 		if c.action == "resume" && sessionIsPinned(session, c.pinnedSessions) {
-			marker += " [pinned]"
+			pinnedMarker = " [pinned]"
 		}
 		sessionIndex := start + i
-		fmt.Fprintf(&text, "%d. %s%s", sessionIndex+1, title, marker)
+		fmt.Fprintf(&text, "%d. %s%s%s", sessionIndex+1, currentMarker, title, pinnedMarker)
 		if updated, err := time.Parse(time.RFC3339Nano, session.UpdatedAt); err == nil {
 			fmt.Fprintf(&text, " | %s", updated.UTC().Format("2006-01-02 15:04 UTC"))
 		}
@@ -673,9 +683,18 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 	if c.action == "export" {
 		receipt += "\nFormat: " + strings.ToUpper(c.exportFormat)
 	}
+	var launchArgs []string
+	if c.action == "resume" {
+		var current bool
+		launchArgs, current = w.b.argsPresetSnapshotIfCurrent(c.argsPresetIndex, c.argsFingerprint)
+		if !current {
+			w.finishMenu(messageID, "OMP argument preset changed. Use /resume again.")
+			return
+		}
+	}
 	w.finishMenu(messageID, receipt)
 	if c.action == "export" {
-		w.beginExport(selected, c.exportFormat, c.workspace, c.generation)
+		w.beginExportWithArgs(selected, c.exportFormat, c.workspace, c.generation, c.ompArgs)
 		return
 	}
 	if w.client != nil && strings.EqualFold(selected.ID, w.sessionID) {
@@ -686,7 +705,7 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		w.say("This session is active in another conversation. Close that instance first.")
 		return
 	}
-	w.startFenced(true, selected.ID, c.workspace, true, c.generation, c.epoch)
+	w.startFencedWithArgs(true, selected.ID, c.workspace, true, c.generation, c.epoch, launchArgs)
 }
 
 func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID int64) {

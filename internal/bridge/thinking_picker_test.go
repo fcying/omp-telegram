@@ -29,6 +29,9 @@ func TestThinkingPickerOwnerAdjustmentAndReplay(t *testing.T) {
 	before := w.binding
 	command("/thinking")
 	buttons := resumeButtons(t, f)
+	if buttons[3]["text"] != "* medium" {
+		t.Fatalf("current thinking level button = %+v", buttons[3])
+	}
 	assertThinkingLevel(t, w, "medium")
 	messageID := f.messageCount()
 	data := buttons[6]["callback_data"].(string)

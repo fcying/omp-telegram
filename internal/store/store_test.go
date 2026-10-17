@@ -44,6 +44,11 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	if version != schemaVersion {
 		t.Fatalf("new database version = %d, want %d", version, schemaVersion)
 	}
+	var selectionTableCount int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='omp_args_selection'").Scan(&selectionTableCount))
+	if selectionTableCount != 1 {
+		t.Fatalf("fresh database args selection table count = %d, want 1", selectionTableCount)
+	}
 	requireNoActivityTable(t, s)
 	var indexCount int
 	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_outbox_inbox_state'").Scan(&indexCount))
@@ -66,13 +71,127 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestOMPArgsSelectionPersistenceAndReset(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	var columns []string
+	rows, err := s.DB.Query("PRAGMA table_info(omp_args_selection)")
+	requireStoreOK(t, err)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		requireStoreOK(t, rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey))
+		columns = append(columns, name)
+	}
+	requireStoreOK(t, rows.Err())
+	requireStoreOK(t, rows.Close())
+	if len(columns) != 2 || columns[0] != "preset_index" || columns[1] != "args_fingerprint" {
+		t.Fatalf("args selection columns = %v, want only preset_index and args_fingerprint", columns)
+	}
+
+	index, err := s.LoadOrResetOMPArgsSelection("fingerprint-a", 3)
+	requireStoreOK(t, err)
+	if index != 1 {
+		t.Fatalf("initial preset index = %d, want 1", index)
+	}
+	if _, err := s.DB.Exec("INSERT INTO omp_args_selection(preset_index,args_fingerprint) VALUES(3,'unexpected')"); err == nil {
+		t.Fatal("args selection table accepted a second row")
+	}
+	requireStoreOK(t, s.SetOMPArgsSelection(2, "fingerprint-a", 3))
+	index, err = s.LoadOrResetOMPArgsSelection("fingerprint-a", 3)
+	requireStoreOK(t, err)
+	if index != 2 {
+		t.Fatalf("retained preset index = %d, want 2", index)
+	}
+	index, err = s.LoadOrResetOMPArgsSelection("fingerprint-b", 3)
+	requireStoreOK(t, err)
+	if index != 1 {
+		t.Fatalf("changed fingerprint preset index = %d, want 1", index)
+	}
+	_, err = s.DB.Exec("UPDATE omp_args_selection SET preset_index=4")
+	requireStoreOK(t, err)
+	index, err = s.LoadOrResetOMPArgsSelection("fingerprint-b", 3)
+	requireStoreOK(t, err)
+	if index != 1 {
+		t.Fatalf("out-of-range preset index = %d, want reset to 1", index)
+	}
+	_, err = s.DB.Exec("UPDATE omp_args_selection SET preset_index='malformed'")
+	requireStoreOK(t, err)
+	index, err = s.LoadOrResetOMPArgsSelection("fingerprint-b", 3)
+	requireStoreOK(t, err)
+	if index != 1 {
+		t.Fatalf("malformed preset index = %d, want reset to 1", index)
+	}
+	var storedIndex int
+	var storedFingerprint string
+	requireStoreOK(t, s.DB.QueryRow("SELECT preset_index,args_fingerprint FROM omp_args_selection").Scan(&storedIndex, &storedFingerprint))
+	if storedIndex != 1 || storedFingerprint != "fingerprint-b" {
+		t.Fatalf("reset selection = (%d, %q), want (1, fingerprint-b)", storedIndex, storedFingerprint)
+	}
+	if _, err := s.LoadOrResetOMPArgsSelection("", 3); err == nil {
+		t.Fatal("empty fingerprint was accepted")
+	}
+	if _, err := s.LoadOrResetOMPArgsSelection("fingerprint-b", 0); err == nil {
+		t.Fatal("zero preset count was accepted")
+	}
+	if err := s.SetOMPArgsSelection(1, "", 3); err == nil {
+		t.Fatal("empty Set fingerprint was accepted")
+	}
+	if err := s.SetOMPArgsSelection(1, "fingerprint-b", 0); err == nil {
+		t.Fatal("zero Set preset count was accepted")
+	}
+	if err := s.SetOMPArgsSelection(0, "fingerprint-b", 3); err == nil {
+		t.Fatal("zero preset index was accepted")
+	}
+	if err := s.SetOMPArgsSelection(4, "fingerprint-b", 3); err == nil {
+		t.Fatal("out-of-range preset index was accepted")
+	}
+}
+
+func TestVersionSixteenMigratesOMPArgsSelection(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	_, err := s.DB.Exec("DROP TABLE omp_args_selection; PRAGMA user_version=16")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var version, tableCount int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='omp_args_selection'").Scan(&tableCount))
+	if version != 17 || tableCount != 1 {
+		t.Fatalf("v16 migration version/table count = %d/%d, want 17/1", version, tableCount)
+	}
+	index, err := s.LoadOrResetOMPArgsSelection("migration-fingerprint", 2)
+	requireStoreOK(t, err)
+	if index != 1 {
+		t.Fatalf("migrated preset index = %d, want 1", index)
+	}
+}
+
+func TestOMPArgsSelectionFailedSetRollsBack(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.SetOMPArgsSelection(2, "fingerprint-a", 3))
+	_, err := s.DB.Exec(`CREATE TRIGGER reject_omp_args_selection_insert BEFORE INSERT ON omp_args_selection
+BEGIN SELECT RAISE(ABORT, 'blocked'); END;`)
+	requireStoreOK(t, err)
+	if err := s.SetOMPArgsSelection(3, "fingerprint-b", 3); err == nil {
+		t.Fatal("triggered selection update unexpectedly succeeded")
+	}
+	var index int
+	var fingerprint string
+	requireStoreOK(t, s.DB.QueryRow("SELECT preset_index,args_fingerprint FROM omp_args_selection").Scan(&index, &fingerprint))
+	if index != 2 || fingerprint != "fingerprint-a" {
+		t.Fatalf("selection after failed update = (%d, %q), want (2, fingerprint-a)", index, fingerprint)
+	}
+}
+
 func TestVersionElevenMigratesToCurrent(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
-	_, err := s.DB.Exec("ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=11")
+	_, err := s.DB.Exec("DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=11")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -98,7 +217,7 @@ func TestVersionTwelveMigrationRollsBackOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
-	_, err := s.DB.Exec(`ALTER TABLE startup_intents DROP COLUMN created_at; CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
+	_, err := s.DB.Exec(`DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	if reopened, err := Open(dir); err == nil {
@@ -125,7 +244,7 @@ func TestVersionTwelveMigratesToCurrentWithoutOtherDataLoss(t *testing.T) {
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Submit(10, 42))
 	requireStoreOK(t, s.SetProgressMessage(10, 99))
-	_, err := s.DB.Exec(`INSERT INTO outbox(inbox_id,chat,thread,text,state) VALUES (10,2,3,'pending reply','pending');
+	_, err := s.DB.Exec(`DROP TABLE omp_args_selection; INSERT INTO outbox(inbox_id,chat,thread,text,state) VALUES (10,2,3,'pending reply','pending');
 CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id));
 INSERT INTO activity_messages(inbox_id,chat,message_id) VALUES (10,2,91);
 ALTER TABLE startup_intents DROP COLUMN created_at;
@@ -164,7 +283,7 @@ func TestVersionThirteenStartsRetentionAtMigration(t *testing.T) {
 	previous := Binding{Bot: 1, Chat: 2, Thread: 3}
 	intent := StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/new", Generation: 1}
 	requireStoreOK(t, s.PrepareStart(previous, intent))
-	_, err := s.DB.Exec("ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=13")
+	_, err := s.DB.Exec("DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=13")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -190,7 +309,7 @@ func TestVersionTwelveMissingTableLeavesDataUntouched(t *testing.T) {
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
-	_, err := s.DB.Exec("PRAGMA user_version=12")
+	_, err := s.DB.Exec("DROP TABLE omp_args_selection; PRAGMA user_version=12")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	if reopened, err := Open(dir); err == nil {

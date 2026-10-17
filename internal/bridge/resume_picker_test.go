@@ -22,10 +22,32 @@ type resumeFixtureSession struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
+func fixtureFlagValue(flag string) string {
+	for i, arg := range os.Args {
+		if arg == flag && i+1 < len(os.Args) {
+			return os.Args[i+1]
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			return strings.TrimPrefix(arg, flag+"=")
+		}
+	}
+	return ""
+}
+
 // The ACP fixture lists only explicitly supplied metadata, never host history.
 func runResumeListFixture() {
 	var sessions []resumeFixtureSession
-	if raw := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSIONS"); raw != "" {
+	if profiles := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSIONS_BY_PROFILE"); profiles != "" {
+		var byProfile map[string][]resumeFixtureSession
+		if json.Unmarshal([]byte(profiles), &byProfile) != nil {
+			os.Exit(2)
+		}
+		profile := fixtureFlagValue("--profile")
+		if failProfile := os.Getenv("OMP_TELEGRAM_FIXTURE_FAIL_PROFILE"); failProfile != "" && failProfile == profile {
+			os.Exit(2)
+		}
+		sessions = byProfile[profile]
+	} else if raw := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSIONS"); raw != "" {
 		if json.Unmarshal([]byte(raw), &sessions) != nil {
 			os.Exit(2)
 		}
@@ -109,11 +131,22 @@ func runResumeListFixture() {
 	}
 }
 
+func fixtureRenderArgumentIndex() int {
+	for i := 1; i+3 < len(os.Args); i++ {
+		if os.Args[i] == "render" && os.Args[i+2] == "-q" && os.Args[i+3] == "-t" {
+			return i
+		}
+	}
+	return -1
+}
+
 func runResumeRenderFixture() {
-	if len(os.Args) < 5 || os.Args[1] != "render" || os.Args[3] != "-q" || os.Args[4] != "-t" {
+	index := fixtureRenderArgumentIndex()
+	if index < 0 {
 		os.Exit(2)
 	}
-	requested := strings.ToLower(os.Args[2])
+	requested := strings.ToLower(os.Args[index+1])
+	recordBridgeFixtureTrace("OMP_TELEGRAM_FIXTURE_RENDER_TRACE", os.Args[1:])
 	root := os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT")
 	if marker := os.Getenv("OMP_TELEGRAM_FIXTURE_RENDER_MARKER"); marker != "" {
 		if err := os.WriteFile(marker, []byte("render\n"), 0600); err != nil {
@@ -468,6 +501,10 @@ func TestResumePickerCurrentSelectionKeepsProcess(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(data))
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
+	text, _ := pickerView(t, f)
+	if !strings.Contains(text, "1. * current-native-session") {
+		t.Fatalf("current session was not marked in the picker: %q", text)
+	}
 	clickResume(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
 	if w.client != client || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("selecting active native session restarted it")

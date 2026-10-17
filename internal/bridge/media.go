@@ -446,6 +446,7 @@ func (b *Bridge) cleanupIncomingAttachments(ctx context.Context, cutoff time.Tim
 	}
 
 	byWorkspace := make(map[string]incomingSessionActivity)
+	presets := b.argsPresetsSnapshot()
 	loggedListFailure := false
 	canRemove := func(owner media.IncomingOwner) bool {
 		if b.sessionInUse(owner.SessionID) {
@@ -458,32 +459,47 @@ func (b *Bridge) cleanupIncomingAttachments(ctx context.Context, cutoff time.Tim
 		}
 		activity, listed := byWorkspace[owner.Workspace]
 		if !listed {
-			activity = incomingSessionActivity{}
+			activity = incomingSessionActivity{available: true, updatedAt: make(map[string]string)}
 			listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			var sessions []omp.SessionSummary
-			var listErr error
-			if b.resumeSlots == nil {
-				sessions, listErr = omp.ListSessions(listCtx, omp.Config{Binary: b.cfg.OMP, CWD: owner.Workspace, Args: b.cfg.OMPArgs, Environment: b.cfg.OMPEnvironment})
-			} else {
-				select {
-				case b.resumeSlots <- struct{}{}:
-					sessions, listErr = omp.ListSessions(listCtx, omp.Config{Binary: b.cfg.OMP, CWD: owner.Workspace, Args: b.cfg.OMPArgs, Environment: b.cfg.OMPEnvironment})
-					<-b.resumeSlots
-				case <-listCtx.Done():
-					listErr = listCtx.Err()
+			for _, args := range presets {
+				var sessions []omp.SessionSummary
+				var listErr error
+				if b.resumeSlots == nil {
+					sessions, listErr = omp.ListSessions(listCtx, omp.Config{Binary: b.cfg.OMP, CWD: owner.Workspace, Args: args, Environment: b.cfg.OMPEnvironment})
+				} else {
+					select {
+					case b.resumeSlots <- struct{}{}:
+						sessions, listErr = omp.ListSessions(listCtx, omp.Config{Binary: b.cfg.OMP, CWD: owner.Workspace, Args: args, Environment: b.cfg.OMPEnvironment})
+						<-b.resumeSlots
+					case <-listCtx.Done():
+						listErr = listCtx.Err()
+					}
+				}
+				if listErr != nil {
+					activity.available = false
+					if ctx.Err() == nil && !loggedListFailure {
+						b.mediaLog.Warn("incoming attachment cleanup deferred", "event", "cleanup_failed", "error_kind", "session_list")
+						loggedListFailure = true
+					}
+					break
+				}
+				for _, session := range sessions {
+					key := strings.ToLower(session.ID)
+					previous, exists := activity.updatedAt[key]
+					if !exists {
+						activity.updatedAt[key] = session.UpdatedAt
+						continue
+					}
+					previousAt, previousErr := time.Parse(time.RFC3339Nano, previous)
+					currentAt, currentErr := time.Parse(time.RFC3339Nano, session.UpdatedAt)
+					if previousErr != nil || currentErr != nil {
+						activity.updatedAt[key] = ""
+					} else if currentAt.After(previousAt) {
+						activity.updatedAt[key] = session.UpdatedAt
+					}
 				}
 			}
 			cancel()
-			if listErr == nil {
-				activity.available = true
-				activity.updatedAt = make(map[string]string, len(sessions))
-				for _, session := range sessions {
-					activity.updatedAt[strings.ToLower(session.ID)] = session.UpdatedAt
-				}
-			} else if ctx.Err() == nil && !loggedListFailure {
-				b.mediaLog.Warn("incoming attachment cleanup deferred", "event", "cleanup_failed", "error_kind", "session_list")
-				loggedListFailure = true
-			}
 			byWorkspace[owner.Workspace] = activity
 		}
 		if !activity.available {

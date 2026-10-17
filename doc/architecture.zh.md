@@ -327,6 +327,7 @@ closed binding 删除与 startup intent 准备使用事务 fence: start 只能�
 | 表 | 键 / 字段 | 用途 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
+| `omp_args_selection` | 单行 singleton; `preset_index,args_fingerprint` | 当前全局 OMP 启动预设及用于检测配置变化的 SHA-256 指纹, 不保存原始参数. |
 | `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | 最后一次已验证的 session binding, 恢复资格, 最后使用时间 metadata 和活动任务中断标记 |
 | `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation,created_at` | 尚未提交的 `/new` 或 `/resume` 持久化转换及其保留期起点 |
 | `workspace_users` | 主键 `(root,bot,chat,thread,session)` | 普通逻辑占用持久化, 包括未连接 runtime 的 session |
@@ -353,9 +354,9 @@ Telegram 输入附件保存在 `storage.data_dir/attachments/inbox/incoming-*` �
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 16. 空库在同一事务中创建所有表, 索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`, binding 中断标记, 消息时间戳, reply target, 原生 session ID, inbox/outbox progress 关联, `bindings.last_used_at`, conversation 级 `/resume` favorites, 持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
+`PRAGMA user_version` 是数据库版本, 当前为 17. 空库在同一事务中创建所有表, 索引和版本号, 不创建 Activity 表. 重新打开时整理上次运行留下的状态. 已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 至 10 会依次通过 `startup_intents`, binding 中断标记, 消息时间戳, reply target, 原生 session ID, inbox/outbox progress 关联, `bindings.last_used_at`, conversation 级 `/resume` favorites, 持久化 outbox 重试元数据和独立的服务端拒绝重试计数进行事务迁移, 然后推进 `user_version`. v8 不猜测历史 `last_used_at`, 旧 binding 的值保持为 0. v10 到 v11 将 `server_retry_count` 初始化为 0, 因为旧 `attempt_count` 混合记录了 rate limit 和服务端拒绝, 无法还原. 应用版本和数据库版本独立变化.
 
-历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 版本 13 到 14 为 `startup_intents` 增加 `created_at`, 并将既有 pending 条目标记为升级时间: 原始年龄未知, 不会立即过期. Workspace 表在版本 15 引入; 更早 schema 现在直接创建当前结构. 版本 15 到 16 在同一事务内将 lease 的 root-only 主键替换为 `(root,bot,chat,thread,session)`, 保留全部既有 owner 和历史 root. Daemon 启动在准入 worker 前, 根据 running binding 和 workspace 已知的 pending intent 重建普通占用. 既有记录和原生 session 数据保持不变. 版本高于 16 的数据库仍不受支持; 旧二进制不能打开 v16 数据库.
+历史迁移链中的版本 11 到 12 会创建 `activity_messages`, 版本 12 到 13 会在同一启动事务中删除该表, 不论其中是否有记录. 版本 13 到 14 为 `startup_intents` 增加 `created_at`, 并将既有 pending 条目标记为升级时间: 原始年龄未知, 不会立即过期. Workspace 表在版本 15 引入; 更早 schema 现在直接创建当前结构. 版本 15 到 16 在同一事务内将 lease 的 root-only 主键替换为 `(root,bot,chat,thread,session)`, 保留全部既有 owner 和历史 root. 版本 16 到 17 创建 singleton 表 `omp_args_selection`. Daemon 启动在准入 worker 前, 根据 running binding 和 workspace 已知的 pending intent 重建普通占用. 既有记录和原生 session 数据保持不变. 版本高于 17 的数据库仍不受支持; 旧二进制不能打开 v17 数据库.
 
 ### 输入与完成事务
 
@@ -419,6 +420,7 @@ Outbox 终态在 snapshot 删除之前提交. 仅观察到 `done` 不代表清�
 ## 会话生命周期
 
 `/new` 解析工作目录, 替换已有运行实例时要求确认. `/new <名称或路径>`, `/resume` 及其他已有命令都可用于普通私聊和 topic. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, 对话, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录. Resume pin 只保存 `(bot,chat,thread,workspace,session_id)` identity metadata; pinned session 排在前面, stale pin 在 native listing 返回同一 identity 前保持隐藏. Pin 和 Unpin 是 picker 控件, 不修改原生 session 或 binding lifecycle. 显式删除 closed binding 时也会删除其 pinned metadata, 但不会触碰原生 session history.
+Resume picker 会记录列出会话时使用的全局 OMP 参数预设. 选择 session 时若预设已变化, callback 会被拒绝并要求重新打开 picker. 验证通过后, 启动使用同一份 argv 快照, 后续切换全局预设不会改变本次启动参数.
 
 `/resume` 的 Delete 与 `/bindings` 删除不同. 首次点击校验 picker workspace 和完整原生 ID, 然后生成绑定用户和消息的红色二次确认. 最终确认再次校验 binding generation、mutation epoch、workspace、运行中 session claim、已持久化的 running binding 和待提交 resume intent. 按 session ID 持有 delete reservation, 排斥同时 resume、export 和其他 delete; resume 启动会在同一把锁下检查 reservation 并写入 startup intent. 完成、失败及 worker 关闭时都会释放 reservation. 删除超时为 30 秒, 不占用常驻 worker runtime slot.
 
@@ -554,6 +556,8 @@ New, compact, 原生 confirm, autoresearch clear, 原生 session Delete 和 bind
 
 `/model` 在 worker 工作目录通过只读 `omp config get ... --json` 子进程读取 `cycleOrder` 和 `modelRoles`. 按参数顺序把 `--config` 文件追加到查询子进程被允许继承的父进程 `PI_CONFIG_FILES`, 由 OMP 自己合并覆盖配置; allowlist 模式下未列入 `allow` 的父进程变量视为不存在, 显式 `omp.args` overlay 仍会生效. 支持两种参数写法, 工作目录相对路径和 `~/` 展开. 包含环境列表分隔符的路径通过继承的只读文件描述符传递, 避免被拆成不同文件. 不修改配置文件或父进程环境. 不通过切换模型枚举角色, 不重复实现 selector 解析. 选择角色时发送原生本地命令 `/model @role`, 并用 `get_state` 验证成功后的模型标识; 不转发原始命令输出. 切换要求原生与 bridge 都空闲且 bridge 队列为空. 尚不支持的 `--profile`, `--smol`, `--slow`, `--plan` 覆盖项仍会禁用角色菜单, 但可手动指定模型. 原生角色命令结果不确定时使 client 失效.
 
+`/args` 是 bot 全局本地控制命令, 对话忙碌或没有运行中的 OMP 时都可使用. 每个预设都有一个非空 `omp.args_labels` 标签时, Telegram picker 显示这些标签; 否则显示通用的 `Preset N` 名称, 并在启动时记录 warning, 不会阻止启动. 当前项的按钮名称前以 `*` 标记. 不显示原始 argv. 标签按字面处理, 能查看该对话的人都能看到, 因此不能包含凭据. 切换先将 1-based 预设编号和当前指纹提交到 SQLite, 再更新内存选择; 写入失败时旧选择继续生效. 启动时只有指纹一致且编号仍有效才恢复已选项; 否则先持久化重置到预设 1, 再恢复 worker. 标签不参与对归一化预设字符串及展开后 argv 计算的 SHA-256 指纹. 旧的 `omp.args` 字符串会归一化为单项数组, 改写成单项数组不重置选择. daemon 重启时发现配置有变化会重置选择; 参数引用文件的内容变化不追踪. 数据库不保存原始参数, 也不为每个 session 保存预设. 每个 OMP 进程在生命周期内保留启动参数快照, 其 `/model` role 查询继续使用该快照; 后续新启动, 包括 release 后懒恢复, 使用当前全局选择. 附件 janitor 检查所有已配置预设下的 session 可见性; 任一必要列表失败就保留文件, 防止 profile 或 session directory 改变后误判旧 session 不存在.
+
 `/thinking` 复用模型选择的 owner/generation/过期与空闲检查. 只有合法按钮被消费后才发送 `set_thinking_level`, 随后读取 `get_state.thinkingLevel`, 报告原生调整后的实际等级而不是回显请求值. 通过 OMP 现有 RPC 修改会话状态, 不编辑 OMP 配置文件, 不启动 agent turn.
 
 `/fast` 打开绑定 owner 的开关菜单; `/fast on` 和 `/fast off` 仅在空闲且队列为空时调用原生 `set_fast_mode`. 回复分别使用原生返回的 `enabled` 和 `active`, 不把请求设置等同于实际生效状态. 模型不支持或请求失败时不提示成功. `/fast status` 只读取原生状态, 任务运行中也可使用. Provider 支持与服务等级行为仍由 OMP 负责.
@@ -641,6 +645,17 @@ allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
 桥接配置使用分组 TOML table: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]` 以及可选 `[omp.environment]` 和 `[logging.component_levels]`. 根级 flat 字段, 原 `[log_component_levels]` table, 放错 table 的字段以及 flat/grouped 混合布局都会拒绝. 这是有意的 breaking cutover: 升级前必须手动迁移现有私有配置; 程序不会自动重写.
 
 环境变量在 TOML 解析后对配置字符串只展开一次, `[omp.environment]` 的模式和变量名除外, 它们均为字面值. 组件名会先按六个支持的名称校验, 再展开覆盖值. `OMP_TELEGRAM_ARGS`、`OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 的可选引用可以未设置. 内嵌配置中的 `telegram.progress_mode` 读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空、未设置或非法时回退到 `summary`. 不读取专用日志环境变量. `logging.level` 默认 `info`, `logging.format` 默认 `text`, 组件覆盖只能使用六个固定组件名. `omp.args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 OMP 自身模型与审批设置. `[omp.environment]` 默认使用无额外排除项的 denylist 模式; allowlist 模式必须显式提供可为空的有效 POSIX 变量名 `allow` 名单, 即使为空也拒绝 `deny`. denylist 模式则拒绝 `allow` (即使为空), 可选提供可为空的有效 POSIX 变量名 `deny` 名单.
+仅用于显示的 `omp.args_labels` 按字面读取, 不展开环境变量.
+
+TOML 的 `omp.args` 同时接受旧的字符串格式和有序预设字符串数组; 旧字符串归一化为单项数组. 随附默认值是 `args = ["${OMP_TELEGRAM_ARGS}"]`. 每项只展开一次并按 shell quoting 分词, 不执行 shell, 且所有预设都会校验. 空项表示不附加 argv. 指纹覆盖归一化预设文本和展开后的 argv; 数据库只持久化 SHA-256 指纹, 不保存原始参数字符串.
+
+## Roadmap
+
+- [ ] **Undo/rewind 和 redo.** 等待上游 OMP 同时提供:
+  - 权威且可持久恢复的 `submissionId -> entryId` 回执, 将 Telegram 输入关联到已落盘的 OMP entry, 覆盖排队输入和重连. 跟踪 [#12991](https://github.com/can1357/oh-my-pi/issues/12991).
+  - 原生 rewind/redo 的 RPC, 或至少支持仅回退会话的原地 `navigateTree` RPC. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) 提供的是只读 tree 查询, 不能移动 session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) 增加原生 TUI 文件及会话 rewind/redo, 仍需通过 RPC 暴露给 bridge. Tree navigation 本身不恢复文件, bridge 不自行实现文件回退引擎.
+- [ ] **Stop 后复用 OMP 进程.** 等待上游提供取消完成屏障, 阻止旧回调继续派发工作及旧任务事件影响后续任务. 包含 `isSettled=true` 的空闲 `get_state` 快照不等于该屏障. 在此之前, 停止活动任务仍会退役进程并保留 session.
+- [ ] **原生排队 prompt 的精确取消.** 等待上游为每个被移除的 prompt 返回真实且关联原请求 ID 的取消终态. OMP 18.10.4 的 `remove_queued_message` 可能返回 `removed:true`, 被移除的 prompt 却随后收到 `prompt_result(status="completed")`. OMP 已有 `abort_and_restore_queue`, 缺的不是另一个原子清队列 RPC. 当前 `/queue` 只取消 bridge 尚未派发的任务; 中止未决原生 steer 时仍退役进程, 并将执行状态保留为 uncertain.
 
 ## 开发与发布
 

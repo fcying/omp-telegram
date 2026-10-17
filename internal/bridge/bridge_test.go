@@ -218,8 +218,29 @@ func waitForFixtureFile(path string) {
 	}
 }
 
+func recordBridgeFixtureTrace(name string, value any) {
+	path := os.Getenv(name)
+	if path == "" {
+		return
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		os.Exit(2)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		os.Exit(2)
+	}
+	_, writeErr := fmt.Fprintln(file, string(raw))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		os.Exit(2)
+	}
+}
+
 func TestMain(m *testing.M) {
 	if len(os.Args) == 5 && os.Args[1] == "config" && os.Args[2] == "get" && os.Args[4] == "--json" {
+		recordBridgeFixtureTrace("OMP_TELEGRAM_FIXTURE_MODEL_TRACE", map[string]string{"key": os.Args[3], "config_files": os.Getenv("PI_CONFIG_FILES")})
 		var value any
 		switch os.Args[3] {
 		case "cycleOrder":
@@ -238,11 +259,12 @@ func TestMain(m *testing.M) {
 		runResumeListFixture()
 		os.Exit(0)
 	}
-	if len(os.Args) > 1 && os.Args[1] == "render" {
+	if fixtureRenderArgumentIndex() >= 0 {
 		runResumeRenderFixture()
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
+		recordBridgeFixtureTrace("OMP_TELEGRAM_FIXTURE_ARGV_TRACE", os.Args[3:])
 		if marker := os.Getenv("OMP_TELEGRAM_FIXTURE_RPC_START_MARKER"); marker != "" {
 			if err := os.WriteFile(marker, []byte("started"), 0600); err != nil {
 				os.Exit(2)
@@ -1256,7 +1278,7 @@ func setupBridgeWithDataDir(t *testing.T, dataDir string) (*fakeHTTP, *store.Sto
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	exe, _ := os.Executable()
-	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7, 8}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: dataDir, MaxWorkers: 2, QueueCapacity: 4}
+	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7, 8}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: exe, DataDir: dataDir, MaxWorkers: 2, QueueCapacity: 4, OMPArgsFingerprint: strings.Repeat("a", 64)}
 	logs := testLogs(t)
 	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
 	t.Cleanup(func() {
@@ -1796,7 +1818,7 @@ func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
 			defer func() { http.DefaultTransport = previous }()
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			if err := Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1}, db, testLogs(t), testAppVersion); err != nil {
+			if err := Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1, OMPArgsFingerprint: strings.Repeat("a", 64)}, db, testLogs(t), testAppVersion); err != nil {
 				t.Fatalf("command registration failure stopped startup: %v", err)
 			}
 		})
@@ -4057,7 +4079,7 @@ func TestPollerDrainsPendingInputsAcrossBatches(t *testing.T) {
 	http.DefaultTransport = fake
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: binary, DataDir: dir, MaxWorkers: 2, QueueCapacity: 4}
+	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: binary, DataDir: dir, MaxWorkers: 2, QueueCapacity: 4, OMPArgsFingerprint: strings.Repeat("a", 64)}
 	logs := testLogs(t)
 	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
 	t.Cleanup(func() {

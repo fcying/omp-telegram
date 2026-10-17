@@ -263,9 +263,15 @@ func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
 				defer func() { http.DefaultTransport = previous }()
 				ctx, cancel := context.WithCancel(context.Background())
 				done := make(chan error, 1)
+				cfg := config.Config{
+					Token:              "fake",
+					OMPArgs:            [][]string{{}},
+					OMPArgsLabels:      []string{"Default"},
+					OMPArgsFingerprint: strings.Repeat("c", 64),
+				}
 				go func() {
 					defer close(done)
-					done <- Run(ctx, config.Config{Token: "fake"}, db, logs, testAppVersion)
+					done <- Run(ctx, cfg, db, logs, testAppVersion)
 				}()
 				defer func() {
 					cancel()

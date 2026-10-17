@@ -239,7 +239,6 @@ func TestOMPArgsRejectInvalidLaunchOverrides(t *testing.T) {
 	}
 	for _, args := range []string{
 		`42`,
-		`["--config", "file.yml"]`,
 		`'--config ${OMP_TELEGRAM_TEST_MISSING_ARG}'`,
 		`'--config "secret-unclosed'`,
 		`'--mode=secret-invalid-mode'`,
@@ -269,25 +268,186 @@ func TestOMPArgsEnvironmentQuotingWithoutShellExpansion(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"--config", "/tmp/config with spaces.yml", "--append-system-prompt", "literal $HOME $(not-run)"}
-	if len(c.OMPArgs) != len(want) {
+	if len(c.OMPArgs) != 1 || !slices.Equal(c.OMPArgs[0], want) {
 		t.Fatal("quoted values were split incorrectly")
-	}
-	for i, value := range want {
-		if c.OMPArgs[i] != value {
-			t.Fatalf("argument %d changed during tokenization", i)
-		}
 	}
 	// Explicit empty configuration opts out even when the optional environment is set.
 	c, err = loadSource(t, path, setTOMLField(source, "omp", "args", `''`))
-	if err != nil || len(c.OMPArgs) != 0 {
+	if err != nil || len(c.OMPArgs) != 1 || len(c.OMPArgs[0]) != 0 {
 		t.Fatal("explicit empty arguments did not override environment")
 	}
 	if err = os.Unsetenv("OMP_TELEGRAM_ARGS"); err != nil {
 		t.Fatal(err)
 	}
 	c, err = loadSource(t, path, source)
-	if err != nil || len(c.OMPArgs) != 0 {
+	if err != nil || len(c.OMPArgs) != 1 || len(c.OMPArgs[0]) != 0 {
 		t.Fatal("missing optional argument environment should preserve omp defaults")
+	}
+}
+
+func TestOMPArgsLegacyScalarAndArrayFingerprint(t *testing.T) {
+	path, source := configFixture(t)
+	scalar, err := loadSource(t, path, setTOMLField(source, "omp", "args", `'--model scalar'`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	array, err := loadSource(t, path, setTOMLField(source, "omp", "args", `["--model scalar"]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--model", "scalar"}
+	if len(scalar.OMPArgs) != 1 || !slices.Equal(scalar.OMPArgs[0], want) {
+		t.Fatalf("legacy scalar preset = %#v", scalar.OMPArgs)
+	}
+	if len(array.OMPArgs) != 1 || !slices.Equal(array.OMPArgs[0], want) {
+		t.Fatalf("single array preset = %#v", array.OMPArgs)
+	}
+	if scalar.OMPArgsFingerprint != array.OMPArgsFingerprint {
+		t.Fatal("legacy scalar and one-element array fingerprints differ")
+	}
+	if len(scalar.OMPArgsFingerprint) != 64 || scalar.OMPArgsFingerprint != strings.ToLower(scalar.OMPArgsFingerprint) {
+		t.Fatal("argument fingerprint is not lowercase SHA-256 hex")
+	}
+}
+
+func TestOMPArgsLabelsAreOptionalLiteralAndDoNotChangeFingerprint(t *testing.T) {
+	path, source := configFixture(t)
+	source = setTOMLField(source, "omp", "args", `["--model one", "--model two"]`)
+	withoutLabels, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withoutLabels.OMPArgsLabels) != 0 {
+		t.Fatalf("unset args_labels = %v", withoutLabels.OMPArgsLabels)
+	}
+
+	t.Setenv("BRIDGE_TEST_LABEL", "expanded-secret")
+	withLabelsSource := setTOMLField(source, "omp", "args_labels", `["Tiny", "${BRIDGE_TEST_LABEL}"]`)
+	withLabels, err := loadSource(t, path, withLabelsSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(withLabels.OMPArgsLabels, []string{"Tiny", "${BRIDGE_TEST_LABEL}"}) {
+		t.Fatalf("args_labels = %v", withLabels.OMPArgsLabels)
+	}
+	if withLabels.OMPArgsFingerprint != withoutLabels.OMPArgsFingerprint {
+		t.Fatal("display labels changed the OMP argument fingerprint")
+	}
+
+	mismatchedSource := setTOMLField(source, "omp", "args_labels", `["Only one label"]`)
+	mismatched, err := loadSource(t, path, mismatchedSource)
+	if err != nil || !slices.Equal(mismatched.OMPArgsLabels, []string{"Only one label"}) {
+		t.Fatalf("mismatched args_labels blocked config load: labels=%v, error=%v", mismatched.OMPArgsLabels, err)
+	}
+}
+
+func TestOMPArgsArrayPresetsExpandOnceAndKeepOrder(t *testing.T) {
+	path, source := configFixture(t)
+	t.Setenv("BRIDGE_TEST_CONFIG", "/tmp/config with spaces.yml")
+	t.Setenv("BRIDGE_TEST_PROMPT", "$BRIDGE_TEST_NESTED")
+	t.Setenv("BRIDGE_TEST_MODEL", "model with spaces")
+	args := `[
+		"--config \"${BRIDGE_TEST_CONFIG}\"",
+		"--append-system-prompt '${BRIDGE_TEST_PROMPT}'",
+		"--model \"${BRIDGE_TEST_MODEL}\"",
+		"--literal 'literal $$HOME $$(not-run)'"
+	]`
+	c, err := loadSource(t, path, setTOMLField(source, "omp", "args", args))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"--config", "/tmp/config with spaces.yml"},
+		{"--append-system-prompt", "$BRIDGE_TEST_NESTED"},
+		{"--model", "model with spaces"},
+		{"--literal", "literal $HOME $(not-run)"},
+	}
+	if len(c.OMPArgs) != len(want) {
+		t.Fatalf("preset count = %d, want %d", len(c.OMPArgs), len(want))
+	}
+	for i := range want {
+		if !slices.Equal(c.OMPArgs[i], want[i]) {
+			t.Fatalf("preset %d = %#v, want %#v", i+1, c.OMPArgs[i], want[i])
+		}
+	}
+}
+
+func TestOMPArgsEmptyPresetListNormalizesToOneEmptyPreset(t *testing.T) {
+	path, source := configFixture(t)
+	var fingerprint string
+	for _, value := range []string{`[]`, `[""]`, `""`} {
+		c, err := loadSource(t, path, setTOMLField(source, "omp", "args", value))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.OMPArgs) != 1 || len(c.OMPArgs[0]) != 0 {
+			t.Fatalf("empty source %s normalized to %#v", value, c.OMPArgs)
+		}
+		if fingerprint != "" && c.OMPArgsFingerprint != fingerprint {
+			t.Fatal("equivalent empty argument sources have different fingerprints")
+		}
+		fingerprint = c.OMPArgsFingerprint
+	}
+}
+
+func TestOMPArgsFingerprintTracksAllPresetsAndEnvironment(t *testing.T) {
+	path, source := configFixture(t)
+	firstSource := setTOMLField(source, "omp", "args", `["--model first", "--model second"]`)
+	first, err := loadSource(t, path, firstSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedUnselected, err := loadSource(t, path, setTOMLField(source, "omp", "args", `["--model first", "--model changed"]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.OMPArgsFingerprint == changedUnselected.OMPArgsFingerprint {
+		t.Fatal("changing an unselected preset did not change the fingerprint")
+	}
+	environmentSource := setTOMLField(source, "omp", "args", `["--model first", "--model ${BRIDGE_TEST_PRESET}"]`)
+	t.Setenv("BRIDGE_TEST_PRESET", "second")
+	firstEnvironment, err := loadSource(t, path, environmentSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BRIDGE_TEST_PRESET", "third")
+	secondEnvironment, err := loadSource(t, path, environmentSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstEnvironment.OMPArgsFingerprint == secondEnvironment.OMPArgsFingerprint {
+		t.Fatal("changing an environment-expanded preset did not change the fingerprint")
+	}
+	t.Setenv("OMP_TELEGRAM_ARGS", "--model default-one")
+	firstDefault, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_ARGS", "--model default-two")
+	secondDefault, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDefault.OMPArgsFingerprint == secondDefault.OMPArgsFingerprint {
+		t.Fatal("changing OMP_TELEGRAM_ARGS did not change the fingerprint")
+	}
+}
+
+func TestOMPArgsRejectsWrongPresetTypesAndValidatesEveryPreset(t *testing.T) {
+	path, source := configFixture(t)
+	for _, value := range []string{`42`, `true`, `{option = "secret-config"}`, `["--model valid", 7]`, `[false]`} {
+		if _, err := loadSource(t, path, setTOMLField(source, "omp", "args", value)); err == nil {
+			t.Fatalf("invalid omp.args type accepted: %s", value)
+		} else if strings.Contains(err.Error(), "secret-config") {
+			t.Fatal("argument type error leaked configuration data")
+		}
+	}
+	_, err := loadSource(t, path, setTOMLField(source, "omp", "args", `["--model valid", "--resume=secret-session"]`))
+	if err == nil {
+		t.Fatal("invalid lifecycle override in a later preset was accepted")
+	}
+	if strings.Contains(err.Error(), "secret-session") {
+		t.Fatal("argument validation error leaked configuration data")
 	}
 }
 
@@ -1023,7 +1183,7 @@ func TestGroupedConfigLoadsAllSections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.ProgressMode != "verbose" || len(c.OMPArgs) != 0 || c.DatabaseRetentionDays != 180 || c.MaxWorkers != 6 || c.QueueCapacity != 9 || c.IdleTimeout != 45*time.Second {
+	if c.ProgressMode != "verbose" || len(c.OMPArgs) != 1 || len(c.OMPArgs[0]) != 0 || c.DatabaseRetentionDays != 180 || c.MaxWorkers != 6 || c.QueueCapacity != 9 || c.IdleTimeout != 45*time.Second {
 		t.Fatalf("grouped sections did not populate runtime config: %#v", c)
 	}
 	if c.LogLevel != "debug" || c.LogFormat != "json" || c.LogComponentLevels["bridge"] != "warn" {
@@ -1050,7 +1210,7 @@ allowed_chats = [-10]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Token != "literal-token" || c.OMP != omp || len(c.OMPArgs) != 0 || c.DataDir != base || c.WorkspaceRoot != filepath.Join(base, "workspace") {
+	if c.Token != "literal-token" || c.OMP != omp || len(c.OMPArgs) != 1 || len(c.OMPArgs[0]) != 0 || c.DataDir != base || c.WorkspaceRoot != filepath.Join(base, "workspace") {
 		t.Fatalf("omitted optional tables did not use defaults: %#v", c)
 	}
 	if c.MaxWorkers != 8 || c.QueueCapacity != 16 || c.DatabaseRetentionDays != 90 || c.IdleTimeout != 30*time.Minute || c.LogLevel != "info" || c.LogFormat != "text" || len(c.LogComponentLevels) != 0 {

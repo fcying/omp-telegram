@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +28,9 @@ type Config struct {
 	AllowedChats          []int64
 	WorkspaceRoot         string
 	OMP                   string
-	OMPArgs               []string
+	OMPArgs               [][]string
+	OMPArgsLabels         []string
+	OMPArgsFingerprint    string
 	OMPEnvironment        omp.Environment
 	DataDir               string
 	MaxWorkers            int
@@ -61,7 +66,8 @@ type telegramFileConfig struct {
 
 type ompFileConfig struct {
 	Binary      string                   `toml:"binary"`
-	Args        string                   `toml:"args"`
+	Args        any                      `toml:"args"`
+	ArgsLabels  []string                 `toml:"args_labels"`
 	Environment ompEnvironmentFileConfig `toml:"environment"`
 }
 
@@ -194,22 +200,33 @@ func load(path, baseDir string) (Config, error) {
 		return c, err
 	}
 
-	argText := raw.OMP.Args
-	if argText == "${OMP_TELEGRAM_ARGS}" || argText == "$OMP_TELEGRAM_ARGS" {
-		argText = os.Getenv("OMP_TELEGRAM_ARGS")
-	} else {
-		argText, err = expand(argText)
-		if err != nil {
-			return c, fmt.Errorf("omp.args: %w", err)
-		}
-	}
-	c.OMPArgs, err = shlex.Split(argText)
+	argSources, err := ompArgSources(raw.OMP.Args)
 	if err != nil {
-		return c, errors.New("omp.args contains invalid quoting or escaping")
-	}
-	if err = omp.ValidateArgs(c.OMPArgs); err != nil {
 		return c, err
 	}
+	c.OMPArgs = make([][]string, len(argSources))
+	for i, source := range argSources {
+		argText := source
+		if argText == "${OMP_TELEGRAM_ARGS}" || argText == "$OMP_TELEGRAM_ARGS" {
+			// This optional default resolves once; environment contents remain literal.
+			argText = os.Getenv("OMP_TELEGRAM_ARGS")
+		} else {
+			argText, err = expand(argText)
+			if err != nil {
+				return c, errors.New("omp.args contains an invalid environment reference or unset variable")
+			}
+		}
+		args, splitErr := shlex.Split(argText)
+		if splitErr != nil {
+			return c, errors.New("omp.args contains invalid quoting or escaping")
+		}
+		if err = omp.ValidateArgs(args); err != nil {
+			return c, err
+		}
+		c.OMPArgs[i] = args
+	}
+	c.OMPArgsFingerprint = fingerprintOMPArgs(argSources, c.OMPArgs)
+	c.OMPArgsLabels = append([]string(nil), raw.OMP.ArgsLabels...)
 	mode := raw.OMP.Environment.Mode
 	var allow []string
 	if raw.OMP.Environment.Allow != nil {
@@ -327,6 +344,56 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("storage.data_dir must be a writable directory")
 	}
 	return c, nil
+}
+
+func ompArgSources(value any) ([]string, error) {
+	switch value := value.(type) {
+	case string:
+		return []string{value}, nil
+	case []string:
+		if len(value) == 0 {
+			return []string{""}, nil
+		}
+		return value, nil
+	case []any:
+		if len(value) == 0 {
+			return []string{""}, nil
+		}
+		sources := make([]string, len(value))
+		for i, entry := range value {
+			source, ok := entry.(string)
+			if !ok {
+				return nil, errors.New("omp.args must be a string or an array of strings")
+			}
+			sources[i] = source
+		}
+		return sources, nil
+	default:
+		return nil, errors.New("omp.args must be a string or an array of strings")
+	}
+}
+
+func fingerprintOMPArgs(sources []string, presets [][]string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte("omp-args-fingerprint\x00v1"))
+	writeCount := func(count int) {
+		var encoded [8]byte
+		binary.BigEndian.PutUint64(encoded[:], uint64(count))
+		_, _ = h.Write(encoded[:])
+	}
+	writeString := func(value string) {
+		writeCount(len(value))
+		_, _ = h.Write([]byte(value))
+	}
+	writeCount(len(sources))
+	for i, source := range sources {
+		writeString(source)
+		writeCount(len(presets[i]))
+		for _, arg := range presets[i] {
+			writeString(arg)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (c Config) Authorized(user, chat int64) bool {

@@ -20,9 +20,13 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
 [omp]
 binary = "omp"
-# Optional shell-style quoting only; never executed by a shell. Unset/empty means no args.
-args = "${OMP_TELEGRAM_ARGS}"
-# Example: args = '--config "${HOME}/.config/omp/telegram.yml"'
+# Each array entry is one ordered preset; shell-style quoting is parsed, never executed.
+# Unset/empty OMP_TELEGRAM_ARGS keeps OMP's own defaults for the default preset.
+args = ["${OMP_TELEGRAM_ARGS}"]
+# Picker labels are visible in Telegram; use non-secret names, one per args preset.
+args_labels = ["Default"]
+# Example custom preset: args = ['--config "${HOME}/.config/omp/telegram.yml" --model @default']
+
 [omp.environment]
 # deny excludes these literal parent variable names from OMP children.
 mode = "denylist"

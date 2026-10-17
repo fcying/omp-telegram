@@ -911,8 +911,10 @@ func TestDirectCurrentPrefixUsesNativeRenderWhenIdle(t *testing.T) {
 
 func TestInactiveExportRejectsCustomSessionDirectory(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
+	w.b.argsPresets = [][]string{{"--session-dir", filepath.Join(t.TempDir(), "native-store")}}
+	w.b.argsFingerprint = strings.Repeat("8", 64)
+	w.b.argsIndex = 1
 	command("/new test")
-	w.b.cfg.OMPArgs = []string{"--session-dir", filepath.Join(t.TempDir(), "native-store")}
 	command("/export deadbeef-0000-4000-8000-000000000000")
 	var text string
 	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil || text != "Cannot export an inactive session when omp uses a custom session directory." {

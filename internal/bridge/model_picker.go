@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"omp-telegram/internal/omp"
 )
@@ -234,7 +235,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 
 func (w *worker) startModelRoles(client *omp.Client, request modelOperationRequest) {
 	workspace := w.binding.Workspace
-	args := append([]string(nil), w.b.cfg.OMPArgs...)
+	args := cloneArgv(w.launchArgs)
 	binary := w.b.cfg.OMP
 	environment := w.b.cfg.OMPEnvironment
 	w.startOperation("model_roles", client, func(ctx context.Context) (json.RawMessage, error) {
@@ -250,6 +251,25 @@ func (w *worker) showModelPicker(user int64) {
 	w.beginModelState("model_picker", modelOperationRequest{action: "model_picker", user: user})
 }
 
+func currentModelRoleIndex(current omp.Model, models []omp.ModelRole) int {
+	if current.Provider == "" || current.ID == "" {
+		return -1
+	}
+	identity := current.Provider + "/" + current.ID
+	match := -1
+	for i, model := range models {
+		selector, _, _ := strings.Cut(model.Selector, ":")
+		if selector != identity {
+			continue
+		}
+		if match != -1 {
+			return -1
+		}
+		match = i
+	}
+	return match
+}
+
 func (w *worker) showModelPickerReady(user int64, current omp.Model, models []omp.ModelRole) {
 	if len(models) == 0 {
 		w.endControlOperation()
@@ -263,10 +283,14 @@ func (w *worker) showModelPickerReady(user int64, current omp.Model, models []om
 		return
 	}
 	options := make([]string, 0, len(models)+1)
-	for _, model := range models {
+	currentRole := currentModelRoleIndex(current, models)
+	for i, model := range models {
 		label := model.Role
 		if model.Selector != "" {
 			label += " - " + model.Selector
+		}
+		if i == currentRole {
+			label = "* " + label
 		}
 		options = append(options, menuText(label, 120))
 	}
@@ -308,7 +332,7 @@ func (w *worker) showThinkingPickerReady(user int64, state modelSettings) {
 	for _, level := range thinkingLevels {
 		label := level
 		if level == state.ThinkingLevel {
-			label += " [effective]"
+			label = "* " + label
 		}
 		labels = append(labels, label)
 	}
@@ -344,9 +368,9 @@ func (w *worker) showFastPickerReady(user int64, state modelSettings) {
 	options := []string{"on", "off"}
 	labels := []string{"on", "off", "Cancel"}
 	if *state.FastModeEnabled {
-		labels[0] += " [current]"
+		labels[0] = "* " + labels[0]
 	} else {
-		labels[1] += " [current]"
+		labels[1] = "* " + labels[1]
 	}
 	w.endControlOperation()
 	w.confirm(confirmation{action: "fast", method: "select", user: user, options: options}, "Choose fast mode\n"+fastModeText(state.FastModeEnabled, state.FastModeActive), labels)

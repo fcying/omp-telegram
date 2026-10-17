@@ -107,7 +107,7 @@ func TestBindingListRendersStatesAndDeletionButtons(t *testing.T) {
 	if len(keyboard.InlineKeyboard) != 11 {
 		t.Fatalf("binding list keyboard rows = %d, want 11", len(keyboard.InlineKeyboard))
 	}
-	titles := []string{"1. current · #11 [current]", "2. open · #55", "3. Closed task · #22", "4. resume · #33", "5. pending · #44"}
+	titles := []string{"1. * current · #11", "2. open · #55", "3. Closed task · #22", "4. resume · #33", "5. pending · #44"}
 	details := []string{"Open · /current", "Open · /open", "Closed 4d · /closed", "Pending resume 7m · /resume", "Pending new · /pending"}
 	for i := range titles {
 		title := keyboard.InlineKeyboard[2*i]
@@ -154,7 +154,7 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	w.showBindings(7, false, 0)
 	text, rows := pickerView(t, fake)
 	titles := []string{
-		"1. current · #11 [current]", "2. pending · #7", "3. recent20 · #20",
+		"1. * current · #11", "2. pending · #7", "3. recent20 · #20",
 		"4. recent50 · #50", "5. old30 · #30", "6. unknown40 · #40",
 	}
 	if text != "Saved bindings\nPage 1/2" || len(rows) != 13 {
@@ -174,7 +174,7 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	w.showBindings(7, true, 0)
 	text, rows = pickerView(t, fake)
 	oldTitles := []string{
-		"1. old30 · #30", "2. current · #11 [current]", "3. recent20 · #20",
+		"1. old30 · #30", "2. * current · #11", "3. recent20 · #20",
 		"4. recent50 · #50", "5. pending · #7", "6. unknown40 · #40",
 	}
 	if text != "Saved bindings (oldest first)\nPage 1/2" || len(rows) != 13 {
@@ -214,7 +214,7 @@ func TestBindingsOldSortsPendingBySavedLastUse(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindings(7, true, 0)
 	_, rows := pickerView(t, fake)
-	if rows[0][0]["text"] != "1. next · #22" || rows[2][0]["text"] != "2. current · #11 [current]" {
+	if rows[0][0]["text"] != "1. next · #22" || rows[2][0]["text"] != "2. * current · #11" {
 		t.Fatalf("oldest-first with pending start = %+v", rows)
 	}
 }
@@ -292,7 +292,7 @@ func TestBindingListDisablesCurrentClosedDelete(t *testing.T) {
 	entries := []store.BindingListEntry{{Binding: &store.Binding{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", SessionID: "current-session", Generation: 7}}}
 	w.showBindingsPage(confirmation{bindings: entries, user: 7}, 0, 0)
 	buttons := resumeButtons(t, fake)
-	if len(buttons) != 3 || buttons[0]["text"] != "1. current · #11 [current]" {
+	if len(buttons) != 3 || buttons[0]["text"] != "1. * current · #11" {
 		t.Fatalf("current closed buttons = %+v", buttons)
 	}
 	if _, ok := buttons[0]["callback_data"]; ok {
