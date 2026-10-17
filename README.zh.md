@@ -208,7 +208,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 chat 保存的对话/session binding. 点击可删除条目的标题, 确认后忘记已关闭或空闲的 binding; 保留 workspace 文件和 OMP history. |
 | `/bindings old` | 按最久未使用优先的顺序显示已保存的 binding. |
-| `/resume` | 从当前 workspace 的已保存原生 OMP session 中选择恢复对象. 提供 Pin/Unpin 和 Delete 控件. |
+| `/resume` | 从当前 workspace 的已保存原生 OMP session 中选择恢复对象. 提供 Pin/Unpin 和 Delete 控件; 被其他对话 claim 或 reservation 的 session 会标记为 `[in use elsewhere]`, 需先在对应对话释放后才能删除. |
 | `/resume <session ID>` | 恢复原生 OMP session 及其原目录. |
 | `/export` | 选择已保存的 session, 导出原始 main-session JSONL. 导出当前 session 前需等待其空闲. |
 | `/export html` | 选择已保存的 session, 导出 standalone HTML viewer. |

@@ -61,7 +61,11 @@ func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageI
 		return
 	}
 	if w.b.sessionInUse(selected.ID) {
-		w.say("This session is currently active. Close it before deleting.")
+		if w.b.sessionInUseByOther(w, selected.ID) {
+			w.say("This session is in use by another conversation. Close it there before deleting.")
+		} else {
+			w.say("This session is currently active in this conversation. Close it before deleting.")
+		}
 		return
 	}
 	available, err := w.sessionDeleteAvailable(selected.ID, c.workspace)
