@@ -87,6 +87,9 @@ func TestModelPickerUsesCycleRolesAndOwner(t *testing.T) {
 			t.Fatalf("choice %d does not show cycle role %q: %v", i, role, buttons[i])
 		}
 	}
+	if buttons[1]["text"] != "* default - fixture/safe:medium" {
+		t.Fatalf("current model role button = %+v", buttons[1])
+	}
 	if !f.has(11, "fixture/safe") {
 		t.Fatal("picker omitted the actual current model")
 	}

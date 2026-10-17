@@ -173,7 +173,7 @@ func TestWorkspaceStartupAdmissionAndIntentRollbackTogether(t *testing.T) {
 func TestVersionFourteenMigratesWorkspaceLeaseTables(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
-	_, err := s.DB.Exec("DROP TABLE workspace_users; DROP TABLE workspace_leases; PRAGMA user_version=14")
+	_, err := s.DB.Exec("DROP TABLE omp_args_selection; DROP TABLE workspace_users; DROP TABLE workspace_leases; PRAGMA user_version=14")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -404,7 +404,7 @@ func TestWorkspaceRefreshRetainsConflictingLeaseOwnersUntilExactRelease(t *testi
 func TestVersionFifteenMigrationPreservesLeaseOwnersAndHistoricalRoots(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
-	_, err := s.DB.Exec(`DROP TABLE workspace_leases;
+	_, err := s.DB.Exec(`DROP TABLE omp_args_selection; DROP TABLE workspace_leases;
 CREATE TABLE workspace_leases(root TEXT PRIMARY KEY,bot INTEGER NOT NULL,chat INTEGER NOT NULL,thread INTEGER NOT NULL,session TEXT NOT NULL);
 PRAGMA user_version=15;`)
 	requireStoreOK(t, err)

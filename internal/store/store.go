@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 16
+const schemaVersion = 17
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -202,6 +202,7 @@ func initialize(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
+	newDatabase := version == 0
 	if version < 0 || version > schemaVersion {
 		return fmt.Errorf("unsupported database schema version %d; this binary supports version %d", version, schemaVersion)
 	}
@@ -235,7 +236,9 @@ func initialize(db *sql.DB) error {
  CREATE INDEX idx_outbox_state ON outbox(state,id);
  CREATE INDEX idx_outbox_inbox_state ON outbox(inbox_id,state);
  CREATE INDEX idx_outbox_delivery ON outbox(state,next_attempt_at,id);
- CREATE INDEX idx_outbox_conversation ON outbox(chat,thread,state,id);`)
+ CREATE INDEX idx_outbox_conversation ON outbox(chat,thread,state,id);
+ CREATE TABLE omp_args_selection(preset_index INTEGER NOT NULL,args_fingerprint TEXT NOT NULL);
+ CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));`)
 		if e != nil {
 			return e
 		}
@@ -374,6 +377,15 @@ DROP TABLE workspace_leases_v15;`); e != nil {
 		}
 		version = 16
 	}
+	if version == 16 {
+		if !newDatabase {
+			if _, e = tx.Exec(`CREATE TABLE omp_args_selection(preset_index INTEGER NOT NULL,args_fingerprint TEXT NOT NULL);
+CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));`); e != nil {
+				return e
+			}
+		}
+		version = 17
+	}
 
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
@@ -392,6 +404,90 @@ DROP TABLE workspace_leases_v15;`); e != nil {
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
+func (s *Store) LoadOrResetOMPArgsSelection(fingerprint string, presetCount int) (int, error) {
+	if fingerprint == "" {
+		return 0, errors.New("OMP arguments fingerprint must not be empty")
+	}
+	if presetCount < 1 {
+		return 0, errors.New("OMP argument preset count must be at least one")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT preset_index,args_fingerprint FROM omp_args_selection")
+	if err != nil {
+		return 0, err
+	}
+	var storedIndex, storedFingerprint any
+	rowCount := 0
+	if rows.Next() {
+		rowCount = 1
+		if err = rows.Scan(&storedIndex, &storedFingerprint); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if rows.Next() {
+			rowCount = 2
+			for rows.Next() {
+			}
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err = rows.Close(); err != nil {
+		return 0, err
+	}
+	if rowCount == 1 {
+		index, indexOK := storedIndex.(int64)
+		savedFingerprint, fingerprintOK := storedFingerprint.(string)
+		if indexOK && fingerprintOK && savedFingerprint == fingerprint && index >= 1 && index <= int64(presetCount) {
+			if err := tx.Commit(); err != nil {
+				return 0, err
+			}
+			return int(index), nil
+		}
+	}
+	if _, err = tx.Exec("DELETE FROM omp_args_selection"); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec("INSERT INTO omp_args_selection(preset_index,args_fingerprint) VALUES(1,?)", fingerprint); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
+func (s *Store) SetOMPArgsSelection(index int, fingerprint string, presetCount int) error {
+	if fingerprint == "" {
+		return errors.New("OMP arguments fingerprint must not be empty")
+	}
+	if presetCount < 1 {
+		return errors.New("OMP argument preset count must be at least one")
+	}
+	if index < 1 || index > presetCount {
+		return fmt.Errorf("OMP argument preset index must be between 1 and %d", presetCount)
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("DELETE FROM omp_args_selection"); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT INTO omp_args_selection(preset_index,args_fingerprint) VALUES(?,?)", index, fingerprint); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Offset() (int64, error) {
 	var n int64
 	e := s.DB.QueryRow("SELECT value FROM meta WHERE key='offset'").Scan(&n)

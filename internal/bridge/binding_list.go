@@ -169,7 +169,7 @@ func (w *worker) lookupBindingNames(entries []store.BindingListEntry, generation
 	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
 	w.bindingNameCancel = cancel
 	slots := w.b.resumeSlots
-	binary, args, environment := w.b.cfg.OMP, w.b.cfg.OMPArgs, w.b.cfg.OMPEnvironment
+	binary, args, environment := w.b.cfg.OMP, w.b.selectedArgsSnapshot(), w.b.cfg.OMPEnvironment
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -273,13 +273,13 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 		}
 		marker := ""
 		if current {
-			marker = " [current]"
+			marker = "* "
 		}
 		topic := "Main chat"
 		if thread := bindingThread(entry); thread != 0 {
 			topic = fmt.Sprintf("#%d", thread)
 		}
-		title := menuText(fmt.Sprintf("%d. %s · %s%s", index+1, bindingSessionName(entry), topic, marker), 128)
+		title := menuText(fmt.Sprintf("%d. %s%s · %s", index+1, marker, bindingSessionName(entry), topic), 128)
 		age := formatLastUsed(bindingLastUsedAt(entry))
 		status := bindingEntryStatus(entry)
 		if age != "unknown" {

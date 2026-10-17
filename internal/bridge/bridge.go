@@ -31,32 +31,36 @@ import (
 )
 
 type Bridge struct {
-	cfg            config.Config
-	version        string
-	db             *store.Store
-	tg             *telegram.Client
-	bot            telegram.User
-	log            *slog.Logger
-	telegramLog    *slog.Logger
-	storeLog       *slog.Logger
-	mediaLog       *slog.Logger
-	rpcLog         *slog.Logger
-	slots          chan struct{}
-	wg             sync.WaitGroup
-	fatal          chan error
-	mediaSlots     chan struct{}
-	resumeSlots    chan struct{}
-	sessionMu      sync.Mutex
-	sessionClaims  map[string]sessionClaim
-	exportClaims   map[*worker]string
-	deleteClaims   map[*worker]string
-	bindingsEpoch  atomic.Uint64
-	incomingMu     sync.Mutex
-	incomingInUse  map[string]struct{}
-	ctx            context.Context
-	workerExits    chan workerExit
-	forgetRequests chan bindingForgetRequest
-	commandMenus   commandMenuState
+	cfg             config.Config
+	version         string
+	db              *store.Store
+	tg              *telegram.Client
+	bot             telegram.User
+	log             *slog.Logger
+	telegramLog     *slog.Logger
+	storeLog        *slog.Logger
+	mediaLog        *slog.Logger
+	rpcLog          *slog.Logger
+	slots           chan struct{}
+	argsMu          sync.Mutex
+	argsPresets     [][]string
+	argsFingerprint string
+	argsIndex       int
+	wg              sync.WaitGroup
+	fatal           chan error
+	mediaSlots      chan struct{}
+	resumeSlots     chan struct{}
+	sessionMu       sync.Mutex
+	sessionClaims   map[string]sessionClaim
+	exportClaims    map[*worker]string
+	deleteClaims    map[*worker]string
+	bindingsEpoch   atomic.Uint64
+	incomingMu      sync.Mutex
+	incomingInUse   map[string]struct{}
+	ctx             context.Context
+	workerExits     chan workerExit
+	forgetRequests  chan bindingForgetRequest
+	commandMenus    commandMenuState
 }
 type incoming struct {
 	id       int64
@@ -143,33 +147,36 @@ type albumEvent struct {
 }
 
 type confirmation struct {
-	action, uiID, method string
-	uiTitle              string
-	uiClientID           uint64
-	workspace            string
-	exportFormat         string
-	options              []string
-	expires              time.Time
-	generation, active   int64
-	epoch                uint64
-	turn                 uint64
-	user                 int64
-	messageID            int64
-	sessions             []omp.SessionSummary
-	nativeSessions       []omp.SessionSummary
-	pickerOptions        []resumePickerOption
-	pinnedSessions       map[string]struct{}
-	models               []omp.ModelRole
-	bindings             []store.BindingListEntry
-	bindingsOld          bool
-	deleteBot            int64
-	deleteChat           int64
-	deleteThread         int64
-	deleteGeneration     int64
-	deleteRunning        bool
-	page                 int
-	uiSelectMenu         bool
-	autoresearchText     string
+	action, uiID, method            string
+	uiTitle                         string
+	uiClientID                      uint64
+	workspace                       string
+	exportFormat                    string
+	ompArgs                         []string
+	argsPresetIndex                 int
+	argsFingerprint                 string
+	options                         []string
+	expires                         time.Time
+	generation, active              int64
+	epoch                           uint64
+	turn                            uint64
+	user                            int64
+	messageID                       int64
+	sessions                        []omp.SessionSummary
+	nativeSessions                  []omp.SessionSummary
+	pickerOptions                   []resumePickerOption
+	pinnedSessions                  map[string]struct{}
+	models                          []omp.ModelRole
+	bindings                        []store.BindingListEntry
+	bindingsOld                     bool
+	deleteBot                       int64
+	deleteChat                      int64
+	deleteThread                    int64
+	deleteGeneration                int64
+	deleteRunning                   bool
+	page, argsPage, argsChoiceCount int
+	uiSelectMenu                    bool
+	autoresearchText                string
 }
 type runtimeState uint8
 
@@ -226,6 +233,7 @@ type worker struct {
 	key            target
 	input          chan incoming
 	client         *omp.Client
+	launchArgs     []string
 	binding        store.Binding
 	startIntent    *store.StartIntent
 	sessionID      string
@@ -474,6 +482,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "followup", Description: "Queue a prompt after the current task"},
 	{Command: "queue", Description: "Show and cancel pending bridge tasks"},
 	{Command: "resume", Description: "Choose or pin an omp session in this working directory"},
+	{Command: "args", Description: "Select OMP argument preset: /args [number]"},
 	{Command: "review", Description: "Run omp review: /review [arguments]"},
 	{Command: "close", Description: "Close omp, keep workspace and session"},
 	{Command: "export", Description: "Export an omp session: /export [html] [session-id]"},
@@ -512,6 +521,13 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		storeLog.Error("bot consistency check failed", "event", "bot_check_failed", "error_kind", "persistence")
 		return err
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	b := &Bridge{cfg: cfg, version: version, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit), forgetRequests: make(chan bindingForgetRequest, 16)}
+	if err := b.initializeArgsSelection(); err != nil {
+		cancel()
+		storeLog.Error("OMP argument selection load failed", "event", "omp_args_selection_failed", "error_kind", "persistence")
+		return err
+	}
 	// Command menus improve discoverability but are not required for polling.
 	registered := 0
 	for _, language := range []string{"", "zh"} {
@@ -527,8 +543,6 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		telegramLog.Info("telegram command menu registered", "event", "command_menu_registered", "languages", registered)
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	b := &Bridge{cfg: cfg, version: version, db: db, tg: tg, bot: bot, log: log, telegramLog: telegramLog, storeLog: storeLog, mediaLog: mediaLog, rpcLog: rpcLog, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2), ctx: ctx, workerExits: make(chan workerExit), forgetRequests: make(chan bindingForgetRequest, 16)}
 	defer func() {
 		cancel()
 		b.wg.Wait()
@@ -1299,9 +1313,10 @@ func (w *worker) runtimeClient() (*omp.Client, bool) {
 
 func (w *worker) beginRuntimeStart() { w.runtime = runtimeStarting }
 
-func (w *worker) runtimeStarted(client *omp.Client) {
+func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 	w.b.registerCommandMenuWorker(w)
 	w.client = client
+	w.launchArgs = args
 	w.runtime = runtimeConnected
 	w.resumeFailed = false
 }
@@ -1318,6 +1333,7 @@ func (w *worker) runtimeStopped() {
 		}
 	}
 	w.client = nil
+	w.launchArgs = nil
 	w.runtime = runtimeReleased
 }
 
@@ -2265,8 +2281,8 @@ func (w *worker) start(resume bool, target, expectedCWD string, replace bool) st
 	return w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, 0, false, 0))
 }
 
-func (w *worker) startFenced(resume bool, target, expectedCWD string, replace bool, generation int64, epoch uint64) {
-	w.reportStartFailure(w.startInternal(resume, target, expectedCWD, replace, generation, true, epoch))
+func (w *worker) startFencedWithArgs(resume bool, target, expectedCWD string, replace bool, generation int64, epoch uint64, args []string) {
+	w.reportStartFailure(w.startInternalWithArgs(resume, target, expectedCWD, replace, generation, true, epoch, &args))
 }
 
 func (w *worker) reportStartFailure(message string) string {
@@ -2312,6 +2328,10 @@ func (w *worker) topicRenameFinished(result topicRenameResult) {
 }
 
 func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64) string {
+	return w.startInternalWithArgs(resume, target, expectedCWD, replace, expectedGeneration, fenced, expectedEpoch, nil)
+}
+
+func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64, argsOverride *[]string) string {
 	if _, connected := w.runtimeClient(); connected && !replace {
 		return "An instance is already running. Use /new for a fresh session, or /close before resuming another session."
 	}
@@ -2470,7 +2490,13 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		}
 	}
 	w.beginRuntimeStart()
-	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
+	var launchArgs []string
+	if argsOverride == nil {
+		launchArgs = w.b.selectedArgsSnapshot()
+	} else {
+		launchArgs = *argsOverride
+	}
+	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
 	if e != nil {
 		if reserved {
 			<-w.b.slots
@@ -2484,7 +2510,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 		}
 		return "Failed to start omp. The startup outcome is uncertain; use /close before retrying."
 	}
-	w.runtimeStarted(c)
+	w.runtimeStarted(c, launchArgs)
 	w.initMedia()
 	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Second)
 	info, e := c.SessionInfo(ctx)
@@ -2687,6 +2713,8 @@ func (w *worker) handle(in incoming) {
 		} else {
 			w.start(true, arg, "", true)
 		}
+	case "/args":
+		w.handleArgsCommand(arg, in.msg.From.ID)
 	case "/export":
 		format, sessionID, ok := parseExportArgs(arg)
 		if !ok {
@@ -4320,6 +4348,10 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	delete(w.confirms, token)
+	if c.action == "args" {
+		w.selectArgsFromMenu(c, n)
+		return callbackDone
+	}
 	if c.action == "ui" && w.exportingSession != "" {
 		text := "Wait for the current session export to finish."
 		w.finishMenu(c.messageID, text)

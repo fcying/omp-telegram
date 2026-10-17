@@ -19,6 +19,32 @@ func assertFastState(t *testing.T, w *worker, enabled, active bool) {
 	}
 }
 
+func TestFastPickerMarksCurrentOptionWithAsterisk(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		want    []string
+	}{
+		{name: "on", enabled: true, want: []string{"* on", "off", "Cancel"}},
+		{name: "off", enabled: false, want: []string{"on", "* off", "Cancel"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, f, _ := setupWorkspaceWorker(t)
+			enabled, active := tc.enabled, tc.enabled
+			w.showFastPickerReady(7, modelSettings{FastModeEnabled: &enabled, FastModeActive: &active})
+			buttons := resumeButtons(t, f)
+			if len(buttons) != len(tc.want) {
+				t.Fatalf("fast picker has %d buttons, want %d: %+v", len(buttons), len(tc.want), buttons)
+			}
+			for i, want := range tc.want {
+				if buttons[i]["text"] != want {
+					t.Fatalf("fast picker button %d = %+v, want %q", i, buttons[i], want)
+				}
+			}
+		})
+	}
+}
+
 func TestFastPickerOwnershipCancelReplayAndBusy(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
