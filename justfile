@@ -7,6 +7,10 @@ build:
     echo "Building omp-telegram..."
     go build -o omp-telegram ./cmd/omp-telegram
 
+# Format Go source and test files.
+fmt:
+    go fmt ./...
+
 # Install only the binary; configuration and data remain user-managed.
 install bin_dir=(env_var("HOME") / "tool/omp-telegram"): build
     echo "Installing omp-telegram to {{bin_dir}}..."

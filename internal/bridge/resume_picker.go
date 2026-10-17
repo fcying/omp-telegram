@@ -561,8 +561,15 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		if c.action == "resume" && sessionIsPinned(session, c.pinnedSessions) {
 			pinnedMarker = " [pinned]"
 		}
+		inUseElsewhereMarker := ""
+		if c.action == "resume" {
+			_, inUseElsewhere := w.b.sessionDeleteStatus(w, session.ID)
+			if inUseElsewhere {
+				inUseElsewhereMarker = " [in use elsewhere]"
+			}
+		}
 		sessionIndex := start + i
-		fmt.Fprintf(&text, "%d. %s%s%s", sessionIndex+1, currentMarker, title, pinnedMarker)
+		fmt.Fprintf(&text, "%d. %s%s%s%s", sessionIndex+1, currentMarker, title, pinnedMarker, inUseElsewhereMarker)
 		if updated, err := time.Parse(time.RFC3339Nano, session.UpdatedAt); err == nil {
 			fmt.Fprintf(&text, " | %s", updated.UTC().Format("2006-01-02 15:04 UTC"))
 		}

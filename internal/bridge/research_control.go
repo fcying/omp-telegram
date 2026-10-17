@@ -27,14 +27,6 @@ type researchControl struct {
 	deadline                       time.Time
 }
 
-func (w *worker) researchLeaseOwned() (bool, error) {
-	owner, err := w.currentWorkspaceOwner()
-	if err != nil {
-		return false, err
-	}
-	return w.b.db.ResearchWorkspaceOwned(owner)
-}
-
 func (w *worker) rememberResearchMode(client *omp.Client, enabled bool) {
 	catalog := client.CommandCatalog()
 	w.research.known, w.research.enabled = true, enabled
@@ -92,7 +84,7 @@ func (w *worker) cancelResearchControl() {
 	} else if c.intent == "off" {
 		w.mark(c.inbox, store.InboxUncertain)
 	}
-	// Cancellation never proves native mode off or releases the workspace lease.
+	// Cancellation never proves that native autoresearch mode is off.
 	if c.intent != "route" || w.research.root {
 		w.research.disablePending, w.resumeFailed = true, true
 	}
@@ -141,13 +133,8 @@ func (w *worker) researchControlMode(c *researchControl, phase string) {
 // Abort cannot fence an asynchronous research hook. Retire research before off,
 // but a proven ordinary mode-off owner must retain its runtime and inbox.
 func (w *worker) disableResearch(inbox int64) {
-	owned, err := w.researchLeaseOwned()
-	if err != nil {
-		w.mark(inbox, store.InboxUncertain)
-		w.researchModeFailure()
-		return
-	}
-	if owned || w.research.root {
+	researchActive := w.research.root || w.research.enabled
+	if researchActive || w.research.disablePending {
 		w.cancelQueuedResearchToggles()
 	}
 	replacedReadOnly := false
@@ -155,7 +142,7 @@ func (w *worker) disableResearch(inbox int64) {
 		// Read-only mode lookups have not submitted a native control. Replacing
 		// them must not retire the ordinary owner, even if its task just completed.
 		readOnly := c.intent == "route" || c.intent == "off" && c.text == ""
-		replacedReadOnly = readOnly && !owned && !w.research.root
+		replacedReadOnly = readOnly && !researchActive
 		w.cancelResearchControl()
 		if !replacedReadOnly {
 			w.retireResearch("Autoresearch control was interrupted. It will not be replayed automatically.")
@@ -163,12 +150,12 @@ func (w *worker) disableResearch(inbox int64) {
 	}
 	w.invalidateResearchAdmission()
 	client, connected := w.runtimeClient()
-	if connected && w.taskActive() && !owned && !w.research.root && w.researchOffProof(client) {
+	if connected && w.taskActive() && !researchActive && w.researchOffProof(client) {
 		w.mark(inbox, store.InboxDone)
 		w.say("Autoresearch mode is already disabled. The current ordinary task was left running.")
 		return
 	}
-	if connected && (w.taskActive() || replacedReadOnly) && !owned && !w.research.root && !w.research.enabled {
+	if connected && (w.taskActive() || replacedReadOnly) && !researchActive {
 		c := w.newResearchControl(client, "off", inbox)
 		w.researchControlMode(c, "mode")
 		return
@@ -201,24 +188,15 @@ func (w *worker) beginResearchDisable(inbox int64) {
 // Process startup keeps the existing lifecycle, but identity/catalog network
 // waits belong to the cancellable operation lane, not the actor.
 func (w *worker) prepareResearchControlRuntime() (*omp.Client, error) {
-	owner, err := w.currentWorkspaceOwner()
-	if err != nil {
-		return nil, err
+	sessionID := w.sessionID
+	if sessionID == "" {
+		sessionID = w.binding.SessionID
 	}
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	if err != nil {
-		return nil, err
+	if sessionID == "" || !strings.EqualFold(sessionID, w.binding.SessionID) {
+		return nil, errors.New("saved autoresearch session is unavailable; restore its session file and working directory before disabling")
 	}
-	if !owned {
-		if err := w.admitCurrentWorkspace(); err != nil {
-			return nil, err
-		}
-	}
-	if !strings.EqualFold(owner.Session, w.binding.SessionID) {
-		return nil, errors.New("saved autoresearch owner is unavailable; restore its session file and working directory before disabling")
-	}
-	if w.b.sessionInUseByOther(w, owner.Session) {
-		return nil, errors.New("autoresearch owner is claimed by another conversation")
+	if w.b.sessionInUseByOther(w, sessionID) {
+		return nil, errors.New("autoresearch session is active in another conversation")
 	}
 	if client, connected := w.runtimeClient(); connected {
 		return client, nil
@@ -234,6 +212,10 @@ func (w *worker) prepareResearchControlRuntime() (*omp.Client, error) {
 	default:
 		return nil, errors.New("the active instance limit has been reached")
 	}
+	if !w.beginSessionRestore(sessionID) {
+		<-w.b.slots
+		return nil, errors.New("autoresearch session is being deleted or used elsewhere")
+	}
 	w.beginRuntimeStart()
 	launchArgs := w.b.selectedArgsSnapshot()
 	client, err := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: w.binding.Workspace,
@@ -241,6 +223,7 @@ func (w *worker) prepareResearchControlRuntime() (*omp.Client, error) {
 	if err != nil {
 		<-w.b.slots
 		w.runtimeStopped()
+		w.releaseSession()
 		return nil, err
 	}
 	w.runtimeStarted(client, launchArgs)
@@ -350,19 +333,6 @@ func (w *worker) researchControlFinished(result operationResult) {
 			w.researchControlFailed(c)
 			return
 		}
-		if enabled {
-			owned, err := w.researchLeaseOwned()
-			if err != nil {
-				w.researchControlFailed(c)
-				return
-			}
-			if !owned {
-				if err := w.ensureResearchWorkspace(); err != nil {
-					w.researchControlFailed(c)
-					return
-				}
-			}
-		}
 		w.rememberResearchMode(client, enabled)
 		if c.phase == "postmode" {
 			if c.intent != "local" && enabled {
@@ -383,24 +353,13 @@ func (w *worker) researchControlFinished(result operationResult) {
 				w.requestAbort("Abort requested and queued prompts cleared.")
 			}
 		case "off":
-			owned, err := w.researchLeaseOwned()
-			if err != nil {
-				w.researchControlFailed(c)
-				return
-			}
-			w.endResearchControl(c)
-			if !enabled && !owned {
-				w.research.disablePending, w.resumeFailed = false, false
-				w.mark(c.inbox, store.InboxDone)
-				w.say("Autoresearch mode is already disabled. The current ordinary task was left running.")
+			if !enabled {
+				w.finishResearchControl(c, false)
 			} else {
+				w.endResearchControl(c)
 				w.beginResearchDisable(c.inbox)
 			}
 		case "clear":
-			if err := w.ensureResearchWorkspace(); err != nil {
-				w.researchControlFailed(c)
-				return
-			}
 			w.researchControlIdle(c)
 		}
 	case "idle":
@@ -479,20 +438,11 @@ func (w *worker) finishResearchControl(c *researchControl, enabled bool) {
 	if c.intent == "local" {
 		w.research.root = false
 		w.finishLocalCommandSubmission()
-		if !enabled {
-			w.releaseConfirmedResearchWorkspace()
-		}
 		return
 	}
 	w.research.disablePending, w.resumeFailed = false, false
 	w.research.root = false
 	w.touchBinding()
-	if !w.releaseConfirmedResearchWorkspace() {
-		if c.intent == "off" {
-			w.mark(c.inbox, store.InboxUncertain)
-		}
-		return
-	}
 	if c.intent == "off" {
 		w.mark(c.inbox, store.InboxDone)
 		w.say("Autoresearch mode disabled. The old research task was not replayed.")

@@ -9,10 +9,6 @@ import (
 )
 
 func (w *worker) sessionDeleteAvailable(sessionID, workspace string) (bool, error) {
-	leased, err := w.b.db.ResearchSessionLeased(w.b.bot.ID, sessionID)
-	if err != nil || leased {
-		return false, err
-	}
 	bindings, err := w.b.db.RunningBindings(w.b.bot.ID)
 	if err != nil {
 		return false, err
@@ -22,8 +18,6 @@ func (w *worker) sessionDeleteAvailable(sessionID, workspace string) (bool, erro
 			if sameWorkspace(binding.Workspace, workspace) {
 				return false, nil
 			}
-		} else if sessionIDsMatch(binding.SessionID, sessionID) {
-			return false, nil
 		}
 	}
 	intents, err := w.b.db.PendingStarts(w.b.bot.ID)
@@ -60,8 +54,13 @@ func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageI
 		w.say("omp returned an unsupported session ID.")
 		return
 	}
-	if w.b.sessionInUse(selected.ID) {
-		w.say("This session is currently active. Close it before deleting.")
+	busy, elsewhere := w.b.sessionDeleteStatus(w, selected.ID)
+	if busy {
+		if elsewhere {
+			w.say("This session is currently active or being processed in another conversation. No deletion was started. Stop or close it there, or wait for the operation to finish, then retry.")
+		} else {
+			w.say("This session is currently active or being processed in this conversation. No deletion was started. Stop or close it, or wait for the operation to finish, then retry.")
+		}
 		return
 	}
 	available, err := w.sessionDeleteAvailable(selected.ID, c.workspace)
@@ -70,7 +69,7 @@ func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageI
 		return
 	}
 	if !available {
-		w.say("This session is currently active or has a retained autoresearch workspace lease. Close active sessions; for a retained lease, resume its owner and confirm autoresearch off before deleting.")
+		w.say("An OMP session is still starting or being restored in this workspace. Wait for that operation to finish before deleting.")
 		return
 	}
 	title := "Delete omp session?\n\nTitle: " + menuText(selected.Title, 80) + "\nID: " + selected.ID + "\n\nThis deletes the saved OMP session and its artifacts.\nThe workspace files will not be deleted."
@@ -92,7 +91,7 @@ func (w *worker) beginSessionDelete(c confirmation) {
 		return
 	}
 	if !w.b.reserveDelete(w, selected.ID) {
-		w.say("This session is currently active or being processed, or has a retained autoresearch workspace lease. Resume a retained lease's owner and confirm autoresearch off before deleting.")
+		w.say("This session is currently active or being processed in another conversation or operation. No deletion was started. Stop or close it, or wait for the work to finish, then retry.")
 		return
 	}
 	available, err := w.sessionDeleteAvailable(selected.ID, c.workspace)
@@ -101,7 +100,7 @@ func (w *worker) beginSessionDelete(c confirmation) {
 		if err != nil {
 			w.say("Failed to check the session state. No session was deleted.")
 		} else {
-			w.say("This session is currently active or has a retained autoresearch workspace lease. Close active sessions; for a retained lease, resume its owner and confirm autoresearch off before deleting.")
+			w.say("This session is active or its identity is still being restored. Wait for that work to finish before deleting it.")
 		}
 		return
 	}
@@ -144,15 +143,26 @@ func (w *worker) sessionDeleteFinished(result sessionDeleteResult) {
 		return
 	}
 	w.b.sessionMu.Lock()
-	cleanupErr := w.b.db.DeletePinnedSession(w.b.bot.ID, result.sessionID)
+	deletedBindings, cleanupErr := w.b.db.DeleteSessionReferences(w.b.bot.ID, result.sessionID)
+	if cleanupErr == nil {
+		for path, claim := range w.b.sessionClaims {
+			if !sessionIDsMatch(claim.id, result.sessionID) {
+				continue
+			}
+			if claim.owner != nil && (claim.owner.sessionRuntimeStarting.Load() || claim.owner.sessionRuntimeActive.Load()) {
+				continue
+			}
+			delete(w.b.sessionClaims, path)
+		}
+	}
 	refresh := result.epoch == w.b.bindingsEpoch.Load()
 	epoch := w.b.bindingsEpoch.Add(1)
 	w.b.sessionMu.Unlock()
 	if cleanupErr != nil {
-		w.b.storeLog.Error("session pin cleanup failed", "event", "session_delete", "session_id", result.sessionID, "error_kind", "persistence")
-		w.say("Session deleted, but failed to clear pinned sessions.")
+		w.b.storeLog.Error("session reference cleanup failed", "event", "session_delete", "session_id", result.sessionID, "error_kind", "persistence")
+		w.say("Session deleted, but failed to clear saved bindings and pins.")
 	} else {
-		w.log.Info("native session deleted", "event", "session_delete", "session_id", result.sessionID, "result", "done")
+		w.log.Info("native session deleted", "event", "session_delete", "session_id", result.sessionID, "bindings_removed", deletedBindings, "result", "done")
 		w.say("Session deleted.")
 	}
 	if refresh && epoch == w.b.bindingsEpoch.Load() && result.generation == w.binding.Generation && w.persistedBindingGenerationMatches(result.generation) {

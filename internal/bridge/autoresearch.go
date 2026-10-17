@@ -179,17 +179,6 @@ func (w *worker) researchDispatchReady(client *omp.Client) bool {
 			return false
 		}
 	}
-	if len(w.queue) != 0 {
-		q := w.queue[0]
-		_, command := autoresearchArguments(q.text, w.b.bot.Username)
-		if w.research.enabled || command && q.kind == queuedNativeCommand && q.nativeName == "autoresearch" {
-			if err := w.ensureResearchWorkspace(); err != nil {
-				w.resumeFailed = true
-				w.say(err.Error())
-				return false
-			}
-		}
-	}
 	return true
 }
 
@@ -299,29 +288,14 @@ func (w *worker) retireResearch(notice string) {
 	w.clearSteerFence()
 }
 
-// routeResearchOff bypasses ordinary admission only for an exact persisted
-// lease owner. Unknown identities still use the normal command routing path.
+// routeResearchOff handles explicit off directly only when the connected catalog is settled.
 func (w *worker) routeResearchOff(in incoming, text string) bool {
 	args, command := autoresearchArguments(text, w.b.bot.Username)
 	if !command || args != "off" {
 		return false
 	}
-	owner, err := w.currentWorkspaceOwner()
-	if err != nil {
-		return false
-	}
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	if err != nil {
-		w.b.fail(err)
-		w.cancel()
-		return true
-	}
-	if !owned {
-		return false
-	}
 	if client, connected := w.runtimeClient(); connected && client.CommandCatalog().State == omp.CatalogUnknown {
-		w.enqueueSlashInput(in, text, client)
-		return true
+		return false
 	}
 	if w.mark(in.id, store.InboxSubmitted) {
 		w.disableResearch(in.id)
@@ -339,12 +313,7 @@ func (w *worker) handleResearchStop() bool {
 		w.retireResearch("Autoresearch control was canceled. Its outcome is uncertain; no control will be replayed automatically.")
 		return true
 	}
-	owned, err := w.researchLeaseOwned()
-	if err != nil {
-		w.researchModeFailure()
-		return true
-	}
-	if owned || w.research.root || w.research.enabled || w.research.disablePending {
+	if w.research.root || w.research.enabled || w.research.disablePending {
 		w.disableResearch(0)
 		return true
 	}

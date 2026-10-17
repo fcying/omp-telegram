@@ -64,17 +64,49 @@ func (b *Bridge) deleteMatchesLocked(id string) bool {
 	return false
 }
 
+// A released logical claim does not block deletion; live runtimes and in-flight operations do.
+func (b *Bridge) sessionDeleteStatus(owner *worker, id string) (busy, elsewhere bool) {
+	b.sessionMu.Lock()
+	defer b.sessionMu.Unlock()
+	return b.sessionDeleteStatusLocked(owner, id)
+}
+
+func (b *Bridge) sessionDeleteStatusLocked(owner *worker, id string) (busy, elsewhere bool) {
+	for _, claim := range b.sessionClaims {
+		if claim.owner == nil || !sessionIDsMatch(claim.id, id) {
+			continue
+		}
+		if !claim.owner.sessionRuntimeActive.Load() && !claim.owner.sessionRuntimeStarting.Load() {
+			continue
+		}
+		busy = true
+		if claim.owner != owner {
+			elsewhere = true
+		}
+	}
+	for claimOwner, claimedID := range b.exportClaims {
+		if sessionIDsMatch(claimedID, id) {
+			busy = true
+			if claimOwner != owner {
+				elsewhere = true
+			}
+		}
+	}
+	for claimOwner, claimedID := range b.deleteClaims {
+		if sessionIDsMatch(claimedID, id) {
+			busy = true
+			if claimOwner != owner {
+				elsewhere = true
+			}
+		}
+	}
+	return busy, elsewhere
+}
 func (b *Bridge) reserveDelete(owner *worker, id string) bool {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
-	if b.sessionMatchesLocked(nil, id) || b.exportMatchesLocked(nil, id) || b.deleteMatchesLocked(id) {
+	if busy, _ := b.sessionDeleteStatusLocked(nil, id); busy {
 		return false
-	}
-	if b.db != nil {
-		leased, err := b.db.ResearchSessionLeased(b.bot.ID, id)
-		if err != nil || leased {
-			return false
-		}
 	}
 	if b.deleteClaims == nil {
 		b.deleteClaims = make(map[*worker]string)
@@ -118,16 +150,55 @@ func (w *worker) claimPersistedSession() bool {
 	if w.binding.Session == "" || !validSessionID(w.binding.SessionID) {
 		return false
 	}
-	// Restoring durable identity does not authorize executing workspace tasks.
-	// Conflicting or unavailable workspaces must not stop unrelated recovery.
 	return w.claimSession(w.binding.Session, w.binding.SessionID)
 }
 
-func (w *worker) claimSession(file, id string) bool {
-	return w.claimSessionWorkspace(file, id, "")
+func (w *worker) beginSessionRestore(id string) bool {
+	if !validSessionID(id) {
+		return false
+	}
+	b := w.b
+	b.sessionMu.Lock()
+	defer b.sessionMu.Unlock()
+	if b.deleteMatchesLocked(id) || b.sessionMatchesLocked(w, id) || b.exportMatchesLocked(w, id) {
+		return false
+	}
+	current, err := b.db.Binding(b.bot.ID, w.key.chat, w.key.thread)
+	if err != nil || current.Generation != w.binding.Generation || current.Workspace != w.binding.Workspace ||
+		current.Session != w.binding.Session || current.Running != w.binding.Running || !strings.EqualFold(current.SessionID, id) {
+		return false
+	}
+	if b.sessionClaims == nil {
+		b.sessionClaims = make(map[string]sessionClaim)
+	}
+	claimPath := ""
+	for path, claim := range b.sessionClaims {
+		if claim.owner != w {
+			continue
+		}
+		if !strings.EqualFold(claim.id, id) {
+			return false
+		}
+		claimPath = path
+		break
+	}
+	if claimPath == "" {
+		claimPath = w.binding.Session
+		if claimPath == "" {
+			return false
+		}
+		if claim, exists := b.sessionClaims[claimPath]; exists && claim.owner != w {
+			return false
+		}
+		b.sessionClaims[claimPath] = sessionClaim{owner: w, id: id}
+	}
+	w.claimedSession = claimPath
+	w.sessionID = id
+	w.sessionRuntimeStarting.Store(true)
+	return true
 }
 
-func (w *worker) claimSessionWorkspace(file, id, workspace string) bool {
+func (w *worker) claimSession(file, id string) bool {
 	w.b.sessionMu.Lock()
 	defer w.b.sessionMu.Unlock()
 	if w.b.sessionClaims == nil {
@@ -144,14 +215,9 @@ func (w *worker) claimSessionWorkspace(file, id, workspace string) bool {
 			return false
 		}
 	}
-	if workspace != "" {
-		root, err := w.b.refreshWorkspaceRootLocked(w.ctx, workspace)
-		if err != nil {
-			return false
-		}
-		owner := w.workspaceOwner(id)
-		if w.b.db.CheckWorkspaceSession(owner) != nil || w.b.db.AdmitWorkspace(root, owner) != nil {
-			return false
+	for path, claim := range w.b.sessionClaims {
+		if claim.owner == w {
+			delete(w.b.sessionClaims, path)
 		}
 	}
 	w.b.sessionClaims[file] = sessionClaim{owner: w, id: id}
@@ -163,9 +229,13 @@ func (w *worker) claimSessionWorkspace(file, id, workspace string) bool {
 func (w *worker) releaseSession() {
 	w.b.sessionMu.Lock()
 	defer w.b.sessionMu.Unlock()
-	if claim, exists := w.b.sessionClaims[w.claimedSession]; exists && claim.owner == w {
-		delete(w.b.sessionClaims, w.claimedSession)
+	for path, claim := range w.b.sessionClaims {
+		if claim.owner == w {
+			delete(w.b.sessionClaims, path)
+		}
 	}
 	w.claimedSession = ""
 	w.sessionID = ""
+	w.sessionRuntimeStarting.Store(false)
+	w.sessionRuntimeActive.Store(false)
 }

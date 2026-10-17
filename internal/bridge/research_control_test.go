@@ -257,11 +257,6 @@ func TestAutoresearchStartupToggleDisablesWithoutWaitingForRoot(t *testing.T) {
 				researchTraceCount(trace, "prompt", "/autoresearch") != 0 || researchTraceCount(trace, "prompt", "/autoresearch off") != 1 {
 				t.Fatal("startup toggle waited behind or reenabled the autonomous research root")
 			}
-			owned, err := w.researchLeaseOwned()
-			requireStoreOK(t, err)
-			if owned {
-				t.Fatal("confirmed off retained the research lease")
-			}
 			nativeInput(t, w, 103, "/followup ordinary work after startup toggle", false)
 			nativeUntil(t, w, func() bool { return queueState(t, w, 103) == "done" })
 			if researchTraceCount(trace, "prompt", "ordinary work after startup toggle") != 1 {
@@ -286,8 +281,6 @@ func TestAutoresearchOffCancelsStartupTogglesAndPreservesQueue(t *testing.T) {
 			nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "agent_start"})
 			nativeInput(t, w, 100, "/autoresearch continuous goal", false)
 			nativeUntil(t, w, func() bool { return w.research.accepted && !w.rpcOperationActive })
-			owner, err := w.currentWorkspaceOwner()
-			requireStoreOK(t, err)
 			nativeInput(t, w, 101, "/followup work before startup toggles", false)
 			for i := 0; i < scenario.toggles; i++ {
 				text := "/autoresearch"
@@ -325,15 +318,13 @@ func TestAutoresearchOffCancelsStartupTogglesAndPreservesQueue(t *testing.T) {
 					prompts = append(prompts, entry.payload)
 				}
 			}
-			owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if queueState(t, w, 100) != "uncertain" || lastMode != "off" || owned {
-				t.Fatal("an old startup toggle reenabled research or reacquired its lease after off")
+			if queueState(t, w, 100) != "uncertain" || lastMode != "off" {
+				t.Fatal("an old startup toggle reenabled research or off failed to leave native mode disabled")
 			}
 			if strings.Join(prompts, "\n") != "/autoresearch continuous goal\n/autoresearch off\nwork before startup toggles\nwork after startup toggles" {
 				t.Fatalf("off replayed a toggle or changed preserved prompt order: %q", prompts)
 			}
-			t.Logf("worker.run: toggles=cancelled off=done queued_work=done mode=%s lease_owned=%t", lastMode, owned)
+			t.Logf("worker.run: toggles=cancelled off=done queued_work=done mode=%s", lastMode)
 		})
 	}
 }
@@ -463,8 +454,6 @@ func TestAutoresearchSlowControlsRemainPreemptible(t *testing.T) {
 						nativeInput(t, w, 100, "/session pin", false)
 						nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
 					}
-					owner, err := w.currentWorkspaceOwner()
-					requireStoreOK(t, err)
 					client := w.client
 					waitKind, waitPhase := "research_control_waiting", phase
 					switch phase {
@@ -503,11 +492,6 @@ func TestAutoresearchSlowControlsRemainPreemptible(t *testing.T) {
 					case <-time.After(time.Second):
 						t.Fatal("Stop/close did not retire a runtime with a held research control")
 					}
-					owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-					requireStoreOK(t, err)
-					if !owned {
-						t.Fatal("cancellation released research ownership without completed local control and disabled mode")
-					}
 					if intent == "off" && queueState(t, w, 101) != "uncertain" {
 						t.Fatal("canceled off was reported complete")
 					}
@@ -528,17 +512,10 @@ func TestAutoresearchLocalCompletionRequiresAcceptanceAndFencesOldResults(t *tes
 	w, command, trace := researchWorker(t, "autoresearch")
 	nativeInput(t, w, 100, "/autoresearch", false)
 	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
-	owner, err := w.currentWorkspaceOwner()
-	requireStoreOK(t, err)
 	nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "prompt"})
 	nativeInput(t, w, 101, "/autoresearch off", false)
 	nativeUntil(t, w, func() bool { return w.research.control != nil && w.research.control.completed })
 	old := w.research.control
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	requireStoreOK(t, err)
-	if !owned || old.accepted || queueState(t, w, 101) != "submitted" {
-		t.Fatal("completion before acceptance released ownership or claimed control done")
-	}
 	command("/close")
 	callback := waitOperation(t, w)
 	w.operationReturned(callback)
@@ -564,8 +541,6 @@ func TestAutoresearchScopeUpdatesDuringLocalResultWaitStayInActor(t *testing.T) 
 			t.Setenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE", "on")
 			w, _, trace := researchWorker(t, "autoresearch")
 			clear := researchClearCallback(t, w, "/autoresearch clear --force --keep-tree")
-			owner, err := w.currentWorkspaceOwner()
-			requireStoreOK(t, err)
 			nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "result"})
 			w.callback(clear)
 			nativeUntil(t, w, func() bool { return w.research.control != nil && w.research.control.phase == "completion" })
@@ -576,10 +551,8 @@ func TestAutoresearchScopeUpdatesDuringLocalResultWaitStayInActor(t *testing.T) 
 			}
 			nativeRPC(t, w, "fixture_catalog_update", fields)
 			nativeUntil(t, w, func() bool { return !w.controlInProgress() })
-			owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if !owned || !w.resumeFailed || w.client != nil {
-				t.Fatal("scope update was stolen during local result wait or released uncertain research ownership")
+			if !w.resumeFailed || w.client != nil {
+				t.Fatal("scope update was stolen during local result wait or the invalid control retained its runtime")
 			}
 			before := nativeOutputs(t, w)
 			w.event([]byte(`{"type":"prompt_result","id":"` + oldID + `","status":"completed","agentInvoked":false,"sessionSettled":true}`))
@@ -594,8 +567,6 @@ func TestAutoresearchResultWaitDispatchesUnrelatedEventsAndMatchesRequest(t *tes
 	t.Setenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE", "on")
 	w, _, trace := researchWorker(t, "autoresearch")
 	clear := researchClearCallback(t, w, "/autoresearch clear --force --keep-tree")
-	owner, err := w.currentWorkspaceOwner()
-	requireStoreOK(t, err)
 	nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "result"})
 	w.callback(clear)
 	nativeUntil(t, w, func() bool { return w.research.control != nil && w.research.control.phase == "completion" })
@@ -605,21 +576,17 @@ func TestAutoresearchResultWaitDispatchesUnrelatedEventsAndMatchesRequest(t *tes
 	}})
 	nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": map[string]any{"type": "auto_retry_start"}})
 	nativeUntil(t, w, func() bool { return w.progress.Retrying })
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	requireStoreOK(t, err)
-	if !owned || w.research.control == nil || w.research.control.completed {
+	if w.research.control == nil || w.research.control.completed {
 		t.Fatal("an unrelated event or request completed the local control or stole actor event dispatch")
 	}
 	nativeRPC(t, w, "fixture_research_control_release", nil)
 	nativeUntil(t, w, func() bool { return !w.controlInProgress() })
-	owned, err = w.b.db.ResearchWorkspaceOwned(owner)
-	requireStoreOK(t, err)
-	if owned || w.resumeFailed || researchTraceCount(trace, "autoresearch_clear", "clear --force --keep-tree") != 1 {
-		t.Fatal("correlated completed local control and disabled mode failed to release its lease exactly once")
+	if w.resumeFailed || researchTraceCount(trace, "autoresearch_clear", "clear --force --keep-tree") != 1 {
+		t.Fatal("correlated completed local control failed to confirm clear exactly once")
 	}
 }
 
-func TestAutoresearchIncompleteLocalResultsNeverReleaseLease(t *testing.T) {
+func TestAutoresearchIncompleteLocalResultsRemainUncertain(t *testing.T) {
 	for _, fields := range []map[string]any{
 		{"status": "aborted"}, {"status": "missing"}, {"agentInvoked": true},
 		{"agentInvoked": "missing"}, {"sessionSettled": false}, {"sessionSettled": "missing"},
@@ -630,18 +597,14 @@ func TestAutoresearchIncompleteLocalResultsNeverReleaseLease(t *testing.T) {
 			t.Setenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE", "on")
 			w, _, trace := researchWorker(t, "autoresearch")
 			clear := researchClearCallback(t, w, "/autoresearch clear --force --keep-tree")
-			owner, err := w.currentWorkspaceOwner()
-			requireStoreOK(t, err)
 			nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "result"})
 			w.callback(clear)
 			nativeUntil(t, w, func() bool { return w.research.control != nil && w.research.control.phase == "completion" })
 			nativeRPC(t, w, "fixture_research_control_release", fields)
 			nativeUntil(t, w, func() bool { return !w.controlInProgress() })
-			owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if !owned || !w.resumeFailed || !w.research.disablePending || w.client != nil ||
+			if !w.resumeFailed || !w.research.disablePending || w.client != nil ||
 				researchTraceCount(trace, "autoresearch_clear", "clear --force --keep-tree") != 1 {
-				t.Fatal("incomplete/nonlocal result released ownership, claimed success, retained the runtime, or replayed destruction")
+				t.Fatal("incomplete/nonlocal result claimed success, retained the runtime, or replayed destruction")
 			}
 		})
 	}
@@ -688,11 +651,7 @@ func TestAutoresearchToggleResultWaitsForAcceptance(t *testing.T) {
 	nativeUntil(t, w, func() bool {
 		return w.research.control != nil && w.research.control.phase == "acceptance"
 	})
-	owner, err := w.currentWorkspaceOwner()
-	requireStoreOK(t, err)
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	requireStoreOK(t, err)
-	if !owned || queueState(t, w, 100) != "submitted" || w.research.control.accepted {
+	if queueState(t, w, 100) != "submitted" || w.research.control.accepted {
 		t.Fatal("local toggle result completed the submission before acceptance")
 	}
 	nativeRPC(t, w, "fixture_research_control_release", nil)
@@ -768,8 +727,6 @@ func TestAutoresearchOffWithoutSessionFileRequiresLiveRuntime(t *testing.T) {
 			nativeInput(t, w, 100, "/autoresearch", false)
 			nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
 			client, binding := w.client, w.binding
-			owner, err := w.currentWorkspaceOwner()
-			requireStoreOK(t, err)
 			// The fixture persists eagerly; live native sessions may have no file yet.
 			requireStoreOK(t, os.Remove(w.binding.Session))
 			if !connected {
@@ -780,16 +737,14 @@ func TestAutoresearchOffWithoutSessionFileRequiresLiveRuntime(t *testing.T) {
 				state := queueState(t, w, 101)
 				return state != "pending" && state != "submitted" && !w.controlInProgress()
 			})
-			owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
 			if !connected {
-				if queueState(t, w, 101) != "uncertain" || !owned || !w.resumeFailed || !w.research.disablePending ||
+				if queueState(t, w, 101) != "uncertain" || !w.resumeFailed || !w.research.disablePending ||
 					w.client != nil || researchTraceCount(trace, "prompt", "/autoresearch off") != 0 {
-					t.Fatal("missing saved history admitted a cold resume or released its lease")
+					t.Fatal("missing saved history admitted a cold resume or reported unconfirmed off as done")
 				}
 				return
 			}
-			if queueState(t, w, 101) != "done" || owned || w.resumeFailed || w.research.disablePending ||
+			if queueState(t, w, 101) != "done" || w.resumeFailed || w.research.disablePending ||
 				w.client != client || !sameBindingIdentity(w.binding, binding) ||
 				researchTraceCount(trace, "prompt", "/autoresearch off") != 1 {
 				t.Fatal("live off required a session file or failed to confirm disable on its original owner")

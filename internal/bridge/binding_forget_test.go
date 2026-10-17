@@ -119,7 +119,7 @@ func TestBindingDeleteOpenFromOtherTopic(t *testing.T) {
 	waitFor(t, func() bool { return fake.has(11, "No saved conversation bindings.") })
 }
 
-func TestBindingForgetPreservesResearchOwner(t *testing.T) {
+func TestBindingForgetDoesNotDependOnWorkspaceCoordination(t *testing.T) {
 	for _, closed := range []bool{false, true} {
 		name := "open"
 		if closed {
@@ -132,8 +132,6 @@ func TestBindingForgetPreservesResearchOwner(t *testing.T) {
 			waitFor(t, func() bool { return fake.has(22, "omp is ready.") })
 			bound, err := db.Binding(99, -10, 22)
 			requireStoreOK(t, err)
-			owner := store.WorkspaceOwner{Bot: 99, Chat: -10, Thread: 22, Session: bound.SessionID}
-			requireStoreOK(t, db.ClaimResearchWorkspace(workspace, owner))
 			if closed {
 				send(update(2, 22, "/close"))
 				waitInputDone(t, db, 2)
@@ -146,17 +144,10 @@ func TestBindingForgetPreservesResearchOwner(t *testing.T) {
 			sendBindingCallback(t, db, send, 4, listID, data)
 			confirmID, data := waitBindingAction(t, fake, int(listID), "binding for Topic 22?", "Delete")
 			sendBindingCallback(t, db, send, 5, confirmID, data)
-			waitFor(t, func() bool { return fake.has(11, "Research workspace is still reserved.") })
-			after, err := db.Binding(99, -10, 22)
-			requireStoreOK(t, err)
-			if after != bound {
-				t.Fatalf("refused forget changed the %s owner: before=%+v after=%+v", name, bound, after)
-			}
+			waitFor(t, func() bool { _, err := db.Binding(99, -10, 22); return errors.Is(err, sql.ErrNoRows) })
+			waitFor(t, func() bool { return fake.has(11, "No saved conversation bindings.") })
 			if _, err := os.Stat(bound.Session); err != nil {
-				t.Fatalf("refused forget removed native history: %v", err)
-			}
-			if err := db.AdmitWorkspace(workspace, store.WorkspaceOwner{Bot: 99, Chat: -10, Thread: 33, Session: "bbbbbbbb-2222"}); !errors.Is(err, store.ErrWorkspaceOccupied) {
-				t.Fatalf("refused forget lost workspace exclusivity: %v", err)
+				t.Fatalf("forget removed native session history: %v", err)
 			}
 		})
 	}

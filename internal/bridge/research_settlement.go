@@ -132,9 +132,6 @@ drained:
 	}
 	w.research.known, w.research.enabled = true, state.Enabled
 	if state.Enabled {
-		if err := w.ensureResearchWorkspace(); err != nil {
-			w.retireResearch("Autoresearch workspace ownership could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
-		}
 		return
 	}
 	if !state.Idle || !state.Settled || state.Pending {
@@ -148,14 +145,4 @@ drained:
 	}
 	w.invalidateResearchSettlement()
 	w.clearSteerFence()
-	w.releaseConfirmedResearchWorkspace()
-}
-
-func (w *worker) releaseConfirmedResearchWorkspace() bool {
-	if err := w.releaseResearchWorkspace(); err != nil {
-		w.resumeFailed = true
-		w.say("Autoresearch workspace ownership could not be released. Queued work is paused: " + err.Error())
-		return false
-	}
-	return true
 }

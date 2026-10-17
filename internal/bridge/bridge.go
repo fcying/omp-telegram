@@ -228,16 +228,19 @@ type runtimeLifecycle struct {
 }
 
 type worker struct {
-	b              *Bridge
-	log            *slog.Logger
-	key            target
-	input          chan incoming
-	client         *omp.Client
-	launchArgs     []string
-	binding        store.Binding
-	startIntent    *store.StartIntent
-	sessionID      string
-	claimedSession string
+	b      *Bridge
+	log    *slog.Logger
+	key    target
+	input  chan incoming
+	client *omp.Client
+	// Cross-worker deletion checks distinguish a live runtime from a retained logical claim.
+	sessionRuntimeActive   atomic.Bool
+	sessionRuntimeStarting atomic.Bool
+	launchArgs             []string
+	binding                store.Binding
+	startIntent            *store.StartIntent
+	sessionID              string
+	claimedSession         string
 	runtimeLifecycle
 	queue                []queued
 	stream               strings.Builder
@@ -1311,7 +1314,11 @@ func (w *worker) runtimeClient() (*omp.Client, bool) {
 	return w.client, w.runtime == runtimeConnected && w.client != nil
 }
 
-func (w *worker) beginRuntimeStart() { w.runtime = runtimeStarting }
+func (w *worker) beginRuntimeStart() {
+	w.sessionRuntimeActive.Store(false)
+	w.sessionRuntimeStarting.Store(true)
+	w.runtime = runtimeStarting
+}
 
 func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 	w.b.registerCommandMenuWorker(w)
@@ -1319,6 +1326,10 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 	w.launchArgs = args
 	w.runtime = runtimeConnected
 	w.resumeFailed = false
+	w.b.sessionMu.Lock()
+	w.sessionRuntimeActive.Store(true)
+	w.sessionRuntimeStarting.Store(false)
+	w.b.sessionMu.Unlock()
 }
 
 func (w *worker) runtimeStopped() {
@@ -1390,6 +1401,8 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.previewID = 0
 	w.previewStopToken = ""
 	w.cancelSteerProbe()
+	w.sessionRuntimeStarting.Store(false)
+	w.sessionRuntimeActive.Store(false)
 }
 
 func (w *worker) releaseRuntime(releaseSlot bool) {
@@ -1401,6 +1414,7 @@ func (w *worker) closeRuntime() { w.releaseRuntimeWithReason(true, "explicit") }
 func (w *worker) closeFailedStart() {
 	if w.runtimeResuming || w.restoring {
 		w.releaseRuntimeWithReason(true, "failure")
+		w.releaseSession()
 		return
 	}
 	w.closeLogicalSession()
@@ -1408,9 +1422,6 @@ func (w *worker) closeFailedStart() {
 
 func (w *worker) ensureRuntime() (*omp.Client, error) {
 	if client, ok := w.runtimeClient(); ok {
-		if err := w.admitCurrentWorkspace(); err != nil {
-			return nil, err
-		}
 		return client, nil
 	}
 	if w.runtime == runtimeStarting {
@@ -1838,18 +1849,6 @@ func (w *worker) operationFinished(result operationResult) {
 		if mode, ok := result.meta.(*statusModeResult); ok && mode != nil && mode.sessionID != "" {
 			catalog := w.client.CommandCatalog()
 			if mode.epoch == catalog.Epoch && mode.sessionID == catalog.SessionID {
-				if mode.known && mode.enabled {
-					if err := w.ensureResearchWorkspace(); err != nil {
-						if w.research.root {
-							w.retireResearch("Autoresearch workspace is shared or unavailable. Its outcome is uncertain and will not be replayed automatically.")
-						} else {
-							w.resumeFailed = true
-							w.say("Autoresearch workspace admission failed: " + err.Error())
-						}
-						w.releaseStatusRuntime(result, valid)
-						return
-					}
-				}
 				w.research.known = mode.known
 				if mode.known {
 					w.research.enabled = mode.enabled
@@ -1947,13 +1946,6 @@ func (w *worker) closeLogicalSession() bool {
 	w.clearQueue()
 	w.teardownWorker(true)
 	w.clearTask()
-	w.b.sessionMu.Lock()
-	err := w.b.db.CloseWorkspaceUsers(w.workspaceOwner(w.sessionID))
-	w.b.sessionMu.Unlock()
-	if err != nil {
-		w.b.fail(err)
-		return false
-	}
 	attrs := []slog.Attr{
 		slog.String("event", "session_close"),
 		slog.Int64("generation", generation),
@@ -2383,23 +2375,6 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			return "Invalid working directory."
 		}
 	}
-	startupOwner := w.workspaceOwner(startupWorkspaceSession(resume, target, nextGeneration))
-	if w.runtimeResuming || w.restoring {
-		startupOwner = w.workspaceOwner(old.SessionID)
-	}
-	w.b.sessionMu.Lock()
-	workspaceRoot, refreshErr := w.b.refreshWorkspaceRootLocked(w.ctx, cwd)
-	e = refreshErr
-	if e == nil {
-		e = w.b.db.CheckWorkspaceSession(startupOwner)
-	}
-	if e == nil && workspaceRoot != "" {
-		e = w.b.db.CheckWorkspace(workspaceRoot, startupOwner)
-	}
-	w.b.sessionMu.Unlock()
-	if e != nil {
-		return "Cannot admit the physical working directory: " + e.Error()
-	}
 	reuseSlot := replace && w.runtime == runtimeConnected && w.client != nil
 	reserved := false
 	if !reuseSlot {
@@ -2449,13 +2424,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			}
 			return "This session is being deleted. Try again after the operation finishes."
 		}
-		workspaceRoot, e = w.b.refreshWorkspaceRootLocked(w.ctx, cwd)
-		if e == nil {
-			e = w.b.db.CheckWorkspaceSession(startupOwner)
-		}
-		if e == nil {
-			e = w.b.db.PrepareWorkspaceStart(previous, intent, workspaceRoot, startupOwner)
-		}
+		e = w.b.db.PrepareStart(previous, intent)
 		w.b.sessionMu.Unlock()
 		if e != nil {
 			if reserved {
@@ -2475,19 +2444,11 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			w.clearTask()
 		}
 	}
-	if w.restoring && workspaceRoot != "" {
-		w.b.sessionMu.Lock()
-		workspaceRoot, e = w.b.refreshWorkspaceRootLocked(w.ctx, cwd)
-		if e == nil {
-			e = w.b.db.AdmitWorkspace(workspaceRoot, startupOwner)
+	if resume && (w.runtimeResuming || w.restoring) && !w.beginSessionRestore(w.binding.SessionID) {
+		if reserved {
+			<-w.b.slots
 		}
-		w.b.sessionMu.Unlock()
-		if e != nil {
-			if reserved {
-				<-w.b.slots
-			}
-			return e.Error()
-		}
+		return "The saved session is being deleted or used elsewhere. No OMP process was started."
 	}
 	w.beginRuntimeStart()
 	var launchArgs []string
@@ -2502,6 +2463,12 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			<-w.b.slots
 		}
 		w.runtimeStopped()
+		if w.runtimeResuming || w.restoring {
+			w.releaseSession()
+		} else {
+			w.sessionRuntimeStarting.Store(false)
+			w.sessionRuntimeActive.Store(false)
+		}
 		if w.runtimeResuming {
 			return "Failed to resume the released OMP session. No prompt was submitted."
 		}
@@ -2539,9 +2506,9 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		w.closeFailedStart()
 		return "omp selected a different working directory. The instance has been closed."
 	}
-	if !w.claimSessionWorkspace(info.File, info.ID, info.CWD) {
+	if !w.claimSession(info.File, info.ID) {
 		w.closeFailedStart()
-		return "This omp session or physical workspace is unavailable or occupied by another conversation."
+		return "This omp session is unavailable or already in use by another conversation."
 	}
 	ctx, cancel = context.WithTimeout(w.ctx, 30*time.Second)
 	_, e = c.Call(ctx, "set_host_tools", map[string]any{"tools": telegramSendTools})
@@ -2553,14 +2520,10 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: nextGeneration, LastUsedAt: old.LastUsedAt, Running: true}
 
 	w.b.sessionMu.Lock()
-	workspaceRoot, e = w.b.refreshWorkspaceRootLocked(w.ctx, info.CWD)
-	if e == nil {
-		if w.runtimeResuming {
-			binding = old
-			e = w.b.db.AdmitWorkspace(workspaceRoot, w.workspaceOwner(info.ID))
-		} else {
-			e = w.b.db.CommitWorkspaceStart(binding, workspaceRoot)
-		}
+	if w.runtimeResuming {
+		binding = old
+	} else {
+		e = w.b.db.CommitStart(binding)
 	}
 	w.b.sessionMu.Unlock()
 	if e != nil {

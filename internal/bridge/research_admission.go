@@ -93,9 +93,6 @@ func (w *worker) researchAdmissionFinished(result operationResult) {
 	if result.err == nil {
 		result.err = json.Unmarshal(result.data, &probe.enabled)
 	}
-	if result.err == nil && probe.enabled {
-		result.err = w.ensureResearchWorkspace()
-	}
 	if result.err != nil {
 		w.research.known = false
 		w.cancelQueuedTask(probe.inbox)
