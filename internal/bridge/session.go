@@ -154,6 +154,11 @@ func (w *worker) claimSessionWorkspace(file, id, workspace string) bool {
 			return false
 		}
 	}
+	for path, claim := range w.b.sessionClaims {
+		if claim.owner == w {
+			delete(w.b.sessionClaims, path)
+		}
+	}
 	w.b.sessionClaims[file] = sessionClaim{owner: w, id: id}
 	w.claimedSession = file
 	w.sessionID = id
@@ -163,8 +168,10 @@ func (w *worker) claimSessionWorkspace(file, id, workspace string) bool {
 func (w *worker) releaseSession() {
 	w.b.sessionMu.Lock()
 	defer w.b.sessionMu.Unlock()
-	if claim, exists := w.b.sessionClaims[w.claimedSession]; exists && claim.owner == w {
-		delete(w.b.sessionClaims, w.claimedSession)
+	for path, claim := range w.b.sessionClaims {
+		if claim.owner == w {
+			delete(w.b.sessionClaims, path)
+		}
 	}
 	w.claimedSession = ""
 	w.sessionID = ""

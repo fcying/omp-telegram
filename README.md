@@ -208,7 +208,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List this chat's saved conversation/session bindings. Tap an eligible title to forget a closed or idle binding after confirmation; workspace files and OMP history are preserved. |
 | `/bindings old` | Show saved bindings from least recently used to most recently used. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Includes Pin/Unpin and Delete controls. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Includes Pin/Unpin and Delete controls; sessions claimed or reserved by another conversation are marked `[in use elsewhere]` and must be released there before deletion. |
 | `/resume <session ID>` | Resume a native OMP session and its original directory. |
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |

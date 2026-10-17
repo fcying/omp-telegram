@@ -82,6 +82,45 @@ func TestSessionDeleteConfirmsAndRefreshesWithoutChangingWorkspace(t *testing.T)
 	}
 }
 
+func TestSessionDeleteAfterCloseReleasesAliasedSessionClaims(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	sessionID, sessionFile, workspace := w.sessionID, w.binding.Session, w.binding.Workspace
+	alias := sessionFile + ".claim-alias"
+	if err := os.Symlink(sessionFile, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(alias) })
+	if !sameSessionFile(sessionFile, alias) || !w.claimSession(alias, sessionID) {
+		t.Fatal("could not reproduce a second path claim for the same native session")
+	}
+	command("/close")
+
+	data, err := json.Marshal([]resumeFixtureSession{{ID: sessionID, CWD: workspace, Title: "closed-session"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(data))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	button := deletePickerButton(t, f, 0)
+	clickSessionButton(w, f, 7, button["callback_data"].(string))
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "Delete omp session?") || len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("closed session was not offered for deletion: %q; %v", text, rows)
+	}
+	clickSessionButton(w, f, 7, rows[0][0]["callback_data"].(string))
+	result := awaitSessionDelete(t, w)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	w.sessionDeleteFinished(result)
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Fatalf("closed native session was not deleted: %v", err)
+	}
+}
+
 func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
 	for _, scenario := range []string{"cancel", "wrong-user", "current", "stale-epoch", "wrong-workspace", "other-active"} {
@@ -109,6 +148,12 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 			saved := filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), selected.ID+".jsonl")
 			command("/resume")
 			w.resumeListed(finishResumeList(t, w))
+			if scenario == "other-active" {
+				text, _ := pickerView(t, f)
+				if !strings.Contains(text, "[in use elsewhere]") {
+					t.Fatalf("picker did not mark the session used by another topic: %q", text)
+				}
+			}
 			button := deletePickerButton(t, f, 0)
 			if scenario == "wrong-workspace" {
 				for token, c := range w.confirms {
@@ -127,6 +172,12 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 			if scenario == "current" || scenario == "other-active" || scenario == "wrong-workspace" {
 				if _, err := os.Stat(saved); err != nil || w.deleteCancel != nil {
 					t.Fatal("ineligible native session was deleted")
+				}
+				if scenario == "other-active" {
+					var reply string
+					if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&reply); err != nil || !strings.Contains(reply, "another conversation") {
+						t.Fatalf("cross-conversation rejection was unclear: %q, %v", reply, err)
+					}
 				}
 				return
 			}
