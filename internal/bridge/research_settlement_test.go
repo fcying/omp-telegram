@@ -180,9 +180,20 @@ func TestAutoresearchQueuedRootCallbackCannotFinishFollowingWork(t *testing.T) {
 		select {
 		case raw := <-w.client.Events():
 			w.event(raw)
+		case result := <-w.operations:
+			if result.kind != "reply_status" {
+				t.Fatalf("unexpected operation before held root callback: %s", result.kind)
+			}
+			w.operationReturned(result)
+			if !w.rpcOperationActive || queueState(t, w, 100) != "submitted" || w.active != 100 || queueState(t, w, 101) != "pending" {
+				t.Fatal("round metadata released the held mutation lane or its research owner")
+			}
 		case <-timer.C:
 			t.Fatal("settlement was not queued behind the root callback")
 		}
+	}
+	if !w.rpcOperationActive || len(w.rpcOperations) != 1 {
+		t.Fatal("settlement bypassed the held root callback's mutation lane")
 	}
 	w.operationReturned(rootCallback)
 	nativeUntil(t, w, func() bool { return w.active == 101 && !w.rpcOperationActive })

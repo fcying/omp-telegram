@@ -52,33 +52,49 @@ func formatStatus(s statusState, workspace, sessionID, home string, queued int) 
 		}
 		session = name + "\nSession ID: " + shortID
 	}
-	model := "n/a"
+	return fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s\nThinking: %s\nFast: %s\nContext: %s\nRunning: %s\nCompacting: %s\nQueued: %d\nSpeed: %s",
+		clipUTF16(statusWorkspace(workspace, home), 1024), session, s.modelText(), s.thinkingText(), s.fastText(), s.contextText(),
+		statusBool(s.IsStreaming, "yes", "no"), statusBool(s.IsCompacting, "yes", "no"), queued, s.speedText())
+}
+
+func (s statusState) modelText() string {
 	if s.Model.Provider != "" && s.Model.ID != "" {
-		model = menuText(s.Model.Provider+"/"+s.Model.ID, 256)
+		return menuText(s.Model.Provider+"/"+s.Model.ID, 256)
 	}
-	thinking := menuText(s.ThinkingLevel, 32)
-	if thinking == "" {
-		thinking = "n/a"
+	return "n/a"
+}
+
+func (s statusState) thinkingText() string {
+	if thinking := menuText(s.ThinkingLevel, 32); thinking != "" {
+		return thinking
 	}
+	return "n/a"
+}
+
+func (s statusState) fastText() string {
 	fast := statusBool(s.FastModeActive, "on", "off")
 	if s.FastModeEnabled != nil && (s.FastModeActive == nil || *s.FastModeActive != *s.FastModeEnabled) {
 		fast += " (setting: " + statusBool(s.FastModeEnabled, "on", "off") + ")"
 	}
-	context := "n/a"
+	return fast
+}
+
+func (s statusState) contextText() string {
 	if usage := s.ContextUsage; usage != nil && usage.Tokens != nil && usage.ContextWindow != nil && *usage.Tokens >= 0 && *usage.ContextWindow > 0 {
 		percent := float64(*usage.Tokens) / float64(*usage.ContextWindow) * 100
 		if usage.Percent != nil && validStatusNumber(*usage.Percent) {
 			percent = *usage.Percent
 		}
-		context = fmt.Sprintf("%.0f%% (%s / %s)", percent, statusTokens(*usage.Tokens), statusTokens(*usage.ContextWindow))
+		return fmt.Sprintf("%.0f%% (%s / %s)", percent, statusTokens(*usage.Tokens), statusTokens(*usage.ContextWindow))
 	}
-	speed := "n/a"
+	return "n/a"
+}
+
+func (s statusState) speedText() string {
 	if s.TokensPerSecond != nil && validStatusNumber(*s.TokensPerSecond) {
-		speed = statusDecimal(*s.TokensPerSecond) + " tok/s"
+		return statusDecimal(*s.TokensPerSecond) + " tok/s"
 	}
-	return fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s\nThinking: %s\nFast: %s\nContext: %s\nRunning: %s\nCompacting: %s\nQueued: %d\nSpeed: %s",
-		clipUTF16(statusWorkspace(workspace, home), 1024), session, model, thinking, fast, context,
-		statusBool(s.IsStreaming, "yes", "no"), statusBool(s.IsCompacting, "yes", "no"), queued, speed)
+	return "n/a"
 }
 
 func formatRuntimeStatus(s statusState, workspace, sessionID, home string, queued int, idle time.Duration, connected bool) string {

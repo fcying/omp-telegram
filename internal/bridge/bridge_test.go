@@ -90,7 +90,7 @@ func waitOperation(t *testing.T, w *worker) operationResult {
 	for {
 		select {
 		case result := <-w.operations:
-			if result.kind == "research_admission" {
+			if result.kind == "research_admission" || result.kind == "reply_status" {
 				w.operationReturned(result)
 				w.dispatch()
 				continue
@@ -312,6 +312,7 @@ func TestMain(m *testing.M) {
 		thinkingLevel := "medium"
 		fastEnabled, fastActive := false, false
 		sessionName := ""
+		var contextUsage any
 		rootPrompts := 0
 		uiReplies := 0
 		uiValue := ""
@@ -367,6 +368,9 @@ func TestMain(m *testing.M) {
 			recordFixtureRPCTrace("autoresearch_mode", mode)
 		}
 		applyCatalogUpdate := func(update map[string]any) {
+			if usage, present := update["contextUsage"]; present {
+				contextUsage = usage
+			}
 			if update["remove"] == true {
 				nativeCommands = []map[string]any{}
 			}
@@ -596,6 +600,9 @@ func TestMain(m *testing.M) {
 					}
 				}
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies, "fixtureUIValue": uiValue}
+				if contextUsage != nil {
+					resp["data"].(map[string]any)["contextUsage"] = contextUsage
+				}
 				resp["data"].(map[string]any)["isStreaming"] = streaming.Load()
 				resp["data"].(map[string]any)["isCompacting"] = false
 				resp["data"].(map[string]any)["isSettled"] = !streaming.Load()

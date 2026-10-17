@@ -213,8 +213,16 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 	} else if len(w.finalAssistantTexts) != 0 {
 		w.preview = strings.Join(w.finalAssistantTexts, "\n\n")
 	}
+	if w.preview != "" && w.terminalState(e) == terminalDone {
+		w.finishReplyWithStatus(true)
+		return
+	}
+	w.commitResearchRound()
+}
+
+func (w *worker) commitResearchRound() {
 	if w.preview != "" {
-		if err := w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, taskReplies(w.preview, "", w.finalOutputTruncated)); err != nil {
+		if err := w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, replyTaskReplies(w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
 			w.b.fail(err)
 			w.cancel()
 			return
@@ -227,6 +235,8 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 	w.finalAssistantBytes, w.finalizedStreamBytes = 0, 0
 	w.finalOutputTruncated = false
 	w.lastAssistant = nil
+	w.replyStatus.header = ""
+	w.replyStatus.metrics = replyMetrics{}
 	w.awaitTaskContinuation()
 }
 

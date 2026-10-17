@@ -138,6 +138,11 @@ func TestAutoresearchRoundsRetainRootAndDurablyFlushWithoutDuplicates(t *testing
 			nativeRPC(t, w, "fixture_autoresearch_continue", nil)
 		}
 		researchRound(t, w, text)
+		awaitReplyStatus(t, w)
+		roundReplies := researchReplies(t, w, 100)
+		if len(roundReplies) != i+1 || !strings.Contains(roundReplies[i], "`safe`") || replyBody(roundReplies[i]) != text {
+			t.Fatalf("round did not persist its own status header and intact reply: %q", roundReplies)
+		}
 		if queueState(t, w, 100) != "submitted" || w.active != 100 || !w.taskActive() || w.client != client || w.turn != turn || w.binding.Generation != generation {
 			t.Fatal("round yield closed or replaced the explicitly managed root")
 		}
@@ -222,7 +227,8 @@ func TestAutoresearchLocalCompletionPreservesImmediateOrdinaryInput(t *testing.T
 				t.Fatal("local completion lost the next ordinary owner or dispatched its followup")
 			}
 			researchRound(t, w, "queued ordinary research reply")
-			if got := strings.Join(researchReplies(t, w, 101), "\n"); got != "queued ordinary research reply" {
+			awaitReplyStatus(t, w)
+			if got := replyBody(strings.Join(researchReplies(t, w, 101), "\n")); got != "queued ordinary research reply" {
 				t.Fatalf("queued ordinary input lost its durable reply: %q", got)
 			}
 			nativeInput(t, w, 103, "/autoresearch off", false)
@@ -349,7 +355,8 @@ func TestAutoresearchEnabledModeWaitsForDiscoveryBeforeOrdinaryRoot(t *testing.T
 	nativeRPC(t, w, "fixture_catalog_update", nil)
 	nativeUntil(t, w, func() bool { return w.research.roundOpen && !w.rpcOperationActive })
 	researchRound(t, w, "restored research round")
-	if queueState(t, w, 100) != "submitted" || strings.Join(researchReplies(t, w, 100), "") != "restored research round" {
+	awaitReplyStatus(t, w)
+	if queueState(t, w, 100) != "submitted" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "restored research round" {
 		t.Fatal("discovered research lost its owner or round reply")
 	}
 }
@@ -877,6 +884,7 @@ func TestAutoresearchRoundRepliesStayBoundedAcrossLongRuns(t *testing.T) {
 			nativeRPC(t, w, "fixture_autoresearch_continue", nil)
 		}
 		researchRound(t, w, strings.Repeat("bounded research output ", 8192))
+		awaitReplyStatus(t, w)
 		if w.preview != "" || w.stream.Len() != 0 || w.finalAssistantBytes != 0 || len(w.finalAssistantTexts) != 0 || queueState(t, w, 100) != "submitted" {
 			t.Fatal("long research accumulated previous round buffers or finalized the root")
 		}

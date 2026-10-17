@@ -249,6 +249,8 @@ type worker struct {
 	progressTransport
 	compacting             bool
 	progress               progressState
+	progressNative         progressNativeState
+	replyStatus            replyStatusState
 	operations             chan operationResult
 	albums                 map[albumKey]*pendingAlbum
 	rpcOperations          []rpcOperation
@@ -346,6 +348,7 @@ type progressState struct {
 	RecentTools  []progressToolResult
 	EarlierTools int
 	Retrying     bool
+	NativeStatus string
 }
 
 type progressTool struct {
@@ -432,11 +435,29 @@ type rpcEvent struct {
 
 type message struct {
 	Role                       string          `json:"role"`
+	ModelID                    string          `json:"model"`
+	Provider                   string          `json:"provider"`
+	Duration                   *float64        `json:"duration"`
+	Usage                      *messageUsage   `json:"usage"`
 	Content                    json.RawMessage `json:"content"`
 	StopReason                 string          `json:"stopReason"`
 	ErrorMessage               string          `json:"errorMessage"`
 	ErrorClassificationMessage string          `json:"errorClassificationMessage"`
 	ErrorStatus                int             `json:"errorStatus"`
+}
+
+type messageUsage struct {
+	Input         *int64 `json:"input"`
+	Output        *int64 `json:"output"`
+	CacheRead     *int64 `json:"cacheRead"`
+	CacheWrite    *int64 `json:"cacheWrite"`
+	TotalTokens   *int64 `json:"totalTokens"`
+	ContextTokens *int64 `json:"contextTokens"`
+	Orchestration *struct {
+		Input     *int64 `json:"input"`
+		Output    *int64 `json:"output"`
+		CacheRead *int64 `json:"cacheRead"`
+	} `json:"orchestration"`
 }
 
 type terminalResult int
@@ -1137,6 +1158,8 @@ func (w *worker) taskActive() bool { return w.active != 0 }
 func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
+	w.cancelProgressNative()
+	w.resetReplyStatus()
 	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true, activeInputKind: q.kind}
 	w.activeAttachmentDir = q.directory
 	w.rootRequestID = ""
@@ -1145,6 +1168,8 @@ func (w *worker) beginTask(q queued) {
 }
 
 func (w *worker) clearTask() {
+	w.cancelProgressNative()
+	w.resetReplyStatus()
 	w.finishActiveIncoming()
 	w.active = 0
 	w.activeReplyTo = 0
@@ -1282,6 +1307,8 @@ func (w *worker) runtimeStarted(client *omp.Client) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.flushReplyStatus()
+	w.cancelProgressNative()
 	w.statusReleaseClientID = 0
 	w.research.known, w.research.enabled = false, false
 	w.clearCommandCatalog()
@@ -1493,6 +1520,9 @@ func (w *worker) run() {
 			w.operationReturned(result)
 			w.dispatch()
 			continue
+		case result := <-w.progressNative.results:
+			w.progressNativeFinished(result)
+			continue
 		case result := <-w.topicRenameResults:
 			w.topicRenameFinished(result)
 			w.dispatch()
@@ -1599,6 +1629,8 @@ func (w *worker) run() {
 			w.idleProbeFinished(result, time.Now())
 		case result := <-w.steerFence.probeResults:
 			w.steeredQuiescenceFinished(result)
+		case result := <-w.progressNative.results:
+			w.progressNativeFinished(result)
 		case <-tick.C:
 			if onTick() {
 				return
@@ -1831,6 +1863,7 @@ func (w *worker) operationFinished(result operationResult) {
 }
 
 func (w *worker) teardownWorker(releaseSlot bool) {
+	w.flushReplyStatus()
 	w.interruptModelMenu()
 	w.b.removeCommandMenu(w)
 	completion := w.taskCompletionAttrs(w.active, "uncertain")
@@ -1921,6 +1954,7 @@ func (w *worker) closeLogicalSession() bool {
 }
 
 func (w *worker) failed() {
+	w.flushReplyStatus()
 	if w.ctx.Err() != nil {
 		return
 	}
@@ -2139,6 +2173,10 @@ func (w *worker) dispatchRPCOperation() {
 }
 
 func (w *worker) operationReturned(result operationResult) {
+	if result.kind == "reply_status" {
+		w.replyStatusFinished(result)
+		return
+	}
 	w.rpcOperationActive = false
 	w.rpcOperationClientID = 0
 	pendingExit := result.clientID != 0 && w.rpcExitPendingClientID == result.clientID
@@ -2539,6 +2577,7 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 	return ""
 }
 func (w *worker) handle(in incoming) {
+	w.flushReplyStatus()
 	w.statusReleaseClientID = 0
 	w.touchLogicalActivity()
 	if in.callback != nil {
@@ -3134,7 +3173,7 @@ func (w *worker) finish() {
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		taskID := w.active
-		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.preview, "", w.finalOutputTruncated)); err != nil {
+		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, replyTaskReplies(w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
@@ -3388,7 +3427,7 @@ func (w *worker) finishTerminal(e rpcEvent) {
 			w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically.")
 			return
 		}
-		w.finish()
+		w.finishReplyWithStatus(false)
 	}
 }
 func (w *worker) finishProgressWhenReady() {
@@ -3414,6 +3453,9 @@ func (w *worker) event(raw []byte) {
 		w.statusReleaseClientID = 0
 		return
 	}
+	if w.replyStatusEvent(e) {
+		return
+	}
 	if w.statusReleaseClientID != 0 {
 		switch e.Type {
 		case "available_commands_update", "session_info_update", "advisor_cost_changed":
@@ -3437,6 +3479,7 @@ func (w *worker) event(raw []byte) {
 	case "available_commands_update":
 		w.commandCatalogUpdated()
 	case "session_info_update":
+		w.cancelProgressNative()
 		// The reader invalidates the catalog before publishing session changes.
 		w.syncCommandMenu()
 		if client, ok := w.runtimeClient(); ok && client.CommandCatalog().State == omp.CatalogUnknown {
@@ -3506,6 +3549,9 @@ func (w *worker) event(raw []byte) {
 		}
 		var m message
 		if json.Unmarshal(e.Message, &m) == nil && m.Role == "assistant" {
+			if w.taskActive() {
+				w.replyStatus.metrics.observe(m)
+			}
 			w.lastAssistant = &terminalAssistant{
 				StopReason:                 m.StopReason,
 				ErrorMessage:               m.ErrorMessage,
@@ -3604,7 +3650,7 @@ func (w *worker) event(raw []byte) {
 	}
 }
 func (w *worker) typing() {
-	if w.b.cfg.ProgressMode == "off" {
+	if w.b.cfg.ProgressMode == "off" || w.replyStatus.pending != nil {
 		return
 	}
 	preparing := len(w.queue) > 0 && w.queue[0].preparing
@@ -3837,12 +3883,16 @@ func (w *worker) renderProgress() string {
 	if !w.taskRunning() {
 		return ""
 	}
-	sections := []string{"Processing..."}
+	var sections []string
+	if w.progress.NativeStatus != "" {
+		sections = append(sections, w.progress.NativeStatus)
+	}
+	sections = append(sections, "Processing...")
 	if status := w.progressStatus(); status != "" {
 		sections = append(sections, "Status: "+status)
 	}
 	verbose := w.b != nil && w.b.cfg.ProgressMode == "verbose"
-	detailBudget := maxToolDetailsUnits
+	detailBudget := max(0, maxToolDetailsUnits-utf16Length(w.progress.NativeStatus))
 	active := sortedProgressTools(w.progress.ActiveTools)
 	if len(active) > 0 {
 		lines := []string{"Tools:"}
@@ -4004,12 +4054,13 @@ func (w *worker) previewFinished(result previewResult) {
 }
 
 func (w *worker) flushPreview() {
-	if w.b.cfg.ProgressMode == "off" || w.progressSuppressed {
+	if w.b.cfg.ProgressMode == "off" || w.progressSuppressed || w.replyStatus.pending != nil {
 		return
 	}
 	if w.previewID == 0 && time.Since(w.progress.StartedAt) < progressInitialDelay {
 		return
 	}
+	w.refreshProgressNative(time.Now())
 	snapshot := w.renderProgress()
 	if w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
 		return

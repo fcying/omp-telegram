@@ -208,7 +208,7 @@ func (w *worker) maybeFinishSteeredRoot() {
 		if w.preview == "" {
 			w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically.")
 		} else {
-			w.finish()
+			w.finishReplyWithStatus(false)
 		}
 	case terminalCancelled:
 		w.finishCancelled("Task was cancelled before completion.")
