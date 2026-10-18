@@ -19,7 +19,7 @@ Each ordinary private chat or topic has its own OMP session. Different conversat
 
 - Linux on amd64 or arm64.
 - An omp installation supporting RPC protocol v2 and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
-- Git available on `PATH`, including for physical-workspace admission checks outside Git repositories.
+- Git is needed only for OMP's native autoresearch workflows.
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
 
@@ -204,12 +204,12 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
 | `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
-| `/followup <message>` | Queue the message as a separate task after the active task and any earlier queued work. |
+| `/followup <message>` | Queue a separate prompt instead of steering the active task. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List this chat's saved conversation/session bindings. Tap an eligible title to forget a closed or idle binding after confirmation; workspace files and OMP history are preserved. |
 | `/bindings old` | Show saved bindings from least recently used to most recently used. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Includes Pin/Unpin and Delete controls. |
-| `/resume <session ID>` | Resume a native OMP session and its original directory. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Pin/Unpin entries or Delete a session after confirmation. |
+| `/resume <session ID>` | Resume the specified native OMP session; OMP may restore its recorded working directory. |
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
@@ -227,7 +227,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
 
-Ordinary text starts a task when idle. While an OMP task is active, ordinary text is routed as a steer when the current task accepts steering; use `/followup <message>` to queue a separate task after active and earlier queued work. Attachments, `/review`, and other supported native commands run through the conversation queue. Different conversations can run concurrently up to the configured worker capacity.
+Ordinary text starts a task when the conversation is idle. While an OMP task is active, OMP may accept ordinary text as a steer. Use `/followup <message>` to queue a separate prompt instead. Attachments, `/review`, and other supported native commands also use the conversation queue and run sequentially. Different conversations can run concurrently up to the configured worker capacity.
 
 ### Native OMP commands
 
@@ -272,11 +272,11 @@ Reduce this project's startup time without changing its public behavior.
 
 Native OMP owns the research loop; see the [native mode instructions](https://github.com/can1357/oh-my-pi/blob/v18.10.3/packages/coding-agent/src/autoresearch/prompt-setup.md). It may create branches, edit files, commit kept experiments, revert discarded experiments, and make repeated model calls. Use a suitable workspace and account for cost and file changes.
 
-Research reserves its workspace from other bridge conversations. Disable it before changing branches or deleting its topic. Interrupted research is not automatically replayed after restart; check `/status` and the native session before deciding whether to resend work.
+The bridge does not lock or isolate workspaces across conversations. OMP sessions using the same workspace can affect the same files; choose separate workspaces or avoid concurrent file-changing tasks. Research is not automatically replayed after a restart; check `/status` and the workspace before resending uncertain work.
 
 ### Delete a saved session
 
-In `/resume`, choose **Delete**, then confirm with the red **Delete** button. Only unused sessions can be deleted; close an active session or wait for its export or another deletion to finish first. OMP removes the selected session history and artifacts, and the session list refreshes. Workspace files, Telegram bindings, and topics are not deleted. This action cannot be undone.
+In `/resume`, choose **Delete**, then confirm with the red **Delete** button. The bridge shows this confirmation only after checking that no runtime or in-flight operation is using the session. If work is still active, it explains why deletion is blocked and offers no force-delete option. OMP removes the selected session history and artifacts, and the bridge clears saved bindings and pins that reference it. Workspace files and Telegram topics remain. This action cannot be undone.
 
 ### Session export
 
@@ -327,7 +327,7 @@ Very large replies may be truncated with an explicit notice. OMP's native sessio
 
 Progress for a new task appears after about three seconds, so short tasks normally produce only their final reply. Active tasks include a **Stop** button; it stops the current task, while `/stop` also clears waiting tasks.
 
-Progress is best-effort UI and does not affect final-reply delivery. For normally completed tasks, progress is removed after final replies are confirmed delivered; progress for cancelled or uncertain tasks may remain. Stopping cannot undo tool side effects.
+Progress is best-effort and may not show every task transition. It does not affect task execution or final replies.
 
 Final text replies may include a compact model and context status header.
 
@@ -365,7 +365,7 @@ Each conversation has its own session, but sessions using the same workspace sha
 
 Bridge data is stored in `<storage.data_dir>/omp-telegram.db`. `storage.data_dir` defaults to the directory beside the real executable; relative storage paths use that directory rather than the launch directory.
 
-`storage.database_retention_days` defaults to 90 days. It controls retention-based cleanup of terminal bridge message records and metadata, eligible incoming attachment files, old unreferenced outgoing attachment snapshots, and expired unfinished `/new` or `/resume` start records. Incoming files are retained while their session is in use or if the bridge cannot verify its status. Outgoing snapshots are normally removed after delivery reaches a final outcome; retention cleanup also removes leftovers. Set it to `0` to disable automatic retention cleanup. This does not remove workspaces, OMP session data, or saved conversation bindings.
+`storage.database_retention_days` controls how long terminal bridge message metadata is retained. Default: `90` days. Set it to `0` to disable automatic cleanup. Workspace files, OMP session data, and saved conversation bindings are not removed by retention cleanup.
 
 Before upgrading, stop the service and back up the data directory, workspaces, and OMP's own session storage. The bridge database alone is not a complete backup of OMP conversations.
 
@@ -381,6 +381,7 @@ Logs are written to stderr; use your process manager for storage and rotation. P
 
 ```sh
 just build
+just fmt
 just test
 just check
 just install
@@ -388,6 +389,7 @@ just deploy
 ```
 
 - `just build` builds the binary.
+- `just fmt` formats all Go source and test files.
 - `just test` runs unit tests without starting or restarting a service.
 - `just check` runs tests, race checks, and `go vet` without starting Telegram polling.
 - `just install` installs only the binary; configuration and data remain user-managed.

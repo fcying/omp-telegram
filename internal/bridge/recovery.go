@@ -86,30 +86,8 @@ func savedSessionAvailable(session, workspace string) bool {
 func (w *worker) restoreBinding() {
 	w.restoring = false
 	if !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
-		owner, ownerErr := w.currentWorkspaceOwner()
-		if ownerErr == nil {
-			leased, err := w.b.db.ResearchWorkspaceOwned(owner)
-			if err != nil {
-				w.b.fail(err)
-				w.cancel()
-				return
-			}
-			if leased {
-				w.resumeFailed = true
-				w.say("The saved autoresearch owner is unavailable. Its workspace lease and session history were retained. Restore the saved session file and working directory, then use /autoresearch off or Stop to confirm disable; no work will be replayed.")
-				return
-			}
-		}
 		sessionID := w.sessionID
 		if w.persistClosed() {
-			w.b.sessionMu.Lock()
-			err := w.b.db.CloseWorkspaceUsers(w.workspaceOwner(w.binding.SessionID))
-			w.b.sessionMu.Unlock()
-			if err != nil {
-				w.b.fail(err)
-				w.cancel()
-				return
-			}
 			w.releaseSession()
 			w.logRuntimeEvent(slog.LevelInfo, "restore_runtime_skipped", "session_file_unavailable", "startup restore skipped", sessionID)
 			w.say("The saved omp session file or working directory is unavailable, so startup restore was skipped. Use /new to start a new session.")
@@ -149,11 +127,6 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 	bindings, err := b.db.RunningBindings(b.bot.ID)
 	if err != nil {
 		b.storeLog.Error("session binding read failed", "event", "binding_read_failed", "reason", "running_bindings", "error_kind", "persistence")
-		return err
-	}
-	// Restore all durable logical users before launching any worker. Runtime
-	// slots and chat filtering must not let another topic claim their worktree.
-	if err := b.restoreWorkspaceUsers(ctx, bindings, intents); err != nil {
 		return err
 	}
 	// Snapshot before polling starts: saved prompts must not restart with their bindings.
@@ -264,6 +237,10 @@ func (w *worker) persistClosed() bool {
 		return true
 	}
 	if err := w.b.db.SetRunning(w.binding, false); err != nil {
+		if errors.Is(err, store.ErrStaleBinding) {
+			w.binding.Running = false
+			return true
+		}
 		w.b.storeLog.Error("session close persistence failed", "event", "binding_write_failed", "reason", "set_running", "error_kind", "persistence")
 		w.b.fail(err)
 		return false

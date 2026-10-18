@@ -697,13 +697,6 @@ func TestAutoresearchClearRejectsScopeChangeDuringFinalIdleCheck(t *testing.T) {
 			if len(buttons) < 2 || len(w.confirms) != 1 {
 				t.Fatal("clear did not create its authorized confirmation")
 			}
-			owner, err := w.currentWorkspaceOwner()
-			requireStoreOK(t, err)
-			owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if !owned {
-				t.Fatal("enabled research had no lease before clear confirmation")
-			}
 			// The mode lookup reads state twice before the final idle query.
 			nativeRPC(t, w, "fixture_get_state_update", change.fields)
 			w.callback(&telegram.CallbackQuery{
@@ -726,11 +719,6 @@ func TestAutoresearchClearRejectsScopeChangeDuringFinalIdleCheck(t *testing.T) {
 			if len(w.confirms) != 0 || w.client != nil || !w.resumeFailed || !w.research.disablePending {
 				t.Fatal("scope-invalid clear confirmation was not consumed and canceled")
 			}
-			owned, err = w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if !owned {
-				t.Fatal("unconfirmed clear released the original research lease")
-			}
 		})
 	}
 }
@@ -748,13 +736,6 @@ func TestAutoresearchOffRejectsScopeChangeDuringFinalIdleCheck(t *testing.T) {
 			nativeInput(t, w, 100, "/autoresearch", false)
 			nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
 			researchBarrier(t, w)
-			owner, err := w.currentWorkspaceOwner()
-			requireStoreOK(t, err)
-			owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if !owned {
-				t.Fatal("enabled idle research had no lease before off")
-			}
 			// Exact-owner runtime restoration checks state once before the final
 			// idle check. The fixture must not invalidate that earlier check.
 			nativeRPC(t, w, "fixture_get_state_update", change.fields)
@@ -768,11 +749,6 @@ func TestAutoresearchOffRejectsScopeChangeDuringFinalIdleCheck(t *testing.T) {
 			}
 			if queueState(t, w, 101) != "uncertain" || !w.research.disablePending || !w.resumeFailed {
 				t.Fatal("rejected off bypassed the existing unconfirmed-disable failure policy")
-			}
-			owned, err = w.b.db.ResearchWorkspaceOwned(owner)
-			requireStoreOK(t, err)
-			if !owned {
-				t.Fatal("unconfirmed off released the original research lease")
 			}
 		})
 	}
@@ -806,8 +782,7 @@ func TestAutoresearchCloseAndStaleOperationCannotAffectReplacement(t *testing.T)
 	researchRoot(t, w, 100, "/autoresearch old root")
 	old := operationResult{kind: "prompt", clientID: w.client.ID(), generation: w.binding.Generation, turn: w.turn, active: w.active, data: json.RawMessage(`{"agentInvoked":true}`)}
 	oldClient := w.client
-	// Closing unknown/on research deliberately retains its durable lease. A
-	// replacement session requires confirmed off, not just runtime shutdown.
+	// Confirm native off before replacing the research session.
 	nativeInput(t, w, 102, "/autoresearch off", false)
 	nativeUntil(t, w, func() bool { return !w.taskActive() && !w.controlInProgress() })
 	command("/close")

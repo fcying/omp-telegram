@@ -1,7 +1,9 @@
 package bridge
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -82,6 +84,263 @@ func TestSessionDeleteConfirmsAndRefreshesWithoutChangingWorkspace(t *testing.T)
 	}
 }
 
+func TestSessionDeleteAfterCloseReleasesAliasedSessionClaims(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	sessionID, sessionFile, workspace := w.sessionID, w.binding.Session, w.binding.Workspace
+	alias := sessionFile + ".claim-alias"
+	if err := os.Symlink(sessionFile, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(alias) })
+	if !sameSessionFile(sessionFile, alias) || !w.claimSession(alias, sessionID) {
+		t.Fatal("could not reproduce a second path claim for the same native session")
+	}
+	command("/close")
+
+	data, err := json.Marshal([]resumeFixtureSession{{ID: sessionID, CWD: workspace, Title: "closed-session"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(data))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	button := deletePickerButton(t, f, 0)
+	clickSessionButton(w, f, 7, button["callback_data"].(string))
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "Delete omp session?") || len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("closed session was not offered for deletion: %q; %v", text, rows)
+	}
+	clickSessionButton(w, f, 7, rows[0][0]["callback_data"].(string))
+	result := awaitSessionDelete(t, w)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	w.sessionDeleteFinished(result)
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Fatalf("closed native session was not deleted: %v", err)
+	}
+}
+
+func TestSessionDeleteRemovesReleasedBindingFromAnotherTopic(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.slots = make(chan struct{}, 2)
+	command("/new test")
+	workspace := w.binding.Workspace
+	other := testWorker(t, &worker{b: w.b, key: target{chat: w.key.chat, thread: 22}, ctx: w.ctx, cancel: func() {}, confirms: make(map[string]confirmation)})
+	t.Cleanup(func() { other.teardownWorker(true); other.background.Wait() })
+	other.start(false, workspace, "", false)
+	if other.client == nil {
+		t.Fatal("old topic session did not start")
+	}
+	sessionID, sessionFile := other.sessionID, other.binding.Session
+	other.releaseRuntime(true)
+	if other.client != nil || other.runtime != runtimeReleased || !other.binding.Running {
+		t.Fatal("old topic runtime was not released with its binding preserved")
+	}
+
+	data, err := json.Marshal([]resumeFixtureSession{{ID: sessionID, CWD: workspace, Title: "released-session"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(data))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	listText, _ := pickerView(t, f)
+	if strings.Contains(listText, "[in use elsewhere]") {
+		t.Fatalf("released session was still marked in use elsewhere: %q", listText)
+	}
+	button := deletePickerButton(t, f, 0)
+	clickSessionButton(w, f, 7, button["callback_data"].(string))
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "Delete omp session?") || len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("released session in another topic was not offered for deletion: %q; %v", text, rows)
+	}
+	clickSessionButton(w, f, 7, rows[0][0]["callback_data"].(string))
+	result := awaitSessionDelete(t, w)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	w.sessionDeleteFinished(result)
+	if _, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, 22); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted session binding remained on the released topic: %v", err)
+	}
+	if w.b.sessionInUse(sessionID) {
+		t.Fatal("released session claim remained after deletion")
+	}
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Fatalf("released session was not deleted: %v", err)
+	}
+	if _, err := other.ensureRuntime(); err == nil || !strings.Contains(err.Error(), "Cannot restore the saved omp session") {
+		t.Fatalf("released topic did not report its missing session on resume: %v", err)
+	}
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Fatalf("failed resume recreated deleted session: %v", err)
+	}
+	w.b.fatal = make(chan error, 1)
+	if !other.closeLogicalSession() {
+		t.Fatal("/close failed after another topic deleted the released session binding")
+	}
+	if other.binding.Running {
+		t.Fatal("close retained running state for a deleted binding")
+	}
+	select {
+	case err := <-w.b.fatal:
+		t.Fatalf("closing a stale binding failed the bridge: %v", err)
+	default:
+	}
+
+}
+
+func TestLazyResumeDoesNotStartWhileSessionDeleteIsReserved(t *testing.T) {
+	sessionRoot := t.TempDir()
+	startMarker := filepath.Join(t.TempDir(), "omp-started")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", sessionRoot)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_START_MARKER", startMarker)
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new test")
+	if _, err := os.Stat(startMarker); err != nil {
+		t.Fatalf("initial OMP process did not start: %v", err)
+	}
+	if err := os.Remove(startMarker); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := w.binding.SessionID
+	w.b.cfg.IdleTimeout = time.Minute
+	w.lastActivity = time.Now().Add(-2 * time.Minute)
+	w.releaseIdleRuntime(time.Now())
+	if w.client != nil || w.runtime != runtimeReleased || !w.binding.Running {
+		t.Fatal("idle release did not retain the logical session")
+	}
+	deleter := testWorker(t, &worker{b: w.b, key: target{chat: w.key.chat, thread: 22}, ctx: w.ctx, cancel: func() {}, confirms: make(map[string]confirmation)})
+	t.Cleanup(func() {
+		w.b.releaseDelete(deleter)
+		deleter.teardownWorker(true)
+		deleter.background.Wait()
+	})
+	if !w.b.reserveDelete(deleter, sessionID) {
+		t.Fatal("delete reservation was not acquired for the released session")
+	}
+	if _, err := w.ensureRuntime(); err == nil || !strings.Contains(err.Error(), "being deleted") {
+		t.Fatalf("lazy resume ignored the delete reservation: %v", err)
+	}
+	if _, err := os.Stat(startMarker); !os.IsNotExist(err) {
+		t.Fatalf("lazy resume launched OMP while deletion was reserved: %v", err)
+	}
+	if w.client != nil || w.runtime != runtimeReleased || w.sessionRuntimeStarting.Load() {
+		t.Fatal("rejected lazy resume changed runtime state")
+	}
+}
+
+func TestLazyResumeStartFailureReleasesSessionClaim(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.slots = make(chan struct{}, 1)
+	command("/new test")
+	sessionID := w.binding.SessionID
+	w.b.cfg.IdleTimeout = time.Minute
+	w.lastActivity = time.Now().Add(-2 * time.Minute)
+	w.releaseIdleRuntime(time.Now())
+	w.b.cfg.OMP = filepath.Join(t.TempDir(), "missing-omp")
+	if _, err := w.ensureRuntime(); err == nil {
+		t.Fatal("lazy resume succeeded with a missing OMP executable")
+	}
+	if w.b.sessionInUse(sessionID) || w.sessionRuntimeStarting.Load() || w.sessionRuntimeActive.Load() {
+		t.Fatal("failed lazy resume retained its session claim or runtime state")
+	}
+}
+
+func TestSessionDeleteAllowsRestoredReleasedBinding(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.slots = make(chan struct{}, 2)
+	command("/new test")
+	session := setResumeFixtures(t, w.binding.Workspace, 1)[0]
+	sessionFile := filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), session.ID+".jsonl")
+	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: 22, Workspace: w.binding.Workspace, Session: sessionFile, SessionID: session.ID, Generation: 1, Running: true}
+	requireStoreOK(t, w.b.db.Save(binding))
+	other := testWorker(t, &worker{b: w.b, key: target{chat: w.key.chat, thread: 22}, ctx: w.ctx, cancel: func() {}, binding: binding, runtimeLifecycle: runtimeLifecycle{restoring: true}, confirms: make(map[string]confirmation)})
+	t.Cleanup(func() { other.teardownWorker(true); other.background.Wait() })
+	if !other.claimPersistedSession() {
+		t.Fatal("startup could not restore the old topic's logical session claim")
+	}
+	other.restoreBinding()
+	if other.sessionRuntimeActive.Load() || other.sessionRuntimeStarting.Load() || other.runtime != runtimeReleased {
+		t.Fatal("restored logical binding was treated as an open OMP runtime")
+	}
+
+	data, err := json.Marshal([]resumeFixtureSession{{ID: session.ID, CWD: w.binding.Workspace, Title: "restored-released-session"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(data))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	button := deletePickerButton(t, f, 0)
+	clickSessionButton(w, f, 7, button["callback_data"].(string))
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "Delete omp session?") || len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("restored released session was not offered for deletion: %q; %v", text, rows)
+	}
+	clickSessionButton(w, f, 7, rows[0][0]["callback_data"].(string))
+	result := awaitSessionDelete(t, w)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	w.sessionDeleteFinished(result)
+	if _, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, 22); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted session binding remained after restored-topic deletion: %v", err)
+	}
+	if w.b.sessionInUse(session.ID) {
+		t.Fatal("restored session claim remained after deletion")
+	}
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Fatalf("restored released session was not deleted: %v", err)
+	}
+}
+
+func TestIdleReleasedSessionCanBeDeleted(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	sessionID, sessionFile, workspace := w.sessionID, w.binding.Session, w.binding.Workspace
+	w.b.cfg.IdleTimeout = time.Minute
+	w.lastActivity = time.Now().Add(-2 * time.Minute)
+	w.releaseIdleRuntime(time.Now())
+	if w.client != nil || w.runtime != runtimeReleased || !w.binding.Running {
+		t.Fatal("idle release did not preserve the logical session")
+	}
+	data, err := json.Marshal([]resumeFixtureSession{{ID: sessionID, CWD: workspace, Title: "idle-session"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(data))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	button := deletePickerButton(t, f, 0)
+	clickSessionButton(w, f, 7, button["callback_data"].(string))
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "Delete omp session?") || len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("idle-released session was not offered for deletion: %q; %v", text, rows)
+	}
+	clickSessionButton(w, f, 7, rows[0][0]["callback_data"].(string))
+	result := awaitSessionDelete(t, w)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	w.sessionDeleteFinished(result)
+	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+		t.Fatalf("native session file remains after deletion: %v", err)
+	}
+	if _, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted session binding remained: %v", err)
+	}
+	if w.b.sessionInUse(sessionID) {
+		t.Fatal("deleted session identity remains claimed")
+	}
+}
+
 func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
 	for _, scenario := range []string{"cancel", "wrong-user", "current", "stale-epoch", "wrong-workspace", "other-active"} {
@@ -109,6 +368,12 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 			saved := filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), selected.ID+".jsonl")
 			command("/resume")
 			w.resumeListed(finishResumeList(t, w))
+			if scenario == "other-active" {
+				text, _ := pickerView(t, f)
+				if !strings.Contains(text, "[in use elsewhere]") {
+					t.Fatalf("picker did not mark the session used by another topic: %q", text)
+				}
+			}
 			button := deletePickerButton(t, f, 0)
 			if scenario == "wrong-workspace" {
 				for token, c := range w.confirms {
@@ -124,9 +389,15 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 				return
 			}
 			clickSessionButton(w, f, 7, button["callback_data"].(string))
-			if scenario == "current" || scenario == "other-active" || scenario == "wrong-workspace" {
+			if scenario == "current" || scenario == "current-research" || scenario == "other-active" || scenario == "wrong-workspace" {
 				if _, err := os.Stat(saved); err != nil || w.deleteCancel != nil {
 					t.Fatal("ineligible native session was deleted")
+				}
+				if scenario == "other-active" {
+					var reply string
+					if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&reply); err != nil || !strings.Contains(reply, "another conversation") {
+						t.Fatalf("cross-conversation rejection was unclear: %q, %v", reply, err)
+					}
 				}
 				return
 			}
@@ -152,9 +423,10 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 	}
 }
 
-func TestSessionDeleteRechecksPersistedBindingAtConfirmation(t *testing.T) {
+func TestSessionDeleteRechecksLiveSessionAtConfirmation(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
 	w, f, command := setupWorkspaceWorker(t)
+	w.b.slots = make(chan struct{}, 2)
 	command("/new test")
 	session := setResumeFixtures(t, w.binding.Workspace, 1)[0]
 	command("/resume")
@@ -162,10 +434,19 @@ func TestSessionDeleteRechecksPersistedBindingAtConfirmation(t *testing.T) {
 	clickSessionButton(w, f, 7, deletePickerButton(t, f, 0)["callback_data"].(string))
 	_, rows := pickerView(t, f)
 	saved := filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), session.ID+".jsonl")
-	requireStoreOK(t, w.b.db.Save(store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: 22, Workspace: w.binding.Workspace, Session: saved, SessionID: session.ID, Generation: 1, Running: true}))
+	other := testWorker(t, &worker{b: w.b, key: target{chat: w.key.chat, thread: 22}, ctx: w.ctx, cancel: func() {}, confirms: make(map[string]confirmation)})
+	t.Cleanup(func() { other.teardownWorker(true); other.background.Wait() })
+	other.start(true, session.ID, w.binding.Workspace, false)
+	if other.client == nil || !other.sessionRuntimeActive.Load() {
+		t.Fatal("second topic did not open the selected native session")
+	}
 	clickSessionButton(w, f, 7, rows[0][0]["callback_data"].(string))
-	if _, err := os.Stat(saved); err != nil || w.deleteCancel != nil || w.b.sessionInUse(session.ID) {
-		t.Fatal("confirmed delete ignored newly active persisted binding")
+	if _, err := os.Stat(saved); err != nil || w.deleteCancel != nil {
+		t.Fatal("confirmed delete ignored newly active session")
+	}
+	var reply string
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&reply); err != nil || !strings.Contains(reply, "currently active or being processed") {
+		t.Fatalf("active-session rejection was unclear: %q, %v", reply, err)
 	}
 }
 

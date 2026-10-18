@@ -158,13 +158,38 @@ func TestVersionSixteenMigratesOMPArgsSelection(t *testing.T) {
 	var version, tableCount int
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='omp_args_selection'").Scan(&tableCount))
-	if version != 17 || tableCount != 1 {
-		t.Fatalf("v16 migration version/table count = %d/%d, want 17/1", version, tableCount)
+	if version != schemaVersion || tableCount != 1 {
+		t.Fatalf("v16 migration version/table count = %d/%d, want %d/1", version, tableCount, schemaVersion)
 	}
 	index, err := s.LoadOrResetOMPArgsSelection("migration-fingerprint", 2)
 	requireStoreOK(t, err)
 	if index != 1 {
 		t.Fatalf("migrated preset index = %d, want 1", index)
+	}
+}
+
+func TestVersionSeventeenDropsWorkspaceTrackingTables(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	_, err := s.DB.Exec(`CREATE TABLE workspace_users(root TEXT,bot INTEGER,chat INTEGER,thread INTEGER,session TEXT);
+CREATE TABLE workspace_leases(root TEXT,bot INTEGER,chat INTEGER,thread INTEGER,session TEXT);
+INSERT INTO workspace_users VALUES('/root',1,2,3,'session');
+INSERT INTO workspace_leases VALUES('/root',1,2,3,'session');
+PRAGMA user_version=17;`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var version int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	if version != schemaVersion {
+		t.Fatalf("v17 migration version = %d, want %d", version, schemaVersion)
+	}
+	for _, table := range []string{"workspace_users", "workspace_leases"} {
+		var count int
+		requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?", table).Scan(&count))
+		if count != 0 {
+			t.Fatalf("legacy workspace tracking table %q remains after migration", table)
+		}
 	}
 }
 
@@ -345,7 +370,7 @@ func TestOpenEscapesQuestionMarkInDirectory(t *testing.T) {
 }
 
 func TestUnsupportedSchemaLeavesDataUntouched(t *testing.T) {
-	for name, version := range map[string]int{"unversioned": 0, "future": 14} {
+	for name, version := range map[string]int{"unversioned": 0, "future": schemaVersion + 1} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
@@ -1560,62 +1585,99 @@ func TestPinnedSessionsAreScopedAndIdempotent(t *testing.T) {
 	}
 }
 
-func TestDeletePinnedSessionClearsAllScopesWithoutChangingBindings(t *testing.T) {
+func TestDeleteSessionReferencesRemovesReleasedBindingsAndMetadata(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/one", Session: "/sessions/abcd-session.jsonl", SessionID: "abcd-session", Generation: 1}
-	second := Binding{Bot: 1, Chat: 4, Thread: 5, Workspace: "/two", Session: "/sessions/other-session.jsonl", SessionID: "other-session", Generation: 2}
-	requireStoreOK(t, s.Save(first))
-	requireStoreOK(t, s.Save(second))
+	second := Binding{Bot: 1, Chat: 4, Thread: 5, Workspace: "/two", Session: "/sessions/abcd-session.jsonl", SessionID: "ABCD-SESSION", Generation: 2}
+	other := Binding{Bot: 1, Chat: 6, Thread: 7, Workspace: "/other", Session: "/sessions/other-session.jsonl", SessionID: "other-session", Generation: 3}
+	otherBot := Binding{Bot: 2, Chat: 2, Thread: 3, Workspace: "/bot-two", Session: "/sessions/abcd-session.jsonl", SessionID: "abcd-session", Generation: 1}
+	for _, binding := range []Binding{first, second, other, otherBot} {
+		requireStoreOK(t, s.Save(binding))
+	}
+	for _, row := range []struct {
+		bot, chat, thread int64
+		workspace, path   string
+		generation        int64
+	}{
+		{1, 2, 3, "/one", "/sessions/abcd-session.jsonl", 1},
+		{1, 4, 5, "/two", "/sessions/abcd-session.jsonl", 2},
+		{1, 2, 3, "/one", "/sessions/previous.jsonl", 0},
+		{1, 6, 7, "/other", "/sessions/other-session.jsonl", 3},
+		{2, 2, 3, "/bot-two", "/sessions/abcd-session.jsonl", 1},
+	} {
+		_, err := s.DB.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) VALUES(?,?,?,?,?,?)", row.bot, row.chat, row.thread, row.workspace, row.path, row.generation)
+		requireStoreOK(t, err)
+	}
 	for _, scope := range []struct {
 		bot, chat, thread int64
 		workspace         string
 	}{
 		{1, 2, 3, "/one"},
-		{1, 2, 3, "/two"},
-		{1, 4, 5, "/one"},
-		{2, 2, 3, "/one"},
+		{1, 4, 5, "/two"},
+		{1, 6, 7, "/other"},
+		{2, 2, 3, "/bot-two"},
 	} {
 		requireStoreOK(t, s.SetPinnedSession(scope.bot, scope.chat, scope.thread, scope.workspace, "abcd-session", true))
 	}
-	// Old rows may retain mixed case even though current pin writes normalize IDs.
 	_, err := s.DB.Exec("INSERT INTO session_favorites(bot,chat,thread,workspace,session_id) VALUES(?,?,?,?,?)", 1, 4, 5, "/two", "ABCD-SESSION")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.SetPinnedSession(1, 2, 3, "/one", "other-session", true))
-	requireStoreOK(t, s.SetPinnedSession(2, 2, 3, "/one", "other-session", true))
-	if err := s.DeletePinnedSession(1, "AbCd-SeSsIoN"); err != nil {
+	deleted, err := s.DeleteSessionReferences(1, "AbCd-SeSsIoN")
+	requireStoreOK(t, err)
+	if deleted != 2 {
+		t.Fatalf("deleted bindings = %d, want 2", deleted)
+	}
+	if _, err := s.DeleteSessionReferences(1, ""); err == nil {
+		t.Fatal("empty session ID accepted")
+	}
+	for _, binding := range []Binding{first, second} {
+		if _, err := s.Binding(binding.Bot, binding.Chat, binding.Thread); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("deleted binding %+v remained: %v", binding, err)
+		}
+	}
+	for _, binding := range []Binding{other, otherBot} {
+		got, err := s.Binding(binding.Bot, binding.Chat, binding.Thread)
+		requireStoreOK(t, err)
+		if got != binding {
+			t.Fatalf("unrelated binding changed from %+v to %+v", binding, got)
+		}
+	}
+	var count int
+	if err := s.DB.QueryRow("SELECT COUNT(*) FROM session_favorites WHERE bot=1 AND session_id=? COLLATE NOCASE", "abcd-session").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	for _, scope := range []struct {
-		bot, chat, thread int64
-		workspace         string
-		want              map[string]struct{}
+	if count != 0 {
+		t.Fatalf("deleted session pins remained: %d", count)
+	}
+	if err := s.DB.QueryRow("SELECT COUNT(*) FROM session_favorites WHERE bot=2 AND session_id=? COLLATE NOCASE", "abcd-session").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("other bot pins = %d, want 1", count)
+	}
+	for _, check := range []struct {
+		bot  int64
+		path string
+		want int
 	}{
-		{1, 2, 3, "/one", map[string]struct{}{"other-session": {}}},
-		{1, 2, 3, "/two", map[string]struct{}{}},
-		{1, 4, 5, "/one", map[string]struct{}{}},
-		{1, 4, 5, "/two", map[string]struct{}{}},
-		{2, 2, 3, "/one", map[string]struct{}{"abcd-session": {}, "other-session": {}}},
+		{1, "/sessions/abcd-session.jsonl", 0},
+		{1, "/sessions/previous.jsonl", 1},
+		{2, "/sessions/abcd-session.jsonl", 1},
 	} {
-		got, err := s.PinnedSessions(scope.bot, scope.chat, scope.thread, scope.workspace)
-		requireStoreOK(t, err)
-		if len(got) != len(scope.want) {
-			t.Fatalf("pins in scope %+v = %+v", scope, got)
+		if err := s.DB.QueryRow("SELECT COUNT(*) FROM history WHERE bot=? AND session=?", check.bot, check.path).Scan(&count); err != nil {
+			t.Fatal(err)
 		}
-		for id := range scope.want {
-			if _, ok := got[id]; !ok {
-				t.Fatalf("pins in scope %+v = %+v", scope, got)
-			}
+		if count != check.want {
+			t.Fatalf("history rows for bot=%d path=%q = %d, want %d", check.bot, check.path, count, check.want)
 		}
 	}
-	for _, original := range []Binding{first, second} {
-		got, err := s.Binding(original.Bot, original.Chat, original.Thread)
-		requireStoreOK(t, err)
-		if got != original {
-			t.Fatalf("binding changed from %+v to %+v", original, got)
-		}
+	got, err := s.PinnedSessions(1, 2, 3, "/one")
+	requireStoreOK(t, err)
+	if len(got) != 1 {
+		t.Fatalf("unrelated pin was removed: %+v", got)
 	}
-	if err := s.DeletePinnedSession(1, ""); err == nil {
-		t.Fatal("empty session ID accepted")
+	if _, ok := got["other-session"]; !ok {
+		t.Fatalf("unrelated pin missing: %+v", got)
 	}
 }
 

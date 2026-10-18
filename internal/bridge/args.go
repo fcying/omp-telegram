@@ -136,6 +136,14 @@ func (b *Bridge) selectArgsPreset(index int) error {
 	return nil
 }
 
+func (b *Bridge) argsPresetSelectionMessage(index int) string {
+	_, count, labels := b.argsMenuSnapshot()
+	if index > 0 && index <= count && len(labels) > 0 {
+		return fmt.Sprintf("Selected OMP argument preset %d: %s.", index, menuText(labels[index-1], 120))
+	}
+	return fmt.Sprintf("Selected OMP argument preset %d.", index)
+}
+
 const argsMenuPageSize = 90
 
 func argsMenuButtonLabel(preset, current int, labels []string) string {
@@ -175,7 +183,7 @@ func (w *worker) handleArgsCommand(arg string, user int64) {
 		w.say("Failed to save the OMP argument preset selection.")
 		return
 	}
-	w.say(fmt.Sprintf("Selected OMP argument preset %d.", index))
+	w.say(w.b.argsPresetSelectionMessage(index))
 }
 
 func (w *worker) showArgsMenuPage(c confirmation, page int) {
@@ -241,7 +249,10 @@ func (w *worker) selectArgsFromMenu(c confirmation, index int) {
 		w.say("Failed to save the OMP argument preset selection.")
 		return
 	}
-	message := fmt.Sprintf("Selected OMP argument preset %d.", preset)
+	message := w.b.argsPresetSelectionMessage(preset)
+	if c.messageID == 0 {
+		w.say(message)
+		return
+	}
 	w.finishMenu(c.messageID, message)
-	w.say(message)
 }

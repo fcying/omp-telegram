@@ -102,12 +102,8 @@ func TestResearchAdmissionCatalogUpdateRequiresFreshMode(t *testing.T) {
 	nativeRPC(t, w, "fixture_catalog_update", map[string]any{"addName": "new_file_command"})
 	nativeRPC(t, w, "fixture_autoresearch_release_entries", nil)
 	nativeUntil(t, w, func() bool { return w.research.roundOpen && !w.rpcOperationActive })
-	owner, err := w.currentWorkspaceOwner()
-	requireStoreOK(t, err)
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	requireStoreOK(t, err)
-	if queueState(t, w, 100) != "submitted" || w.active != 100 || !w.research.root || !owned || researchTraceCount(trace, "prompt", "root after mode changed") != 1 {
-		t.Fatal("stale disabled snapshot lost research root ownership or workspace exclusivity")
+	if queueState(t, w, 100) != "submitted" || w.active != 100 || !w.research.root || researchTraceCount(trace, "prompt", "root after mode changed") != 1 {
+		t.Fatal("stale disabled snapshot lost research root ownership")
 	}
 }
 
@@ -124,12 +120,8 @@ func TestResearchAdmissionReadyModeCannotSurviveOff(t *testing.T) {
 	}
 	nativeInput(t, w, 101, "/autoresearch off", false)
 	nativeUntil(t, w, func() bool { return w.active == 100 })
-	owner, err := w.currentWorkspaceOwner()
-	requireStoreOK(t, err)
-	owned, err := w.b.db.ResearchWorkspaceOwned(owner)
-	requireStoreOK(t, err)
-	if queueState(t, w, 101) != "done" || w.research.root || w.research.enabled || owned {
-		t.Fatal("cached on mode re-established research ownership after confirmed off")
+	if queueState(t, w, 101) != "done" || w.research.root || w.research.enabled {
+		t.Fatal("cached on mode re-established research state after confirmed off")
 	}
 	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" && !w.rpcOperationActive })
 	if researchTraceCount(trace, "prompt", "/autoresearch off") != 1 || researchTraceCount(trace, "prompt", "ordinary work after explicit off") != 1 {

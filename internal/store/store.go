@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 17
+const schemaVersion = 18
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -362,19 +362,7 @@ func initialize(db *sql.DB) error {
 		}
 		version = 14
 	}
-	if version == 0 || version == 14 {
-		if _, e = tx.Exec(workspaceLeaseSchema); e != nil {
-			return e
-		}
-		version = 16
-	}
-	if version == 15 {
-		if _, e = tx.Exec(`ALTER TABLE workspace_leases RENAME TO workspace_leases_v15;
-CREATE TABLE workspace_leases(root TEXT NOT NULL,bot INTEGER NOT NULL,chat INTEGER NOT NULL,thread INTEGER NOT NULL,session TEXT NOT NULL,PRIMARY KEY(root,bot,chat,thread,session));
-INSERT INTO workspace_leases SELECT root,bot,chat,thread,session FROM workspace_leases_v15;
-DROP TABLE workspace_leases_v15;`); e != nil {
-			return e
-		}
+	if version == 0 || version == 14 || version == 15 {
 		version = 16
 	}
 	if version == 16 {
@@ -385,6 +373,12 @@ CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));
 			}
 		}
 		version = 17
+	}
+	if version == 17 {
+		if _, e = tx.Exec("DROP TABLE IF EXISTS workspace_leases; DROP TABLE IF EXISTS workspace_users"); e != nil {
+			return e
+		}
+		version = 18
 	}
 
 	if e = backfillSessionIDs(tx); e != nil {
@@ -721,13 +715,31 @@ func (s *Store) SetPinnedSession(bot, chat, thread int64, workspace, sessionID s
 	return err
 }
 
-// DeletePinnedSession clears a native session's favorites for one bot in every scope.
-func (s *Store) DeletePinnedSession(bot int64, sessionID string) error {
+// DeleteSessionReferences removes bridge metadata for a deleted native session.
+func (s *Store) DeleteSessionReferences(bot int64, sessionID string) (int64, error) {
 	if sessionID == "" {
-		return errors.New("invalid pinned session")
+		return 0, errors.New("invalid session ID")
 	}
-	_, err := s.DB.Exec("DELETE FROM session_favorites WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID)
-	return err
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("DELETE FROM history WHERE bot=? AND session<>'' AND session IN (SELECT session FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND session<>'')", bot, bot, sessionID); err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec("DELETE FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec("DELETE FROM session_favorites WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID); err != nil {
+		return 0, err
+	}
+	return count, tx.Commit()
 }
 
 // SetPinnedSessionIfGeneration changes a favorite only while the conversation
@@ -865,15 +877,6 @@ func (s *Store) DeleteClosedBinding(bot, chat, thread, generation int64) (bool, 
 	}
 	if changed != 1 {
 		return false, nil
-	}
-	// Keep the original workspace source until every research lease is released.
-	// The deferred rollback restores the binding when deletion is refused.
-	var leased bool
-	if err = tx.QueryRow("SELECT EXISTS(SELECT 1 FROM workspace_leases WHERE bot=? AND chat=? AND thread=?)", bot, chat, thread).Scan(&leased); err != nil {
-		return false, err
-	}
-	if leased {
-		return false, ErrWorkspaceOccupied
 	}
 	if _, err = tx.Exec("DELETE FROM history WHERE bot=? AND chat=? AND thread=?", bot, chat, thread); err != nil {
 		return false, err
@@ -1105,10 +1108,6 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 	return count, paths, nil
 }
 func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
-	return s.PrepareWorkspaceStart(previous, intent, "", WorkspaceOwner{})
-}
-
-func (s *Store) PrepareWorkspaceStart(previous Binding, intent StartIntent, root string, owner WorkspaceOwner) error {
 	if previous.Generation < 0 || (intent.Kind != "new" && intent.Kind != "resume") || intent.Generation != previous.Generation+1 || intent.Bot != previous.Bot || intent.Chat != previous.Chat || intent.Thread != previous.Thread {
 		return errors.New("invalid startup intent")
 	}
@@ -1117,11 +1116,6 @@ func (s *Store) PrepareWorkspaceStart(previous Binding, intent StartIntent, root
 		return err
 	}
 	defer tx.Rollback()
-	if root != "" {
-		if err := admitWorkspace(tx, root, owner); err != nil {
-			return err
-		}
-	}
 	if previous.Running {
 		result, err := tx.Exec("UPDATE bindings SET running=0 WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=1", previous.Bot, previous.Chat, previous.Thread, previous.Generation)
 		if err != nil {
@@ -1156,24 +1150,11 @@ func (s *Store) PrepareWorkspaceStart(previous Binding, intent StartIntent, root
 	return tx.Commit()
 }
 func (s *Store) CommitStart(b Binding) error {
-	return s.CommitWorkspaceStart(b, "")
-}
-
-func (s *Store) CommitWorkspaceStart(b Binding, root string) error {
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if root != "" {
-		owner := WorkspaceOwner{Bot: b.Bot, Chat: b.Chat, Thread: b.Thread, Session: b.SessionID}
-		if err = admitWorkspace(tx, root, owner); err != nil {
-			return err
-		}
-		if _, err = tx.Exec("DELETE FROM workspace_users WHERE bot=? AND chat=? AND thread=? AND NOT(root=? AND session=?)", b.Bot, b.Chat, b.Thread, root, b.SessionID); err != nil {
-			return err
-		}
-	}
 	var generation int64
 	if err = tx.QueryRow("SELECT generation FROM startup_intents WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread).Scan(&generation); err != nil {
 		return err
@@ -1211,23 +1192,13 @@ func (s *Store) ExpireStart(ctx context.Context, intent StartIntent, cutoff int6
 	return count != 0, err
 }
 
-// retireStartupIntents removes only admissions belonging to matched intents.
-// Keep a running binding's normal registration and every research lease; a
-// stale generation or fresh timestamp must not remove either intent or user.
+// retireStartupIntents removes only intents matching the supplied predicate.
 func (s *Store) retireStartupIntents(ctx context.Context, predicate string, args ...any) (int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	query := `DELETE FROM workspace_users AS u
-	WHERE EXISTS(SELECT 1 FROM startup_intents AS i
-	 WHERE i.bot=u.bot AND i.chat=u.chat AND i.thread=u.thread AND (` + predicate + `))
-	AND NOT EXISTS(SELECT 1 FROM bindings AS b
-	 WHERE b.bot=u.bot AND b.chat=u.chat AND b.thread=u.thread AND b.running=1 AND lower(b.session_id)=lower(u.session))`
-	if _, err = tx.ExecContext(ctx, query, args...); err != nil {
-		return 0, err
-	}
 	result, err := tx.ExecContext(ctx, "DELETE FROM startup_intents WHERE rowid IN (SELECT i.rowid FROM startup_intents AS i WHERE "+predicate+")", args...)
 	if err != nil {
 		return 0, err

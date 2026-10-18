@@ -108,6 +108,10 @@ func TestArgsCommandMenuFallsBackToPresetNumbersAndPersistsSelection(t *testing.
 		t.Fatalf("preset menu = %q, %v", text, rows)
 	}
 	messageID := int64(f.messageCount())
+	var outboxBefore int
+	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxBefore); err != nil {
+		t.Fatal(err)
+	}
 	w.callback(&telegram.CallbackQuery{
 		ID: "args-menu", From: telegram.User{ID: 7},
 		Message: &telegram.Message{MessageID: messageID, MessageThreadID: w.key.thread, Chat: telegram.Chat{ID: w.key.chat}},
@@ -116,6 +120,14 @@ func TestArgsCommandMenuFallsBackToPresetNumbersAndPersistsSelection(t *testing.
 	if index, _ := w.b.argsPresetSelection(); index != 2 {
 		t.Fatalf("selected preset = %d, want 2", index)
 	}
+	requireFinishedSessionPicker(t, f, messageID, "Selected OMP argument preset 2.")
+	var outboxAfter int
+	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxAfter); err != nil {
+		t.Fatal(err)
+	}
+	if outboxAfter != outboxBefore {
+		t.Fatalf("menu selection queued a duplicate reply: outbox rows %d -> %d", outboxBefore, outboxAfter)
+	}
 	var storedIndex int
 	var fingerprint string
 	if err := w.b.db.DB.QueryRow("SELECT preset_index,args_fingerprint FROM omp_args_selection").Scan(&storedIndex, &fingerprint); err != nil {
@@ -123,13 +135,6 @@ func TestArgsCommandMenuFallsBackToPresetNumbersAndPersistsSelection(t *testing.
 	}
 	if storedIndex != 2 || fingerprint != strings.Repeat("a", 64) {
 		t.Fatalf("persisted selection = %d, %q", storedIndex, fingerprint)
-	}
-	var outbox string
-	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&outbox); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(outbox, first) || strings.Contains(outbox, second) {
-		t.Fatal("raw preset arguments appeared in bridge output")
 	}
 }
 
@@ -146,6 +151,32 @@ func TestArgsCommandMenuUsesConfiguredLabels(t *testing.T) {
 	}
 	if strings.Contains(text, first) || strings.Contains(text, second) {
 		t.Fatalf("raw argv appeared despite configured labels: %q", text)
+	}
+	messageID := int64(f.messageCount())
+	var outboxBefore int
+	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxBefore); err != nil {
+		t.Fatal(err)
+	}
+	w.callback(&telegram.CallbackQuery{
+		ID: "args-labeled", From: telegram.User{ID: 7},
+		Message: &telegram.Message{MessageID: messageID, MessageThreadID: w.key.thread, Chat: telegram.Chat{ID: w.key.chat}},
+		Data:    rows[1][0]["callback_data"].(string),
+	})
+	requireFinishedSessionPicker(t, f, messageID, "Selected OMP argument preset 2: Pro.")
+	var outboxAfter int
+	if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxAfter); err != nil {
+		t.Fatal(err)
+	}
+	if outboxAfter != outboxBefore {
+		t.Fatalf("labeled menu selection queued a duplicate reply: outbox rows %d -> %d", outboxBefore, outboxAfter)
+	}
+	command("/args 2")
+	var directReply string
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&directReply); err != nil {
+		t.Fatal(err)
+	}
+	if directReply != "Selected OMP argument preset 2: Pro." {
+		t.Fatalf("direct preset selection reply = %q", directReply)
 	}
 }
 
