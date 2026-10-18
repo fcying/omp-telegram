@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
@@ -113,14 +114,16 @@ func nativeOutputs(t *testing.T, w *worker) string {
 	return output.String()
 }
 
-func TestNativeCommandLocalSubmissionAndUncorrelatedOutput(t *testing.T) {
+func TestNativeCommandLocalSubmissionAndStandaloneOutput(t *testing.T) {
 	w, _, trace := nativeWorker(t, "enabled")
 	nativeCatalogReady(t, w)
 	nativeInput(t, w, 100, "/native_local@fixture_bot arg  two", true)
-	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
+	nativeUntil(t, w, func() bool {
+		return queueState(t, w, 100) == "done" && strings.Contains(nativeOutputs(t, w), "native local output")
+	})
 	waitFixtureRPCTrace(t, trace, "prompt", "/native_local arg  two")
-	if w.taskActive() || strings.Contains(nativeOutputs(t, w), "PRIVATE_NATIVE_OUTPUT") {
-		t.Fatal("local submission kept active ownership or delivered uncorrelated output")
+	if w.taskActive() || !strings.Contains(nativeOutputs(t, w), "native local output") {
+		t.Fatal("local submission kept active ownership or lost its operator output")
 	}
 	var replies int
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=100").Scan(&replies))
@@ -131,9 +134,64 @@ func TestNativeCommandLocalSubmissionAndUncorrelatedOutput(t *testing.T) {
 	nativeUntil(t, w, func() bool { return w.busy && !w.rpcOperationActive })
 	nativeRPC(t, w, "fixture_finish_root", nil)
 	nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" })
-	output := nativeOutputs(t, w)
-	if !strings.Contains(output, "root completed") || strings.Contains(output, "PRIVATE_LATE_NATIVE_OUTPUT") {
-		t.Fatalf("late native output changed the next root's reply: %q", output)
+	var rootReply string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=101 ORDER BY id LIMIT 1").Scan(&rootReply))
+	if !strings.Contains(rootReply, "root completed") || strings.Contains(rootReply, "late native output") {
+		t.Fatalf("late native output changed the next root's reply: %q", rootReply)
+	}
+	var notices int
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=0 AND text IN (?, ?)", "native local output", "late native output").Scan(&notices))
+	if notices != 2 {
+		t.Fatalf("native outputs were not independent notices: %d", notices)
+	}
+}
+
+func TestNativeCommandOutputBudgetPreservesRunningTask(t *testing.T) {
+	w, _, _ := nativeWorker(t, "enabled")
+	nativeCatalogReady(t, w)
+	nativeInput(t, w, 100, "wait", false)
+	nativeUntil(t, w, func() bool { return w.busy && !w.rpcOperationActive })
+	var before int64
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT coalesce(max(id),0) FROM outbox").Scan(&before))
+	w.event([]byte(`{"type":"command_output","text":" \n\t "}`))
+	var after int64
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT coalesce(max(id),0) FROM outbox").Scan(&after))
+	if after != before {
+		t.Fatal("blank native output produced a Telegram message")
+	}
+	raw, err := json.Marshal(map[string]any{"type": "command_output", "text": strings.Repeat("😀", maxFinalReplyBytes)})
+	requireStoreOK(t, err)
+	w.event(raw)
+	rows, err := w.b.db.DB.Query("SELECT inbox_id,text FROM outbox WHERE id>? ORDER BY id", before)
+	requireStoreOK(t, err)
+	defer rows.Close()
+	var count, bytes int
+	var last string
+	for rows.Next() {
+		var inbox int64
+		requireStoreOK(t, rows.Scan(&inbox, &last))
+		if inbox != 0 || !utf8.ValidString(last) {
+			t.Fatal("native output acquired task ownership or invalid UTF-8")
+		}
+		units := 0
+		for _, r := range last {
+			units++
+			if r > 0xffff {
+				units++
+			}
+		}
+		if units > telegram.MaxMessageUTF16 {
+			t.Fatal("native output exceeded the Telegram message limit")
+		}
+		count++
+		bytes += len(last)
+	}
+	requireStoreOK(t, rows.Err())
+	if count > maxFinalReplyMessages || bytes > maxFinalReplyBytes || last != replyTruncatedNotice {
+		t.Fatalf("unbounded native output: parts=%d bytes=%d", count, bytes)
+	}
+	if w.active != 100 || !w.busy || queueState(t, w, 100) != "submitted" {
+		t.Fatal("native output prematurely completed the running task")
 	}
 }
 

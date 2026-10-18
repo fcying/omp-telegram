@@ -284,7 +284,11 @@ func TestMain(m *testing.M) {
 		sessionID := fmt.Sprintf("%08x-0000-4000-8000-%012x", os.Getpid(), os.Getpid())
 		session := filepath.Join(root, sessionID+".jsonl")
 		var resume string
+		noSession := false
 		for i, arg := range os.Args {
+			if arg == "--no-session" {
+				noSession = true
+			}
 			if arg == "--resume" && i+1 < len(os.Args) {
 				resume = os.Args[i+1]
 			}
@@ -318,7 +322,7 @@ func TestMain(m *testing.M) {
 			if json.Unmarshal(data, &saved) != nil || os.Chdir(saved.CWD) != nil {
 				os.Exit(2)
 			}
-		} else {
+		} else if !noSession {
 			cwd, err := os.Getwd()
 			if err != nil {
 				os.Exit(2)
@@ -354,6 +358,15 @@ func TestMain(m *testing.M) {
 			nativeCommands = append(nativeCommands, map[string]any{"name": "plugin:command", "source": "file"}, map[string]any{"name": "foo", "source": "file"}, map[string]any{"name": "foo:bar", "source": "file"}, map[string]any{"name": "extension_switch", "aliases": []string{"extension_alias", "extension:session"}, "source": "extension"})
 		} else {
 			nativeCommands = []map[string]any{}
+		}
+		if nativeMode == "bootstrap" {
+			nativeCommands = []map[string]any{
+				{"name": "shake", "aliases": []string{"jiggle", "bad-alias"}, "source": "builtin", "description": "Fixture builtin description"},
+				{"name": "native_agent", "source": "file", "description": "Workspace command"},
+				{"name": "autoresearch", "source": "extension", "description": "Extension command"},
+				{"name": "status", "source": "builtin", "description": "Native status"},
+				{"name": "move", "source": "builtin", "description": "Move workspace"},
+			}
 		}
 		autoresearchFixture := strings.HasPrefix(nativeMode, "autoresearch")
 		autoresearchEnabled := os.Getenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE") == "on"
@@ -391,8 +404,10 @@ func TestMain(m *testing.M) {
 			if enabled {
 				mode = "on"
 			}
-			if err := os.WriteFile(autoresearchState, []byte(mode), 0600); err != nil {
-				os.Exit(2)
+			if !noSession {
+				if err := os.WriteFile(autoresearchState, []byte(mode), 0600); err != nil {
+					os.Exit(2)
+				}
 			}
 			recordFixtureRPCTrace("autoresearch_mode", mode)
 		}
@@ -433,7 +448,7 @@ func TestMain(m *testing.M) {
 					os.Exit(2)
 				}
 				data, _ := json.Marshal(map[string]string{"type": "session", "id": sessionID, "cwd": cwd})
-				if os.WriteFile(session, data, 0600) != nil {
+				if !noSession && os.WriteFile(session, data, 0600) != nil {
 					os.Exit(2)
 				}
 				emit(map[string]any{"type": "session_info_update", "sessionId": sessionID})
@@ -607,7 +622,7 @@ func TestMain(m *testing.M) {
 				heldNativeLocalID = ""
 			case "fixture_finish_root":
 				streaming.Store(false)
-				emit(map[string]any{"type": "command_output", "text": "PRIVATE_LATE_NATIVE_OUTPUT"})
+				emit(map[string]any{"type": "command_output", "text": "late native output"})
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "root completed"}}}}})
 			case "extension_ui_response":
 				uiReplies++
@@ -964,7 +979,7 @@ func TestMain(m *testing.M) {
 						heldNativeLocalID, _ = cmd["id"].(string)
 						emit(resp)
 					} else {
-						emit(map[string]any{"type": "command_output", "text": "PRIVATE_NATIVE_OUTPUT"})
+						emit(map[string]any{"type": "command_output", "text": "native local output"})
 						resp["data"] = map[string]any{"agentInvoked": false}
 						emit(resp)
 					}
@@ -1845,6 +1860,11 @@ func TestServerRetryBudgetIgnoresRateLimitAttempts(t *testing.T) {
 	finished = true
 }
 func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name         string
 		rejectAll    bool
@@ -1862,13 +1882,41 @@ func TestCommandRegistrationFailureDoesNotStopStartup(t *testing.T) {
 			}
 			defer db.Close()
 			previous := http.DefaultTransport
-			http.DefaultTransport = &fakeHTTP{rejectCommands: true, rejectAllCommands: tc.rejectAll, rejectLanguage: tc.rejectLocale}
+			transport := &fakeHTTP{updates: make(chan telegram.Update, 1), commandRequests: make(chan map[string]any, 16), rejectCommands: true, rejectAllCommands: tc.rejectAll, rejectLanguage: tc.rejectLocale}
+			http.DefaultTransport = transport
 			defer func() { http.DefaultTransport = previous }()
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			if err := Run(ctx, config.Config{Token: "fake", MaxWorkers: 1, QueueCapacity: 1, OMPArgsFingerprint: strings.Repeat("a", 64)}, db, testLogs(t), testAppVersion); err != nil {
-				t.Fatalf("command registration failure stopped startup: %v", err)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			cfg := config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, OMP: executable, WorkspaceRoot: t.TempDir(), MaxWorkers: 1, QueueCapacity: 1, OMPArgsFingerprint: strings.Repeat("a", 64)}
+			go func() { done <- Run(ctx, cfg, db, testLogs(t), testAppVersion) }()
+			defer func() {
+				cancel()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("command registration failure stopped startup: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("daemon did not stop")
+				}
+			}()
+			rejected := false
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+			for !rejected {
+				select {
+				case request := <-transport.commandRequests:
+					rejected = tc.rejectAll || request["language_code"] == tc.rejectLocale
+				case <-deadline.C:
+					t.Fatal("startup never attempted the rejected command registration")
+				}
 			}
+			transport.updates <- update(1, 11, "/help")
+			waitFor(t, func() bool {
+				var input, output string
+				err := db.DB.QueryRow("SELECT i.state,o.state FROM inbox i JOIN outbox o ON o.chat=-10 AND o.thread=11 WHERE i.id=1 ORDER BY o.id DESC LIMIT 1").Scan(&input, &output)
+				return err == nil && input == "done" && output == "done"
+			})
 		})
 	}
 }

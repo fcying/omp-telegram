@@ -9,6 +9,7 @@ import (
 
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
+	"omp-telegram/internal/telegram"
 )
 
 type queuedInputKind uint8
@@ -158,7 +159,13 @@ func (w *worker) syncCommandMenu() {
 	if w.nativeCatalog.menuClientID == client.ID() && w.nativeCatalog.menuRevision == catalog.Revision {
 		return
 	}
-	var names []string
+	if catalog.State == omp.CatalogUnknown {
+		w.b.invalidateCommandMenu(w)
+		w.nativeCatalog.menuClientID = client.ID()
+		w.nativeCatalog.menuRevision = catalog.Revision
+		return
+	}
+	var commands []telegram.BotCommand
 	for name := range catalog.ExecutableCommands {
 		if !telegramMenuCommandName(name) {
 			continue
@@ -167,9 +174,9 @@ func (w *worker) syncCommandMenu() {
 		if knownBridgeCommand(invocation) || unsupportedNativeCommand(invocation, w.b.bot.Username) != "" {
 			continue
 		}
-		names = append(names, name)
+		commands = append(commands, telegram.BotCommand{Command: name, Description: catalog.CommandDescription(name)})
 	}
-	w.b.updateCommandMenu(w, names)
+	w.b.updateCommandMenu(w, commands)
 	w.nativeCatalog.menuClientID = client.ID()
 	w.nativeCatalog.menuRevision = catalog.Revision
 }
@@ -465,4 +472,14 @@ func (w *worker) finishLocalCommandSubmission() {
 	w.preview = ""
 	w.finalOutputTruncated = false
 	w.finish()
+}
+
+// Native output has no request ID, so publish it outside task replies.
+func (w *worker) nativeCommandOutput(text string) {
+	if _, connected := w.runtimeClient(); !connected || strings.TrimSpace(text) == "" {
+		return
+	}
+	for _, part := range taskReplies(text, "", false) {
+		w.say(part)
+	}
 }

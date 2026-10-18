@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -240,6 +241,10 @@ func (f *startupLogTransport) RoundTrip(r *http.Request) (*http.Response, error)
 }
 
 func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, endpoint := range []string{"getMe", "setMyCommands"} {
 		for _, reject := range []bool{false, true} {
 			name := endpoint + "/cancel"
@@ -247,6 +252,7 @@ func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
 				name = endpoint + "/reject"
 			}
 			t.Run(name, func(t *testing.T) {
+				t.Setenv("PATH", t.TempDir())
 				db, err := store.Open(t.TempDir())
 				if err != nil {
 					t.Fatal(err)
@@ -265,6 +271,8 @@ func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
 				done := make(chan error, 1)
 				cfg := config.Config{
 					Token:              "fake",
+					OMP:                executable,
+					WorkspaceRoot:      t.TempDir(),
 					OMPArgs:            [][]string{{}},
 					OMPArgsLabels:      []string{"Default"},
 					OMPArgsFingerprint: strings.Repeat("c", 64),
