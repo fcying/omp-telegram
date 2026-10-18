@@ -125,7 +125,7 @@ func TestReplyMetricsThresholdZeroOutputAndOverflow(t *testing.T) {
 	}
 }
 
-func TestReplyHeaderShowsLiteralModelAndEffectiveSettings(t *testing.T) {
+func TestReplyHeaderShowsLiteralModelAndConfiguredSettings(t *testing.T) {
 	state := replyMetricsState(t, `{
 		"model":{"id":"**answer**`+"`"+`<model>","provider":"private-provider"},
 		"thinkingLevel":"**high**`+"`"+`<level>",
@@ -134,6 +134,7 @@ func TestReplyHeaderShowsLiteralModelAndEffectiveSettings(t *testing.T) {
 		"contextUsage":{"tokens":64000,"contextWindow":128000},
 		"tokensPerSecond":99999
 	}`)
+	state.ConfiguredThinking = "**configured**`<level>"
 	var metrics replyMetrics
 	msg := replyMetricsMessage(120, 1000)
 	msg.ModelID = state.Model.ID
@@ -144,7 +145,7 @@ func TestReplyHeaderShowsLiteralModelAndEffectiveSettings(t *testing.T) {
 	rendered := telegram.ConvertMarkdown(header)
 	for _, want := range []string{
 		"<code>" + html.EscapeString(state.Model.ID) + "</code>",
-		"<code>" + html.EscapeString(state.ThinkingLevel) + "</code>",
+		"<code>" + html.EscapeString(state.ConfiguredThinking) + "</code>",
 		"fast off (setting: on)", "◫ 50%", "avg 120 tok/s",
 	} {
 		if !strings.Contains(rendered, want) {
@@ -164,7 +165,9 @@ func TestReplyHeaderDoesNotAttachOtherModelSettings(t *testing.T) {
 	} {
 		var metrics replyMetrics
 		metrics.observe(replyMetricsMessage(10, 1000))
-		header := replyHeader(replyMetricsState(t, raw), metrics)
+		state := replyMetricsState(t, raw)
+		state.ConfiguredThinking = "high"
+		header := replyHeader(state, metrics)
 		if !strings.Contains(header, "answer-model") || !strings.Contains(header, "10 tok/s") || strings.Contains(header, "◒") || strings.Contains(header, "⚡") || strings.Contains(header, "other-") {
 			t.Fatalf("queried model settings crossed model identity: %s", header)
 		}

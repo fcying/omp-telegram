@@ -214,6 +214,16 @@ func (c *Client) Events() <-chan json.RawMessage { return c.events }
 func (c *Client) Done() <-chan struct{}          { return c.done }
 func (c *Client) ID() uint64                     { return c.id }
 
+// Stopping reports a terminal transport signal without waiting for process reaping.
+func (c *Client) Stopping() bool {
+	select {
+	case <-c.stop:
+		return true
+	default:
+		return false
+	}
+}
+
 // BufferedOutput includes partially read frames and events awaiting consumption.
 func (c *Client) BufferedOutput() bool { return c.bytes.used.Load() != 0 }
 

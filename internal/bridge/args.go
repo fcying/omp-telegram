@@ -223,7 +223,7 @@ func (w *worker) showArgsMenuPage(c confirmation, page int) {
 
 func (w *worker) selectArgsFromMenu(c confirmation, index int) {
 	if index == len(c.options) {
-		w.finishMenu(c.messageID, "Cancel")
+		w.finishConfirmation(c, index)
 		return
 	}
 	if index < 0 || index >= len(c.options) {

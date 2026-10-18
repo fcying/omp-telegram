@@ -770,3 +770,27 @@ func TestArgsMenuDoesNotDisplayLongRawArgs(t *testing.T) {
 		t.Fatal("long raw arguments appeared in the menu")
 	}
 }
+
+func TestArgsCancelKeepsOperationContextAndSelection(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	configureTestArgPresets(w.b, [][]string{{"--model", "private-first"}, {"--model", "private-second"}}, strings.Repeat("a", 64), 2)
+	persistTestSelection(t, w.b, 2)
+	command("/args")
+	_, rows := pickerView(t, f)
+	messageID := f.messageCount()
+	selectFirst := rows[0][0]["callback_data"].(string)
+	clickKeyboard(w, 7, rows[len(rows)-1][0]["callback_data"].(string))
+	text := assertFinishedMenu(t, f, messageID, "Cancel")
+	if !strings.Contains(text, "OMP argument preset") || strings.Contains(text, "private-first") || strings.Contains(text, "private-second") {
+		t.Fatalf("cancel receipt lost its operation or exposed raw arguments: %q", text)
+	}
+	clickKeyboard(w, 7, selectFirst)
+	if after := assertFinishedMenu(t, f, messageID, "Cancel"); after != text {
+		t.Fatal("replayed selection changed the canceled receipt")
+	}
+	index, _ := w.b.argsPresetSelection()
+	var stored int
+	if err := w.b.db.DB.QueryRow("SELECT preset_index FROM omp_args_selection").Scan(&stored); err != nil || index != 2 || stored != 2 || len(w.confirms) != 0 {
+		t.Fatalf("cancel changed or retained selection: memory=%d stored=%d error=%v", index, stored, err)
+	}
+}

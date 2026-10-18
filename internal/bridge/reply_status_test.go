@@ -110,6 +110,74 @@ func TestFinalReplyUsesWholeTaskAverageAndPostOutputContext(t *testing.T) {
 	}
 }
 
+func TestFinalReplyUsesConfiguredThinkingAcrossEffectiveLevels(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		configured string
+		symbol     string
+	}{
+		{"auto", "auto", "⟳"},
+		{"manual", "max", "◉"},
+		{"unknown", "", ""},
+	} {
+		for _, effective := range []string{"low", "high"} {
+			t.Run(scenario.name+"/"+effective, func(t *testing.T) {
+				w, _, _, _ := replyStatusWorker(t)
+				w.configuredThinking = scenario.configured
+				nativeRPC(t, w, "set_thinking_level", map[string]any{"level": effective})
+				replyStatusMessage(t, w, 100, 1000, 1100)
+				endReplyStatus(w)
+				result := receiveReplyStatus(t, w)
+				w.operationReturned(result)
+				output, err := w.b.db.NextOutput()
+				requireStoreOK(t, err)
+				if !strings.HasSuffix(output.Text, "\n\nanswer") || !strings.Contains(output.Text, "safe") || strings.ContainsAny(output.Text, "◔◒") {
+					t.Fatalf("effective thinking replaced configured reply state: %s", output.Text)
+				}
+				if scenario.symbol == "" {
+					if strings.ContainsAny(output.Text, "⦸○◔◑◒◕◉⟳") {
+						t.Fatalf("unknown configured thinking displayed a symbol: %s", output.Text)
+					}
+				} else if !strings.Contains(output.Text, scenario.symbol) {
+					t.Fatalf("configured thinking %q lost its symbol: %s", scenario.configured, output.Text)
+				}
+			})
+		}
+	}
+}
+
+func TestFinalReplyRejectsUnconfirmedThinkingSnapshots(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		change func(*worker, *replyStatusResult)
+	}{
+		{"binding_session", func(w *worker, _ *replyStatusResult) { w.binding.SessionID = "other-session" }},
+		{"native_session", func(_ *worker, r *replyStatusResult) { r.state.SessionID = "other-session" }},
+		{"epoch", func(_ *worker, r *replyStatusResult) { r.request.epoch++ }},
+		{"query_failure", func(_ *worker, r *replyStatusResult) { r.valid = false }},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, _, _, _ := replyStatusWorker(t)
+			w.configuredThinking = "auto"
+			replyStatusMessage(t, w, 100, 1000, 1100)
+			endReplyStatus(w)
+			result := receiveReplyStatus(t, w)
+			sample := result.meta.(replyStatusResult)
+			if !sample.valid {
+				t.Fatal("fixture did not supply a valid native snapshot")
+			}
+			scenario.change(w, &sample)
+			result.meta = sample
+			w.operationReturned(result)
+			output, err := w.b.db.NextOutput()
+			requireStoreOK(t, err)
+			if !strings.HasSuffix(output.Text, "\n\nanswer") || !strings.Contains(output.Text, "100 tok/s") || strings.ContainsAny(output.Text, "⦸○◔◑◒◕◉⟳") {
+				t.Fatalf("unconfirmed snapshot changed reply or projected configured thinking: %s", output.Text)
+			}
+		})
+	}
+}
+
 func TestFinalReplyMetadataTimeoutDoesNotDiscardConfirmedAnswer(t *testing.T) {
 	w, _, _, trace := replyStatusWorker(t)
 	replyStatusMessage(t, w, 100, 1000, 1100)
@@ -133,6 +201,7 @@ func TestFinalReplyLateSnapshotCannotChangeNewInputOrRPCOwnership(t *testing.T) 
 	for _, control := range []string{"/stop", "/close", "missing-terminal"} {
 		t.Run(control, func(t *testing.T) {
 			w, _, command, _ := replyStatusWorker(t)
+			w.configuredThinking = "auto"
 			replyStatusMessage(t, w, 100, 1000, 1100)
 			endReplyStatus(w)
 			late := receiveReplyStatus(t, w)
@@ -143,7 +212,7 @@ func TestFinalReplyLateSnapshotCannotChangeNewInputOrRPCOwnership(t *testing.T) 
 			}
 			output, err := w.b.db.NextOutput()
 			requireStoreOK(t, err)
-			if !strings.HasSuffix(output.Text, "\n\nanswer") || strings.Contains(output.Text, "◫") {
+			if !strings.HasSuffix(output.Text, "\n\nanswer") || strings.Contains(output.Text, "◫") || strings.Contains(output.Text, "⟳") {
 				t.Fatalf("input delayed answer delivery or used an unaccepted snapshot: %q", output.Text)
 			}
 			w.dispatch()

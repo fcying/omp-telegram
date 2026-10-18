@@ -94,5 +94,6 @@ func (w *worker) progressNativeFinished(result progressNativeResult) {
 	if !result.valid || catalog.Epoch != request.epoch || w.binding.SessionID != request.sessionID || catalog.SessionID != request.sessionID || result.state.SessionID != request.sessionID {
 		return
 	}
+	result.state.ConfiguredThinking = w.configuredThinking
 	w.progress.NativeStatus = compactProgressStatus(result.state)
 }

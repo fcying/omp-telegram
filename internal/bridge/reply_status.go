@@ -92,6 +92,7 @@ func (w *worker) replyStatusFinished(result operationResult) {
 	}
 	catalog := request.client.CommandCatalog()
 	if sample.valid && request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID && sample.state.SessionID == request.sessionID {
+		sample.state.ConfiguredThinking = w.configuredThinking
 		w.replyStatus.header = replyHeader(sample.state, w.replyStatus.metrics)
 	}
 	w.commitReplyStatus(request.round)
@@ -133,7 +134,7 @@ func (w *worker) replyStatusEvent(e rpcEvent) bool {
 		if e.Status == "completed" {
 			return false
 		}
-	case "session_settled", "available_commands_update", "advisor_cost_changed":
+	case "session_settled", "available_commands_update", "advisor_cost_changed", "thinking_level_changed":
 		return false
 	}
 	w.flushReplyStatus()

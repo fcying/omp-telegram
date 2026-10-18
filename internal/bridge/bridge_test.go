@@ -333,6 +333,12 @@ func TestMain(m *testing.M) {
 		var streaming atomic.Bool
 		modelProvider, modelID := "fixture", "safe"
 		thinkingLevel := "medium"
+		configuredThinking := os.Getenv("OMP_TELEGRAM_FIXTURE_CONFIGURED_THINKING")
+		if configuredThinking == "" {
+			configuredThinking = thinkingLevel
+		}
+		effortCalls := 0
+		effortFailureAfter, _ := strconv.Atoi(os.Getenv("OMP_TELEGRAM_FIXTURE_EFFORT_AFTER"))
 		fastEnabled, fastActive := false, false
 		sessionName := ""
 		var contextUsage any
@@ -446,6 +452,8 @@ func TestMain(m *testing.M) {
 			typ, _ := cmd["type"].(string)
 			resp := map[string]any{"type": "response", "id": cmd["id"], "command": typ, "success": true}
 			switch typ {
+			case "set_host_tools":
+				recordFixtureRPCTrace(typ, "")
 			case "get_entries":
 				recordFixtureRPCTrace("get_entries", "")
 				if nativeMode == "autoresearch-entries-error" || autoresearchEntriesMode == "error" {
@@ -701,9 +709,14 @@ func TestMain(m *testing.M) {
 					resp["success"] = false
 				} else {
 					if level == "max" {
+						configuredThinking = "high"
 						thinkingLevel = "high"
 					} else {
+						configuredThinking = level
 						thinkingLevel = level
+						if level == "auto" {
+							thinkingLevel = "medium"
+						}
 					}
 					recordFixtureRPCTrace(typ, "")
 					if fixtureHoldsRPC(typ) {
@@ -739,6 +752,35 @@ func TestMain(m *testing.M) {
 				os.Exit(2)
 			case "prompt":
 				text, _ := cmd["message"].(string)
+				if text == "/effort" {
+					recordFixtureRPCTrace("effort_query", "")
+					effortCalls++
+					mode := os.Getenv("OMP_TELEGRAM_FIXTURE_EFFORT_MODE")
+					if mode != "" && effortCalls >= max(1, effortFailureAfter) {
+						recordFixtureRPCTrace("effort_failure", mode)
+						switch mode {
+						case "hold":
+							continue
+						case "reject":
+							resp["success"], resp["error"] = false, "PRIVATE_EFFORT_REJECTION"
+						case "missing":
+							resp["data"] = map[string]any{"agentInvoked": false}
+						case "malformed":
+							emit(map[string]any{"type": "command_output", "text": "Thinking: PRIVATE_EFFORT_OUTPUT\nAvailable: unknown"})
+							resp["data"] = map[string]any{"agentInvoked": false}
+						case "unknown-ack":
+							emit(map[string]any{"type": "command_output", "text": "Thinking: " + configuredThinking + "\nAvailable: auto, low"})
+						default:
+							os.Exit(2)
+						}
+						emit(resp)
+						continue
+					}
+					emit(map[string]any{"type": "command_output", "text": "Thinking: " + configuredThinking + "\nAvailable: off, minimal, low, medium, high, xhigh, max, auto"})
+					resp["data"] = map[string]any{"agentInvoked": false}
+					emit(resp)
+					continue
+				}
 				recordFixtureRPCTrace(typ, text)
 				if autoresearchFixture && (text == "/autoresearch" || strings.HasPrefix(text, "/autoresearch ")) {
 					args := strings.TrimSpace(strings.TrimPrefix(text, "/autoresearch"))
@@ -863,6 +905,11 @@ func TestMain(m *testing.M) {
 						os.Exit(2)
 					}
 					modelProvider, modelID = "fixture", id
+					if modelID == "deep" {
+						configuredThinking, thinkingLevel = "auto", "high"
+					} else {
+						configuredThinking, thinkingLevel = "low", "low"
+					}
 					emit(map[string]any{"type": "command_output", "text": "Model set to " + modelProvider + "/" + modelID + "."})
 					resp["data"] = map[string]any{"agentInvoked": false}
 					emit(resp)
@@ -3525,10 +3572,7 @@ func TestConfirmationOwnerReplayAndCompactCompletion(t *testing.T) {
 	if current.Generation != replaced.Generation {
 		t.Fatal("consumed callback replaced session again")
 	}
-	after = f.messageCount()
 	send(update(6, 11, "/compact"))
-	waitFor(t, func() bool { return f.button(after) != "" })
-	callback(7, 7, f.button(after))
 	send(update(8, 11, "after compact"))
 	waitFor(t, func() bool { return f.has(11, "answer: after compact") })
 }

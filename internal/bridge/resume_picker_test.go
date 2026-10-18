@@ -546,12 +546,12 @@ func TestResumePickerRejectsInvalidCallbacks(t *testing.T) {
 				t.Fatal("picker interrupted the active task")
 			}
 			if scenario == "cancel" {
-				requireFinishedSessionPicker(t, f, 1, "Cancel")
+				assertFinishedMenu(t, f, 1, "/resume")
 				clickResume(w, 7, buttons[0]["callback_data"].(string))
 				if !sameBindingIdentity(w.binding, before) || w.client != client {
 					t.Fatal("cancelled picker accepted an old selection")
 				}
-				requireFinishedSessionPicker(t, f, 1, "Cancel")
+				assertFinishedMenu(t, f, 1, "/resume")
 			}
 			if scenario != "cancel" {
 				requireNoSessionSelectionReceipt(t, f)

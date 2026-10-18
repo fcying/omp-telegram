@@ -98,8 +98,8 @@ func TestThinkingPickerRejectsUnavailableActions(t *testing.T) {
 			}
 			completed := settingsMenuResult(t, f, messageID)
 			if scenario == "cancel" {
-				if completed != "Cancel" {
-					t.Fatalf("cancelled thinking menu = %q", completed)
+				if !strings.Contains(completed, "thinking level") {
+					t.Fatalf("cancelled thinking menu lost its operation context: %q", completed)
 				}
 			} else if strings.Contains(completed, "Thinking level:") {
 				t.Fatalf("rejected thinking selection appeared successful: %q", completed)

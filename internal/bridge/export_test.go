@@ -362,9 +362,18 @@ func TestExportPickerCancelCompletesOriginalMenu(t *testing.T) {
 			w.resumeListed(finishResumeList(t, w))
 			buttons := resumeButtons(t, f)
 			clickResume(w, 7, buttons[len(buttons)-1]["callback_data"].(string))
-			requireFinishedSessionPicker(t, f, 1, "Cancel")
+			text := assertFinishedMenu(t, f, 1, "/export")
+			format := "SESSION"
+			if commandText == "/export html" {
+				format = "HTML"
+			}
+			if !strings.Contains(text, format) {
+				t.Fatalf("cancelled export lost its format: %q", text)
+			}
 			clickResume(w, 7, buttons[0]["callback_data"].(string))
-			requireFinishedSessionPicker(t, f, 1, "Cancel")
+			if after := assertFinishedMenu(t, f, 1, "/export"); after != text {
+				t.Fatal("replayed export selection changed the cancel receipt")
+			}
 			if w.exportCancel != nil || w.client != client || !sameBindingIdentity(w.binding, before) {
 				t.Fatal("cancelled export picker remained actionable or changed the session")
 			}

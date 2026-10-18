@@ -28,11 +28,12 @@ func TestStatusDisplaysWhitelistedNativeMetrics(t *testing.T) {
 	}`), &state); err != nil {
 		t.Fatal(err)
 	}
+	state.ConfiguredThinking = "auto"
 	text := formatStatus(state, "/home/test/project/foo", "saved-id", "/home/test", 2)
 	fields := statusFields(text)
 	for key, want := range map[string]string{
 		"Workspace": "~/project/foo", "Session": "Bugfix HAL", "Model": "openai/gpt-5.6",
-		"Thinking": "high", "Fast": "off", "Context": "64% (82k / 128k)",
+		"Fast": "off", "Context": "64% (82k / 128k)",
 		"Running": "yes", "Compacting": "no", "Queued": "2", "Speed": "87 tok/s",
 	} {
 		if fields[key] != want {
@@ -44,6 +45,46 @@ func TestStatusDisplaysWhitelistedNativeMetrics(t *testing.T) {
 	}
 	if strings.Contains(text, "SECRET") || strings.Contains(text, "PRIVATE") || strings.Contains(text, "Authorization") {
 		t.Fatal("status leaked non-whitelisted native state")
+	}
+}
+
+func TestStatusUsesConfiguredThinkingInsteadOfEffectiveLevel(t *testing.T) {
+	for _, scenario := range []struct{ configured, want string }{
+		{"auto", "auto"}, {"low", "low"}, {"", "n/a"},
+	} {
+		for _, effective := range []string{"medium", "high"} {
+			t.Run(scenario.want+"/"+effective, func(t *testing.T) {
+				var state statusState
+				if err := json.Unmarshal([]byte(`{"thinkingLevel":"`+effective+`"}`), &state); err != nil {
+					t.Fatal(err)
+				}
+				state.ConfiguredThinking = scenario.configured
+				if got := statusFields(formatStatus(state, "/work", "session", "", 0))["Thinking"]; got != scenario.want {
+					t.Fatalf("configured %q with effective %q displayed %q", scenario.configured, effective, got)
+				}
+			})
+		}
+	}
+}
+
+func TestNativeStatusCannotSupplyConfiguredThinking(t *testing.T) {
+	var state statusState
+	if err := json.Unmarshal([]byte(`{
+		"model":{"id":"answer-model"},"thinkingLevel":"high",
+		"configuredThinking":"auto","ConfiguredThinking":"max","configured":"low"
+	}`), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.ConfiguredThinking != "" {
+		t.Fatal("native JSON supplied the actor-owned thinking projection")
+	}
+	if got := statusFields(formatStatus(state, "/work", "session", "", 0))["Thinking"]; got != "n/a" {
+		t.Fatalf("native state supplied configured thinking to detailed status: %q", got)
+	}
+	for _, text := range []string{compactProgressStatus(state), replyHeader(state, replyMetrics{})} {
+		if !strings.Contains(text, "answer-model") || strings.ContainsAny(text, "⦸○◔◑◒◕◉⟳") || strings.Contains(text, "high") {
+			t.Fatalf("unknown configured thinking inferred a native level: %s", text)
+		}
 	}
 }
 
@@ -107,6 +148,7 @@ func TestStatusHomeAbbreviationRespectsDirectoryBoundaries(t *testing.T) {
 }
 
 func TestStatusCommandPublishesDetailedReply(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_CONFIGURED_THINKING", "auto")
 	w, _, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
 	client := w.client
@@ -119,8 +161,8 @@ func TestStatusCommandPublishesDetailedReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	fields := statusFields(text)
-	if fields["Model"] != "fixture/safe" || fields["Thinking"] != "medium" || fields["Queued"] != "0" {
-		t.Fatalf("status command omitted native model state: %v", fields)
+	if fields["Model"] != "fixture/safe" || fields["Thinking"] != "auto" || fields["Queued"] != "0" {
+		t.Fatalf("status command omitted configured thinking or native model state: %v", fields)
 	}
 	if strings.Contains(text, "SECRET") || strings.Contains(text, "PRIVATE") {
 		t.Fatal("status command leaked native secrets")

@@ -111,6 +111,8 @@ Configuration is selected in this order:
 
 An explicitly selected missing file, unreadable file, or invalid TOML causes startup to fail. Configuration uses the grouped tables shown above; legacy flat fields and mixed layouts are not accepted.
 
+Explicit relative `--config` paths use the launch directory. Relative `storage.data_dir` and `storage.workspace_root` paths always use the real executable directory, not the config file's directory.
+
 Configuration strings support `$VAR` and `${VAR}` except for `[omp.environment]` mode and `allow`/`deny` variable names, which are literal. Use `$$` for a literal dollar sign. Environment references are expanded once after TOML parsing. The default references to `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset. An empty or invalid `telegram.progress_mode` falls back to `summary`. The token and allowlists must be provided. `.env` files are not loaded automatically.
 The display-only `omp.args_labels` values are literal and are not environment-expanded.
 
@@ -129,17 +131,19 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
 | `storage.data_dir` | Database, lock, and incoming/outgoing attachment storage. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
-| `storage.database_retention_days` | Retention period for terminal bridge message metadata. Default: `90` days; `0` disables automatic cleanup. Workspaces, OMP session data, and saved conversation bindings are not removed. See [Data and Retention](#data-and-retention). |
+| `storage.database_retention_days` | Retention period for terminal bridge messages and eligible attachment caches. Default: `90` days; `0` disables automatic retention cleanup. Workspaces, OMP session data, and saved conversation bindings are not removed. See [Data and Retention](#data-and-retention). |
 | `worker.max_workers` | Maximum number of connected OMP processes. Default: `8`; maximum: `64`. |
-| `worker.queue_capacity` | Maximum number of waiting tasks per conversation. Default: `16`; maximum: `1024`. |
+| `worker.queue_capacity` | Shared per-conversation limit for waiting tasks and unresolved steers. Default: `16`; maximum: `1024`. |
 | `worker.idle_timeout` | Time before releasing an otherwise idle OMP process while keeping its session available. Default: `30m`; `0` or `disabled` turns this off. |
 | `logging.level` | Global log level: `debug`, `info`, `warn`, or `error`. Default: `info`. |
 | `logging.format` | Log format: `text` or `json`. Default: `text`. |
 | `[logging.component_levels]` | Optional per-component levels for `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. |
 
-Each `omp.args` array item is a complete shell-style argument string, parsed for quoting but passed directly without a shell. The legacy scalar form remains accepted as a single preset. `/args` uses `omp.args_labels` as Telegram picker names only when there is one nonempty label per preset; otherwise it uses generic `Preset N` names and logs a startup warning without blocking startup. Raw argv is never shown. Labels are literal, visible to anyone who can read the conversation, and must not contain credentials. OMP configuration overlays remain OMP configuration; the bridge does not change models, credentials, tools, or approval policies.
+Each `omp.args` array item is a complete shell-style argument string, parsed for quoting but passed directly without a shell. OMP's own configuration remains unchanged unless explicitly selected through these arguments or a user-requested command.
 
-To explicitly restrict OMP children, configure the table like this:
+`/args` selection applies across all conversations and survives service restarts. Changing the preset definitions or their expanded argument values resets selection to preset 1 on startup; changing display labels alone does not. Connected OMP processes keep their launch arguments.
+
+To explicitly restrict OMP children, replace the existing `[omp.environment]` table with the following. Do not configure `allow` and `deny` together, even if one list is empty.
 
 ```toml
 [omp.environment]
@@ -200,7 +204,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 
 | Command | What it does |
 | --- | --- |
-| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. A topic's first session sets its title to the workspace name. |
+| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On a topic's first session, the bridge attempts to set its title to the workspace name. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
 | `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
@@ -213,7 +217,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
-| `/status` | Show the current workspace, session, model, thinking, fast-mode, context, active task, and queue status. |
+| `/status` | Show the current workspace, session, model, thinking, fast-mode, context, runtime, and queue status. |
 | `/args [preset-number]` | View configured preset labels and switch the OMP startup preset for future process starts across all conversations. Running OMP processes are unchanged. |
 | `/doctor` | Run safe, asynchronous bridge diagnostics without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
@@ -221,11 +225,13 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/model provider/model` | Switch to a specific model while idle. |
 | `/thinking` | Choose the thinking level while idle. |
 | `/fast [on\|off\|status]` | Choose fast mode, explicitly enable or disable it, or inspect its status. |
-| `/compact` | Compact the current context while idle, after confirmation. |
+| `/compact` | Compact the current context immediately while idle, without confirmation. The status message updates with the result and context usage. |
 | `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue. |
 | `/review [arguments]` | Run OMP's native `/review` command as a queued task. |
 | `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
+
+A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
 
 Ordinary text starts a task when the conversation is idle. While an OMP task is active, OMP may accept ordinary text as a steer. Use `/followup <message>` to queue a separate prompt instead. Attachments, `/review`, and other supported native commands also use the conversation queue and run sequentially. Different conversations can run concurrently up to the configured worker capacity.
 
@@ -244,7 +250,7 @@ The exact native `/autoresearch` extension has dedicated support. The following 
 | `/session delete` | Rejected: use **Delete** in `/resume`, with its confirmation and in-use checks. |
 | `/plan`, `/plan-review` | Depend on upstream OMP RPC support. The bridge does not implement their planning workflow; use interactive OMP when RPC support is unavailable. |
 | Other extensions and extension aliases | Rejected, including aliases of autoresearch: generic extension session-lifecycle changes are not integrated. Use OMP directly. |
-| Commands with unidentified sources | Rejected rather than guessing whether they are safe or forwarding them as ordinary model text. |
+| Advertised commands with unidentified sources | Rejected rather than guessing whether they are safe or forwarding them as ordinary model text. |
 
 The Telegram menu lists bridge commands and available native commands. Telegram allows at most 100 entries with restricted command names; supported commands that do not fit can still be typed manually.
 
@@ -261,7 +267,7 @@ Requires OMP to advertise its native `autoresearch` extension. Send `/autoresear
 - `/autoresearch <goal>` enables research and starts the native goal.
 - `/autoresearch` toggles mode. When enabling a new experiment, it confirms the mode; the next ordinary message supplies the goal.
 - `/autoresearch off` disables research and interrupts an active research run; waiting bridge tasks remain queued. Use `/stop` to clear the queue.
-- `/autoresearch clear [--keep-tree] [--reset-tree]` requires an idle instance, an empty queue, and confirmation. It removes research artifacts and may reset tracked files or delete untracked files. Use only in a workspace where those changes are acceptable.
+- `/autoresearch clear [--keep-tree] [--reset-tree]` requires an idle instance, an empty queue, and confirmation. OMP removes research artifacts and may reset tracked files or delete untracked files. `--keep-tree` skips the worktree reset/clean, but still allows artifact deletion; it is not a backup or a nondestructive mode. Use only where those changes are acceptable.
 
 Two-step usage:
 
@@ -297,7 +303,7 @@ To use a native JSONL export on another computer, prepare the corresponding sour
 omp --resume /path/to/session.jsonl
 ```
 
-If the old working directory recorded in the session no longer exists, OMP may ask you to re-root the session in the current directory. Session export does not include workspace source files, the source tree, Git state, uncommitted files, credentials, OMP configuration, or the shell environment. Synchronize project files separately with `git clone`, `git pull`, `scp`, `rsync`, or another method.
+If the old working directory recorded in the session no longer exists, OMP may ask you to re-root the session in the current directory. Export is not a project backup: it does not separately collect workspace files, Git state, OMP configuration, credential files, or environment variables. Any such content already recorded in the transcript remains in the export. Synchronize project files separately with `git clone`, `git pull`, `scp`, `rsync`, or another method.
 
 Exported session files may contain sensitive conversation, tool, command, and path data, including prompts, assistant responses, tool calls, tool results, local paths, command output, source snippets, and secrets accidentally present in the transcript. Only send them to trusted Telegram conversations. No additional confirmation is requested; entering `/export` is the explicit user action.
 
@@ -308,7 +314,7 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 | Symptom | Check |
 | --- | --- |
 | Bot does not respond | Both allowlists, group topics, group privacy settings, and whether another poller or webhook uses the bot. |
-| `omp executable not found` | The service process's `PATH`, including omp and its runtime. It may differ from your interactive shell. |
+| `omp.binary executable not found` | The configured executable and the service process's `PATH`, including omp and its runtime. It may differ from your interactive shell. |
 | `/resume` shows no sessions | The selected directory and whether OMP has saved history yet. A new session may have no resumable file. |
 | `/compact` fails | Short sessions may have nothing to compact. Check OMP's model configuration if local compaction also fails. |
 | Unsupported database schema | Back up the data and use a supported database or fresh data directory; do not change a version number by hand. |
@@ -329,7 +335,7 @@ Progress for a new task appears after about three seconds, so short tasks normal
 
 Progress is best-effort and may not show every task transition. It does not affect task execution or final replies.
 
-Final text replies may include a compact model and context status header.
+Final text replies may include a compact model and context status header. Thinking symbols in live progress and reply headers, and the `Thinking` field in `/status`, reflect the configured level rather than its per-turn resolution. Configured `auto` remains `auto` in `/status` and uses `⟳` in compact headers.
 
 ## Attachments
 
@@ -343,7 +349,7 @@ To receive a file, ask OMP directly, for example, "Send me the report as a file.
 | Send a document | 50 MB |
 | Send a photo | 10 MB, JPEG or PNG |
 
-Incoming attachments are stored separately from project files and are subject to the configured retention policy. Move files you want to keep into your workspace. Large images may be provided as previews or local file paths; image understanding depends on the model, and document reading depends on its tools.
+Incoming attachments are stored under `storage.data_dir/attachments/inbox/` and are subject to the configured retention policy. This directory can lie inside a workspace if the configured paths overlap. Copy files you want to keep out of the attachment cache. Large images may be provided as previews or local file paths; image understanding depends on the model, and document reading depends on its tools.
 
 ## Telegram reply context
 
@@ -363,9 +369,9 @@ Each conversation has its own session, but sessions using the same workspace sha
 
 ## Data and Retention
 
-Bridge data is stored in `<storage.data_dir>/omp-telegram.db`. `storage.data_dir` defaults to the directory beside the real executable; relative storage paths use that directory rather than the launch directory.
+Bridge data is stored in `<storage.data_dir>/omp-telegram.db`, including accepted Telegram input content, outgoing replies, and message metadata. Attachments are stored as files under the same data directory. Treat the database, attachment caches, and their backups as sensitive. `storage.data_dir` defaults to the real executable directory; relative storage paths use that directory rather than the launch directory.
 
-`storage.database_retention_days` controls how long terminal bridge message metadata is retained. Default: `90` days. Set it to `0` to disable automatic cleanup. Workspace files, OMP session data, and saved conversation bindings are not removed by retention cleanup.
+`storage.database_retention_days` controls retention of terminal bridge messages and eligible attachment caches. Default: `90` days. Set it to `0` to disable automatic retention cleanup. Workspace files, OMP session data, and saved conversation bindings are not removed. Retention does not delete delivered Telegram replies.
 
 Before upgrading, stop the service and back up the data directory, workspaces, and OMP's own session storage. The bridge database alone is not a complete backup of OMP conversations.
 
@@ -393,7 +399,7 @@ just deploy
 - `just test` runs unit tests without starting or restarting a service.
 - `just check` runs tests, race checks, and `go vet` without starting Telegram polling.
 - `just install` installs only the binary; configuration and data remain user-managed.
-- `just deploy` installs the binary and restarts the existing supervised daemon.
+- `just deploy` installs the binary, then schedules a background restart of the existing `supervisord` service after five seconds. Returning from the recipe does not confirm that the restart succeeded.
 
 ## Architecture
 
