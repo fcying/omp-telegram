@@ -215,15 +215,23 @@ Discovery waiter 超时/取消/拒绝不会推翻 reader 已发布的可用目�
 
 会改变生命周期的 `/move`, `/wt`, `/worktree`, `/session delete` 在路由和派发时都拒绝, 即使 discovery 不可用也如此. Session 拒绝只匹配不区分大小写且没有额外参数的 `delete`. `/session info` 和 `/session pin` 保持原生路由. 已保存绑定由桥接 session 生命周期 API 管理; 任意 extension 生命周期变更不在协调范围内. Snapshot 校验不是上游原子 check-and-execute, 桥接围栏也无法可靠识别没有 session 标记的旧 session 主动 update.
 
-明确原生 local acknowledgment `agentInvoked:false`, 或请求关联的 local `prompt_result(status:"completed", agentInvoked:false)`, 无需 assistant 文本即可完成提交. 这不证明后台 operation 已结束. Local `error` 为 uncertain, `aborted` 为 cancelled, 缺失/未知状态为 uncertain; 通用通知与状态一起提交, 不泄露原始 RPC 错误, 不退役健康 runtime, 不重放命令. 无关联 `command_output` 不转发 Telegram, 因此 local 命令可无可见答案而完成. 仅目录识别不能实现原生 `/plan` 或 `/plan-review` 的 RPC 支持.
+明确原生 local acknowledgment `agentInvoked:false`, 或请求关联的 local `prompt_result(status:"completed", agentInvoked:false)`, 无需 assistant 文本即可完成提交. 这不证明后台 operation 已结束. Local `error` 为 uncertain, `aborted` 为 cancelled, 缺失/未知状态为 uncertain; 通用通知与状态一起提交, 不泄露原始 RPC 错误, 不退役健康 runtime, 不重放命令. 仅目录识别不能实现原生 `/plan` 或 `/plan-review` 的 RPC 支持.
+
+RPC client 消费私有元数据查询回复后, 已连接 runtime 的 `command_output.text` 通过 outbox 作为独立对话通知交付, 不关联 inbox. 该事件没有 request ID: 不改变任务预览或完成状态, 迟到输出也不会成为下一个根任务的最终回复. 忽略空白输出; 每个事件复用最终回复的字节, 消息数和 UTF-16 展示预算并在超限时截断. 只展示文字, 不展示 RPC frame, 不记录 payload 日志.
 
 ### 命令菜单发布
 
-[`command_menu.go`](../internal/bridge/command_menu.go) 保留默认桥接菜单, 并发布 chat 范围的桥接命令与可执行原生名称/别名并集. Telegram 没有 topic 命令 scope: 同 chat topic 共享并集, 不同 chat 相互独立. 菜单可见性不授予执行权限. 名称本身须匹配 `[a-z0-9_]{1,32}`; 桥接条目/描述优先, 排除隐藏 `/start` 与被拒绝生命周期名称, 原生描述固定为通用文本, 排序去重的原生条目填充剩余空间直到总数 100. 省略的可执行名称仍能手动调用.
+[`command_menu.go`](../internal/bridge/command_menu.go) 保留默认桥接菜单, 并发布 chat 范围的桥接命令与可执行原生名称/别名并集. Telegram 没有 topic 命令 scope: 同 chat topic 共享并集, 不同 chat 相互独立. 菜单可见性不授予执行权限. 名称本身须匹配 `[a-z0-9_]{1,32}`; 桥接条目/描述优先, 排除隐藏 `/start` 与被拒绝生命周期名称, 排序去重的原生条目填充剩余空间直到总数 100. 省略的可执行名称仍能手动调用.
 
-Session/catalog 失效清空旧 contribution. 逻辑 close/replacement/failure/shutdown 只移除该 worker 的 contribution; 空闲进程释放保留它. 指针 owner 与 inactive tombstone 阻止退役 worker 的迟到更新/移除. 启动重置允许 chat scope, 但不丢弃早到目录.
+恢复 worker 和开始轮询前, 启动流程在 `storage.workspace_root` 中运行一个有界的 `omp --mode rpc --no-session` 发现进程, 沿用已选启动参数和配置的环境, 不覆盖 OMP 设置. [`DiscoverCommands`](../internal/omp/catalog.go) 持续读取并丢弃事件, 请求官方目录, 返回前关闭并回收进程和事件读取协程. 发现 deadline 为 20 秒, 不发送 prompt, 不写原生 session 历史或 bridge binding/start intent, 在正常运行时名额投入使用前结束. 仅允许的 builtin 名称和别名填充内存回退目录; workspace 专属来源等待真实会话. 失败只记录通用分类, 保留 bridge 菜单及后续 worker 的发现路径.
 
-单一后台 publisher 合并 dirty chat, 在 actor/reader 外以 20 秒 deadline 写入默认语言和 `zh` scope. 每 chat/language 缓存已确认列表. 失败不使任务失败; 后续 contribution 改变可重试, 没有独立重试循环. 不确定发布会清空先前成功缓存, 因 Telegram 可能已应用更新; 明确拒绝保留缓存. 菜单状态不在本地持久化, 已发布原生名称对 chat 成员可见, 包括无权操作 bot 的成员. 原始目录, 描述和参数不进入菜单诊断.
+每个 chat 在活跃 topic 公布权威目录前使用启动回退目录. 真实 topic 目录随后替换回退目录, 包括空目录和不支持目录. 未知目录清除该 topic 的旧贡献, 但不把回退目录替换成权威空列表. 移除或使最后一个已知贡献失效后恢复回退目录. 探针仍会正常初始化 OMP 配置和扩展; `--no-session` 不保证隔离或没有任何副作用.
+
+可执行原生命令及别名使用 OMP 提供的说明, 规范为最多 256 个 UTF-16 单位的单行文本. 缺失, null, 非字符串或仅有空白的说明不使目录无效, 菜单使用通用说明. 被拒绝的命令不保留说明. 目录相等性包含规范化说明, 因而只修改说明也会推进 revision 并刷新菜单. 不同 topic 公布同名命令时优先非空说明, 多个非空说明选择字典序最小者, 保持 chat 并集确定性.
+
+Session/catalog 失效清空旧 contribution. 逻辑 close/replacement/failure/shutdown 只移除该 worker 的 contribution; 空闲进程释放保留它. 指针 owner 与 inactive tombstone 阻止退役 worker 的迟到更新/移除. 启动时直接发布发现的 builtin 回退目录, 不先把 chat 菜单替换为仅含 bridge 命令的列表, 同时保留早到的权威目录.
+
+单一后台 publisher 合并 dirty chat, 在 actor/reader 外以 20 秒 deadline 写入默认语言和 `zh` scope. 每 chat/language 缓存已确认列表. 失败不使任务失败; 后续 contribution 改变可重试, 没有独立重试循环. 不确定发布会清空先前成功缓存, 因 Telegram 可能已应用更新; 明确拒绝保留缓存. 菜单状态不在本地持久化, 已发布原生名称和说明对 chat 成员可见, 包括无权操作 bot 的成员. 原始目录, 描述和参数不进入菜单诊断.
 
 ### 原生对话与 session operation
 
@@ -405,7 +413,7 @@ Clear 要求实例空闲, 队列为空, 没有未解决引导, 并取得绑定�
 
 ### 重启恢复与空闲释放
 
-轮询前, [`restoreWorkers`](../internal/bridge/recovery.go)为已授权且受支持的运行中绑定重建逻辑认领. 此时不启动 OMP 进程, 不占运行时名额. 保存的会话文件必须是绝对路径上的普通文件, 工作目录必须是可用的绝对目录. 文件或目录不可用时, 关闭该绑定的恢复资格并报告跳过, 不创建替代会话. 已保存认领身份冲突或不可用时使恢复失败, 而不是共享会话.
+轮询前, [`restoreWorkers`](../internal/bridge/recovery.go)为已授权且受支持的运行中绑定重建逻辑认领. 此时不启动保存会话的 OMP 进程, 不占运行时名额; 独立的临时菜单发现进程已经退出. 保存的会话文件必须是绝对路径上的普通文件, 工作目录必须是可用的绝对目录. 文件或目录不可用时, 关闭该绑定的恢复资格并报告跳过, 不创建替代会话. 已保存认领身份冲突或不可用时使恢复失败, 而不是共享会话.
 
 带中断标记的绑定收到警告并清除标记, 不改变代际. 已提交任务不重放; 按输入恢复策略取消待处理的提示词类输入. 未完成的启动意图只报告, 不作为另一次启动尝试执行. `/close` 仍是显式取消路径.
 
@@ -698,6 +706,8 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
 
 Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 request 和 epoch, 再注入 deadline 错误; 根任务, session 和队列断言仍然适用. RPC 测试单独覆盖真实 context deadline, 合并发现请求和迟到响应. 不为测试提速缩短生产查询 deadline.
+
+会进入原生启动路径的单元测试必须使用 RPC 子进程 fixture 的绝对可执行路径和隔离 workspace. 启动取消及菜单注册拒绝场景在 `PATH` 中没有 `omp` 的环境下验证; 只有显式真实 OMP smoke 可以依赖本机安装的 OMP.
 
 真实 OMP smoke 必须使用隔离的 profile, workspace, 数据库和显式 environment 策略. 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 

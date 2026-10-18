@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -677,6 +678,10 @@ func TestDaemonRecoveryMissingSessionAfterStartupReportsOnce(t *testing.T) {
 }
 
 func TestDaemonRecoveryStartsProcessesOnlyOnDemand(t *testing.T) {
+	starts := filepath.Join(t.TempDir(), "starts.jsonl")
+	sessions := t.TempDir()
+	t.Setenv("OMP_TELEGRAM_FIXTURE_ARGV_TRACE", starts)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT", sessions)
 	d := newRecoveryDaemon(t, 2)
 	d.command(11, "/new "+t.TempDir())
 	d.command(22, "/new "+t.TempDir())
@@ -684,6 +689,27 @@ func TestDaemonRecoveryStartsProcessesOnlyOnDemand(t *testing.T) {
 	d.stop()
 	d.cfg.MaxWorkers = 1
 	d.start()
+	// A bridge-only control confirms recovery and polling are ready without
+	// waking a saved runtime, unlike the state-query checks below.
+	d.command(33, "/help")
+	// Cold topics must not launch persistent runtimes, but each daemon lifetime
+	// legitimately starts one ephemeral menu discovery process.
+	trace := readStringArgvTrace(t, starts)
+	ephemeral, persistent := 0, 0
+	for _, args := range trace {
+		if slices.Contains(args, "--no-session") {
+			ephemeral++
+		} else {
+			persistent++
+		}
+	}
+	if ephemeral != 2 || persistent != 2 {
+		t.Fatalf("cold recovery launches = ephemeral:%d persistent:%d, want two bootstraps and only the original two runtimes", ephemeral, persistent)
+	}
+	entries, err := os.ReadDir(sessions)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("cold recovery changed saved native history: %v, %v", entries, err)
+	}
 	for _, b := range before {
 		d.cold(b)
 	}

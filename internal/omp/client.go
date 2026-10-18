@@ -65,6 +65,7 @@ type Config struct {
 	Binary, CWD, Resume string
 	Args                []string
 	Environment         Environment
+	NoSession           bool
 }
 type result struct {
 	data json.RawMessage
@@ -140,6 +141,9 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	if err := ValidateArgs(cfg.Args); err != nil {
 		return nil, err
 	}
+	if cfg.Resume != "" && cfg.NoSession {
+		return nil, errors.New("omp: resume and no-session lifecycle selections conflict")
+	}
 	if cfg.Binary == "" {
 		cfg.Binary = "omp"
 	}
@@ -153,6 +157,9 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 		args = append(args, "--resume", cfg.Resume)
 	}
 	args = append(args, cfg.Args...)
+	if cfg.NoSession {
+		args = append(args, "--no-session")
+	}
 	cmd := exec.Command(cfg.Binary, args...)
 	cmd.Env = ChildEnv(cfg.Environment)
 	cmd.Dir = cfg.CWD

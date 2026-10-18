@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"maps"
 	"strings"
+	"unicode"
 )
 
 // CommandCatalogState distinguishes undiscovered, available, and explicitly unsupported catalogs.
@@ -28,15 +30,54 @@ const (
 	commandSourceAutoresearch
 )
 
+type commandInfo struct {
+	source      commandSource
+	description string
+}
+
 // CommandCatalog is an immutable snapshot scoped to one logical native session.
 // Revision increases on replacement; Epoch increases when the session scope is invalidated.
-// Names and aliases may be deliberately published in chat-scoped menus, but must not be logged or persisted.
+// Names, aliases, and descriptions may be published in chat-scoped menus, but must not be logged or persisted.
 type CommandCatalog struct {
 	State     CommandCatalogState
 	Revision  uint64
 	Epoch     uint64
 	SessionID string
-	commands  map[string]commandSource
+	commands  map[string]commandInfo
+}
+
+// DiscoverCommands owns a single sessionless RPC process and discards all events.
+// The caller supplies the deadline; the process and event drainer are joined before return.
+func DiscoverCommands(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (CommandCatalog, error) {
+	cfg.NoSession = true
+	client, err := Start(ctx, cfg, rpcLogger)
+	if err != nil {
+		if ctx.Err() != nil {
+			return CommandCatalog{}, ctx.Err()
+		}
+		return CommandCatalog{}, err
+	}
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range client.Events() {
+		}
+	}()
+	defer func() {
+		_ = client.Close()
+		<-drained
+	}()
+	if _, err := client.RefreshCommandCatalog(ctx); err != nil {
+		return CommandCatalog{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CommandCatalog{}, err
+	}
+	catalog := client.CommandCatalog()
+	if catalog.State != CatalogReady {
+		return CommandCatalog{}, errors.New("omp: command discovery unavailable")
+	}
+	return catalog, nil
 }
 
 // HasCommand accepts an advertised name or alias without a leading slash.
@@ -47,8 +88,17 @@ func (s CommandCatalog) HasCommand(name string) bool {
 
 // HasExecutableCommand permits known sources and the explicitly supported autoresearch extension.
 func (s CommandCatalog) HasExecutableCommand(name string) bool {
-	source := s.commands[name]
+	source := s.commands[name].source
 	return s.State == CatalogReady && executableCommand(source)
+}
+
+// CommandDescription returns a bounded, single-line description only for executable commands.
+func (s CommandCatalog) CommandDescription(name string) string {
+	info := s.commands[name]
+	if s.State != CatalogReady || !executableCommand(info.source) {
+		return ""
+	}
+	return info.description
 }
 
 // ExecutableCommands yields advertised names and aliases permitted by the bridge.
@@ -57,8 +107,8 @@ func (s CommandCatalog) ExecutableCommands(yield func(string) bool) {
 	if s.State != CatalogReady {
 		return
 	}
-	for name, source := range s.commands {
-		if executableCommand(source) && !yield(name) {
+	for name, info := range s.commands {
+		if executableCommand(info.source) && !yield(name) {
 			return
 		}
 	}
@@ -70,12 +120,12 @@ func executableCommand(source commandSource) bool {
 
 // HasBuiltinCommand limits colon/whitespace invocation syntax to advertised builtins.
 func (s CommandCatalog) HasBuiltinCommand(name string) bool {
-	return s.State == CatalogReady && s.commands[name] == commandSourceBuiltin
+	return s.State == CatalogReady && s.commands[name].source == commandSourceBuiltin
 }
 
 // HasExtensionCommand identifies advertised extensions that may change native session ownership.
 func (s CommandCatalog) HasExtensionCommand(name string) bool {
-	source := s.commands[name]
+	source := s.commands[name].source
 	return s.State == CatalogReady && (source == commandSourceExtension || source == commandSourceAutoresearch)
 }
 
@@ -188,20 +238,21 @@ func validCommandName(name string) bool {
 	return name != "" && !strings.HasPrefix(name, "/")
 }
 
-// Retain only recognition fields and compact source classification. Other metadata
-// must not escape into diagnostic errors.
-func parseCommandCatalog(data []byte) (map[string]commandSource, error) {
+// Retain only recognition fields, compact source classification, and bounded descriptions
+// for executable commands. Raw metadata must not escape into diagnostic errors.
+func parseCommandCatalog(data []byte) (map[string]commandInfo, error) {
 	var payload struct {
 		Commands []struct {
-			Name    string          `json:"name"`
-			Aliases json.RawMessage `json:"aliases"`
-			Source  json.RawMessage `json:"source"`
+			Name        string          `json:"name"`
+			Aliases     json.RawMessage `json:"aliases"`
+			Source      json.RawMessage `json:"source"`
+			Description json.RawMessage `json:"description"`
 		} `json:"commands"`
 	}
 	if json.Unmarshal(data, &payload) != nil || payload.Commands == nil {
 		return nil, errProtocol
 	}
-	commands := make(map[string]commandSource, len(payload.Commands))
+	commands := make(map[string]commandInfo, len(payload.Commands))
 	for _, command := range payload.Commands {
 		if !validCommandName(command.Name) {
 			return nil, errProtocol
@@ -218,10 +269,22 @@ func parseCommandCatalog(data []byte) (map[string]commandSource, error) {
 				classification = commandSourceOther
 			}
 		}
-		commands[command.Name] = classification
+		info := commandInfo{source: classification}
 		if command.Name == "autoresearch" && classification == commandSourceExtension {
-			commands[command.Name] = commandSourceAutoresearch
+			info.source = commandSourceAutoresearch
 		}
+		if executableCommand(info.source) {
+			var description string
+			if json.Unmarshal(command.Description, &description) == nil {
+				info.description = normalizeCommandDescription(description)
+			}
+		}
+		commands[command.Name] = info
+		// The autoresearch exception applies to its canonical name, not extension aliases.
+		if !executableCommand(classification) {
+			info.description = ""
+		}
+		info.source = classification
 		if command.Aliases == nil {
 			continue
 		}
@@ -234,11 +297,44 @@ func parseCommandCatalog(data []byte) (map[string]commandSource, error) {
 				return nil, errProtocol
 			}
 			if alias != command.Name {
-				commands[alias] = classification
+				commands[alias] = info
 			}
 		}
 	}
 	return commands, nil
+}
+
+// Normalize in one pass, retaining at most Telegram's 256 UTF-16 code units.
+func normalizeCommandDescription(description string) string {
+	var normalized strings.Builder
+	units := 0
+	space := false
+	for _, char := range description {
+		if unicode.IsSpace(char) || unicode.IsControl(char) {
+			space = units > 0
+			continue
+		}
+		width := 1
+		if char > 0xffff {
+			width = 2
+		}
+		if space {
+			width++
+		}
+		if units+width > 256 {
+			break
+		}
+		if units == 0 {
+			normalized.Grow(min(len(description), 256*3))
+		}
+		if space {
+			normalized.WriteByte(' ')
+		}
+		normalized.WriteRune(char)
+		units += width
+		space = false
+	}
+	return normalized.String()
 }
 
 func (c *Client) receiveCommandCatalogUpdate(frame []byte) error {
@@ -260,7 +356,7 @@ func (c *Client) receiveCommandCatalogUpdate(frame []byte) error {
 // since request registration, or a changed session scope, always wins.
 func (c *Client) receiveCommandCatalogResponse(query *commandCatalogQuery, env envelope) error {
 	state := CatalogReady
-	var commands map[string]commandSource
+	var commands map[string]commandInfo
 	if !*env.Success {
 		// Only the native unknown-command rejection proves lack of discovery support.
 		var rejection string

@@ -254,6 +254,12 @@ The exact native `/autoresearch` extension has dedicated support. The following 
 
 The Telegram menu lists bridge commands and available native commands. Telegram allows at most 100 entries with restricted command names; supported commands that do not fit can still be typed manually.
 
+At startup, one temporary OMP RPC process discovers built-in commands before chat menus are published. It sends no prompt and saves no session; workspace-specific commands appear after their sessions connect. If discovery fails, the bridge menu remains available.
+
+Native commands and aliases use descriptions advertised by OMP; commands without usable descriptions keep a generic label. These descriptions are visible to everyone who can view the chat.
+
+Native text output, including `/shake` summaries, is delivered as separate messages. Local commands do not require a model reply; later background output does not confirm task completion.
+
 Command recognition and source restrictions are documented in [Architecture](doc/architecture.md#native-command-recognition-and-submission).
 
 All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.

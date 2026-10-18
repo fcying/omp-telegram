@@ -54,6 +54,12 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
+		fixtureDiscoveryStart()
+		if os.Getenv("OMP_TEST_DISCOVERY_WAIT_READY") == "1" {
+			fixtureDiscoveryWrite("waiting", "ready")
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			os.Exit(0)
+		}
 		if os.Getenv("OMP_TEST_RPC_EOF_BEFORE_READY") == "1" {
 			_ = os.Stdout.Close()
 			_, _ = io.Copy(io.Discard, os.Stdin)
@@ -65,12 +71,14 @@ func TestMain(m *testing.M) {
 		for {
 			line, err := input.ReadBytes('\n')
 			if err != nil {
+				fixtureDiscoveryFinish()
 				os.Exit(0)
 			}
 			var command map[string]any
 			if json.Unmarshal(line, &command) != nil {
 				os.Exit(1)
 			}
+			fixtureDiscoveryRecord(command)
 			if fixtureSessionCommand(command) {
 				continue
 			}

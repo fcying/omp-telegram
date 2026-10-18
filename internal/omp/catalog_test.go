@@ -1,14 +1,21 @@
 package omp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf16"
 )
 
 var fixtureCatalogPending map[string]any
@@ -72,6 +79,16 @@ func fixtureCatalogCommand(command map[string]any) bool {
 		switch mode {
 		case "empty":
 			data["commands"] = []any{}
+		case "discovery":
+			// Enough paced notifications to overflow an undrained event queue.
+			for range 256 {
+				emit(map[string]any{"type": "discovery_notice", "private": rpcSensitiveCanary})
+				time.Sleep(time.Millisecond)
+			}
+			data["commands"] = []map[string]any{
+				{"name": "shake", "aliases": []string{"reset_context"}, "source": "builtin", "description": "Native context reset"},
+				{"name": "custom", "source": "extension", "description": rpcSensitiveCanary},
+			}
 		case "sources":
 			data["commands"] = sourceCommands(fixtureCatalogQueryCount > 1)
 		case "unicode":
@@ -189,6 +206,390 @@ func finishCatalogRefresh(t *testing.T, finished <-chan catalogRefreshResult) (u
 	case <-time.After(5 * time.Second):
 		t.Fatal("catalog refresh did not finish")
 		return 0, nil
+	}
+}
+
+func fixtureDiscoveryWrite(name, value string) {
+	dir := os.Getenv("OMP_TEST_DISCOVERY_DIR")
+	if dir == "" {
+		return
+	}
+	file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		os.Exit(3)
+	}
+	if _, err := file.WriteString(value + "\n"); err != nil {
+		os.Exit(3)
+	}
+	if err := file.Close(); err != nil {
+		os.Exit(3)
+	}
+}
+
+func fixtureDiscoveryStart() {
+	fixtureDiscoveryWrite("starts", strconv.Itoa(os.Getpid()))
+	for _, arg := range os.Args[1:] {
+		if arg == "--no-session" {
+			return
+		}
+	}
+	fixtureDiscoveryWrite("history", "persistent session")
+}
+
+func fixtureDiscoveryRecord(command map[string]any) {
+	if kind, ok := command["type"].(string); ok {
+		fixtureDiscoveryWrite("requests", kind)
+	}
+}
+
+func fixtureDiscoveryFinish() {
+	if os.Getenv("OMP_TEST_DISCOVERY_DIR") != "" && os.Getenv("OMP_TEST_CATALOG_MODE") == "discovery" {
+		// Shutdown may replace the live catalog but must not mutate the returned snapshot.
+		fmt.Println(`{"type":"available_commands_update","commands":[{"name":"shutdown_only","source":"builtin"}]}`)
+	}
+	fixtureDiscoveryWrite("closed", "stdin EOF")
+}
+
+func discoveryFixture(t *testing.T, mode string) Config {
+	t.Helper()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	t.Setenv("OMP_TEST_DISCOVERY_DIR", dir)
+	t.Setenv("OMP_TEST_CATALOG_MODE", mode)
+	return Config{Binary: binary, CWD: dir}
+}
+
+func assertDiscoveryReaped(t *testing.T, cfg Config) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(cfg.CWD, "starts"))
+	if err != nil {
+		t.Fatal("discovery subprocess did not record its start")
+	}
+	starts := strings.Fields(string(data))
+	if len(starts) != 1 {
+		t.Fatal("discovery did not own exactly one subprocess")
+	}
+	pid, err := strconv.Atoi(starts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
+		t.Fatalf("discovery returned before reaping its subprocess: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.CWD, "history")); !os.IsNotExist(err) {
+		t.Fatal("ephemeral discovery created persistent session history")
+	}
+	requests, err := os.ReadFile(filepath.Join(cfg.CWD, "requests"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, request := range strings.Fields(string(requests)) {
+		if request != "negotiate_protocol" && request != "get_available_commands" {
+			t.Fatal("discovery submitted a task or performed unrelated RPC work")
+		}
+	}
+}
+
+func TestDiscoverCommandsReturnsOwnedReadySnapshot(t *testing.T) {
+	for _, mode := range []string{"discovery", "empty"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := discoveryFixture(t, mode)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			catalog, err := DiscoverCommands(ctx, cfg, testRPCLogger())
+			if err != nil || catalog.State != CatalogReady {
+				t.Fatalf("discovery did not return a ready catalog: %v", err)
+			}
+			assertDiscoveryReaped(t, cfg)
+			if _, err := os.Stat(filepath.Join(cfg.CWD, "closed")); err != nil {
+				t.Fatal("discovery did not close its owned input before returning")
+			}
+			if mode == "empty" {
+				if len(catalog.commands) != 0 {
+					t.Fatal("empty ready catalog gained commands")
+				}
+				return
+			}
+			for _, name := range []string{"shake", "reset_context"} {
+				if !catalog.HasBuiltinCommand(name) || catalog.CommandDescription(name) == "" {
+					t.Fatal("discovery lost builtin names, aliases, or descriptions during shutdown")
+				}
+			}
+			if !catalog.HasExtensionCommand("custom") || catalog.HasCommand("shutdown_only") {
+				t.Fatal("owned shutdown mutated the retained discovery snapshot")
+			}
+		})
+	}
+}
+
+func TestDiscoverCommandsFailuresReapOwnedProcess(t *testing.T) {
+	for _, mode := range []string{"rejected", "unsupported", "missing", "invalid_alias", "transport", "startup_failure"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := discoveryFixture(t, mode)
+			if mode == "startup_failure" {
+				t.Setenv("OMP_TEST_RPC_EOF_BEFORE_READY", "1")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			catalog, err := DiscoverCommands(ctx, cfg, logger)
+			if err == nil || catalog.State == CatalogReady || len(catalog.commands) != 0 {
+				t.Fatal("failed discovery exposed a usable catalog")
+			}
+			if strings.Contains(err.Error(), rpcSensitiveCanary) || strings.Contains(logs.String(), rpcSensitiveCanary) {
+				t.Fatal("discovery leaked native diagnostics")
+			}
+			assertDiscoveryReaped(t, cfg)
+		})
+	}
+}
+
+func TestDiscoverCommandsCancellationReapsOwnedProcess(t *testing.T) {
+	for _, phase := range []string{"startup", "query"} {
+		t.Run(phase, func(t *testing.T) {
+			cfg := discoveryFixture(t, "deferred")
+			if phase == "startup" {
+				t.Setenv("OMP_TEST_DISCOVERY_WAIT_READY", "1")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			finished := make(chan error, 1)
+			go func() {
+				_, err := DiscoverCommands(ctx, cfg, testRPCLogger())
+				finished <- err
+			}()
+			deadline := time.After(5 * time.Second)
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			waiting := true
+			for waiting {
+				select {
+				case err := <-finished:
+					t.Fatalf("discovery returned before cancellation: %v", err)
+				case <-deadline:
+					t.Fatal("discovery did not reach the cancellation fixture")
+				case <-ticker.C:
+					if phase == "startup" {
+						_, err := os.Stat(filepath.Join(cfg.CWD, "waiting"))
+						waiting = err != nil
+					} else {
+						data, _ := os.ReadFile(filepath.Join(cfg.CWD, "requests"))
+						waiting = !strings.Contains(string(data), "get_available_commands\n")
+					}
+				}
+			}
+			cancel()
+			select {
+			case err := <-finished:
+				if err == nil || ClassifyError(err) != "cancelled" {
+					t.Fatal("cancelled discovery did not report cancellation")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("cancelled discovery did not join its owned subprocess")
+			}
+			assertDiscoveryReaped(t, cfg)
+		})
+	}
+}
+
+func TestEphemeralLifecycleRejectsConflictingSelectionsBeforeStart(t *testing.T) {
+	for _, mode := range []string{"resume", "discover_resume", "args"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := discoveryFixture(t, "empty")
+			cfg.NoSession = true
+			if mode == "args" {
+				cfg.Args = []string{"--no-session"}
+			} else {
+				cfg.Resume = "saved-session"
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var err error
+			if mode == "discover_resume" {
+				cfg.NoSession = false
+				_, err = DiscoverCommands(ctx, cfg, testRPCLogger())
+			} else {
+				var client *Client
+				client, err = Start(ctx, cfg, testRPCLogger())
+				if client != nil {
+					_ = client.Close()
+				}
+			}
+			if err == nil {
+				t.Fatal("conflicting or user-owned lifecycle selection was accepted")
+			}
+			if _, err := os.Stat(filepath.Join(cfg.CWD, "starts")); !os.IsNotExist(err) {
+				t.Fatal("invalid lifecycle selection launched a subprocess")
+			}
+		})
+	}
+}
+
+func TestCommandCatalogDescriptionNormalization(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		description string
+		want        string
+	}{
+		{"whitespace-and-controls", " \t\r\n\x00 First\u00a0\u2003line\u2028next\x1b\x7fword \n", "First line next word"},
+		{"empty", "", ""},
+		{"only-separators", "\t\x00\u2029\x7f ", ""},
+		{"ascii-limit", strings.Repeat("a", 256), strings.Repeat("a", 256)},
+		{"ascii-truncation", strings.Repeat("a", 257), strings.Repeat("a", 256)},
+		{"bmp-limit", strings.Repeat("界", 257), strings.Repeat("界", 256)},
+		{"supplementary-limit", strings.Repeat("😀", 129), strings.Repeat("😀", 128)},
+		{"no-split-surrogate-pair", strings.Repeat("a", 255) + "😀tail", strings.Repeat("a", 255)},
+		{"separator-at-limit", strings.Repeat("a", 254) + "\n b", strings.Repeat("a", 254) + " b"},
+		{"no-trailing-separator", strings.Repeat("a", 255) + "\n b", strings.Repeat("a", 255)},
+		{"large-description", strings.Repeat("a", 1<<20), strings.Repeat("a", 256)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{"commands": []map[string]any{{
+				"name": "native", "source": "builtin", "aliases": []string{"alias"}, "description": test.description,
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			commands, err := parseCommandCatalog(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog := CommandCatalog{State: CatalogReady, commands: commands}
+			for _, name := range []string{"native", "alias"} {
+				got := catalog.CommandDescription(name)
+				if got != test.want || len(utf16.Encode([]rune(got))) > 256 || strings.ContainsFunc(got, func(char rune) bool {
+					return unicode.IsControl(char) || (unicode.IsSpace(char) && char != ' ')
+				}) {
+					t.Fatal("catalog description was not normalized within its UTF-16 bound")
+				}
+			}
+		})
+	}
+}
+
+func TestCommandCatalogOptionalDescriptionsDoNotRejectCommands(t *testing.T) {
+	for _, description := range []string{"", `,"description":null`, `,"description":true`, `,"description":42`, `,"description":[]`, `,"description":{"text":"private"}`} {
+		commands, err := parseCommandCatalog([]byte(`{"commands":[{"name":"native","source":"file","aliases":["alias"]` + description + `}]}`))
+		if err != nil {
+			t.Fatal("optional description rejected a valid catalog")
+		}
+		catalog := CommandCatalog{State: CatalogReady, commands: commands}
+		for _, name := range []string{"native", "alias"} {
+			if !catalog.HasExecutableCommand(name) || catalog.CommandDescription(name) != "" {
+				t.Fatal("invalid optional description changed command authorization or became visible")
+			}
+		}
+	}
+}
+
+func TestCommandCatalogDescriptionsRespectSourceAndState(t *testing.T) {
+	for _, source := range []string{"builtin", "file", "custom", "skill", "mcp_prompt", "extension", "future", ""} {
+		for _, name := range []string{"native", "autoresearch"} {
+			raw, err := json.Marshal(map[string]any{"commands": []map[string]any{{
+				"name": name, "source": source, "aliases": []string{"alias"}, "description": " Advertised\nsummary ",
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			commands, err := parseCommandCatalog(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog := CommandCatalog{State: CatalogReady, commands: commands}
+			for _, command := range []string{name, "alias", "absent"} {
+				want := ""
+				if catalog.HasExecutableCommand(command) {
+					want = "Advertised summary"
+				}
+				if catalog.CommandDescription(command) != want || commands[command].description != want {
+					t.Fatal("description was omitted for an executable command or retained for a denied command")
+				}
+				for _, state := range []CommandCatalogState{CatalogUnknown, CatalogUnsupported} {
+					unavailable := catalog
+					unavailable.State = state
+					if unavailable.CommandDescription(command) != "" {
+						t.Fatal("unavailable catalog exposed a description")
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestCommandCatalogDescriptionCollisionsFollowSourcePriority(t *testing.T) {
+	for _, raw := range []string{
+		`{"commands":[{"name":"first","source":"builtin","aliases":["shared"],"description":"allowed"},{"name":"shared","source":"extension","description":"denied"}]}`,
+		`{"commands":[{"name":"shared","source":"builtin","description":"allowed"},{"name":"last","source":"extension","aliases":["shared"],"description":"denied"}]}`,
+	} {
+		commands, err := parseCommandCatalog([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		catalog := CommandCatalog{State: CatalogReady, commands: commands}
+		if !catalog.HasExtensionCommand("shared") || catalog.HasExecutableCommand("shared") || catalog.CommandDescription("shared") != "" || commands["shared"].description != "" {
+			t.Fatal("a displaced source left behind its authorization or description")
+		}
+	}
+	commands, err := parseCommandCatalog([]byte(`{"commands":[{"name":"shared","source":"extension","description":"denied"},{"name":"last","source":"builtin","aliases":["shared","last"],"description":"allowed"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := CommandCatalog{State: CatalogReady, commands: commands}
+	if !catalog.HasBuiltinCommand("shared") || catalog.CommandDescription("shared") != "allowed" || catalog.CommandDescription("last") != "allowed" {
+		t.Fatal("a winning executable alias did not replace the prior source and description")
+	}
+}
+
+func TestCommandCatalogDescriptionChangesAdvanceRevisionWithoutMutatingSnapshots(t *testing.T) {
+	payload := func(description string) []byte {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{"commands": []map[string]any{{
+			"name": "native", "source": "builtin", "aliases": []string{"alias"}, "description": description,
+		}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	client := &Client{}
+	if err := client.receiveCommandCatalogUpdate(payload(" First\nsummary ")); err != nil {
+		t.Fatal(err)
+	}
+	initial := client.CommandCatalog()
+	query := &commandCatalogQuery{epoch: initial.Epoch, updateRevision: client.catalogUpdateRevision}
+	success := true
+	if err := client.receiveCommandCatalogResponse(query, envelope{Success: &success, Data: payload("First summary")}); err != nil {
+		t.Fatal(err)
+	}
+	if client.CommandCatalog().Revision != initial.Revision {
+		t.Fatal("equivalent normalized description changed the catalog revision")
+	}
+	if err := client.receiveCommandCatalogResponse(query, envelope{Success: &success, Data: payload("Second summary")}); err != nil {
+		t.Fatal(err)
+	}
+	queried := client.CommandCatalog()
+	if queried.Revision <= initial.Revision || queried.Epoch != initial.Epoch {
+		t.Fatal("description-only query change did not advance the catalog revision")
+	}
+	if err := client.receiveCommandCatalogUpdate(payload("Third summary")); err != nil {
+		t.Fatal(err)
+	}
+	updated := client.CommandCatalog()
+	if updated.Revision <= queried.Revision {
+		t.Fatal("description update did not advance the catalog revision")
+	}
+	client.InvalidateCommandCatalog()
+	for _, name := range []string{"native", "alias"} {
+		if initial.CommandDescription(name) != "First summary" || queried.CommandDescription(name) != "Second summary" || updated.CommandDescription(name) != "Third summary" {
+			t.Fatal("later catalog changes mutated a retained description snapshot")
+		}
+		if client.CommandCatalog().CommandDescription(name) != "" {
+			t.Fatal("invalidated catalog exposed a retained description")
+		}
 	}
 }
 

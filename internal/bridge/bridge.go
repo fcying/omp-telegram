@@ -436,6 +436,7 @@ type rpcEvent struct {
 	Configured            *string                      `json:"configured"`
 	Title                 string                       `json:"title"`
 	Message               json.RawMessage              `json:"message"`
+	Text                  string                       `json:"text"`
 	Options               []string                     `json:"options"`
 	AgentInvoked          *bool                        `json:"agentInvoked"`
 	IsTerminal            *bool                        `json:"isTerminal"`
@@ -535,6 +536,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		storeLog.Error("OMP argument selection load failed", "event", "omp_args_selection_failed", "error_kind", "persistence")
 		return err
 	}
+	b.bootstrapCommandMenus(ctx)
 	// Command menus improve discoverability but are not required for polling.
 	registered := 0
 	for _, language := range []string{"", "zh"} {
@@ -3551,6 +3553,8 @@ func (w *worker) event(raw []byte) {
 		return
 	}
 	switch e.Type {
+	case "command_output":
+		w.nativeCommandOutput(e.Text)
 	case "thinking_level_changed":
 		if e.Configured != nil {
 			w.configuredThinking = *e.Configured
