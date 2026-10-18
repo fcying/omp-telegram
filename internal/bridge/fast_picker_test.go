@@ -77,8 +77,8 @@ func TestFastPickerOwnershipCancelReplayAndBusy(t *testing.T) {
 	messageID = f.messageCount()
 	clickKeyboard(w, 7, buttons[len(buttons)-1]["callback_data"].(string))
 	assertFastState(t, w, false, false)
-	if got := settingsMenuResult(t, f, messageID); got != "Cancel" {
-		t.Fatalf("cancelled fast menu = %q", got)
+	if got := settingsMenuResult(t, f, messageID); !strings.Contains(got, "fast mode") {
+		t.Fatalf("cancelled fast menu lost its operation context: %q", got)
 	}
 	command("/fast")
 	buttons = resumeButtons(t, f)

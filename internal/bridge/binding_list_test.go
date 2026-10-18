@@ -736,7 +736,10 @@ func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
 	c := onlyBindingConfirmation(t, w)
 	approve := bindingButton(t, fake, "Delete")
 	w.callback(&telegram.CallbackQuery{ID: "cancel-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Cancel")})
-	assertFinishedMenu(t, fake, int(c.messageID), "Cancel")
+	text := assertFinishedMenu(t, fake, int(c.messageID), "Cancel")
+	if !strings.Contains(text, "Topic 22") {
+		t.Fatal("cancelled binding deletion lost its conversation identity")
+	}
 	w.callback(&telegram.CallbackQuery{ID: "replay-delete", From: telegram.User{ID: 7}, Data: approve})
 	saved, err := db.Binding(closed.Bot, closed.Chat, closed.Thread)
 	requireStoreOK(t, err)

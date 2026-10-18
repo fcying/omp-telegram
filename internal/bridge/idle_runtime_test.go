@@ -44,13 +44,12 @@ func releasedIdleWorker(t *testing.T) (*worker, *fakeHTTP, func(string), store.B
 }
 func TestCompactResumesReleasedSession(t *testing.T) {
 	w, f, command, before := releasedIdleWorker(t)
+	w.operations = make(chan operationResult, 1)
 	command("/compact")
 	messageID := f.messageCount()
 	if w.client == nil || w.runtime != runtimeConnected || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("compact did not restore the released session")
 	}
-	w.operations = make(chan operationResult, 1)
-	clickKeyboard(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
 	w.operationReturned(waitOperation(t, w))
 	if w.sessionOperationActive() || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("compaction changed the restored session or left it busy")
@@ -59,32 +58,18 @@ func TestCompactResumesReleasedSession(t *testing.T) {
 }
 
 func TestCompactReportsResumeFailureInsteadOfBusy(t *testing.T) {
-	for _, phase := range []string{"command", "confirmation"} {
-		t.Run(phase, func(t *testing.T) {
-			w, f, command, before := releasedIdleWorker(t)
-			var button string
-			if phase == "confirmation" {
-				command("/compact")
-				button = resumeButtons(t, f)[0]["callback_data"].(string)
-				w.releaseRuntime(true)
-			}
-			w.b.cfg.OMP = t.TempDir() + "/missing-omp"
-			if phase == "command" {
-				command("/compact")
-			} else {
-				clickKeyboard(w, 7, button)
-			}
-			if w.client != nil || w.sessionOperationActive() || !sameBindingIdentity(w.binding, before) {
-				t.Fatal("failed resume changed the saved session or began compaction")
-			}
-			var text string
-			if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(text, "Failed to resume") || strings.Contains(text, "idle") {
-				t.Fatalf("runtime startup failure was misreported as busy: %q", text)
-			}
-		})
+	w, _, command, before := releasedIdleWorker(t)
+	w.b.cfg.OMP = t.TempDir() + "/missing-omp"
+	command("/compact")
+	if w.client != nil || w.sessionOperationActive() || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("failed resume changed the saved session or began compaction")
+	}
+	var text string
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Failed to resume") || strings.Contains(text, "idle") {
+		t.Fatalf("runtime startup failure was misreported as busy: %q", text)
 	}
 }
 
@@ -181,6 +166,7 @@ func drainStatusOutput(t *testing.T, w *worker) {
 }
 
 func TestReleasedStatusQueriesSavedSessionAndReleasesRuntime(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_CONFIGURED_THINKING", "auto")
 	w, _, _, before := releasedIdleWorker(t)
 	w.status()
 	client := w.client
@@ -203,8 +189,8 @@ func TestReleasedStatusQueriesSavedSessionAndReleasesRuntime(t *testing.T) {
 	out, err := w.b.db.NextOutput()
 	requireStoreOK(t, err)
 	fields := statusFields(out.Text)
-	if fields["Model"] != "fixture/safe" || fields["Thinking"] != "medium" || fields["OMP"] != "released" {
-		t.Fatalf("status did not publish the native snapshot and final runtime state: %v", fields)
+	if fields["Model"] != "fixture/safe" || fields["Thinking"] != "auto" || fields["OMP"] != "released" {
+		t.Fatalf("status lost configured thinking while releasing its temporary runtime: %v", fields)
 	}
 	var native struct {
 		Prompts int `json:"fixtureRootPrompts"`
@@ -641,10 +627,6 @@ func TestIdleReleaseBlockedByThinkingConfirmation(t *testing.T) {
 
 func TestIdleReleaseBlockedByFastConfirmation(t *testing.T) {
 	assertIdleReleaseBlockedByConfirmation(t, "fast")
-}
-
-func TestIdleReleaseBlockedByCompactConfirmation(t *testing.T) {
-	assertIdleReleaseBlockedByConfirmation(t, "compact")
 }
 
 func TestIdleReleaseBlockedByNativeUIConfirmation(t *testing.T) {

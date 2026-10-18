@@ -412,8 +412,8 @@ func TestSessionDeleteCancelAndRejectedTargetsKeepNativeFile(t *testing.T) {
 			clickSessionButton(w, f, 7, rows[0][index]["callback_data"].(string))
 			if scenario == "cancel" {
 				text, rows := pickerView(t, f)
-				if text != "Cancel" || len(rows) != 0 {
-					t.Fatalf("cancelled delete retained its question or choices: %q; %v", text, rows)
+				if !strings.Contains(text, selected.ID) || len(rows) != 0 {
+					t.Fatalf("cancelled delete lost its target identity or retained choices: %q; %v", text, rows)
 				}
 			}
 			if _, err := os.Stat(saved); err != nil || w.deleteCancel != nil || w.b.sessionInUse(selected.ID) {

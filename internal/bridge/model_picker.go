@@ -4,17 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"omp-telegram/internal/omp"
 )
 
 type modelSettings struct {
-	Model           omp.Model `json:"model"`
-	ThinkingLevel   string    `json:"thinkingLevel"`
-	IsStreaming     bool      `json:"isStreaming"`
-	IsCompacting    bool      `json:"isCompacting"`
-	FastModeEnabled *bool     `json:"fastModeEnabled"`
-	FastModeActive  *bool     `json:"fastModeActive"`
+	Model              omp.Model `json:"model"`
+	ThinkingLevel      string    `json:"thinkingLevel"`
+	ConfiguredThinking string    `json:"configuredThinking"`
+	IsStreaming        bool      `json:"isStreaming"`
+	IsCompacting       bool      `json:"isCompacting"`
+	FastModeEnabled    *bool     `json:"fastModeEnabled"`
+	FastModeActive     *bool     `json:"fastModeActive"`
 }
 
 type modelOperationRequest struct {
@@ -29,9 +31,29 @@ type modelOperationRequest struct {
 	current   omp.Model
 }
 
+type modelSelectionResult struct {
+	omp.Model
+	ConfiguredThinking  string `json:"configuredThinking"`
+	ThinkingUnavailable bool   `json:"thinkingUnavailable"`
+}
+
+type thinkingSelectionResult struct {
+	ThinkingLevel       string `json:"thinkingLevel"`
+	ConfiguredThinking  string `json:"configuredThinking"`
+	ThinkingUnavailable bool   `json:"thinkingUnavailable"`
+}
+
 type modelFastResult struct {
 	Enabled *bool `json:"enabled"`
 	Active  *bool `json:"active"`
+}
+
+func modelSelectionWithThinking(ctx context.Context, client *omp.Client, model omp.Model) (json.RawMessage, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	configured, err := client.ConfiguredThinking(queryCtx)
+	// The mutation is already confirmed; this optional read cannot undo it.
+	return json.Marshal(modelSelectionResult{Model: model, ConfiguredThinking: configured, ThinkingUnavailable: err != nil})
 }
 
 func (w *worker) beginModelState(action string, request modelOperationRequest) bool {
@@ -136,11 +158,19 @@ func (w *worker) modelOperationFinished(result operationResult) {
 				if err != nil {
 					return nil, err
 				}
-				return json.Marshal(model)
+				return modelSelectionWithThinking(ctx, client, model)
 			}, 0, "", request)
 		case "model_switch":
 			w.startOperation("model_set_model", client, func(ctx context.Context) (json.RawMessage, error) {
-				return client.Call(ctx, "set_model", map[string]any{"provider": request.provider, "modelId": request.modelID})
+				raw, err := client.Call(ctx, "set_model", map[string]any{"provider": request.provider, "modelId": request.modelID})
+				if err != nil {
+					return nil, err
+				}
+				var model omp.Model
+				if err := json.Unmarshal(raw, &model); err != nil {
+					return nil, err
+				}
+				return modelSelectionWithThinking(ctx, client, model)
 			}, 0, "", request)
 		case "thinking_picker":
 			w.showThinkingPickerReady(request.user, state)
@@ -167,37 +197,59 @@ func (w *worker) modelOperationFinished(result operationResult) {
 			return
 		}
 		w.showModelPickerReady(request.user, request.current, roles)
-	case "model_set_role":
-		var model omp.Model
+	case "model_set_role", "model_set_model":
+		var model modelSelectionResult
 		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
 			w.endControlOperation()
-			w.say(modelOperationFailure("model_select"))
-			w.finishMenu(request.messageID, modelOperationFailure("model_select"))
+			if result.kind == "model_set_model" {
+				w.releaseRuntimeWithReason(true, "failure")
+			}
+			w.say(modelOperationFailure(request.action))
+			w.finishMenu(request.messageID, modelOperationFailure(request.action))
 			return
 		}
 		w.endControlOperation()
 		w.touchBinding()
+		w.configuredThinking = model.ConfiguredThinking
 		text := "Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + "."
-		w.say(text)
-		w.finishMenu(request.messageID, text+"\nRole: "+menuText(request.role, 120))
-	case "model_set_model":
-		var model omp.Model
-		if json.Unmarshal(result.data, &model) != nil || model.Provider == "" || model.ID == "" {
-			w.endControlOperation()
-			w.releaseRuntimeWithReason(true, "failure")
-			w.say(modelOperationFailure("model_switch"))
-			w.finishMenu(request.messageID, modelOperationFailure("model_switch"))
-			return
+		stopping := client.Stopping()
+		if model.ThinkingUnavailable {
+			w.configuredThinking = ""
+			text += "\nThinking: n/a\nThe model switch succeeded, but the follow-up thinking query failed"
+			if stopping {
+				text += " and the runtime was closed. The session was kept open."
+			} else {
+				text += "."
+			}
 		}
-		w.endControlOperation()
-		w.touchBinding()
-		w.say("Model switched to " + menuText(model.Provider+"/"+model.ID, 256) + ".")
+		if stopping {
+			// Retire before the actor can dispatch another call to this client.
+			w.releaseRuntimeWithReason(true, "failure")
+		}
+		w.say(text)
+		if result.kind == "model_set_role" {
+			w.finishMenu(request.messageID, text+"\nRole: "+menuText(request.role, 120))
+		}
 	case "model_set_thinking":
 		w.startOperation("model_verify_thinking", client, func(ctx context.Context) (json.RawMessage, error) {
-			return client.Call(ctx, "get_state", nil)
+			raw, err := client.Call(ctx, "get_state", nil)
+			if err != nil {
+				return nil, err
+			}
+			var state modelSettings
+			if err := json.Unmarshal(raw, &state); err != nil {
+				return nil, err
+			}
+			queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			configured, queryErr := client.ConfiguredThinking(queryCtx)
+			// The effective level is verified; the optional query cannot undo it.
+			return json.Marshal(thinkingSelectionResult{
+				ThinkingLevel: state.ThinkingLevel, ConfiguredThinking: configured, ThinkingUnavailable: queryErr != nil,
+			})
 		}, 0, "", request)
 	case "model_verify_thinking":
-		var state modelSettings
+		var state thinkingSelectionResult
 		if json.Unmarshal(result.data, &state) != nil || state.ThinkingLevel == "" {
 			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
@@ -207,9 +259,24 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		}
 		w.endControlOperation()
 		w.touchBinding()
+		w.configuredThinking = state.ConfiguredThinking
 		text := "Thinking level: " + menuText(state.ThinkingLevel, 32)
 		if state.ThinkingLevel != request.requested {
 			text += " (OMP adjusted the requested " + request.requested + " level)"
+		}
+		stopping := client.Stopping()
+		if state.ThinkingUnavailable {
+			w.configuredThinking = ""
+			text += "\nThinking: n/a\nThe thinking level change succeeded, but the follow-up thinking query failed"
+			if stopping {
+				text += " and the runtime was closed. The session was kept open."
+			} else {
+				text += "."
+			}
+		}
+		if stopping {
+			// Retire before the actor can dispatch another call to this client.
+			w.releaseRuntimeWithReason(true, "failure")
 		}
 		w.say(text)
 		w.finishMenu(request.messageID, text)

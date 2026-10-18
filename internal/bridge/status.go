@@ -13,10 +13,12 @@ import (
 
 // Decode only fields that are safe to display, never raw model configuration.
 type statusState struct {
+	// ConfiguredThinking is an actor-owned projection, not native effective state.
+	ConfiguredThinking string `json:"-"`
+
 	Model           omp.Model `json:"model"`
 	SessionID       string    `json:"sessionId"`
 	SessionName     string    `json:"sessionName"`
-	ThinkingLevel   string    `json:"thinkingLevel"`
 	FastModeEnabled *bool     `json:"fastModeEnabled"`
 	FastModeActive  *bool     `json:"fastModeActive"`
 	IsStreaming     *bool     `json:"isStreaming"`
@@ -65,7 +67,7 @@ func (s statusState) modelText() string {
 }
 
 func (s statusState) thinkingText() string {
-	if thinking := menuText(s.ThinkingLevel, 32); thinking != "" {
+	if thinking := menuText(s.ConfiguredThinking, 32); thinking != "" {
 		return thinking
 	}
 	return "n/a"

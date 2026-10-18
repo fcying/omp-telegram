@@ -101,6 +101,9 @@ func TestNewConfirmationDisplaysDecision(t *testing.T) {
 			}
 			text := assertFinishedMenu(t, f, messageID, expected)
 			if scenario == "cancel" {
+				if !strings.Contains(text, before.Workspace) {
+					t.Fatal("cancelled session replacement lost its workspace context")
+				}
 				if !sameBindingIdentity(w.binding, before) || w.client != client {
 					t.Fatal("cancel replaced the running session")
 				}
@@ -424,21 +427,20 @@ func TestCompactCompletionUsesOneMessageAndFreshUsage(t *testing.T) {
 		timeout     bool
 		newSession  bool
 		editFailure bool
+		sendFailure bool
 	}{
 		{name: "post-compaction usage"},
 		{name: "usage unavailable", missing: true},
 		{name: "usage query timeout", timeout: true},
 		{name: "different native session", newSession: true},
 		{name: "menu edit failure", editFailure: true},
+		{name: "status send failure", sendFailure: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, f, command := setupWorkspaceWorker(t)
 			command("/new " + t.TempDir())
 			before, client := w.binding, w.client
 			w.operations = make(chan operationResult, 1)
-			command("/compact")
-			data := resumeButtons(t, f)[0]["callback_data"].(string)
-			messageID := f.messageCount()
 			var outboxBefore int
 			if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxBefore); err != nil {
 				t.Fatal(err)
@@ -453,9 +455,12 @@ func TestCompactCompletionUsesOneMessageAndFreshUsage(t *testing.T) {
 			if scenario.timeout {
 				nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "get_state"})
 			}
-			clickKeyboard(w, 7, data)
-			if w.sessionOp != sessionOperationCompact || w.taskActive() || !sameBindingIdentity(w.binding, before) {
-				t.Fatal("confirmation did not start compaction in the current session")
+			messagesBefore := f.messageCount()
+			f.failProgress = scenario.sendFailure
+			command("/compact")
+			messageID := f.messageCount()
+			if w.sessionOp != sessionOperationCompact || w.taskActive() || !sameBindingIdentity(w.binding, before) || len(w.confirms) != 0 || f.button(messagesBefore) != "" {
+				t.Fatal("compact did not start directly without confirmation in the current session")
 			}
 			result := waitOperation(t, w)
 			if result.err != nil {
@@ -487,9 +492,9 @@ func TestCompactCompletionUsesOneMessageAndFreshUsage(t *testing.T) {
 				t.Fatal(err)
 			}
 			var text string
-			if scenario.editFailure {
+			if scenario.editFailure || scenario.sendFailure {
 				if outboxAfter != outboxBefore+1 {
-					t.Fatal("failed menu edit lost the compaction result")
+					t.Fatal("failed status send or edit lost the compaction result")
 				}
 				if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
 					t.Fatal(err)
@@ -509,12 +514,6 @@ func TestCompactCompletionUsesOneMessageAndFreshUsage(t *testing.T) {
 			}
 			if strings.Contains(text, "PRIVATE") || strings.Contains(text, "SECRET") || strings.Contains(text, "90%") {
 				t.Fatalf("compaction result exposed raw state or stale usage: %s", text)
-			}
-			if !scenario.editFailure {
-				clickKeyboard(w, 7, data)
-				if after := assertFinishedMenu(t, f, messageID, "Context:"); after != text || w.sessionOperationActive() {
-					t.Fatal("replayed compact confirmation changed the completed result")
-				}
 			}
 			if scenario.newSession {
 				command("/name restored original session")
@@ -847,8 +846,8 @@ func TestNativeUISelectionDisplaysResult(t *testing.T) {
 			click(data)
 			text, rows := pickerView(t, f)
 			if cancel {
-				if text != "Cancel" {
-					t.Fatalf("cancelled review still shows a selection prompt: %q", text)
+				if !strings.Contains(text, "review") {
+					t.Fatalf("cancelled review lost its operation context: %q", text)
 				}
 			} else if !strings.Contains(text, options[uiSelectPageSize]) || strings.Contains(text, "Select commit to review") || strings.Contains(text, "Page ") {
 				t.Fatalf("completed review does not identify the selected commit: %q", text)
@@ -925,6 +924,9 @@ func TestNativeConfirmationDisplaysDecision(t *testing.T) {
 			data := buttons[index]["callback_data"].(string)
 			clickKeyboard(w, 7, data)
 			text := assertFinishedMenu(t, f, messageID, expected)
+			if cancel && !strings.Contains(text, "native operation") {
+				t.Fatal("cancelled native confirmation lost its operation context")
+			}
 			if w.client != client || !sameBindingIdentity(w.binding, before) || len(w.confirms) != 0 {
 				t.Fatal("native confirmation changed the session or retained an actionable token")
 			}

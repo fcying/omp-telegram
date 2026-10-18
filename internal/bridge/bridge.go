@@ -237,6 +237,7 @@ type worker struct {
 	sessionRuntimeActive   atomic.Bool
 	sessionRuntimeStarting atomic.Bool
 	launchArgs             []string
+	configuredThinking     string
 	binding                store.Binding
 	startIntent            *store.StartIntent
 	sessionID              string
@@ -430,6 +431,8 @@ type rpcEvent struct {
 	Method                string                       `json:"method"`
 	TargetID              string                       `json:"targetId"`
 	Arguments             json.RawMessage              `json:"arguments"`
+	ThinkingLevel         string                       `json:"thinkingLevel"`
+	Configured            *string                      `json:"configured"`
 	Title                 string                       `json:"title"`
 	Message               json.RawMessage              `json:"message"`
 	Options               []string                     `json:"options"`
@@ -496,7 +499,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "model", Description: "Choose a cycle role or /model provider/model"},
 	{Command: "thinking", Description: "Choose the thinking level for this session"},
 	{Command: "fast", Description: "Choose fast mode: /fast [on|off|status]"},
-	{Command: "compact", Description: "Compact context after confirmation"},
+	{Command: "compact", Description: "Compact context while idle"},
 	{Command: "handoff", Description: "Run native handoff: /handoff [instructions]"},
 	{Command: "help", Description: "Show usage help"},
 }
@@ -1273,7 +1276,7 @@ func (w *worker) canEvict() bool {
 func (w *worker) hasRuntimeConfirmation() bool {
 	for _, c := range w.confirms {
 		switch c.action {
-		case "model", "thinking", "fast", "compact", "ui", "new", "autoresearch_clear":
+		case "model", "thinking", "fast", "ui", "new", "autoresearch_clear":
 			return true
 		}
 	}
@@ -1324,6 +1327,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 	w.b.registerCommandMenuWorker(w)
 	w.client = client
 	w.launchArgs = args
+	w.configuredThinking = ""
 	w.runtime = runtimeConnected
 	w.resumeFailed = false
 	w.b.sessionMu.Lock()
@@ -1335,6 +1339,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 func (w *worker) runtimeStopped() {
 	w.flushReplyStatus()
 	w.cancelProgressNative()
+	w.configuredThinking = ""
 	w.statusReleaseClientID = 0
 	w.research.known, w.research.enabled = false, false
 	w.clearCommandCatalog()
@@ -1800,14 +1805,15 @@ func (w *worker) operationFinished(result operationResult) {
 		if uncertain {
 			w.releaseRuntimeWithReason(true, "failure")
 		}
+		var message string
 		if result.err != nil {
 			if uncertain {
-				w.say("Compaction failed or its outcome is uncertain. The instance was closed and will resume on the next request.")
+				message = "Compaction failed or its outcome is uncertain. The instance was closed and will resume on the next request."
 			} else {
-				w.say("omp rejected compaction.")
+				message = "omp rejected compaction."
 			}
 		} else if result.cancelled {
-			w.say("Compaction was canceled. The instance was closed and will resume on the next request.")
+			message = "Compaction was canceled. The instance was closed and will resume on the next request."
 		} else {
 			w.touchBinding()
 			var state statusState
@@ -1821,11 +1827,11 @@ func (w *worker) operationFinished(result operationResult) {
 				}
 				state = statusState{}
 			}
-			message := "Compaction completed.\nContext: " + state.contextText()
-			messageID, _ := result.meta.(int64)
-			if !w.finishMenu(messageID, message) {
-				w.say(message)
-			}
+			message = "Compaction completed.\nContext: " + state.contextText()
+		}
+		messageID, _ := result.meta.(int64)
+		if !w.finishMenu(messageID, message) {
+			w.say(message)
 		}
 	case "abort":
 		if result.err != nil || result.cancelled {
@@ -1874,6 +1880,9 @@ func (w *worker) operationFinished(result operationResult) {
 			w.releaseStatusRuntime(result, false)
 			w.say("Failed to read the session state.")
 			return
+		}
+		if state.SessionID == w.binding.SessionID {
+			state.ConfiguredThinking = w.configuredThinking
 		}
 		research := w.researchStatus()
 		w.releaseStatusRuntime(result, true)
@@ -2529,6 +2538,16 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		w.closeFailedStart()
 		return "This omp session is unavailable or already in use by another conversation."
 	}
+	ctx, cancel = context.WithTimeout(w.ctx, 3*time.Second)
+	configuredThinking, thinkingErr := c.ConfiguredThinking(ctx)
+	cancel()
+	if thinkingErr != nil {
+		if c.Stopping() {
+			w.closeFailedStart()
+			return "Cannot query omp thinking configuration. The instance has been closed."
+		}
+		configuredThinking = ""
+	}
 	ctx, cancel = context.WithTimeout(w.ctx, 30*time.Second)
 	_, e = c.Call(ctx, "set_host_tools", map[string]any{"tools": telegramSendTools})
 	cancel()
@@ -2551,6 +2570,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		return "Failed to save the session binding. The instance has been closed."
 	}
 	w.binding = binding
+	w.configuredThinking = configuredThinking
 	w.startIntent = nil
 	w.preview, w.lastPreview = "", ""
 	w.previewID = 0
@@ -2787,11 +2807,32 @@ func (w *worker) handle(in incoming) {
 			w.say("An idle instance is required.")
 			return
 		}
-		if _, err := w.ensureRuntime(); err != nil {
+		client, err := w.ensureRuntime()
+		if err != nil {
 			w.say(err.Error())
 			return
 		}
-		w.confirm(confirmation{action: "compact", user: in.msg.From.ID}, "Compact the current session?", []string{"Confirm", "Cancel"})
+		w.beginSessionOperation(sessionOperationCompact)
+		w.touchActivity()
+		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+		var messageID int64
+		if message, err := w.b.tg.Send(ctx, w.key.chat, w.key.thread, "Compacting...", telegram.SendOptions{}); err == nil {
+			messageID = message.MessageID
+		}
+		cancel()
+		w.startOperation("compact", client, func(ctx context.Context) (json.RawMessage, error) {
+			if _, err := client.Call(ctx, "compact", nil); err != nil {
+				return nil, err
+			}
+			stateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			// Usage lookup cannot turn confirmed compaction into a failure.
+			state, err := client.Call(stateCtx, "get_state", nil)
+			if err != nil {
+				return nil, nil
+			}
+			return state, nil
+		}, 0, "", messageID)
 	}
 }
 func (w *worker) handoff(instructions string) {
@@ -3486,6 +3527,12 @@ func (w *worker) event(raw []byte) {
 		return
 	}
 	switch e.Type {
+	case "thinking_level_changed":
+		if e.Configured != nil {
+			w.configuredThinking = *e.Configured
+		} else {
+			w.configuredThinking = e.ThinkingLevel
+		}
 	case "available_commands_update":
 		w.commandCatalogUpdated()
 	case "session_info_update":
@@ -4403,31 +4450,6 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			return callbackDone
 		}
 		w.start(false, c.workspace, "", true)
-	case "compact":
-		if w.sessionControlBusy() {
-			w.say("The instance is not idle. Compaction was canceled.")
-			return callbackDone
-		}
-		client, err := w.ensureRuntime()
-		if err != nil {
-			w.say(err.Error())
-			return callbackDone
-		}
-		w.beginSessionOperation(sessionOperationCompact)
-		w.touchActivity()
-		w.startOperation("compact", client, func(ctx context.Context) (json.RawMessage, error) {
-			if _, err := client.Call(ctx, "compact", nil); err != nil {
-				return nil, err
-			}
-			stateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			// Usage lookup cannot turn confirmed compaction into a failure.
-			state, err := client.Call(stateCtx, "get_state", nil)
-			if err != nil {
-				return nil, nil
-			}
-			return state, nil
-		}, 0, "", c.messageID)
 	}
 	return callbackDone
 }
@@ -4439,7 +4461,11 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 		cancelled = index == len(c.options)
 	}
 	text := "Cancel"
-	if !cancelled {
+	if cancelled {
+		if c.uiTitle != "" {
+			text += "\n" + c.uiTitle
+		}
+	} else {
 		if c.method == "select" {
 			text = "Selected: " + c.options[index]
 			if c.action == "model" || c.action == "thinking" || c.action == "fast" {

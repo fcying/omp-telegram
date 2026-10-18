@@ -12,6 +12,9 @@ import (
 )
 
 func fixtureSessionCommand(command map[string]any) bool {
+	if fixtureThinkingCommand(command) {
+		return true
+	}
 	file := os.Getenv("OMP_TEST_SESSION_FILE")
 	if file == "" {
 		return false

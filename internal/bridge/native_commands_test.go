@@ -344,15 +344,16 @@ func TestColonCompactRetainsBridgeControls(t *testing.T) {
 		t.Fatal("unsupported compact arguments bypassed bridge refusal")
 	}
 	nativeInput(t, w, 101, "/compact:", false)
-	if queueState(t, w, 101) != "done" || len(w.confirms) != 1 || w.taskActive() || w.sessionOp != sessionOperationNone {
-		t.Fatal("colon compact bypassed confirmation")
+	if queueState(t, w, 101) != "done" || len(w.confirms) != 0 || w.taskActive() || w.sessionOp != sessionOperationCompact {
+		t.Fatal("colon compact did not start directly")
 	}
 	w.busy = true
 	nativeInput(t, w, 102, "/compact:", false)
-	if queueState(t, w, 102) != "done" || len(w.confirms) != 1 || w.sessionOp != sessionOperationNone || len(w.queue) != 0 {
+	if queueState(t, w, 102) != "done" || len(w.confirms) != 0 || w.sessionOp != sessionOperationCompact || len(w.queue) != 0 {
 		t.Fatal("colon compact bypassed the idle check")
 	}
 	w.busy = false
+	nativeUntil(t, w, func() bool { return w.sessionOp == sessionOperationNone })
 	nativeRPC(t, w, "get_state", nil)
 	for _, entry := range fixtureRPCTrace(trace) {
 		if entry.kind == "prompt" && entry.payload != "/session info" {

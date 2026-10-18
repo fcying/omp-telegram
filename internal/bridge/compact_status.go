@@ -64,7 +64,7 @@ func compactContextStatus(s statusState) string {
 func compactProgressStatus(s statusState) string {
 	identity := ""
 	if model := menuText(s.Model.ID, 128); model != "" {
-		identity = compactModelStatus(model, s.ThinkingLevel)
+		identity = compactModelStatus(model, s.ConfiguredThinking)
 	}
 	if fast := compactFastStatus(s); fast != "" {
 		if identity != "" {

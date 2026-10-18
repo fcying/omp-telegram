@@ -662,7 +662,7 @@ func TestAutoresearchClearRequiresIdleAuthorizedFencedConfirmation(t *testing.T)
 			if scenario == "approve" {
 				assertFinishedMenu(t, f, int(messageID), "Confirmed")
 			} else if scenario == "cancel" {
-				assertFinishedMenu(t, f, int(messageID), "Cancel")
+				assertFinishedMenu(t, f, int(messageID), "autoresearch")
 			}
 			if scenario == "approve" {
 				nativeUntil(t, w, func() bool {

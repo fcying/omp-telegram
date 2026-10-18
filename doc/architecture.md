@@ -2,689 +2,709 @@
 
 English | [中文](architecture.zh.md) | [User guide](../README.md)
 
-This document describes the current implementation and its recovery semantics.
+This is a reference for the current implementation: ownership, state transitions, persistence, failure handling, and recovery. Installation, configuration examples, and command usage belong in the [README](../README.md). Source links identify the implementation boundary; test links identify regression coverage, not evidence of live Telegram validation.
 
-Installation, configuration, command usage, and user-visible limits belong in the [user guide](../README.md). Keep protocol, state-machine, persistence, and recovery details in this document instead of duplicating them in the README.
+**Contents**
 
-## Scope and ownership
+- [Ownership and system boundaries](#ownership-and-system-boundaries)
+- [Components and data flow](#components-and-data-flow)
+- [Bootstrap, configuration, and process policy](#bootstrap-configuration-and-process-policy)
+- [Execution workers and RPC](#execution-workers-and-rpc)
+- [Native commands and Telegram menus](#native-commands-and-telegram-menus)
+- [Progress, status and final replies](#progress-status-and-final-replies)
+- [Interruption and conservative recovery](#interruption-and-conservative-recovery)
+- [Managed autoresearch](#managed-autoresearch)
+- [Session lifecycle](#session-lifecycle)
+- [Session discovery and management](#session-discovery-and-management)
+- [Runtime settings and diagnostics](#runtime-settings-and-diagnostics)
+- [Persistence and recovery](#persistence-and-recovery)
+- [Telegram delivery and progress cleanup](#telegram-delivery-and-progress-cleanup)
+- [Attachments and host-tool file boundaries](#attachments-and-host-tool-file-boundaries)
+- [Logging contract](#logging-contract)
+- [Development, verification, and release](#development-verification-and-release)
 
-The bridge owns Telegram polling, authorization, conversation routing, subprocess startup/shutdown, and reliable message delivery. omp owns model execution, tools, configuration, credentials, and native session history.
+## Ownership and system boundaries
 
-The deployment model is one bot per database and one worker per conversation: an ordinary private chat, private-chat topic, or group topic. Non-topic group messages are unsupported. There is no terminal emulation, second model transcript, multi-bot dispatcher, generic backend abstraction, or automatic replay of uncertain tasks. Different sessions do not isolate filesystems or credentials.
+The daemon bridges Telegram conversations to native OMP sessions. It owns authorization, routing, process lifecycle, RPC transport, task bookkeeping, and Telegram delivery. OMP owns model execution, tools, credentials, configuration, and native session history. The bridge neither emulates a terminal nor maintains a second model transcript.
 
-## Modules
+One database belongs to one bot. Each supported conversation has one worker and one session binding: ordinary private chats use thread ID `0`; private-chat topics and group topics use their Telegram thread IDs. A group topic shares its session among authorized users. Group messages outside a topic are not routed to an inferred session. Independent sessions do not isolate filesystems or credentials.
 
-| Location | Responsibility |
+Core invariants:
+
+- Authorize both the user and chat for every input and callback, before retaining content or downloading attachments.
+- Keep RPC stdout consumption independent of Telegram HTTP delivery. Acceptance is not completion.
+- Fence asynchronous work by its original worker, client, generation, request, and task/session scope. A stale result cannot mutate a replacement runtime.
+- Persist native session-file identities, not PIDs. Do not automatically replay work whose execution status is uncertain.
+- Commit task settlement and final output atomically. A later `/new` or `/close` does not cancel already committed replies.
+- Start native programs with argument arrays, without a shell. Do not implicitly alter OMP models, tools, configuration, or approval policy.
+
+## Components and data flow
+
+| Implementation | Responsibility |
 | --- | --- |
-| [`cmd/omp-telegram`](../cmd/omp-telegram/main.go) | CLI, version output, data-directory lock, signal handling |
-| [`internal/config`](../internal/config/config.go) | TOML, environment references, path defaults, startup-argument validation |
-| [`internal/bridge`](../internal/bridge/bridge.go) | Worker actors, commands, prompt queues, previews, final replies, host tools |
-| [`internal/bridge/recovery.go`](../internal/bridge/recovery.go) | Startup restoration and persisted close state |
-| [`internal/bridge/resume_picker.go`](../internal/bridge/resume_picker.go) | Native session listing, export jobs, and authorized, expiring selection menus |
-| [`internal/bridge/session_delete.go`](../internal/bridge/session_delete.go) | Delete confirmation, session reservations, native deletion orchestration |
-| [`internal/omp`](../internal/omp/client.go) | RPC framing, request correlation, events, native session metadata, ACP listing, and native export delegation |
-| [`internal/omp/delete.go`](../internal/omp/delete.go) | Native RPC session deletion and file-absence verification |
-| [`internal/telegram`](../internal/telegram/client.go) | Bot API, attachment transport, sanitized errors and delivery certainty |
-| [`internal/media`](../internal/media/media.go) | Confined file handling, incoming attachment storage, image preparation and outgoing snapshots |
-| [`internal/store`](../internal/store/store.go) | SQLite schema, bindings, durable input/output and completion transactions |
-| [`config.go`](../config.go) | Embeds the canonical [`config.toml`](../config.toml) |
-
-## Runtime flow
+| [`cmd/omp-telegram`](../cmd/omp-telegram/main.go) | CLI, signal handling, process-wide data-directory lock |
+| [`internal/config`](../internal/config/config.go), [`config.go`](../config.go) | Strict TOML loading, executable-relative paths, embedded [`config.toml`](../config.toml), argv/environment policy |
+| [`bridge.go`](../internal/bridge/bridge.go), [`steer.go`](../internal/bridge/steer.go), [`recovery.go`](../internal/bridge/recovery.go) | Routing, worker actors, task ownership, queueing, completion, startup/shutdown recovery |
+| [`native_commands.go`](../internal/bridge/native_commands.go), [`command_menu.go`](../internal/bridge/command_menu.go) | Command-source validation, native submission, Telegram discovery menus |
+| [`autoresearch.go`](../internal/bridge/autoresearch.go), `research_*.go` | Native research admission, controls, round settlement, disable recovery |
+| [`session.go`](../internal/bridge/session.go), [`resume_picker.go`](../internal/bridge/resume_picker.go), [`binding_list.go`](../internal/bridge/binding_list.go), [`session_delete.go`](../internal/bridge/session_delete.go), [`export.go`](../internal/bridge/export.go) | Session transitions, listings, reservations, favorites, deletion, export |
+| [`args.go`](../internal/bridge/args.go), [`model_picker.go`](../internal/bridge/model_picker.go), [`doctor.go`](../internal/bridge/doctor.go) | Startup presets, runtime settings, session-preserving diagnostics |
+| [`progress_status.go`](../internal/bridge/progress_status.go), [`reply_status.go`](../internal/bridge/reply_status.go), [`reply_metrics.go`](../internal/bridge/reply_metrics.go), [`watchdog.go`](../internal/bridge/watchdog.go) | Best-effort live state, bounded final headers, conservative missing-completion recovery |
+| [`internal/omp`](../internal/omp/client.go) | RPC v2 framing and correlation, process supervision, native metadata, ACP session listing, export/render/delete delegation |
+| [`internal/store`](../internal/store/store.go) | SQLite schema, inbox/outbox, bindings, startup intents, atomic transitions and retention |
+| [`internal/telegram`](../internal/telegram/client.go) | Bot API, Markdown-to-HTML rendering, reply fallback, transport/delivery classification |
+| [`internal/media`](../internal/media/media.go), [`bridge/media.go`](../internal/bridge/media.go) | Authorized downloads, workspace-confined file access, snapshots and attachment lifecycle |
+| [`internal/logging`](../internal/logging/logging.go) | Fixed component loggers, synchronized text/JSON output |
 
 ```mermaid
 flowchart LR
-    TG[Telegram getUpdates] --> IN[Atomic inbox and offset commit]
-    IN --> AUTH[Authorization and conversation routing]
-    AUTH --> W[Per-conversation worker]
-    W --> Q[Sequential prompt queue]
-    Q --> RPC[omp RPC client]
-    RPC --> OMP[Independent omp process]
+    TG[Telegram getUpdates] --> AUTH[User and chat authorization]
+    AUTH --> IN[Atomic inbox and offset commit]
+    AUTH --> IG[Ignored ID and offset only]
+    IN --> ROUTE[Conversation routing]
+    ROUTE --> W[Worker actor]
+    W --> RPC[OMP RPC client]
+    RPC --> OMP[Native OMP process]
     OMP --> READER[Continuous stdout reader]
     READER --> W
-    W --> PREVIEW[Best-effort preview]
-    W --> OUT[Durable outbox]
-    OUT --> DELIVERY[Independent Telegram delivery loop]
+    W --> PREVIEW[Best-effort progress]
+    W --> OUT[Atomic completion and outbox]
+    OUT --> SEND[Independent Telegram delivery workers]
 ```
 
-Startup proceeds through configuration loading, the data-directory lock, database initialization/reconciliation, `getMe`, database bot-ownership checking, command registration, restoration, then polling and delivery. `--version` returns before configuration loading. `--check` validates local configuration and creates the configured directories; it does not open the database or authenticate with Telegram.
+Polling persists updates before worker routing. Unauthorized or senderless updates keep only their ID and ignored state while advancing the offset; they cannot start OMP or download files. Authorized typed updates retain the content needed by routing. Routing rechecks authorization for inputs and callbacks. Replies, progress, and exports are visible to anyone with access to the destination conversation, not just the submitting user.
 
-Incoming updates are authorized before persistence. Authorized inputs retain the typed update in the inbox for routing; unauthorized inputs retain only update ID, ignored state, and receive timestamps while the offset advances atomically. Unauthorized inputs cannot start a process, download a file, or execute a command. Users and chats must both be allowed, including both the user ID and matching private chat ID for ordinary private chats. After authorization, messages with a nonzero thread ID or private chat type are accepted; non-topic group messages receive guidance rather than an inferred destination. A group topic has one shared OMP session for all authorized users, and Telegram members who can view the topic can also see bot replies and `/export` attachments even without bot command access.
+Polling failures use cancellable exponential backoff from one to 30 seconds. A positive Telegram `retry_after` can extend the actual delay beyond that ceiling; a successful poll resets backoff. Durable offset reads or update writes fail the daemon rather than acknowledging uncommitted inputs.
 
-### Concurrency
+### Identity and stale work
 
-- Each conversation has an actor-like worker. Idle ordinary text begins an independent root prompt; ordinary text arriving during a root is a tracked OMP steer, not a new root. `/followup <message>`, attachments, `/review`, and other recognized native OMP commands use the deferred bridge queue as independent submissions. The active root owns the final reply; different conversations run concurrently.
-- Bridge controls and callbacks use the worker's control path rather than waiting behind queued prompts. This does not promise that every operation is nonblocking: startup and some control RPC round trips still take time.
-- Command recognition gives the registered bridge commands plus the hidden `/start` alias precedence, then checks the current OMP command catalog. An `@bot` suffix is recognized only for a single-segment Telegram command name (ASCII letters, digits, underscores; 1-32 characters) and a username-shaped target (5-32 such characters). Paths such as `/opt/user@host/file` remain ordinary prompts. Foreign-bot commands are ignored, including pending ones after restart; startup cancels pending slash-prefixed prompts just like ordinary queued text, never replaying them automatically.
-- `/queue` reads only the current worker's in-memory `queue`, `active`, and `busy` state. It is a per-conversation viewer; its Cancel buttons target pending bridge inbox IDs and never abort the active task or manage OMP's native queue. The queue is runtime-only: worker shutdown cancels remaining pending inboxes, and no queue entry is restored.
-- Attachment preparation and uploads are asynchronous and bounded. Pending preparation retains its queue position.
-- The RPC stdout reader never performs Telegram HTTP delivery. A shared 64 MiB credit budget includes reserved frame reassembly capacity and queued asynchronous event bytes; credits return when the worker receives an event. Protocol violations or overload fail the client rather than allowing unbounded growth. The worker separately limits accumulated pre-terminal assistant text to 4 MiB. Either overflow before a terminal event fails the runtime and leaves the task uncertain without replay. After a confirmed terminal event, only display overflow is truncated: up to 32 Telegram messages and 1 MiB of reply text, with an explicit notice, while the task remains done.
-  The 64 MiB logical-frame protocol ceiling and 64 MiB buffered-resource policy are independent: a valid near-limit frame may exceed the resource budget while its physical chunk or queued events are retained. A completed assistant message replaces its in-progress streamed bytes in the 4 MiB logical output budget; the retained stream buffer has a separate 4 MiB cap.
-- `worker.max_workers` bounds connected OMP processes, not logical sessions. A positive `worker.idle_timeout` may release a quiescent worker's process and return its slot while retaining its validated binding and session claim.
+| Identity | Representation and scope |
+| --- | --- |
+| Bot | Numeric `getMe` ID, checked against database ownership; not token or username |
+| Conversation | `(bot, chat, thread)`; the daemon's worker map can use `(chat, thread)` because the bot is fixed |
+| Binding | Workspace, native session-file path and validated session ID, persisted generation, running/interrupted state |
+| Runtime | Current `omp.Client` and process-local monotonic client ID; never a durable PID |
+| Root task | Inbox ID, worker generation, turn, and owning prompt request |
+| Asynchronous operation or picker | Captured request/token plus the relevant client, generation, session, catalog/preset revision, and message/owner scope |
+| Telegram input/output | Bot-database update ID / bridge outbox ID, distinct from Telegram message IDs |
 
-The client waits for `ready`, negotiates protocol v2, serializes stdin writes, and correlates responses by request ID. A successful `Call("prompt")` means acceptance, not task completion. Only `agent_end` events whose `isTerminal` is not `false`, or a local-command completion signal, finish the task; nonterminal events must not dispatch the next queued prompt. On a terminal assistant message, `stopReason=error` or a nonempty `errorMessage` commits the input as `uncertain`; `stopReason=aborted` commits it as `cancelled`; otherwise confirmed text commits it as `done`. Partial text remains deliverable for `uncertain` and `cancelled` terminal results. An uncertain failure reply may include a bounded `errorMessage` summary after redacting credentials, request IDs, URLs, and absolute paths; unsafe details and provider classifications are not forwarded. Framing and reassembly have explicit bounds, with no PTY/ANSI parsing.
+The exact fence depends on the operation; no single generation check replaces all task, session, and menu checks. Session claims and export/delete reservations are synchronized under `sessionMu` and apply only within this daemon. They do not lock a workspace or prevent another program from opening native history. Recovery cannot infer Telegram chat type from a binding: zero-thread restoration requires a positive private-chat ID and the current chat allowlist.
 
-Managed autoresearch is the explicit exception to ordinary-root completion above: a terminal-looking round does not settle its research owner. See [Managed autoresearch](#managed-autoresearch).
+`daemon.lock` prevents two daemons from opening the same data directory. Database bot ownership prevents another bot from reusing it. Neither prevents another poller from using the same bot token with a different directory or webhook; deployment must enforce a single consumer.
+
+## Bootstrap, configuration, and process policy
+
+### Startup and shutdown boundaries
+
+[`main.go`](../cmd/omp-telegram/main.go) handles `--version`/`-v` before configuration. `--check` loads and validates configuration, resolves the OMP executable, and creates configured data/workspace directories; it does not open SQLite, start OMP, or contact Telegram.
+
+Normal startup performs:
+
+1. Configuration loading and logger creation, then restrictive umask and exclusive `daemon.lock` acquisition.
+2. SQLite initialization/migration and runtime-state reconciliation.
+3. Telegram `getMe`, database bot-ownership check, and persisted argument-preset selection initialization.
+4. Best-effort default command registration for the default and `zh` language scopes.
+5. Progress-cleanup reconciliation, restoration of eligible session claims/workers, and retention cleanup.
+6. Polling, actor routing, four delivery workers, command-menu updates, progress cleanup, and the optional daily retention janitor.
+
+Command-menu registration failure does not prevent polling. Durable-state failures are not hidden by best-effort UI paths. SIGINT/SIGTERM cancel the shared context; workers settle/cancel outstanding work conservatively, close owned processes, and complete background work before the store closes. Session-specific shutdown and unfinished-start recovery are described with the session lifecycle below.
+
+### Configuration and path contracts
+
+[`config.Load`](../internal/config/config.go) resolves symlinks on the bridge executable and uses its real directory for defaults. The implicit `config.toml` lives there; only an absent implicit file falls back to the embedded root configuration. An explicit missing file, unreadable file, invalid TOML, unknown field, or wrong table is an error. Explicit relative `--config`/`-c` paths remain caller-relative.
+
+| Path or setting | Resolution |
+| --- | --- |
+| Relative `storage.data_dir` and `storage.workspace_root` | Real bridge executable directory, even when the config file lives elsewhere |
+| Empty optional workspace root | `workspace/` beside the executable |
+| Default OMP binary | `omp` resolved through the daemon's `PATH`, then made absolute |
+| Lock, database, attachment spools | Under `storage.data_dir` |
+| Native OMP configuration, credentials and session storage | OMP defaults or explicitly configured native arguments; not relocated by the bridge |
+
+The supported tables are `[telegram]`, `[omp]`, `[omp.environment]`, `[storage]`, `[worker]`, `[logging]`, and `[logging.component_levels]`. Legacy flat fields and misplaced fields are rejected, not migrated automatically. Both allowlists must be nonempty; user IDs must be positive and chat IDs nonzero. `max_workers` is bounded to `1..64`, `queue_capacity` to `1..1024`, and retention days must be nonnegative. A positive Go duration enables idle release; empty, `0`, or `disabled` disables it.
+
+String references expand once after TOML parsing: `$VAR`, `${VAR}`, and `$$` for a literal dollar. Inserted environment contents are not expanded again and cannot inject TOML. Numeric and allowlist fields accept their documented environment-reference strings. The default `OMP_TELEGRAM_ARGS` and workspace-root references may be unset; invalid/unset progress mode falls back to `summary`. Other required references fail when unset. Environment-policy mode/names and display-only `omp.args_labels` remain literal. `.env` files are not loaded.
+
+`omp.args` accepts an ordered array of preset strings or a scalar normalized to one preset. Each string is tokenized with quoting support, not executed by a shell; all presets are validated before startup. Bridge-owned mode/cwd/session options, their protected short forms, `--`, and NUL bytes are rejected. Only the normalized preset fingerprint and chosen index are persisted, not raw arguments. Selection semantics and per-runtime snapshots are described under runtime settings.
+
+### Child environment and containment limits
+
+[`omp.Environment`](../internal/omp/env.go) filters parent variables for native RPC, ACP, model-query, render/export, deletion, and diagnostic child processes. `denylist` mode inherits everything except explicitly denied names. The bundled configuration denies `OMP_TELEGRAM_BOT_TOKEN`; the loader adds no implicit secret-name filtering. A custom token variable is inherited unless explicitly denied. `allowlist` mode requires an explicit `allow` list, possibly empty, and passes only listed names that exist. Each mode rejects the other list even if empty. Bridge-side TOML expansion is independent of this child policy.
+
+Passing provider credentials is intentional when configured. This is not a sandbox: withholding `HOME` or a token variable does not prevent same-user filesystem/process access, tool access to other copies of credentials, or outbound networking. Use trusted OMP code and deployment-level isolation where required. The bridge does not enable automatic tool approval.
+
+On Linux, native RPC, ACP, model-query, render/export and deletion paths using [`startProcess`](../internal/omp/process_linux.go) receive a dedicated process group and parent-death SIGTERM. The creating OS thread stays locked until `Wait` returns because Linux associates that signal with the creating thread. Their normal shutdown can escalate to killing the owned process group; parent death itself supplies no later SIGKILL escalation. The `/doctor` version probe instead uses direct `exec.CommandContext` and has neither of these process-group/parent-death guarantees. Ignored signals, surviving descendants, escaped groups, and programs clearing parent-death settings require external containment. RPC/ACP stderr is discarded; render path resolution inspects bounded native diagnostics internally. Raw diagnostics are not forwarded to logs or Telegram.
+
+## Execution workers and RPC
+
+### Actor ownership and input lanes
+
+[`worker`](../internal/bridge/bridge.go) owns one conversation's logical binding, active root, deferred FIFO queue, control state, progress and callbacks. Connected processes are a separate resource: runtime state is `released`, `starting`, or `connected`. `worker.max_workers` limits connected OMP processes, not logical sessions. Idle release can return a process slot without discarding the validated binding or native session claim.
+
+| Lane | Admission and ownership |
+| --- | --- |
+| Root | Ordinary text with no active root starts an independent submission. Its inbox owns the final reply and Telegram reply target. |
+| Steer | Ordinary text during an active agent root uses native `prompt` with `streamingBehavior:"steer"`. It has a submitted inbox and correlated request, but no independent final reply or progress message. |
+| Deferred root | `/followup`, attachments, bridge `/review`, and recognized native commands retain FIFO positions and become independent submissions. Attachment preparation is asynchronous; an unprepared head cannot be overtaken. |
+| Control | Bridge controls and callbacks do not enter the prompt FIFO. Slow mutation/control RPCs run through one asynchronous operation lane; actor event handling remains separate. Startup and some bounded Telegram/RPC calls can still occupy the actor. |
+
+`worker.queue_capacity` bounds queued roots plus unresolved steers. `/queue` reads only this worker's runtime queue/active/busy state; its Cancel buttons cancel selected pending inboxes and prepared resources, never the active root or OMP's native steer queue. Shutdown cancels waiting inputs. Neither queued inputs nor uncertain submissions are automatically replayed after restart.
+
+A native-command owner remains native while acceptance omits `agentInvoked`; new ordinary text stays queued. Only `agentInvoked:true` or `agent_start` proves agent execution and enables ordinary root steering under the original reply owner. Text arriving while `controlAbort` is pending always becomes a new queued root, including unknown slash text classified during Stop. Managed research has a special long-lived owner; its terminal/settlement policy is not the ordinary-root policy.
+
+### Transport and completion boundaries
+
+[`Client`](../internal/omp/client.go) owns an OMP process group, a continuous stdout reader, serialized stdin writes, pending request IDs and an asynchronous event forwarder. Startup validates `ready` transport limits and negotiates public RPC v2. `Call` registers correlation before writing and waits for the command acknowledgment, not agent completion. Response IDs and command names must match; uncorrelated/malformed responses fail closed, while late responses for abandoned IDs are discarded rather than reinterpreted as events. Text steering additionally requires request-correlated `prompt_result` and settlement support.
+
+The root inbox is durably `submitted` before the request is sent. Steers first validate frame size, reserve an ID, persist submission, and register `(request, root, client, generation, turn, admission)` before sending. Asynchronous operation results carry client/generation/root/turn fences. Runtime release drops waiting old-client operations but does not free an already-running RPC lane until its result returns. If the process exits during that call, exit policy waits for its result; an old exit fence cannot block a replacement runtime.
+
+| Evidence | Ordinary-root outcome |
+| --- | --- |
+| Successful prompt acknowledgment | Accepted only; continue waiting unless explicit local completion applies. |
+| `agent_end` with `isTerminal:false` | Await continuation; do not dispatch another root. |
+| `agent_end` not explicitly `isTerminal:false`, with confirmed assistant text | `done`, subject to steer settlement and assistant error/cancellation metadata below. |
+| Assistant `stopReason:"aborted"` | `cancelled`; retain available partial text. |
+| Assistant error stop reason, nonempty `errorMessage`/`errorClassificationMessage`, or nonzero `errorStatus` | `uncertain`; retain available partial text and a safe notice. |
+| Terminal event without confirmed text | `uncertain`, except confirmed local native-command completion. |
+
+Terminal messages take precedence over cached `message_end` data. RPC v2 may omit already-emitted messages from a compacted terminal frame, so the worker retains finalized assistant text and the latest terminal metadata. `agent_start`, task settlement and teardown reset these caches. A late/unsolicited `agent_start` without an active bridge owner cannot restart typing or wedge the queue.
+
+[`steerFence`](../internal/bridge/steer.go) requires a terminal root event, terminal results for every steer, and current-session settlement before finalization. Steer statuses map `completed` to `done`, `aborted` to `cancelled`, and `error` to `failed`; unknown status is uncertain. Explicit rejection fails that steer without claiming its instruction was applied; unconfirmed transport outcomes retire the runtime. A local-only `agentInvoked:false` acknowledgment can finish that steer but still requires quiescence evidence for its root.
+
+Any later correlated `sessionSettled:false` invalidates earlier true evidence regardless of admission order. Only the latest admission's true result can establish settlement directly. Unkeyed `session_settled` requests a bounded `get_state.isSettled` probe, never releases the fence itself. Probe results are fenced by client/generation/root/turn/revision and yield to queued events or buffered RPC output. A new `agent_start` discards a deferred old terminal.
+
+### Resource and privacy boundaries
+
+| Resource | Bound and failure behavior |
+| --- | --- |
+| Physical RPC frame | At most 1 MiB, reduced to the negotiated limit. Oversized outgoing requests are rejected before writing. |
+| Reassembled logical frame | At most 64 MiB, with validated chunk framing/order/length. |
+| Buffered RPC resources | Shared 64 MiB credits for physical/reassembly capacity and queued event bytes; event credit returns when the worker receives it. Queue-slot or byte overflow fails the client. |
+| Pre-terminal assistant text | 4 MiB logical finalized-plus-pending output and a separate 4 MiB retained stream cap. Finalized messages replace their streamed contribution to logical accounting. Overflow before completion is uncertain, not successful display truncation. |
+| Confirmed final display | At most 1 MiB and 32 Telegram messages, including header/notices; explicit truncation does not turn a confirmed task into failure. |
+
+Logical-frame capacity and buffered-resource policy are independent: a valid near-limit frame can still exhaust credits while a physical chunk or queued events remain retained. The RPC reader never performs Telegram delivery.
+
+[`reply_context.go`](../internal/bridge/reply_context.go) adds only Telegram's supplied immediate reply context to ordinary prompts, steers, followups and current attachment prompts. An explicit selected quote wins over full replied text. Otherwise it uses text, photo/document labels, a document filename and caption, or an unsupported-message marker. It does not fetch older messages, recurse through replies, download replied-to media, or reveal sender names/IDs; the sender label is only `bot` or `user`.
+
+The quoted envelope is capped at 3000 UTF-16 units, including delimiters and `...[truncated]`; the current user message is not truncated by this helper. Reserved delimiter strings inside quoted content are escaped. This is quoted input, not trusted instructions or an authorization boundary. Bridge controls and generic recognized native commands receive no reply-context wrapper. Bridge `/review` keeps its slash command first and appends the context. Queue previews use current-message text rather than the quoted envelope. Telegram payload persistence and eventual model input still contain the supplied quoted text; this is minimization, not secret redaction.
+
+## Native commands and Telegram menus
 
 ### Native command recognition and submission
 
-Phase 1 uses a per-client, immutable command-catalog snapshot with distinct `CatalogUnknown`, `CatalogReady` (including an empty catalog), and `CatalogUnsupported` states. Advertised aliases participate in lookup. Discovery runs asynchronously with at most one query in flight, and availability is refreshed after lazy session restore. Explicit unsupported discovery is not a transport failure: slash input not explicitly owned by the bridge is cancelled because its command source cannot be verified; non-slash text and bridge controls retain their existing routing. Transport failures remain errors, and malformed catalogs are protocol errors, never unsupported or ready-empty fallbacks. Unknown discovery does not block an ordinary root when current-branch metadata confirms research mode is disabled. Enabled research waits for discovery before taking ownership. Catalog names, descriptions, and raw frames are not logged or persisted; no schema or queue-persistence change is introduced.
+[`catalog.go`](../internal/omp/catalog.go) publishes immutable per-client catalogs with distinct `CatalogUnknown`, `CatalogReady` (including empty), and `CatalogUnsupported` states. Discovery is asynchronous and single-flight. Only the explicit native unknown-command response proves discovery unsupported; rejection, timeout, malformed catalogs and transport failure are not interchangeable fallback states.
 
-The catalog retains compact unknown/builtin/extension/other source classification, plus a canonical-autoresearch extension variant, in one private map. The general executable whitelist is `builtin`, `skill`, `custom`, `mcp_prompt`, and `file`; only `builtin` enables builtin invocation syntax. The sole extension exception is the canonical name `autoresearch` with source `extension`. Its aliases retain ordinary extension refusal, and another extension's alias named `autoresearch` cannot gain permission. Missing, null, non-string, empty, and unrecognized source values remain unknown: their names and aliases stay recognizable but are not executable. Source anomalies alone do not reject the catalog or close the runtime. Other aliases inherit their command's source classification; other metadata is discarded.
+Bridge commands and hidden `/start` take precedence. A valid `@bot` suffix is recognized only for a single-segment command with 1-32 ASCII letters/digits/underscores and a 5-32-character username-shaped target; foreign-bot commands are ignored. Paths such as `/opt/user@host/file` remain ordinary text. Invocation parsing follows OMP whitespace, including BOM but excluding NEL, and `:`. Native lookup first tries the whole name before the first literal space, preserving names such as `plugin:command`; only advertised builtins enable the additional separator syntax. Refused advertised sources also match those separators so they cannot fall back to model input.
 
-Names and aliases are retained as opaque strings without normalization, including Unicode format, whitespace, and control characters. Validation still rejects empty names, a leading `/`, and invalid name/alias field types. Catalog validity is separate from invocation matching: a file command named `code review` must not close the runtime even though the current literal-space parser cannot match that whole name. Existing bridge/native precedence and separators still determine routing; retaining an entry does not make its full name callable.
-
-The stdout reader applies `available_commands_update` snapshots before waking any later response waiter. Worker events are notifications only and read the authoritative client snapshot; an older already-queued event cannot reapply an obsolete catalog. A discovery query records the reader's update revision and session scope before it is issued. The reader decides whether to apply the query snapshot before waking its response waiter, and applies it only if both revision and scope are unchanged. A newer reader update therefore wins over an older query result. Session transitions invalidate the catalog and fence in-flight queries without changing the client ID; stale bridge continuations must also be rejected against the current runtime/session scope.
-
-A discovery response with the same catalog state and name/alias-to-source classification preserves the existing snapshot and revision. In particular, the startup refresh after lazy restore must not invalidate an in-flight autoresearch mode lookup merely by confirming the already-published catalog. A changed discovery result still advances the revision. Unsolicited `available_commands_update` notifications also advance it even when the names and sources are unchanged, because native implementations may have reloaded; session-epoch and reader-update fencing remain unchanged.
-
-Supported recognized native text is normalized from `/cmd@thisbot` to `/cmd` while preserving its arguments, and is submitted through the existing bridge queue without a reply-context wrapper or `streamingBehavior: "steer"`. With a ready catalog, unrecognized slash input, including absolute paths, retains its original text and ordinary prompt/steer routing. Native queue entries retain their native classification and revalidate availability at dispatch. If the current catalog no longer advertises a queued command (including after a transition to unsupported discovery), that entry is cancelled, never downgraded to model text. Refresh failures cannot be used as a healthy unsupported fallback.
-
-The Unsupported fail-closed check is shared by direct slash routing, pending slash classification, raw slash-headed queued prompt dispatch (including followups and prepared attachments), and the active-task steer path. Rejection cancels the inbox, removes queued input and its prepared attachment resources, and emits a generic capability notice without closing the runtime or changing its binding. Explicit bridge `/review` queue entries carry bridge-owned provenance; raw `/followup /review ...` or attachment text cannot gain that exemption by matching a command name. Unknown discovery remains a separate waiting state, never an Unsupported rejection or a ready-empty fallback.
-
-Bridge routing, lifecycle refusal, and restart classification use the slash invocation parser. It splits at the earliest OMP-compatible whitespace or `:`, including JavaScript BOM whitespace but excluding NEL. Advertised-native recognition first matches the complete name before the first literal space, preserving extension/custom/file names such as `plugin:command` and `foo:bar` and normalizing valid bot suffixes. Only advertised builtin names and aliases enable colon/other-whitespace invocation syntax. Advertised non-executable sources are also recognized under these separators solely to refuse them; a complete literal-space name still takes precedence over a refused prefix. Unadvertised names and executable extension/custom/file non-literal-space invocations remain ordinary input with reply context and prompt/steer routing intact. Dispatch revalidation uses the same full-name-first recognition and requires the saved native name to match. Removal, source changes that invalidate the syntax, or adding a longer matching name cancel the queued submission even if its original name remains advertised. Bot targeting is parsed only in the command token. Bridge argument handling removes one separator and trims surrounding whitespace; native normalization retains the original separator and argument bytes. Unknown commands are never normalized. Thus colon syntax cannot bypass bridge command precedence, confirmation, idle checks, or session-operation ownership. Unsupported `/compact` arguments are rejected locally.
-
-Native queue entries also retain the native session ID. A changed session cancels them even if the new session advertises the same command; a new client restoring the same session does not. Same-session catalog revisions alone do not cancel still-advertised commands. A rejection from an old-session discovery request cannot close a newer session. Native ownership survives acknowledgment when `agentInvoked` is absent: ordinary text remains queued until `agentInvoked:true` or `agent_start` proves agent execution. Those signals switch the active input to ordinary root-task behavior, permitting subsequent text steering under the original final-reply owner.
-
-`RefreshCommandCatalog` returns the epoch of the query it actually creates or joins under the client mutex. The worker uses that returned epoch to distinguish an old-session result from a current-session failure; a worker snapshot taken before launching discovery is not a query scope token.
-
-Discovery waiter deadlines, cancellation, and request rejection do not prove runtime failure, regardless of query epoch. A reader-published usable catalog remains authoritative and can resolve waiting inputs. If discovery remains unknown, slash inputs stay pending and the worker pauses discovery for that client/epoch instead of repeatedly joining the unanswered query. A scope change can refresh discovery; a reader-published update restores classification. The user-facing failure notice points to `/queue` and Cancel on the waiting slash item; removing that item releases following work without reordering FIFO. Actual transport, protocol, process, and other discovery failures retain runtime-failure handling. Interrupted discovery never becomes an unsupported-catalog fallback or a reason to retire an unrelated healthy root.
-
-Pending classification rereads the current catalog for every entry, including after a research-mode query while the stdout reader may publish an update. An unknown catalog leaves remaining inputs pending. Dispatch rereads the queue head after classification and refuses a still-preparing attachment, even when rejecting an earlier command has exposed it. After asynchronous research-mode admission completes for the original queue head, a final queue-head validation rereads the current catalog's source, name, and session before removing or submitting the input. This final validation does not classify pending inputs or issue another blocking query. It also covers raw slash-headed queued prompts; a catalog revision alone does not cancel a command that remains executable and available under the same name and session.
-
-Lifecycle-mutating builtins `/move`, `/wt`, `/worktree`, and `/session delete` are reserved as unsupported at input routing and checked again before queued prompt dispatch. OMP's whitespace/colon invocation syntax, bot suffixes, and the worktree alias are covered. The session refusal matches the case-insensitive `delete` verb with no remaining arguments; `/session info` and `/session pin` retain normal native routing. Refusal cancels the inbox and notifies the user without submitting a prompt, moving or deleting the session file, creating a worktree, or changing the saved binding. This policy applies even when discovery is unknown or unsupported, because falling back to raw model text would still let OMP dispatch the builtin. Session deletion remains owned by the `/resume` picker with its confirmation and in-use checks. No per-command session reconciliation or binding migration is implemented.
-
-Except for canonical autoresearch, advertised extension and unknown-source commands and aliases are refused at ready input routing, pending discovery classification, and queued dispatch. Extension handlers can call native session lifecycle APIs such as `newSession`, `branch`, `navigateTree`, `switchSession`, and `reload`; generic extension lifecycle changes are not reconciled with the saved binding and session claim, and unknown sources must not inherit permission to execute. Refusal cancels the inbox and emits a generic source-specific notice without echoing catalog names, arguments, or raw source data; it never falls back to an ordinary prompt or steer and does not close the current runtime. Dispatch also checks raw slash-headed queued prompts from followups or attachments and source changes from executable sources to extension or unknown. Slash-headed prompts wait while discovery is unknown; research admission also checks the catalog before other roots. Bridge control precedence and foreign-bot ignoring remain unchanged. This refusal does not disable extensions in OMP or add session identity migration.
-
-Dispatch revalidation closes the bridge's queue-time stale-catalog window, but is not an atomic upstream check-and-execute operation: OMP can change availability after the last snapshot check and before accepting the prompt. Likewise, an untagged old-session `available_commands_update` on the same client cannot be reliably identified as stale; query fencing does not supply the missing session identity. These are RPC protocol limits, not guarantees supplied by bridge generations.
-
-A successful native local response with `agentInvoked:false`, or a request-correlated `prompt_result` with `agentInvoked:false` and `status:"completed"`, marks the bridge submission `done` even without assistant text. Retaining native ownership after an acknowledgment without `agentInvoked` lets a delayed local completion settle correctly. This is submission completion, not proof that a background operation has finished. Phase 1 leaves uncorrelated native `command_output` handling unchanged and does not deliver it to Telegram; local commands may emit output but yield no visible reply. It adds no rich ask UI. `/plan` and `/plan-review` still require upstream RPC implementation; catalog recognition alone does not implement them.
-
-Recorded research mode does not change ACK-only completion for other native commands, such as `/session info`. Only the canonical research command bypasses that shortcut and requires correlated local completion.
-
-For a local `prompt_result`, `status:"error"` retains root-task failure semantics (`uncertain`), `status:"aborted"` becomes `cancelled`, and absent or unknown status becomes `uncertain`. These outcomes atomically persist a generic notice with the terminal inbox state, without exposing raw RPC errors. They do not close the runtime or replay the command; following bridge tasks can continue normally.
-
-### Managed autoresearch
-
-[`internal/bridge/autoresearch.go`](../internal/bridge/autoresearch.go) owns only research operation metadata. The native extension owns experiments, Git operations, artifacts, and autonomous continuation. Startup adds no confirmation or approval override. Direct goal and empty-toggle commands use the native handler; off and clear use correlated local completion, not an acceptance response or a notification. A confirmed local startup refusal completes the command without leaving a fake research root.
-
-Before dispatch, including lazy restore, `Client.AutoresearchMode` obtains the native session ID/file from `get_state`, reads only ancestry/control metadata from that JSONL history, and requests `get_entries` with `since` set to the last entry in its valid prefix. RPC supplies the canonical suffix and the authoritative current `leafId`; the file's append order never selects the current branch. The session ID/file is rechecked after the query. This avoids transferring the entire native transcript, which can exceed the 64 MiB RPC reassembly limit even when the active model context is compacted. New sessions without a persisted file use the initial entries query. No metadata cache, model/tool payload copy, or second history is persisted.
-
-[`internal/bridge/research_admission.go`](../internal/bridge/research_admission.go) runs dispatch mode lookup in the existing asynchronous RPC lane. Its evidence is scoped to client, generation, turn, queue-head inbox, catalog epoch/revision, and native session. Canceled or replaced heads cannot consume an old result; catalog revisions require fresh mode evidence without replaying a command. Queue cancellation, runtime retirement, and explicit off discard the lookup or its ready result. Evidence is consumed by one submission, never reused for a following root. Stop and close remain actionable while native metadata is withheld.
-
-OMP can recover malformed JSONL records without immediately rewriting its history. On a JSON syntax error, the disk reader stops at the preceding complete entry and obtains the canonical remaining entries through RPC. It neither skips ahead to a later disk cursor nor assumes the mode is off, and never repairs the file itself. Valid JSON with invalid control metadata still fails closed.
-
-Legacy session headers with `version < 2`, including an omitted version, cannot supply disk entry IDs or ancestry: OMP migrates them in memory without necessarily rewriting the file. The reader uses the initial native `get_entries` snapshot instead of a disk cursor, then applies the same identity, control, and ancestry validation. Modern histories still require valid entry IDs. The bridge never writes the migrated history itself.
-
-The reader follows `leafId` through parent IDs to the nearest `autoresearch-control` entry (`on`, `off`, or `clear`). Opposite-mode entries on other branches are ignored. Missing metadata, invalid modes, broken ancestry, cycles, unreadable history or missing/mismatched session headers, stale cursors, session changes, and query failures are not interpreted as disabled mode: attempted input is cancelled and waiting work pauses. This is the recorded control flag, not a second experiment state or a guarantee about branch-dependent tool activation. Pending slash inputs must be classified by the actor before research admission, even if the reader has already published a ready catalog.
-
-Known upstream limitation: this is control intent, not authoritative effective state. OMP 18.8.2 can restore a recorded `on` entry while disabling research for the current Git branch. Its [`get_state` implementation](https://github.com/can1357/oh-my-pi/blob/v18.8.2/packages/coding-agent/src/modes/rpc/rpc-mode.ts) does not expose effective autoresearch mode. The bridge must not duplicate OMP's branch/storage reconstruction rules or infer mode from notifications/tools. Consequently recorded-on/effective-off can still create a managed root that does not naturally settle; this P2 requires an upstream authoritative query tied to the current session and extension lifecycle. A missing field is not evidence of off.
-
-Discovery classification converts queued research goals and enabling toggles in place, preserving their original FIFO position. Immediate off/disable-toggle controls and clear remove their own pending entry before applying control checks; clear still requires all other queued work to be absent. Taking over an active research root also cancels queued empty-toggle controls, including inputs awaiting catalog classification, without removing ordinary work or nonempty research goals.
-
-If a control replaces the runtime during classification, that pass stops immediately. Remaining entries wait for the new client's catalog instead of being cancelled or classified through the retired client.
-
-A research owner alone does not enable steering. Ordinary text arriving while a native command awaits agent admission or local completion stays queued. Once that command enters the ordinary-prompt state, text can steer the same root, including between research rounds.
-
-While a native-command root is pending and no research control is already loading, a newly accepted research goal or toggle stays queued without starting another routing-mode query. This keeps the root's correlated local-completion control exclusive; dispatch reads fresh mode evidence for the queued input after that root settles. If the research root instead enters agent execution, deferred empty toggles return to the immediate control path with fresh catalog/session validation and mode lookup. They must not wait behind the autonomous root. Off for an active research root cancels both a pending toggle lookup and every queued empty-toggle control before retirement, even before agent execution is observed. Canceled toggles become `cancelled` and cannot later be reinterpreted as enabling commands after off completes; ordinary prompts, attachments, and nonempty queued goals retain their order.
-
-An enabled mode makes the next ordinary submission a research root. Its original inbox, request owner, turn, and progress association survive autonomous `agent_start`/`agent_end` pairs, terminal-looking `prompt_result`, and transient settled/idle states. The bridge does not replay the goal or synthesize continuation prompts. Each round appends bounded replies atomically to outbox while leaving the owner `submitted`, then clears round text buffers. Duplicate end events without a new start do not append another round. Ordinary text steers the same root; native commands, attachments, and followups remain deferred. Generic completion, idle release, and watchdog paths cannot conclude that explicit research has finished. `/status` distinguishes managed research, recorded enabled mode without a root, and an unconfirmed disable.
-
-Natural shutdown has a separate completion path. `session_settled` only invalidates older evidence and schedules an asynchronous query through the existing RPC lane. After the round closes and every steer resolves, recorded mode must be off and `get_state` must explicitly report `isStreaming=false`, `isCompacting=false`, `isSettled=true`, `hasPendingAsyncWork=false`, and `queuedMessageCount=0`. Only then does the root transition to `done` and permit queue dispatch, without copying already committed round replies. Query errors or incomplete state retire the root as uncertain and pause the queue; mode-on or pending work retains the root. Results are fenced by client, generation, root/request, turn, catalog epoch/revision/session, settlement revision, and steer admission; buffered events take precedence. Stop and close remain actionable during the query.
-
-Connected `/status` reads research metadata and runtime state in the asynchronous RPC lane, not synchronously in the worker actor. Slow `get_entries` therefore does not hold up active-research Stop or `/close` handling. Mode-cache updates require the original generation, turn, client, catalog epoch, and session identity; stale results cannot restore enabled mode in a replacement runtime.
-
-[`internal/bridge/research_control.go`](../internal/bridge/research_control.go) advances routing, mode lookup, off identity verification, final idle checks, prompt acceptance, correlated local completion, and post-control mode lookup as actor-owned phases. RPC work uses the existing cancellable operation lane and returns immutable results; it does not mutate worker state or drain `Client.Events`. `worker.event` remains the single dispatcher for control results, catalog/session updates, host tools, notifications, and other events. Results require the original client, generation, turn, catalog epoch/revision, and native session. Local research completion requires both acceptance and a correlated `status:"completed"`, `agentInvoked:false`, `sessionSettled:true` result before its post-mode query. Stop/close can cancel these waits and retire the original runtime; an interrupted off/clear leaves the live worker's disable-pending pause and never implicitly replays the control. Process startup retains its existing lifecycle.
-
-Research notifications are display-only, bounded, sanitized through the existing terminal-detail filter, and delivered through durable outbox with a budget of eight per round/local control. They do not prove mode or completion. Error/abort events, process exit, and resource overflow retire the runtime and settle interrupted owners conservatively, never replaying research.
-
-Explicit `/autoresearch off` distinguishes an active research root or enabled mode from an ordinary task. With no research activity, a scoped recorded-off proof completes the control without sending native off or abort, preserving the ordinary task, runtime, binding, and deferred queue. A stale proof requires an asynchronous read-only mode query. Failure marks the control uncertain and pauses future queued work, but does not interrupt the ordinary task or discard its final reply. An empty-argument toggle still requires mode lookup; when discovery is pending, the control removes only its own queue entry.
-
-Catalog scope invalidation follows the same rule: failing a read-only off or route mode query does not consume ordinary-task events already queued before the reader's catalog update when the original runtime is preserved. The actor still handles their output and completion normally. A failed route cancels the unsubmitted research command and pauses queued work; stale mode results cannot clear the queue pause.
-
-Retrying a failed read-only off lookup remains read-only while no research root, enabled mode, or disable-pending state is active. A repeated off, or an off arriving during a route query before its research command is submitted, cancels and replaces only the read-only query, not the ordinary runtime, even if the root finishes during the lookup. The canceled off control remains uncertain; an unsubmitted routed command is cancelled. Stale results cannot affect the replacement. Confirmation of recorded-off mode clears the disable-pending queue pause without changing the ordinary root's runtime, identity, or pending work. Repeated query failures retain both the ordinary task and the pause.
-
-For active research or enabled mode, Stop/off first invalidates and immediately terminates the active research process group, then durably marks its root and unresolved steers `uncertain`. A resumed runtime must be idle, settled, and without pending work before sending native `/autoresearch off`; acceptance, a correlated completed local result (`agentInvoked:false`, `sessionSettled:true`), and a subsequent disabled-mode query permit preserved work to dispatch. Failure closes the runtime and leaves a disable-pending pause. Progress Stop/off preserve ordinary queued work; `/stop` clears the queue. Old client/generation/turn results cannot mutate the resumed worker. Termination does not undo tool effects or guarantee that the session remains resumable.
-
-An idle connected runtime can confirm local off before its first native session file has been persisted. Saved-file availability is required only for a cold resume. The connected path still validates the native session ID, exact file identity, working directory, session claim, correlated local completion, and subsequent disabled-mode evidence before reporting off as confirmed.
-
-When Stop interrupts an unfinished admission lookup and canonical autoresearch is available, it clears the queue and retires the blocked runtime before restoring the original session and confirming local off. It does not start another mode lookup behind the withheld response. If the native session has not yet been persisted, or restoration/disable cannot be confirmed, the live worker keeps its disable-pending pause, reports the failure, and never invents a replacement session or replays canceled input.
-
-When process exit is deferred behind an outstanding RPC, handling that result clears the old client's exit fence before research retirement. The active RPC lane still waits for its result, but the exit fence must not prevent later calls on a replacement runtime.
-
-Once the worker context is cancelled, a concurrently ready client-exit notification is not an unexpected-exit close. Normal worker teardown retains the saved running binding, marks an active root uncertain and interrupted, and cancels queued work. A real OMP 18.8.2 smoke observed both cancellation and actual native process exit, then confirmed preserved session identity/history, uncertain active work, and a cancelled followup without replay, using a local provider and simulated Telegram.
-
-Clear requires an idle instance, no queued work or unresolved steers, and a confirmation fenced by owner, chat, topic, message, generation, and catalog epoch. Original native clear arguments are retained. Raw followup/attachment forms cannot bypass these controls. Native clear may reset/clean the worktree and removes research artifacts even with `--keep-tree`; the bridge never implements its own filesystem cleanup. Shutdown/restart settles in-flight work as uncertain and cancels waiting work through existing recovery; it does not resume the loop automatically. The next explicit prompt rechecks native recorded mode.
-
-Immediately after the final idle `get_state`, off and confirmed clear recheck the original client, native session, catalog epoch, and executable canonical autoresearch source before sending their control prompt. Session changes or revoked sources during the query prevent submission; failure retains the disable-pending pause. This is still a snapshot check, not an atomic upstream check-and-execute transaction.
-
-The bridge does not track or reserve workspace ownership. A binding and startup intent retain the selected working-directory path so OMP can start in that directory and the bridge can validate the returned identity; this path is not an admission lock. `storage.workspace_root` supplies the base for named `/new` paths. Separate conversation workers may use the same directory, including during autoresearch, and can modify the same files or Git state. Users must coordinate shared workspaces; process and session isolation do not provide filesystem or credential isolation.
-
-Schema version 18 drops the former `workspace_users` and `workspace_leases` tables when migrating a v17 database; new databases do not create them. Startup restores bindings and exact native session claims without scanning or registering workspace roots. The in-memory session claim prevents two workers in this daemon from opening the same native conversation, not different sessions from using the same directory.
-
-Autoresearch off/Stop still targets the owning conversation's native session. A connected runtime can confirm off without a saved history file; cold recovery requires the original session and working directory to remain available. If recovery or native off cannot be confirmed, the live worker pauses queued work and reports the uncertain state.
-
-Real OMP 18.8.2 smoke used an isolated profile/environment and a local deterministic OpenAI-compatible endpoint: native `init_experiment` armed two autonomous rounds; Progress Stop confirmed native off on a new process before a preserved followup completed. This exercised actual RPC and extension hooks, not live Telegram or a production model provider. Destructive Git/reset behavior was not exercised by this smoke.
-
-Real OMP 18.10.3 two-step smoke used an isolated agent directory, a disposable Git clone, simulated Telegram, and a deterministic local model endpoint. Empty `/autoresearch` completed locally, delivered the native next-message notice, retained enabled mode, and made no model request. A subsequent ordinary message reached the model under the native harness-setup prompt and its reply entered durable outbox; explicit off then confirmed disabled mode. This smoke did not initialize an experiment, run a benchmark, verify optimization quality, or access production providers, sessions, or workspaces.
-
-A recovery smoke with existing native history also exercised process exit before handling a pending status result, confirmed off and subsequent local/ordinary RPC completion, and a deferred off followed by a queued research goal and preserved followup across runtime replacement. It used real OMP with simulated Telegram and a local deterministic model endpoint.
-
-A natural-stop smoke ran real OMP 18.8.2 with `init_experiment(max_iterations=1)`, a harmless `run_experiment` harness, and `log_experiment(status="keep")` in an isolated non-Git directory. Native off completed the original root exactly once and let its queued work proceed. The provider was local and deterministic, Telegram was simulated, and no Git reset/commit or live Telegram delivery was exercised.
-
-
-A separate recovery smoke first saved native history, then armed a fault for old-runtime `get_entries` during active research. Explicit off skipped that query, retired the original root as uncertain, resumed and confirmed native off, and executed the preserved queued task exactly once. It used an isolated profile, a local deterministic provider, and simulated Telegram; no native reset/clean or live Telegram delivery was exercised.
-
-A real OMP 18.8.6 smoke restored a synthetic 78,750,537-byte native history in an isolated agent directory/workspace. Incremental mode lookup confirmed off within its five-second query deadline, canonical `autoresearch` qualified as an executable extension through the Go client, native `/autoresearch off` completed through its correlated local result, and a subsequent `/session info` completed locally. No provider prompt, production history mutation, Git operation, or live Telegram delivery was exercised. Permanent regressions cover large-history branch selection, updates after the file snapshot, mismatched history, and session changes during lookup.
-
-A crash-tail recovery smoke with real OMP 18.8.6 restored synthetic recorded-off and recorded-on histories ending in an incomplete message record. Both mode queries succeeded without changing the damaged files; native off then completed through a correlated local result, followed by a successful local `/session info`. No provider prompt or live Telegram operation was submitted. Regressions also require RPC-supplied on metadata to survive a partial disk control record and retain fail-closed behavior for invalid control metadata, rejected cursors, and broken ancestry.
-
-A real-OMP recovery smoke covered v1 and unversioned histories with both recorded modes: lookup preserved the original file, correlated native off completed, and `/session info` completed afterward. The final smoke covered a connected runtime with an invalidated catalog and cold recovery. These used isolated profiles and simulated Telegram, without provider prompts or native reset/clean.
-
-### Telegram command menus
-
-The default menu retains the bridge commands. A separate chat-scoped menu combines those commands with executable advertised names and aliases from that chat's workers. `builtin`, `skill`, `custom`, `mcp_prompt`, and `file` sources qualify, plus the exact canonical `autoresearch` extension. Other extensions and extension aliases, unknown-source commands, hidden `/start`, and refused lifecycle commands are excluded. Bridge commands keep their descriptions and precedence. Native entries use a fixed generic description, never upstream catalog descriptions.
-
-Telegram has no topic-specific command scope. Topics in one chat therefore share a union, while different chats remain separate. A menu entry is not execution permission: routing and dispatch still validate the current session. Native names must match `[a-z0-9_]{1,32}` without normalization or invented aliases. Names are deduplicated and sorted after the bridge entries, and the combined list is capped at 100. Omitted executable commands remain manually callable.
-
-Catalog results and reader update notifications publish the authoritative snapshot in memory. Session invalidation clears the old contribution; runtime startup registers the current worker, including reopening after `/close`. Closing, replacing, failing, or shutting down a logical worker removes its contribution without removing other topics' entries. Idle process release alone retains the discovered contribution until the next session/catalog update. Pointer ownership and removal fencing reject late updates or removals from retired workers.
-
-A single background publisher coalesces dirty chats, performs bounded `setMyCommands` requests outside worker actors and the RPC reader, and updates both the default language and `zh` for each chat scope. Startup synchronizes allowed chat scopes, using bridge-only lists where discovery has not completed and preserving catalogs that arrived early. Successful lists are cached per chat/language; failures are not cached, and later contribution updates can retry. An in-flight older publication is followed by the latest queued union. Menu failure does not fail tasks or block worker control handling.
-
-An uncertain publication invalidates the last successful cache entry for that chat/language: Telegram may have applied the new list before its response was lost. Returning to the previously acknowledged list must publish it again. A definite rejection retains the successful cache; this adds no publisher retry or backoff policy.
-
-Menu state is not persisted by the bridge. Published command names are visible to Telegram chat members, including those not authorized to operate the bot. Logs contain only bounded chat/language/error metadata (`telegram_chat_commands_failed`), never native names, descriptions, arguments, or raw RPC data.
-
-### Manual compaction
-
-Manual compaction requires an idle logical session, not an already-connected process. A released session is resumed before confirmation and rechecked when confirmed. Startup/resume failures retain their recovery error instead of being reported as an idle-state violation.
-
-The compact operation has a 180-second deadline; other operations dispatched through the same RPC lane retain their 30-second deadline. Worker cancellation still interrupts either deadline. The post-compaction usage query remains capped at three seconds and cannot outlive the compact operation's remaining deadline.
-
-After a successful manual `compact` RPC, the same asynchronous operation queries `get_state`. Only the matching native session's safe `contextUsage` projection is displayed, using the `/status` percentage and used/capacity format. Missing or invalid usage, a session mismatch, or a failed query displays `n/a` without reclassifying confirmed compaction as failed. A different nonempty native session ID also retires the runtime while preserving the original binding and session claim, so subsequent requests must resume the saved session instead of using the switched process. Existing client/generation fencing rejects stale operation results.
-
-Success replaces the original confirmation message and removes its keyboard, rather than leaving a confirmation receipt plus a separate completion message. If the original message is unavailable or its edit fails, the completion goes through durable outbox instead. A real OMP 18.12.0 smoke with an isolated agent directory/environment, a local deterministic provider, and simulated Telegram confirmed the in-place completion with post-compaction usage and a persisted native compaction entry; live Telegram delivery was not exercised.
-
-A real OMP 18.12.1 smoke delayed one local summary response by 31 seconds. Manual compaction completed after 31.06 seconds, retained the original runtime and binding, persisted the native compaction entry, and updated the simulated Telegram confirmation with post-compaction usage. Deterministic virtual-clock regression coverage checks the 180-second compact limit, the unchanged 30-second deadline for other operations, and worker cancellation. Session-switch regression coverage checks runtime retirement and restoration of the original native session on the next request. Live Telegram delivery was not exercised.
-
-### Prompt and interrupt semantics
-
-The bridge uses public RPC v2. Root prompts persist their inbox before sending; acceptance and `agentInvoked=false` retain the existing terminal handling. A failed or unconfirmed root submission closes its client and cancels the bridge queue without replay. For running text, the worker validates the frame, reserves an RPC request ID, persists the steer inbox as `submitted`, registers the request under the current root/client/generation/turn, then sends `prompt` with `streamingBehavior: "steer"`. OMP >= 18.3.2 is required for correlated `prompt_result` and settlement evidence. A steer does not own a final reply, create progress, or enter the bridge queue. `/followup` instead creates a separate bridge-queued root; attachments and `/review` remain queued. The combined number of queued roots and unresolved steers is bounded by `worker.queue_capacity`.
-
-Except for the existing pre-write frame-limit rejection, root `prompt`/`native_prompt` submission errors without a steer fence retire only the runtime. Ordinary unexpected process exits, assistant-output budget overflow before task completion, and failed native confirmation/select replies use the same retirement path. It clears control/compaction/session-operation state, cancels pending bridge tasks, and atomically completes an active inbox as `uncertain` with its notice. An idle failure emits a notice without inventing a task result. The running binding, native session file/ID, generation, and session claim remain available for lazy resume on the next explicit request; neither uncertain tasks nor cancelled work are replayed. Existing research and steer paths retain their queue protection and disable-pending pause. An unavailable native file, including a fresh session whose history was never persisted, remains a restore failure rather than creating a replacement session.
-
-The root submission wait still has its existing 30-second deadline. A native dialog opened by `/review` can keep that submission pending until the user chooses, so an unanswered picker can reach the deadline. This is an acceptance timeout, not a time limit on an already accepted model task; retaining the binding does not extend that deadline.
-
-A real OMP 18.10.3 smoke used an isolated agent directory, disposable workspaces/database, simulated Telegram, and a local deterministic provider. Active-process termination, injected over-budget RPC delta events, and an oversized reply to an actual native `/review` select menu each preserved the running binding and exact native session identity; the root became uncertain, queued work was cancelled, and a fresh explicit prompt completed on a replacement process without replay. The overflow scenario injected events during a real active turn rather than relying on naturally oversized provider output. Live Telegram delivery was not exercised.
-
-OMP 18.3.2 is the oldest version verified for text steering with request-ID-correlated RPC v2 `prompt_result` statuses (`completed`, `aborted`, `error`) and settlement evidence. This feature requirement is newer than the bridge's underlying RPC v2 requirement.
-
-Root finalization is fenced until a terminal `agent_end`, every steer request's terminal result (`completed`, `aborted`, `error`; local-only `agentInvoked=false`), and current-session settlement have all been observed. A result's `sessionSettled=false` invalidates earlier true evidence; unkeyed `session_settled` only requests a `get_state.isSettled` probe, never releases the fence itself. Probe results are checked against client, generation, root, turn, and revision after already queued events. `agent_start` clears a deferred old terminal, while local-only steer responses preserve it. A missing result after repeated confirmed idle probes retires the old runtime and settles unresolved steer inputs and the root as `uncertain` without replay. Worker shutdown and unexpected client exit settle unresolved submitted steer inboxes likewise.
-
-Settlement evidence follows receipt order: any correlated steer's `sessionSettled=false` invalidates prior true evidence, even when that request was admitted earlier. Only the latest admission's true result can establish settlement; otherwise current quiescence must be confirmed with `get_state`.
-
-An errored `handoff` or `compact` request retires the client unless omp explicitly rejects it; timeouts, cancellations, and unconfirmed results force lazy resume on the next request. An explicitly rejected `abort` keeps the client reusable; an unconfirmed abort retires it and settles any active task as `uncertain` without replay, then continues queued work on a fresh runtime. `set_model`, `set_thinking_level`, and `set_fast_mode` retain the client only on explicit RPC rejection; uncertain errors or unconfirmed results retire it before queued prompts run. Native cycle-role selection retains `SetModelRole`'s fail-closed behavior. If the client exits during a worker RPC, the worker waits for that RPC's result before applying exit policy; model-role failures therefore retire only the runtime and preserve the logical binding for lazy resume. If writing a `host_tool_result` fails, the bridge settles the active task as `uncertain` and retires that client.
-
-Without a steer fence, Progress Stop sends plain `abort` for the active task and preserves bridge-queued tasks; `/stop` also clears the bridge queue. A successful abort response is not a fence against native asynchronous continuations. Before releasing queued work, the worker therefore immediately terminates the old process group without graceful stdin draining, retains the logical session identity and generation, clears session-operation state, and completes a still-active root as `cancelled`. A root already settled before the response is not rewritten. Subsequent work lazily resumes the saved session on a replacement runtime; the old runtime cannot consume a new prompt or publish late task events into it.
-
-Ordinary text received while `controlAbort` is pending enters the bridge queue as a separate root, never the native steering queue. This also applies to an unrecognized `queuedSlashPending` input when discovery changes from unknown to ready during Stop: catalog callbacks convert it to an independent queued prompt rather than steering the old root. Existing command/button queue policies apply only to work already waiting when Stop was requested. Once an actual abort is issued, a successful response retires its client even if the root's terminal event arrived first.
-
-When no bridge root is active, Stop first queries native state in the asynchronous RPC lane with the existing idle-probe deadline. The no-abort fast path requires an idle, settled snapshot with no reported asynchronous work or queued native messages, no bridge task/session operation, no pending native UI or host request, and no buffered native output. Native idle/settled flags alone do not prove that a startup dialog has no outstanding decision. A confirmed quiescent runtime is kept regardless of whether its history file exists. Pending dialogs, busy state, or unconfirmed state follow the normal abort and retirement path; explicit abort rejection retains its existing failure semantics. History-file existence is not evidence of native activity.
-
-An additional real OMP 18.10.4 smoke confirmed that idle Stop kept a saved session on the same client. During an active Stop, it invalidated discovery and handled the real unknown-to-ready catalog callback before applying the abort response. The unknown slash remained pending, then received its own confirmed reply once on a replacement client with the exact original session identity. The provider was local and deterministic and Telegram was simulated; no live Telegram interaction was exercised.
-
-A real OMP 18.10.4 smoke used isolated profile/history/workspaces, simulated Telegram, and a local deterministic provider. Both `/stop` and the Progress Stop control were exercised with a new message arriving before abort completion and after completion. All four cases kept the exact session binding, observed the old client exit, and delivered one confirmed reply for the new root from a replacement client, with no replay of the stopped request. Regression fixtures additionally cover native continuation after an aborted terminal and preserve an idle unsaved session. No live Telegram client interaction was exercised.
-
-With a steer fence, plain `abort` cannot guarantee OMP's native steer queue is cleared. Both controls first invalidate and immediately terminate the old process group (without graceful stdin draining), then mark the root and unresolved steers `uncertain`; Progress Stop preserves bridge follow-ups, `/stop` clears them. A preserved follow-up can only start on a newly resumed runtime after durable settlement. Forced termination cannot undo tool effects and may leave OMP's session unrestorable. `/queue` cancels only its selected pending bridge task, never native steers.
-
-Workspace-sharing conflicts do not gate dispatch or interruption. Ordinary abort uses the current connected client without lazy restoration, so it remains actionable even when the shared directory or Git state changes. Each conversation still owns its bridge queue; Progress Stop preserves waiting bridge prompts while `/stop` clears them. Separate OMP processes may still modify the same files.
-
-Steered-root retirement clears the old runtime's compaction/session-operation state without waiting for an end event from the terminated process. Attachment preparation belongs to the preserved logical-session queue: results still apply while the client is released when generation and pending inbox ID match. Cancelled tasks and old-generation results remain discarded, including their temporary files.
-
-OMP 18.10.4 provides `abort_and_restore_queue`, which atomically withdraws native queued user input before aborting. A real isolated RPC smoke confirmed correlated `aborted` results for queued prompts on this path. A separate single-item `remove_queued_message` smoke returned `removed:true` without sending the removed text to the provider, but its accepted prompt later received `prompt_result(status="completed")` when the active root completed. Queue removal therefore cannot be treated as authoritative per-prompt cancellation. Neither command replaces the stale-callback isolation requirement above. The bridge retains fail-closed runtime retirement; a future reusable cancellation path needs truthful request-ID-correlated terminal results for removed prompts and a barrier preventing old work from affecting subsequent tasks.
-
-RPC v2 may compact large terminal frames and omit messages already emitted by `message_end`. The worker caches the latest assistant message's `stopReason` and `errorMessage`, plus finalized text from every assistant `message_end`; terminal `agent_end` messages take precedence, and the cache is used only when they contain no assistant message. The cache resets at `agent_start`, terminal completion, and shutdown. Cached error metadata classifies the result; only a bounded sanitized `errorMessage` summary may be included in an uncertain reply, never the raw metadata.
-
-An `agent_start` changes task busy state only while a bridge input owns the active lane. A late or unsolicited start after task settlement cannot restart typing or block queued prompts. `/status` reports OMP's native streaming state, while bridge queue dispatch uses its own active-task state.
-
-### Missing terminal completion and watchdog
-
-Missing terminal completion has a separate conservative recovery path, never a success path. An active busy root task must have no activity for 30 seconds and no compaction/handoff, retry, running tool, host request, or native UI wait. A background `get_state` call has a five-second timeout and never blocks actor control handling. Both `isStreaming` and `isCompacting` must explicitly be `false`; absent/null/malformed fields and errors discard confirmation. Two confirmations must be separated by at least 30 seconds. Every event, including unknown or malformed events, and ordinary RPC activity invalidates probes. Results are fenced by client identity, generation, turn, active input, and activity revision; queued events take precedence over probe results. Confirmed missing completion uses the existing atomic uncertain-result transaction and progress cleanup, then retires the old client before queue dispatch, preserving the logical session claim and queued inputs for lazy resume without replay. Pending typing requests are canceled on terminal completion, turn changes, runtime release, and shutdown; their timeout remains four seconds.
-
-`awaitingContinuation` records explicit `agent_end isTerminal=false` and blocks ordinary-root watchdog probes. Native async work may legitimately remain non-streaming for minutes. `agent_start`, task settlement, new root dispatch, and runtime teardown clear this state; unrelated events and status calls do not. Ordinary roots intentionally retain this suppression rather than assuming a missing continuation has failed.
-
-The steer fence is the exception to normal `awaitingContinuation` watchdog suppression. Streaming, compaction, tools, native UI, and active retry prevent idle recovery. Explicitly idle probes with `hasPendingAsyncWork=true` or a positive `queuedMessageCount` instead get a five-minute grace period from the first such confirmation. Repeated idle-pending probes do not reset it. Activity, an ineligible/non-idle observation, or pending work disappearing clears the continuous-pending timer. At or after the deadline, another current idle-pending confirmation force-terminates the old process and marks the root and unresolved steers `uncertain`, preserving bridge follow-ups without replay. This bounds a stuck native queue but may interrupt legitimate async work that remains entirely silent and pending for five minutes.
-
-Actor lifecycle logs identify the client, active input, busy flag, turn, and generation for `agent_start`, `agent_end`, `prompt_result`, auto-compaction boundaries, and failed requests. Terminal flags distinguish absent/true/false. They record metadata only, never raw events, prompts, output, provider diagnostics, or credentials.
-
-RPC client logs use the same client identity to distinguish receipt, event queueing, failed-response routing, and rejection. `event_queued` confirms a buffered send, not actor consumption; compare it with the actor's `phase=received` entry. Only locally numeric request IDs are logged, never arbitrary peer IDs or response bodies.
-
-### Structured logging
-
-The daemon creates one `slog` registry after configuration succeeds. It has exactly six component loggers: `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. Text and JSON handlers share one synchronized writer, so concurrent records are complete and independently parseable. `logging.level` sets the default threshold (`debug`, `info`, `warn`, or `error`), and `logging.format` selects text or JSON output; `[logging.component_levels]` may override the level for named components. Component names, levels, formats, event names, and RPC phases are fixed allowlists rather than user-defined labels.
-
-Text output uses compact `YYYY-MM-DD HH:MM:SS LEVEL [component] message key=value` lines, for example `2026-09-19 13:20:01 WARN [telegram] telegram polling failed event=poll_failed reason=timeout`. The component header comes from the registry. Original message content and all remaining structured attributes are preserved, without `time=`, `level=`, `msg=`, or `component=` header labels. Strings and control characters are escaped as needed to keep records single-line. JSON output remains standard `slog.JSONHandler` output, including the `component` field. These are the only two formats; unspecified components inherit `logging.level`.
-
-Events use short stable `snake_case` names. `debug` is for RPC/probe detail and bridge handled-path detail; `info` records successful lifecycle milestones; `warn` records recoverable delivery, media, or watchdog failures; `error` records durable persistence failures, protocol violations, and buffer overflow. Ordinary user cancellations are not warning or error events. A failure is recorded at the layer that owns its policy, with callers avoiding duplicate copies of the same error.
-
-RPC lifecycle detail is emitted as `event=rpc_lifecycle` with an allowlisted `rpc_event` (`agent_start`, `agent_end`, `prompt_result`, `auto_compaction_start`, `auto_compaction_end`, or `response`) and a phase of `received`, `event_queued`, `response_queued`, `response_ignored`, `rejected`, or `handled`. `terminal` is one of `absent`, `true`, `false`, or `invalid`. `request_id` is included only when the local decimal value parses safely as an unsigned integer. Bridge lifecycle records retain their component and stable event fields; handled bridge paths remain at debug level.
-
-Log metadata is a reviewed whitelist: component/event identity, bounded numeric state such as chat/thread IDs, turn/generation, retry counts, error classification, and internal session UUIDs may be recorded when needed for correlation. At startup, `daemon_start` includes only the effective progress mode, worker/queue limits, idle timeout, database retention days, and log level/format; this info-level event follows the daemon component threshold. Logs never contain prompts, output, reasoning, tokens, headers, URLs, raw errors or frames, tool arguments/results, callback tokens, filenames, workspace/session paths, authorization lists, unreviewed configuration values, or `omp.args`. Asynchronous callbacks capture the identity of the operation when scheduled; they never read dynamic identity from a reused worker. Configuration and CLI failures happen before this registry exists and stay plain text rather than being formatted as JSON.
-
-Both formats write to stderr. File storage and rotation belong to supervisor/journald; there is no asynchronous log queue, sampling, network exporter, or runtime level reload. The shared writer serializes this registry's records only, not output from other processes. Logging write errors never enter task state transitions.
-
-| Component | Main events |
+| Catalog/source | Routing contract |
 | --- | --- |
-| `daemon` | `daemon_start`, `daemon_stop`, `daemon_fatal`, `lock_failed` |
-| `bridge` | `worker_start`, `worker_stop`, `task_submit`, `task_complete`, `queue_rejected`, `session_new`, `session_resume`, `session_replace`, `session_close`, `runtime_connected`, `runtime_resume`, `runtime_release`, `runtime_exit`, `restore_claim`, `restore_runtime_failed`, `restore_runtime_skipped`, `topic_rename_failed`, `watchdog_probe`, `watchdog_probe_reset`, `watchdog_async_wait`, `watchdog_recover` |
-| `rpc` | `rpc_lifecycle`, `rpc_protocol_error`, `rpc_queue_overflow`, `rpc_process_exit` |
-| `telegram` | `command_menu_registered`, `poll_failed`, `delivery_rate_limited`, `delivery_retry_scheduled`, `delivery_retry_exhausted`, `delivery_failed`, `delivery_uncertain`, `reply_fallback`, `progress_cleanup_failed`, `progress_cleanup_abandoned` |
-| `store` | `cleanup_completed`, `cleanup_failed`, `snapshot_cleanup_failed`, `outbox_read_failed`, `outbox_write_failed`, `outbox_state_write_failed`, `inbox_state_write_failed`, `final_commit_failed`, `progress_message_write_failed`, `progress_cleanup_state_failed` |
-| `media` | `prepare_failed`, `snapshot_failed`, `attachment_persist_failed`, `cleanup_failed` |
+| Unknown | Slash input waits for classification in FIFO. Ordinary non-slash roots need not wait for discovery when their other admission evidence is available. |
+| Ready, executable | `builtin`, `skill`, `custom`, `mcp_prompt`, and `file` commands/aliases enter the native deferred queue without steering or reply-context wrapping. |
+| Ready, unrecognized slash input | Preserve text and ordinary prompt/steer routing, including absolute paths. |
+| Unsupported discovery | Cancel non-bridge slash-headed input, including followup/attachment/steer paths; ordinary non-slash input and bridge controls remain usable. Explicit bridge `/review` provenance retains its exception. |
+| Extension or unknown source | Recognize and refuse generically, without echoing catalog names, arguments or raw source. Only exact canonical extension `autoresearch` has a specialized owner; its aliases and other extensions do not inherit that permission. |
 
-Root task correlation uses `chat_id`, `thread_id`, `generation`, `turn`, `inbox_id`, and `client_id` where applicable. `thread_id=0` is meaningful for private chats. Native `session_id` is recorded in full only after validation; file paths are never session log identities. `client_id` is process-local and monotonic, not persisted. `task_complete` reports `result=done|cancelled|uncertain` after the durable transaction succeeds, with `duration_ms` when the root start time is available. Delivery metadata uses `outbox_id`, `kind`, `api_code`, `retry_after_s`, `uncertain`, and `replay`; descriptions and response bodies are never logged. To trace receipt through actor handling, set `logging.component_levels.rpc = "debug"` and `logging.component_levels.bridge = "debug"`.
+Names and aliases are opaque, unnormalized strings. Empty names, leading `/`, and invalid name/alias types invalidate the catalog; unusual whitespace/control/Unicode names alone do not. Missing/null/non-string/unknown sources stay recognizable but non-executable. Catalog validity does not imply that the current invocation parser can call every retained name.
 
-Bot IDs remain part of internal session identity and database checks, but are omitted from logs because each daemon serves one bot. Chat and thread IDs are not credentials, but are linkable identifiers; restrict log access and replace them with consistent placeholders before sharing logs publicly.
+The stdout reader publishes unsolicited catalog updates before later response waiters. Queries record their actual epoch and reader-update revision; a changed session or newer update wins over an older query response. Identical discovery preserves snapshot/revision, while even identical unsolicited updates advance revision. Worker catalog events are wakeups, not snapshots to reapply. Lazy restoration refreshes discovery.
 
-Live progress is an in-memory, best-effort view using the existing one-message preview transport. `telegram.progress_mode=off` suppresses Telegram Send/Edit and typing but continues text-delta processing for final-result fallback. `summary` shows editable assistant output, active tool names keyed by tool call ID, and state; `verbose` adds bounded raw tool arguments, partial updates, final results, and recent completed tool outcomes in that same message without sending a separate Activity message. Retry, compaction, and concurrent tools are explicit events. `tool_execution_end` is the sole completion source, including host tools; host callbacks correct a matching active tool name and may supply arguments. Reasoning and whole RPC frames are never rendered; tool payloads are rendered only in `verbose` and are not logged by the bridge. Each active root progress message has a Stop button fenced by owner, worker generation, active inbox ID, and turn. A valid click consumes and removes the button, sends native `abort` only for that active root task, and unlike `/stop` preserves bridge-deferred prompts for ordered dispatch after cancellation; stale buttons are removed without aborting. Programmatic task settlement, worker replacement, and shutdown invalidate the button through the bounded cleanup queue. An initial Send failure suppresses progress for that turn to avoid duplicate messages; an Edit failure remains retryable. Progress replies to the root input when possible, but reply rejection falls back to a plain message without changing task state.
+A discovery waiter timeout/cancellation/rejection preserves a reader-published usable catalog. If discovery remains unknown, the worker pauses discovery for that client/epoch and leaves slash inputs pending; `/queue` cancellation of the waiting item can release later FIFO work. Scope changes or reader updates restore classification. Actual transport/protocol/process failure retains normal runtime-failure policy.
 
-The compact native status line reuses `/status`'s safe field projection without changing that command's detailed format. Model IDs omit the provider and render literally. Thinking uses the [TUI Unicode symbols](https://github.com/can1357/oh-my-pi/blob/main/packages/tui/src/theme/symbols.ts): `⦸` off, `○` minimal, `◔` low, `◑` medium, `◒` high, `◕` xhigh, `◉` max, and `⟳` auto; unrecognized levels render as bounded literal text. Active fast mode uses `⚡`; confirmed inactive fast mode is omitted unless its setting differs from actual activity, in which case both values remain explicit. `◫` shows the context percentage followed by context-window capacity, for example `◫ 55% (128k)`, using the existing token-count abbreviations. Live speed uses native `tokensPerSecond`; final speed uses the reply aggregate below and an `avg` prefix. Unknown fields are omitted, not estimated from text deltas. Both progress and final headers join the available fields on one logical line; Telegram may wrap it according to screen width. The native status line shares the existing message budget, reducing verbose tool-detail space rather than expanding the preview.
+[`native_commands.go`](../internal/bridge/native_commands.go) revalidates the queue head immediately before submission, including after asynchronous admission work. It checks current source/name and native session identity; a removed command or changed native session cancels the entry, never downgrades it to model text. Same-session revision changes do not cancel a still-valid command; a replacement client restoring the same session is allowed. Raw slash-headed followups and prepared attachments cannot bypass source/lifecycle checks.
 
-After the initial progress delay, an independent asynchronous `get_state` sampler runs at most once every five seconds, scheduled by the existing worker tick, with one in-flight query and a three-second deadline. It does not enter the control-operation queue, touch lifecycle idle evidence, or start a runtime. Idle, `off`, suppressed, and finishing progress do not sample. Results are fenced by request identity, client, generation, root inbox, turn, catalog epoch, and native/bound session identity. Task transitions, runtime retirement, and session-info updates cancel the query and clear the block. Query failures clear only this UI block; they do not settle, replay, or deliberately retire a task. Raw snapshots are neither logged nor persisted; accepted fields appear on subsequent normal preview updates. Idle inspection remains `/status`.
+Lifecycle-mutating `/move`, `/wt`, `/worktree`, and `/session delete` are refused both at routing and dispatch, even without discovery. Session refusal matches only case-insensitive `delete` with no further arguments. `/session info` and `/session pin` keep native routing. Bridge session lifecycle APIs own the saved binding; arbitrary extension lifecycle mutations are not reconciled. Snapshot validation is not atomic upstream check-and-execute, and untagged old-session unsolicited updates cannot be reliably identified by bridge fences.
 
-Successful text completion adds a first-message-only status header independently of progress mode. Completed main-agent `message_end` frames contribute only safe numeric usage/duration and model identity to reply-scoped counters; `agent_end` summaries are not counted again. Average speed is `sum(usage.output) * 1000 / sum(duration_ms)`, covering tool continuations but excluding tool/queue time, with the native positive-output and 100ms aggregate-duration rules. Missing or invalid call metrics suppress the average instead of presenting a partial aggregate. A new task resets the counters; each successful autoresearch round commits and resets its own counters without settling the research root.
+An explicit native local acknowledgment `agentInvoked:false`, or request-correlated local `prompt_result(status:"completed", agentInvoked:false)`, completes the submission without requiring assistant text. This does not prove background operations finished. Local `error` is uncertain, `aborted` cancelled, and missing/unknown status uncertain; generic notices commit with those states without exposing raw RPC errors, retiring a healthy runtime, or replaying the command. Uncorrelated `command_output` is not forwarded to Telegram, so local commands can complete without a visible answer. Recognition alone does not implement native `/plan` or `/plan-review` RPC support.
 
-Output-inclusive context follows native [context-token accounting](https://github.com/can1357/oh-my-pi/blob/main/packages/agent/src/compaction/compaction.ts): prefer explicit `usage.contextTokens`, otherwise use a positive `totalTokens` or a complete input/output/cache sum, subtract provider-side orchestration tokens, and clamp to zero. Missing, negative, or overflowing data is not guessed. This differs from native `get_state.contextUsage.tokens`, which may still be the final input anchor without that call's output. After confirmed completion, a separate asynchronous `get_state` query obtains the current model/window and idle evidence with a one-second deadline. Context requires an explicitly idle, non-compacting snapshot for the same model/provider and native session; its percentage is recomputed from the last call's output-inclusive usage and this window, never from an old progress sample.
+### Command menu publication
 
-The final query has its own callback path and cannot release the mutation RPC lane. Client, generation, root inbox, turn, catalog epoch, and bound/native session checks fence results. New input, subsequent native work, runtime retirement, or a failed query commits the confirmed reply with only already-known model/average fields; late callbacks cannot affect the next task. Completion trailers and harmless metadata may drain while the query runs. The answer and accepted header enter the same durable completion transaction; a crash before that commit retains the existing uncertain/no-replay semantics, without a new persisted metadata state. Header space is reserved within the existing first-page, total-byte, and message-count budgets; truncation remains explicit. Error/cancellation notices and local control responses are unchanged. `/status` retains its detailed provider/model and native sampling semantics.
+[`command_menu.go`](../internal/bridge/command_menu.go) keeps the default bridge menu and publishes chat-scoped unions of bridge commands plus executable native names/aliases. Telegram has no topic command scope: topics in one chat share the union, while chats remain separate. Menu visibility never grants execution permission. Names must already match `[a-z0-9_]{1,32}`; bridge entries/descriptions take precedence, hidden `/start` and refused lifecycle names are excluded, native descriptions are fixed generic text, and sorted/deduplicated native entries fill the remaining space up to 100. Omitted executable names remain manually callable.
 
-Assistant text deltas update the editable preview's `Output`; completed assistant text remains available for the durable final reply. Only in `verbose`, active tools retain at most 100 UTF-16 units each of raw JSON arguments and the latest partial update or final result. Completed tools retain these bounded fields, outcomes (`completed` or `failed`), and rounded elapsed times for the 5 most recent calls, with an earlier-call count. Tool detail text has a 1600-unit aggregate budget; active tools remain visible independently so a running tool can still be identified. Only a matching `tool_execution_end` records a completed outcome; partial updates change only the active tool's preview. This history uses the existing one-message preview and its Stop keyboard, never a second Activity message. The preview and durable final reply retain their independent delivery and cleanup rules. Tool payloads are not redacted and may reveal credentials or private files to anyone who can read the progress message.
+Session/catalog invalidation clears old contributions. Logical close/replacement/failure/shutdown removes only that worker's contribution; idle process release retains it. Pointer ownership and inactive tombstones prevent late updates/removals from retired workers. Startup resets allowed chat scopes without discarding early catalogs.
 
-The JSON decoder still scans the full tool event, but each payload field copies only its bounded prefix instead of duplicating the entire value. The 100-unit limit includes `…`; when a rune would fill the limit exactly and more data follows, that rune is omitted to make room for the marker.
+One background publisher coalesces dirty chats and writes both default-language and `zh` scopes with 20-second deadlines outside actors/readers. It caches acknowledged lists per chat/language. Failure does not fail tasks; later contribution changes can retry, without an independent retry loop. Uncertain publication invalidates the prior successful cache because Telegram may have applied the update; definite rejection retains it. Menu state is not persisted locally, and published native names are visible to chat members even if they cannot operate the bot. Raw catalogs, descriptions and arguments do not enter menu diagnostics.
 
-Development schema 12 stored historical Activity message IDs. Migrating to schema 13 discards those IDs along with their table; any old Activity messages still present in Telegram cannot be cleaned up automatically. Previously accepted sends with an unknown ID likewise cannot be cleaned up automatically.
+### Native dialogs and session operations
 
-Progress creation is evaluated on the regular 1.5-second worker tick after a three-second initial delay for a new task. Existing-message updates, typing, and durable final replies retain their independent behavior. Each progress preview is associated with its root inbox. For every terminal inbox state (`done`, `cancelled`, `ignored`, `failed`, or `uncertain`), the bridge attempts to delete that progress message once every associated outbox part reaches a terminal delivery state (`done`, `failed`, `uncertain`, `cancelled`, or legacy `sent`); `pending` and `sending` parts defer cleanup. Terminal delivery failure therefore does not retain the progress association. The association is a local cleanup aid, not a permanent retention pin: when terminal data reaches the retention cutoff with no associated `pending` or `sending` outbox work, cleanup clears only the local association and leaves the Telegram message in place. A confirmed non-retryable Telegram rejection also clears the local association.
+[`worker.ui`](../internal/bridge/bridge.go) maps native `confirm` to Confirm/Cancel buttons and `select` to an eight-option paged picker with cancellation. Empty selects are cancelled. `input`/`editor` requests are cancelled with guidance to send ordinary text; widgets and generic native output are not a terminal UI emulation. Tokens are owner/generation/client scoped and single-use; selections are also tied to their menu message. Unlike bridge-owned menus, native dialogs have no bridge expiry, including after pagination: OMP owns any native deadline and cancel signal. Without cancellation, they remain actionable until a user decision, task settlement, or runtime/session teardown, and block normal idle release while pending.
 
-## Identity and stale work
+Native cancellation invalidates matching tokens. Teardown removes obsolete tokens before bounded keyboard cleanup. A menu receipt records the user's choice, not operation success; failed confirmation/select writes retire the runtime conservatively.
 
-| Identity | Representation |
+Manual `/compact` requires an idle logical session, not an already-connected process, and starts without confirmation after restoring a released runtime. It attempts a button-free `Compacting...` message with a five-second timeout, then runs native `compact` in the operation lane with a 180-second deadline. A post-success `get_state` query has at most three seconds within that remaining deadline. Missing/invalid usage or failed sampling displays `n/a` without changing confirmed compaction into failure. A different nonempty native session ID additionally retires the runtime while preserving the original binding/claim. Completion replaces the status message; absent status or failed edit falls back to durable outbox.
+
+`/handoff` requires idle session controls and an empty queue, passes optional `customInstructions` to native RPC, and holds subsequent queue dispatch until its result. Its normal operation deadline is 30 seconds. Explicit compact/handoff rejection retains a reusable runtime; errors, timeouts, cancellation and unconfirmed results release it for lazy resume. Neither operation creates a model root or borrows its progress/Stop keyboard. Session/model/argument selection and native export/path resolution are separate lifecycle interfaces; [`render.go`](../internal/omp/render.go) resolves native history paths through `omp render`, not Telegram final-answer formatting.
+
+## Progress, status and final replies
+
+### Best-effort progress
+
+[`worker.renderProgress`](../internal/bridge/bridge.go) uses one editable, in-memory preview. The 1.5-second worker tick evaluates creation after a three-second initial delay. `off` suppresses progress Send/Edit and typing, but still accumulates text for final replies. `summary` shows output, state and active tools; `verbose` adds bounded raw arguments, latest partial/final results and the five most recent tool outcomes, with an omitted-earlier count. Retry/compaction states are explicit. Only matching `tool_execution_end` completes a tool; host callbacks may correct its name/arguments but do not invent completion. Reasoning and whole frames are never rendered.
+
+At most six active tools are displayed, with 64-unit names, 100 UTF-16-unit payload fields, a 1600-unit aggregate detail budget and a 2200-unit output tail within a 3500-unit preview budget. The bounded JSON payload decoder scans the event but copies only limited prefixes. Verbose payloads are not redacted and can expose credentials or private files to everyone who can read the conversation; truncation is not a privacy filter.
+
+A root's Stop button is fenced by owner, generation, active inbox and turn. Valid use consumes the token before requesting interruption; stale buttons cannot abort later work. Initial Send failure suppresses further progress for that turn to avoid duplicates; Edit failure remains retryable. Preview and final replies target the root's original Telegram message when possible; reply rejection can fall back to a plain message without changing execution state. Progress cleanup is driven by durable completion/output delivery, not proof that a preview was visible. Typing runs at most every five seconds with a four-second timeout and is cancelled on completion, turn change, runtime release and shutdown.
+
+### Native status projection
+
+[`status.go`](../internal/bridge/status.go) decodes only display-safe fields, never raw model configuration. Detailed `/status` reports workspace, session/name, provider/model, configured thinking, fast setting/activity, native context usage, streaming/compaction, bridge queue count, native speed, runtime connectivity and idle age. Missing or invalid data is `n/a`, not a guessed value. Its `Running` flag is native streaming, not the bridge's active-root predicate. Inspecting a released running binding may temporarily restore and then release a durably idle runtime; new input, pending work/UI or buffered output prevents premature release.
+
+[`progress_status.go`](../internal/bridge/progress_status.go) samples connected running roots independently of the mutation lane: one in-flight `get_state`, at most every five seconds after initial progress delay, with a three-second deadline. It never starts a process or changes idle-watchdog evidence. Results require matching request/client/generation/root/turn/catalog epoch and bound/native session. Failure clears only the UI block; it does not settle or replay the task. Task/session/runtime transitions cancel stale samples.
+
+[`compact_status.go`](../internal/bridge/compact_status.go) presents bounded literal model IDs without provider, native thinking symbols, fast activity, context percentage/window capacity and native speed on one logical line. Unknown fields are omitted; it never estimates tokens/s from text deltas. Thinking comes from the runtime-scoped configured-selector cache populated by the local `/effort` metadata query and `thinking_level_changed`, not effective `get_state.thinkingLevel`. Unknown/model-default/non-adjustable selectors omit the compact symbol and show `n/a` in detailed status. Runtime stop clears the cache. Optional configured-selector read failures do not undo an already verified setting mutation; a stopping client still cannot be reused.
+
+### Confirmed final rendering and metrics
+
+[`reply_metrics.go`](../internal/bridge/reply_metrics.go) adds a first-message-only header to successful text replies independently of progress mode. Main-agent assistant `message_end` frames contribute model/provider identity and safe numeric usage/duration; terminal summaries are not counted again. Average generation speed is `sum(output tokens) * 1000 / sum(duration_ms)`, excluding queue/tool time and requiring positive output and at least 100 ms total duration. Any missing/invalid contributing call suppresses the aggregate rather than reporting a partial average. Counters reset per root or successful managed-research round.
+
+Final context uses the last call's output-inclusive usage: prefer explicit `contextTokens`, otherwise positive `totalTokens` or a complete input/output/cache sum, subtract orchestration input/output/cache-read usage, and clamp at zero. Missing, negative or overflowing data is not estimated. This differs from `get_state.contextUsage.tokens`, which can still be the final input anchor.
+
+After confirmed text completion, [`reply_status.go`](../internal/bridge/reply_status.go) makes an independent one-second `get_state` query for current window/model and idle evidence. Context is added only for matching model/provider/native session with explicit non-streaming/non-compacting state; percentage is recomputed from output-inclusive usage and the sampled window. Thinking/fast fields also require matching model identity. The query cannot free the mutation lane. Client/generation/root/turn/catalog epoch/session fences reject late results; new input, native activity, retirement or query failure commits the confirmed answer with already-known model/average fields. Harmless metadata/completion trailers may drain without replacing it.
+
+The accepted header and answer enter the same durable inbox-completion/outbox transaction; failure before commit retains uncertain/no-replay recovery. Header space, Markdown-aware splitting/fence repair and explicit truncation share the 1 MiB/32-message display budget. Error/cancellation notices and local command receipts do not gain this success header. Attachment/output transport remains the responsibility of the media and durable-delivery interfaces.
+
+Terminal errors expose fixed RPC failure classes through [`ClassifyError`](../internal/omp/errors.go), not raw rejections. Assistant failures can include a bounded 512-unit `errorMessage` summary after credential, request/trace/correlation ID, URL and filesystem-path filtering; ambiguous unkeyed secret markers suppress that detail. HTTP 429 or recognized rate-limit classification produces a generic provider-rate-limit notice. `errorClassificationMessage`/`errorStatus` classify failures but are never copied as raw detail. This filtering does not redact ordinary assistant answers or verbose tool payloads.
+
+## Interruption and conservative recovery
+
+### Stop and runtime retirement
+
+Without a steer fence, Progress Stop preserves deferred bridge tasks while `/stop` cancels tasks already waiting when it is requested. Plain native `abort` uses the connected process without lazy restore. A successful abort acknowledgment cannot fence native asynchronous continuation, so the bridge immediately terminates the old process group without draining stdin before releasing following work. A still-active root becomes `cancelled`; a root already durably settled is not rewritten. The original binding, generation and session claim remain, and later work lazily resumes the same native session on a replacement process. New text received during abort remains a separate queued root.
+
+With a steer fence, both Stop controls terminate first and settle the root and unresolved steers as `uncertain`, since native queued input cannot be safely withdrawn by plain abort. Progress Stop preserves followups; `/stop` clears them. Research has its own owner/off-confirmation policy. Termination cannot undo tool effects or guarantee that an unsaved/corrupted native session is resumable. Native queue-removal APIs are not used as authoritative per-prompt cancellation or as a stale-event barrier.
+
+When no bridge root is active, Stop first probes native state asynchronously with a five-second deadline. It keeps the runtime only with explicit idle/settled evidence, no reported async/queued native work, no bridge session operation, UI/host request or buffered output. History-file existence is not evidence of activity; a confirmed idle unsaved session can remain connected. Otherwise normal abort/retirement applies. Explicit abort rejection retains the client; unconfirmed abort retires it and makes a still-active root uncertain before preserved work continues on a fresh runtime.
+
+Ordinary root submission failure/unconfirmed acceptance, unexpected process exit, pre-terminal assistant overflow, and failed native UI response writes retire the runtime and cancel ordinary waiting work. Root acceptance still has a 30-second deadline, even if a native `/review` picker is waiting for a user choice; this is not a timeout on accepted model execution. Pre-write oversize rejection reports that no task was sent. Steered/research retirement has its own queue-preservation policy. Retirement clears session/control/compaction state, durably settles interrupted owners, and preserves the logical binding for explicit reuse. An absent native history file remains a restore failure, never permission to invent a replacement session.
+
+### Missing completion watchdog
+
+[`watchdog.go`](../internal/bridge/watchdog.go) is a conservative uncertainty path, not a success detector. An active busy ordinary root is eligible only after 30 seconds without activity and without compaction/session work, retry, running tools, host requests or native UI waits. A background `get_state` probe has a five-second timeout. Idle requires explicit `isStreaming:false` and `isCompacting:false`; absent/null/malformed fields or errors do not prove idle. Two confirmations at least 30 seconds apart are required before settling missing completion uncertain and retiring the old runtime before queue dispatch. The logical session and queued roots are preserved for lazy resume, never replay of the uncertain root.
+
+Every event, including unknown/malformed input, and ordinary RPC activity invalidates idle evidence. Results carry client/generation/turn/active-inbox/activity-revision fences and yield to queued events and buffered output. Explicit nonterminal `agent_end` records `awaitingContinuation` and suppresses ordinary watchdog recovery until a new `agent_start`, settlement, dispatch or teardown; a legitimately silent native async continuation has no invented ordinary-root deadline. Managed research is excluded from this watchdog.
+
+The steer fence is the exception to nonterminal suppression. Streaming, compaction, tools, retry and UI still prevent recovery. Repeated explicit idle snapshots with reported native async/queued work receive five minutes from the first continuous idle-pending confirmation; they do not continually reset the timer. Activity, non-idle/ineligible evidence or disappearance of pending work resets it. A current idle-pending confirmation at/after the limit terminates the process and marks the root/unresolved steers uncertain while preserving bridge followups. This bounds a stuck native queue but can interrupt legitimate work that stays wholly silent and pending for five minutes.
+
+## Managed autoresearch
+
+### Capability and ownership
+
+The bridge manages research operation ownership, not experiments. The native extension owns experiment setup, Git operations, artifacts, and autonomous continuation. Startup adds no bridge approval override. The implementation is split between [research routing and round ownership](../internal/bridge/autoresearch.go), [admission](../internal/bridge/research_admission.go), [controls](../internal/bridge/research_control.go), and [settlement](../internal/bridge/research_settlement.go).
+
+The command catalog grants a narrow exception to the canonical `autoresearch` command advertised with source `extension`. Extension aliases, another extension aliased as `autoresearch`, and unknown sources do not gain that permission. Managed research additionally requires the command to remain executable in the current catalog; queued commands are revalidated against their session and source. See [catalog classification](../internal/omp/catalog.go) and [native routing](../internal/bridge/native_commands.go).
+
+| Input | Meaning |
 | --- | --- |
-| Bot | Numeric ID returned by `getMe`, not its token or username |
-| Conversation | `(bot, chat, thread)`; ordinary private chats use `thread=0` |
-| Live worker incarnation | Conversation plus `generation` and its current client |
-| Saved conversation | Native omp session-file path |
-| Inbound update | Telegram update ID, unique within this bot-owned database |
+| `/autoresearch <goal>` | Submit the goal to the native handler. |
+| Empty `/autoresearch`, mode off | Enable through the native handler. It can complete locally without a model call; the next ordinary prompt supplies the research task. |
+| Empty `/autoresearch`, mode on | Disable through the managed control path, rather than waiting behind the autonomous root. |
+| `/autoresearch off` | Explicitly request confirmed disable, including recovery from unconfirmed mode. |
+| `/autoresearch clear ...` | Request destructive native clear, subject to idle checks and confirmation. |
 
-Ordinary private chats use the existing `(chat, 0)` target and worker/session lifecycle; topic targets retain their thread IDs. No new worker type or schema migration is required. Stored bindings do not contain Telegram chat type, so recovery accepts zero-thread targets only for positive private chat IDs, still enforcing the chat allowlist; topic targets keep their existing recovery behavior.
+Thus enabling mode and starting an agent task are distinct steps. A confirmed local startup refusal or local native command completes without retaining a fictitious research root.
 
-`CheckBot` rejects another bot using the same database. `daemon.lock` prevents two bridge processes from opening the same data directory concurrently. Operators must still avoid running the same bot with another data directory or polling client.
+### Recorded mode and dispatch admission
 
-A successful new/resumed instance increments the persisted generation. Background results are checked against the appropriate generation, turn, request token, or client identity. Session claims prevent two workers in this daemon from opening the same native conversation concurrently. Each worker holds at most one claim; a successful claim replaces that worker's previous claim under `sessionMu`, and closing releases all claims owned by that worker. Claims do not lock a workspace against other programs.
+[Client.AutoresearchMode](../internal/omp/autoresearch.go) reads recorded control intent on the current native branch. It does not reconstruct experiment state or prove effective Git-branch-dependent tool activation. Recorded-on mode can therefore retain a managed owner even when the native extension cannot continue; notifications and tool availability are not substitutes for authoritative mode evidence.
 
-Closed-binding deletion and startup-intent preparation use a transaction fence: a start reserves only the exact persisted binding generation, or an actually unbound conversation, while deletion succeeds only when no startup intent exists and the target binding is closed. A bridge-wide menu mutation epoch invalidates picker and list callbacks after binding or native session deletion, and a worker also drops old confirmations before recreating a binding after observing a missing row.
-Lazy restoration rechecks the persisted binding identity, saved session claim, and any delete reservation under the same `sessionMu` lock, then marks the claim as starting before calling `omp.Start`. If deletion reserves first, no OMP process starts; if restoration marks the claim first, deletion is refused while startup is in progress.
+The reader:
 
-**The acceptance boundary matters:** stale runtime work must not affect a replacement instance, but already committed outbox results remain deliverable after `/new` or `/close`. A later generation is not permission to discard accepted results.
+1. Obtains the native session ID and absolute history path with `get_state`.
+2. Reads only ancestry/control metadata from the JSONL file, then calls `get_entries` with `since` set to the last valid disk entry. RPC supplies the canonical suffix and current `leafId`.
+3. Rechecks the session ID/path and walks the leaf's complete parent chain. The nearest `autoresearch-control` selects `on`, `off`, or `clear`; other branches do not select mode.
 
-## SQLite
+This avoids transferring an entire saved transcript through the 64 MiB logical RPC limit. Model/tool payloads are not retained in metadata. A new session without a persisted file uses RPC alone. A JSON syntax error stops disk reading at the valid prefix; RPC must supply the canonical remainder, including records after malformed middle entries. Legacy headers with `version < 2`, including omitted versions, use native in-memory migration through an initial RPC snapshot instead of disk ancestry. The bridge never repairs or rewrites history.
 
-The database is `omp-telegram.db` under `storage.data_dir`. It uses WAL, a busy timeout, and one open connection. It stores bridge state and Telegram message content, not an independent copy of omp's model context.
+A valid empty branch or branch without a control entry means off. Missing required RPC fields, invalid controls, duplicate IDs, broken/cyclic ancestry, mismatched session headers, unreadable/nonregular history, and failed or inconsistent queries do not mean off. Admission cancels the attempted queue head and pauses waiting work when mode cannot be confirmed.
 
-| Table | Key / fields | Role |
-| --- | --- | --- |
-| `meta` | `key`, integer `value` | Owning bot ID and polling offset |
-| `omp_args_selection` | Singleton; `preset_index,args_fingerprint` | Current global OMP startup preset and the SHA-256 fingerprint used to detect configuration changes; raw arguments are not stored. |
-| `bindings` | PK `(bot,chat,thread)`; `workspace,session,session_id,generation,last_used_at,running,interrupted` | Last validated session binding, restoration eligibility, last-use metadata, and active-task interruption marker |
-| `startup_intents` | PK `(bot,chat,thread)`; `kind,workspace,session,generation,created_at` | Durable uncommitted `/new` or `/resume` transition and its retention age |
-| `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots; deleting a closed binding removes this conversation's snapshots, and deleting a native session removes snapshots for its bound session paths. It is not a session browser. |
-| `session_favorites` | PK `(bot,chat,thread,workspace,session_id)` | Pinned native session identities for the `/resume` picker; no session content |
-| `inbox` | PK `id`; `raw,state,reply_to,progress_message_id,created_at,updated_at` | Update deduplication, processing state, and optional live-progress identity |
-| `outbox` | Autoincrement `id`; `inbox_id,chat,thread,text,state,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count,created_at,updated_at` | Ordered Telegram delivery; definite rate limits are uncapped, while the separate server-rejection count bounds retryable 5xx failures |
+[Admission evidence](../internal/bridge/research_admission.go) belongs to one queue head, scoped by client, binding generation, turn, inbox ID, catalog epoch/revision, and native session. Catalog revision changes require fresh evidence; session/epoch changes reject the original admission. Cancellation, off, retirement, and submission invalidate it, so the next root cannot reuse it. Lookups run outside the actor in the cancellable operation lane; Stop and close remain actionable.
 
-### Database retention
+Pending slash inputs are classified before dispatch. Confirmed off permits ordinary roots while discovery is pending; confirmed on waits for the canonical extension. Once discovery is settled without that extension, managed-research admission is not applied. Discovery converts queued research inputs in place, preserving FIFO position; a control removes only its own entry when handled immediately.
 
-`storage.database_retention_days` defaults to 90. `0` disables automatic cleanup; positive values retain terminal Telegram bridge message records for that many days, measured from `updated_at`, the latest state transition. The Bridge runs the best-effort message and attachment janitor once at startup and every 24 hours thereafter. Its failures are logged and retry on the next interval; they do not stop Telegram or omp processing.
+### Root ownership and agent rounds
 
-Only explicitly enumerated terminal states are eligible: inbox `done`, `cancelled`, `ignored`, `failed`, `uncertain`; outbox `done`, legacy `sent`, `failed`, `uncertain`, `cancelled`. Inbox `pending`/`submitted` and outbox `pending`/`sending` remain durable. Deletion uses committed batches of 1000 rows; the service never automatically runs `VACUUM`.
+[The worker event dispatcher](../internal/bridge/bridge.go) distinguishes a submitted root from its agent rounds. Enabled mode makes the next agent task a research owner. Its inbox, request ownership, turn, and progress association survive successive `agent_start`/`agent_end` pairs. An end event, terminal-looking root `prompt_result`, temporary idleness, or a settled notification alone cannot finish it. The bridge neither replays the goal nor synthesizes continuation prompts.
 
-Terminal inbox rows with a nonzero `progress_message_id`, and their associated outbox rows, remain outside retention cleanup until the Telegram progress deletion succeeds, a confirmed non-retryable rejection clears the association, or the retention cutoff is reached with no associated `pending` or `sending` outbox work. The last case clears only the local association and does not call Telegram Delete.
-Transient progress deletion failures retain the association and are retried every minute during normal operation as well as at startup. Confirmed permanent Telegram rejections clear the association without retry.
-Retention never deletes bindings, history, session favorites, workspaces, omp session files, or other omp data. A terminal outbox row owns its attachment snapshot until the row is deleted. The bridge removes snapshots best-effort after persisting any terminal outbox state; retention removes a remaining snapshot only after its outbox row is deleted and only when confined to `storage.data_dir/attachments/outbox/`. Each janitor run also removes unreferenced `attachment-*` snapshots in that private spool once their file modification time exceeds the retention cutoff.
+Each successful round appends bounded replies to durable outbox while the root remains `submitted`, then clears round buffers. An end event without another start does not append the round again. Ordinary text can steer the same owner once native-command admission has crossed into agent execution, including between rounds. Before that boundary it remains queued. Native commands, attachments, and followups stay deferred. [Generic steering completion](../internal/bridge/steer.go), watchdogs, and idle release cannot conclude research between rounds.
 
-Uncommitted `startup_intents` use their own `created_at` and the same retention cutoff. At startup, expired intents are removed before restoring workers or accepting updates; cleanup failure aborts startup rather than misrepresenting intent state. While running, a worker with a pending intent checks once per day and removes it only after its runtime has stopped, using `(bot,chat,thread,generation)` and the cutoff as a deletion fence. It invalidates stale binding menus after removal. A currently executing OMP start is not deleted by the periodic janitor. This removes only the bridge's unresolved intent, never its previous committed binding, workspace, or any OMP session it may have created; the native startup outcome remains unknown. With retention disabled (`0`), intents remain until explicitly closed or committed.
+A queued goal or enabling toggle does not start a competing routing lookup while a native-command root still owns local completion. If that root starts agent execution, deferred empty toggles return to the immediate control path with fresh session/catalog checks. Off takeover cancels queued empty toggles, including unclassified ones, so they cannot later re-enable research; ordinary work and nonempty goals remain queued.
 
-Incoming Telegram files live in private `storage.data_dir/attachments/inbox/incoming-*` directories, not in SQLite. If a selected workspace contains this path, the attachments are inside that workspace too. Preparation failures and tasks canceled before submission remove their directories. While the daemon runs, submitted queued or active task paths are excluded from cleanup; settlement refreshes the directory modification time. The startup/daily janitor considers only directories older than the retention cutoff and not in use: completed attachments additionally require a valid owner and a successful `session/list` showing that the session is absent or was last updated before the cutoff. Unverifiable owner/session state retains them. Interrupted preparations with the bridge's `.preparing` marker but no valid owner are removed after the cutoff; unmarked directories without valid owner metadata are preserved. `database_retention_days = 0` disables this cleanup. Directories under the legacy workspace `.telegram/incoming/` path are neither migrated nor deleted. Retained OMP session history may still contain a path after the corresponding file is removed by retention.
+Natural completion uses a separate [settlement probe](../internal/bridge/research_settlement.go). After the round closes and steers resolve, recorded mode must be off and `get_state` must explicitly report all of:
 
-### Schema version
+| Field | Required value |
+| --- | --- |
+| `isStreaming`, `isCompacting` | `false` |
+| `isSettled` | `true` |
+| `hasPendingAsyncWork` | `false` |
+| `queuedMessageCount` | `0` |
 
-`PRAGMA user_version` is the schema version, currently 18. An empty database creates all tables, indexes, and the version in one transaction, without an Activity table. Reopening reconciles runtime states. Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Versions 1 through 10 migrate transactionally through `startup_intents`, the binding interruption marker, message timestamps, reply targets, native session IDs, inbox/outbox progress associations, `bindings.last_used_at`, per-conversation `/resume` favorites, durable outbox retry metadata, and separate server-rejection retry counts before advancing `user_version`. The v8 migration leaves existing `last_used_at` values at zero; the v10-to-v11 migration initializes `server_retry_count` to zero because legacy `attempt_count` mixed rate limits and server rejections. Application versions and database versions evolve independently.
+Mode-on or pending work retains ownership. Missing fields or query errors retire the root as `uncertain` and pause the queue. Results are fenced by client, generation, root/request, turn, catalog/session, settlement revision, and steer admission. Before accepting off, the actor processes queued native events and checks buffered reader output; a new round or steer invalidates older evidence. Confirmed completion marks the root `done` without copying already committed replies.
 
-The historical version 11-to-12 migration creates `activity_messages`; version 12-to-13 drops that table in the same startup transaction, regardless of whether it contains rows. Version 13-to-14 adds `startup_intents.created_at` and stamps existing pending rows with the migration time. Version 15-to-16 reshapes legacy workspace table keys; version 16-to-17 creates the singleton `omp_args_selection` table. Version 17-to-18 drops `workspace_users` and `workspace_leases` if they exist. Existing bindings, selected workspace paths, and native session data remain intact. Versions above 18 remain unsupported; older binaries cannot open a v18 database.
+### Stop, explicit off, and uncertain disable
 
-### Input and completion transactions
+[Research controls](../internal/bridge/research_control.go) are actor-owned phases: lookup, identity/catalog validation, final idle check, submission, acceptance, correlated local completion, and post-control mode confirmation. RPC closures return results without mutating worker state or consuming native events. Local research completion requires both acceptance and a matching `prompt_result` with `status=completed`, `agentInvoked=false`, and `sessionSettled=true`; off/clear additionally require recorded-off evidence afterward. A notification is never completion evidence. Display notices are sanitized, bounded, and limited to eight per round/local control.
 
-```text
-Telegram update
-  -> transaction: insert inbox pending + advance offset
-  -> authorize and route
-  -> persist submitted
-  -> write prompt to omp stdin
-  -> receive terminal completion
-  -> transaction: persist final text parts + set inbox done, uncertain, or cancelled
-```
+| Action | Waiting work |
+| --- | --- |
+| Progress Stop | Preserve deferred work; active research must be disabled before dispatch resumes. |
+| `/autoresearch off` | Preserve deferred work; confirm disable rather than steer or abort an ordinary owner. |
+| `/stop` | Cancel the queue, then stop/disable the owner. |
 
-`Accept` performs one atomic transaction per update. Offset advancement never precedes durable input, and duplicates do not overwrite the original stored update.
+Explicit off is read-only when a scoped off proof already exists or a fresh lookup proves an ordinary owner is mode-off: it preserves the ordinary task, runtime, binding, and replies without submitting native off. A failed lookup marks the control uncertain and pauses future dispatch, but leaves that ordinary task running. Repeated read-only off or replacement of an unsubmitted route lookup does not retire the ordinary runtime; confirmed off clears the pause.
 
-For ordinary root tasks, submission durably records the originating Telegram message ID before OMP accepts the prompt. Completion requires that submitted input and commits all final text parts, their persisted reply target, and the terminal inbox state in one transaction. Normal terminal output is `done`; a provider/model error is `uncertain`; an explicit OMP abort is `cancelled`. Any failure rolls back both. `say()` remains a notification helper, not the completion API. Control-command completion is handled separately. Tool attachments can be queued during execution and are not retroactively included in the final-text transaction.
+An active research process cannot be fenced by ordinary abort alone. Stop/off retires its process group, marks the interrupted root and unresolved steers uncertain, and resumes the exact original session to disable it. An idle enabled runtime can instead complete off locally. Before native off, identity, file/workspace, session claim, catalog source, and idle/settled/no-pending state are checked. Acceptance, correlated completion, and post-off mode confirmation gate preserved work. Failures retain `disablePending`, close a mutated/uncertain runtime, and never replay the control. Interrupting an already loading control likewise retires uncertain work; cancellation itself does not prove mode-off.
 
-Steer inputs transition from `pending` to `submitted` before their first RPC byte; `FinishSubmitted` accepts only one `submitted` row into `done`, `cancelled`, `failed`, or `uncertain`. They do not create final-reply outbox rows. Crash recovery converts any unresolved submitted steer to `uncertain` and never replays it; OMP session history remains OMP-owned.
+Cold disable requires the original saved file and working directory, available session ownership, and runtime capacity. A connected session may confirm off before its history file exists. Recovery never invents a replacement session. Stop during a blocked admission lookup retires that runtime before attempting disable, rather than queueing another lookup behind it. Termination cannot undo tool effects or guarantee resumability.
 
-When an inbound message replies to another Telegram message, the bridge composes a separate input-only context before `prompt`: a non-empty Telegram `quote.text` wins, otherwise it uses one level of replied text, photo/document metadata and caption, caption-only content, or an unsupported marker. The complete quoted block is capped at 3000 UTF-16 code units and receives `...[truncated]` when necessary. It labels the sender only as `From: bot` or `From: user`. The current message follows under `[Current user message]` and is never truncated. The bridge never follows `ReplyToMessage` recursively, downloads or re-imports replied attachments, or changes the existing output `reply_to` target. Queue previews use the current user text rather than this synthetic wrapper.
+### Destructive clear and crash recovery
 
-Reply context is derived only from the current Update's decoded `ReplyToMessage` and `Quote`; the durable source remains `inbox.raw`. No Telegram history lookup, extra history API request, or reply-context database column is used.
+Clear requires an idle instance, empty queue, no unresolved steers, and an owner-authorized confirmation tied to chat, topic, message, generation, and catalog epoch. Arguments are preserved. Busy clear is rejected, not saved for later; raw followup/attachment text cannot bypass confirmation. Confirmation rechecks availability, mode, scope, and native idle state before submission. Off and clear revalidate scope after the final idle query; a revoked source or changed session prevents submission. This is not an atomic upstream check-and-execute transaction.
 
-A database completion failure stops the worker rather than pretending the task completed. On restart, submitted inputs become `uncertain`; previously pending ordinary messages, attachments, and `/review` commands are canceled rather than replayed. Other pending controls still pass normal authorization, and old in-memory callback tokens expire when their state is lost.
+The [native clear handler](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/autoresearch/index.ts) may hard-reset tracked files and delete untracked files. `--keep-tree` suppresses that worktree reset/clean, not artifact cleanup: native research artifacts can still be deleted, so the flag does not make clear nondestructive. The bridge warns about destructive behavior and cannot undo it; native code, not the bridge, owns artifact/worktree cleanup. An unconfirmed clear is not retried automatically.
 
-### Output delivery and progress cleanup
-
-```text
-pending -> sending -> done
-                   -> pending (429 uncapped / definite 5xx before the 12th server rejection)
-                   -> failed (12th definite 5xx rejection, or other failure)
-                   -> uncertain
-
-restart: sending -> uncertain
-```
-
-The Telegram client classifies failures at the transport boundary:
-
-- Local pre-send failures and trustworthy, complete API rejections are definite failures.
-- Transport interruption, incomplete responses, or otherwise unconfirmed delivery remain uncertain.
-- HTTP status alone is insufficient. Prior uncertainty must not be erased by a later local failure.
-
-Complete, definite 500, 502, 503, and 504 rejections use exponential retry delay starting at one second and capped at five minutes. A durable `server_retry_count` records only these definite rejections; the 12th marks the output `failed` rather than scheduling another retry, allowing later outputs in that conversation to proceed. `attempt_count` tracks total claims and does not consume this server-rejection budget. Definite 429 responses return to the durable pending queue at Telegram's `retry_after` deadline, or after one second when it is absent; 429 retries are uncapped. Uncertain outcomes and other failures are not automatically retried. A database transaction cannot atomically commit a Telegram network side effect, so exactly-once delivery is not promised.
-
-For progress deletion, a confirmed non-retryable Telegram 4xx other than 429 clears only the local progress association. A 429, 5xx, transport failure, or uncertain response retains that association for a later cleanup attempt. Cleanup state never changes the task or outbox result.
-
-Outbox replay preserves the stored reply target for every final text part. If Telegram rejects that target because the original message is unavailable, the client sends the same text once without reply binding; this UX fallback does not change inbox/outbox ownership or task settlement.
-
-Each progress preview is associated with its root inbox, and every final outbox part carries that inbox ID. For any terminal inbox (`done`, `cancelled`, `ignored`, `failed`, or `uncertain`), progress cleanup starts once all associated outbox parts reach terminal delivery states (`done`, `failed`, `uncertain`, `cancelled`, or legacy `sent`); `pending` and `sending` parts defer cleanup, but terminal delivery failures do not. Startup retries terminal associations left by a previous run. A confirmed non-retryable Telegram deletion rejection clears the best-effort progress association; once terminal data reaches the retention cutoff without pending or sending outbox work, retention clears the local association without deleting the Telegram message. Transport failures, 429, 5xx, and uncertain responses retain it for retry without changing task delivery state.
-
-### Attachment lifecycle
-
-Incoming Telegram attachments are downloaded only after authorization into private `storage.data_dir/attachments/inbox/incoming-*` directories, not into SQLite. The configured data directory may be inside the selected workspace if their paths overlap. Queued and active task paths are excluded from cleanup while their worker is running; normal task settlement refreshes the directory modification time. After a crash, old files from interrupted tasks may become eligible at startup. Legacy workspace `.telegram/incoming/` directories are neither migrated nor deleted. OMP session history can retain paths after retention removes their files. Outgoing `telegram_send` files must be regular files inside the active workspace. The bridge copies each file into a private `storage.data_dir/attachments/outbox/` snapshot before enqueueing it, so delivery is independent of later changes to the source file. After the outbox state is durably terminal (`done`, `failed`, `uncertain`, `cancelled`, or legacy `sent`), the bridge best-effort removes the snapshot regardless of delivery success; the workspace source remains untouched. If immediate removal fails, retention and the spool janitor can remove the remaining snapshot.
-
-Terminal outbox state is committed before snapshot removal. Observing `done` alone is not a cleanup-completion signal; verification must also observe removal or synchronize with the delivery loop finishing. This ordering preserves the snapshot when terminal-state persistence fails and keeps the workspace source unchanged.
-
-`/export` uses only the committed binding workspace and native session identity. It never calls `ensureRuntime`, changes binding state, claims a session, touches `last_used_at`, or consumes the normal runtime slot. If the selected ID is the committed binding's `session_id`, export uses the committed `session` path directly, including after idle release or `/close`; other IDs are resolved by OMP's native `omp <omp.args...> render <session-id> -q -t` command with the configured working directory, then validated against the returned first `session  <absolute-path>` diagnostic line and the persisted session header. Inactive-session export is rejected when `omp.args` or `PI_CODING_AGENT_SESSION_DIR` selects a custom session directory, because native render does not receive that launch-global store override. The bridge does not discover or emulate OMP session storage rules. Raw export opens the absolute source read-only with no-follow semantics, checks it against `Fstat`, copies it with a bounded `MaxDocumentBytes` limit into the private attachment outbox spool, fsyncs it, sets mode `0400`, and preserves a sanitized OMP basename as the Telegram filename. HTML export first makes the same no-follow stable snapshot of only the selected main JSONL, then passes that bridge-owned snapshot to OMP's native exporter; companion and subagent transcript files are not copied. HTML output is monitored during generation and is removed when it exceeds `MaxDocumentBytes`. Only the main session JSONL is exported; the bridge does not create zips or subagent bundles.
-
-Photo and document messages with a non-empty `media_group_id` are collected in the owning worker by `(media_group_id,sender_id)`. The first member immediately reserves one bridge queue slot and owns the logical task and inbox; later members are marked `done` as consumed continuations and never enter the queue. A 500 ms quiet-period timer, capped at 2 seconds from the first member, seals the ordered group with a version fence. An album accepts at most 10 members. The sealed members are sorted by Telegram message ID and downloaded into one incoming directory with indexed filenames. The worker submits one prompt with the first non-empty caption and only the leading inline images that fit the negotiated physical RPC frame; every original remains available at its listed data-directory path. If text alone exceeds the frame, the pending task is marked `failed` without closing the session. A pre-write frame rejection after submission is instead completed as `cancelled` without closing the session; errors with uncertain execution retire the runtime and preserve the logical session without replay. A reply context from the first member that has one is applied once, and the final reply targets the first album message. Preparation is all-or-nothing; a member failure removes the directory and owner queue entry, marks the owner `failed`, and emits one album-specific notice. Attachments without a media group keep the existing single-message path. Album collection is worker-local transient state; cancellation, rejection, sealing, and teardown suppress late members for a short window, and daemon restart cancels unfinished owners without replaying album state.
+[Startup recovery](../internal/bridge/recovery.go) restores session identity, not autonomous operation. Interrupted submitted work becomes uncertain and waiting work is cancelled; neither goals nor in-flight controls replay after shutdown/crash. Native recorded mode may survive: the next explicit prompt obtains fresh admission evidence, or explicit off restores the original owner and confirms disable first. Closing a runtime is not proof that its saved mode is off.
 
 ## Session lifecycle
 
-`/new` resolves a working directory and, when replacing a live instance, requires confirmation. `/new <name or path>`, `/resume`, and the other existing commands work in ordinary private chats and topics alike. `/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, conversation, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory. Resume pins store only `(bot,chat,thread,workspace,session_id)` identity metadata; pinned entries sort first, while stale pins simply remain hidden until native listing returns the same identity. Pin and Unpin are picker controls and do not alter native sessions or binding lifecycle. Explicit deletion of a closed binding also removes its pinned metadata without touching native session history.
-The Resume picker records the global OMP argument preset used to list sessions. If the preset changes before a session is selected, that selection is rejected and the picker must be reopened. A valid selection launches with the verified argv snapshot, so a later global preset change cannot alter that start.
+### Logical session and runtime
 
-The `/resume` Delete button is separate from `/bindings` deletion. Its first click validates the picker workspace and full native ID, then creates an owner- and message-bound confirmation with a destructive button. The picker marks sessions with a connected runtime or operation reservation in another worker as `[in use elsewhere]`. Confirmation rechecks the binding generation and mutation epoch, workspace, live runtime claims, running bindings without a known session ID, pending resume intents, and operation reservations. A connected or starting runtime and other in-flight work block native deletion; an idle released binding does not. Forgetting a binding through `/bindings` removes bridge metadata only and preserves OMP history. A per-session delete reservation excludes concurrent live resume claims, exports, and other deletes; resume startup checks that reservation under the same mutex while writing its startup intent. The reservation is released on every completion, failure, or worker-shutdown path. Deletion has a 30-second deadline and does not consume a normal worker runtime slot.
+A conversation binding identifies the selected workspace, native session ID and session-file path, plus its generation. It is not a PID. The binding's `running` flag means that the logical session is eligible for on-demand restoration; it does not mean an OMP process is connected. Native history and session titles remain OMP-owned.
 
-A picker-initiated resume carries its menu epoch into startup. Under `sessionMu`, the bridge compares that epoch, checks the delete reservation, and persists `PrepareStart` before releasing the lock. A deletion completed first cannot be resumed by a callback that passed an earlier UI check; an intent prepared first prevents deletion. Explicit `/resume ID` has no picker epoch.
-
-A running binding with a known native session ID blocks deletion only while its runtime is connected or starting; a released logical binding does not. A legacy running binding without an ID blocks only deletions in its workspace; it does not prevent deleting sessions in other workspaces. Schema migration backfills IDs from recognizable session filenames; unrecognized paths remain empty. An idle non-current binding can be forgotten with `/bindings`; a current binding can be replaced by a successful `/new` or by resuming a known session ID.
-
-On the installed OMP 18.3.2, `omp -p --resume ID "/session delete"` sends the slash text to the model rather than executing it locally. The bridge instead uses an isolated short-lived native RPC process, validates its exact session ID, canonical workspace, and existing regular session file, then submits `/session delete` through the existing `prompt` command. Success requires a local-only acknowledgment, native deletion output for that exact file, and absence of the file after terminating the temporary process group. This local command does not emit a `prompt_result`. Graceful shutdown after its acknowledgment can recreate the deleted file, so the process is terminated immediately; the bridge never removes OMP session files or computes artifact paths itself. OMP owns artifact removal. Native or persistence failures cannot be rolled back or safely replayed automatically.
-
-Before attempting the mutating RPC prompt, deletion arms a hard-stop boundary for the temporary process. On a rejected response, missing or changed output, protocol failure, cancellation, or deadline, the process group is killed before stdin can close gracefully; native execution may still be uncertain, so the bridge reports failure without replaying the command. A recognized native `Failed to delete session: ...` output fails promptly without exposing its diagnostic text. With an assistant message in history, a graceful shutdown can write a new session-exit entry after the original JSONL and artifacts have been removed.
-
-After a confirmed native deletion, `DeleteSessionReferences` atomically removes every case-insensitive exact-ID matching binding for this bot, its bound session-path history snapshots, and pins across this bot's conversations and workspaces. Before invoking native deletion, the bridge checks live runtimes and in-flight operations. Under `sessionMu`, released in-memory claims are removed only after the transaction commits; matching active or starting claims are retained. Workspace files and Telegram topics are untouched. Metadata cleanup failures are reported separately from the confirmed native deletion, which cannot be rolled back.
-Another topic's successful session deletion can remove a released worker's binding row while that worker still holds an in-memory snapshot. If it later closes, `SetRunning` may return `ErrStaleBinding`; `persistClosed` treats the row as already closed and completes local teardown instead of failing the bridge.
-
-A confirmed native deletion advances the bridge-wide menu mutation epoch even if reference cleanup fails. Other conversations' earlier `/resume` and `/export` menus and in-flight session listings are rejected on that epoch mismatch. Pin changes serialize with reference cleanup so an already validated callback cannot recreate a pin for the deleted session. The deleting conversation refreshes its picker only if its binding generation remains persisted and no intervening mutation invalidates the request.
-
-If native deletion returns an error but the verified session file is absent after the temporary process is hard-stopped, the bridge still reports failure and retains saved bindings and pins, but advances the menu epoch before releasing the delete reservation. Old pickers cannot start the now-missing session. Failures that leave the file present do not advance the epoch; neither case automatically replays deletion.
-
-If deletion advances the epoch after list acceptance but during Telegram delivery, an old menu may still appear. Its callbacks fail the epoch check; `sessionMu` is never held across Telegram network I/O.
-
-On the first `/new` in an unbound forum topic, the bridge schedules a best-effort Telegram topic-title update to the resolved workspace basename outside the worker's command path. Rename failure does not undo a successful session start. Later session replacements do not rename the topic; `/name` changes only the native OMP session title.
-
-`/export` opens the generation- and binding-identity-fenced picker with native session JSONL as the default format; `/export html` opens the same picker for native HTML rendering. `/export <session ID>` and `/export html <session ID>` list no sessions and export the requested session directly after native identity and workspace validation. The picker may open while the current worker is busy because listing is read-only. Selecting the current session is rejected until its active task, compaction/finalization, and queued prompts finish; another inactive, unclaimed session may export concurrently. Each in-flight export reserves its selected session identity, so another conversation cannot claim or export that session until the operation finishes. Export delivery is queued to the current conversation as a document; successful export only means that a durable outbox item was created, while Telegram delivery is confirmed separately.`
-
-Session export is a bridge control-plane operation, not an OMP task-queue item. The native JSONL path is:
-
-```text
-/export
-  |
-  v
-read committed binding
-  |
-  v
-validate workspace
-  |
-  v
-omp.ListSessions(workspace)
-  |
-  v
-Telegram session picker
-  |
-  v
-omp <omp.args...> render <session-id> -q -t -> native session path
-  |
-  v
-snapshot JSONL
-  |
-  v
-durable attachment outbox
-  |
-  v
-Telegram document
-```
-
-HTML follows the same control-plane path until session resolution, then delegates rendering to the native exporter:
-
-```text
-/export html
-  |
-  v
-read committed binding -> validate workspace -> omp.ListSessions(workspace)
-  |
-  v
-select session -> omp <omp.args...> render <session-id> -q -t -> bridge-owned main JSONL snapshot -> omp --export
-  |
-  v
-private HTML spool file -> durable attachment outbox -> Telegram document
-```
-
-Export does not:
-
-- submit a prompt;
-- mutate the session;
-- change binding generation;
-- update `last_used_at`;
-- wake an idle runtime;
-- consume a normal runtime slot;
-- create a `startup_intents` row;
-- mutate session claims.
-
-The outbox never points at the original native session file. Once its outbox state is durably terminal, the bridge best-effort removes only the private snapshot, whether delivery succeeded or failed; the source session file is unchanged.
-
-The native JSONL returned by `/export` can be used on another computer by preparing the corresponding source directory, downloading the file, and running `omp --resume /path/to/exported-session.jsonl` in the target project directory. If the recorded old working directory is unavailable, OMP may require re-rooting the session to the current directory. The export is not a project archive and does not include source files, Git state, uncommitted files, OMP configuration, API credentials, or the shell environment; synchronize those separately. JSONL and HTML exports may contain sensitive conversation and tool data, including prompts, responses, tool calls and results, local paths, command output, source snippets, and accidentally captured secrets. Send them only to trusted Telegram conversations; entering `/export` is the explicit confirmation.
-
-Without arguments, `/new` reuses the saved conversation workspace. With no saved workspace, it resolves and uses `storage.workspace_root` itself; it does not create a per-conversation subdirectory. Database read failures still fail instead of falling back. Conversations selecting the same directory share files, not native session identities.
-
-### Binding viewer
-
-`/bindings` reads only committed bindings and unfinished `startup_intents` for the current bot and Telegram chat. The bridge merges rows by `(bot,chat,thread)` into one display entry; a pending intent takes precedence over the committed binding's `running` value. The display states are `Pending new`, `Pending resume`, `Open`, and `Closed`. A pending entry uses the intent workspace and resume session target, while its last-used age comes from the old committed binding; a first `/new` uses the workspace basename as its fallback title and omits the unavailable age.
-
-Native session names are resolved best-effort from short-lived `omp acp` `session/list` queries for each saved workspace. The names are transient viewer metadata and are never copied into SQLite; unavailable or unnamed sessions use the workspace basename as the title. Long names are shortened before appending the topic ID so it stays visible.
-
-The message body contains only the viewer header. Each binding occupies two full-width inline-keyboard rows: a numbered session title with `#thread` (or `Main chat`), then a disabled state, compact last-used age when known, and workspace. Whole-day ages omit zero hours (for example, `4d` rather than `4d 0h`); unknown ages are omitted. The title and detail are sanitized and bounded; the full session ID is not displayed here. An eligible title is a neutral callback button with no separate Del control. The title is disabled for current-conversation and pending entries. Only the Delete button on the following Delete/Cancel confirmation is danger-styled.
-
-On opening `/bindings`, the worker sorts the merged snapshot with the current conversation first, pending starts next, then all remaining entries by descending `last_used_at`. Zero or future timestamps count as unknown and come last; equal timestamps within a group use ascending thread ID. Native session names arriving asynchronously update titles without reordering the snapshot. The viewer has six entries per page. Pending and current-conversation titles have no callback data. Tapping an eligible title from another conversation opens the Delete/Cancel confirmation, whether the binding is Open or Closed. Every list and delete callback is fenced by its authorized user, current conversation generation, expiry, source message ID, action token, target binding generation, and the bridge-wide in-memory binding mutation epoch. A successful `DeleteClosedBinding` advances that epoch for every worker, invalidating older `/bindings` menus and delete confirmations even if a deleted generation is later reused. Refreshing `/bindings` also invalidates older viewer tokens; stale callbacks cannot paginate or clear a newer page.
-
-`/bindings old` sorts all entries by known `last_used_at` from oldest to newest, including the current conversation and pending starts with a prior binding. Entries without a known time, including first-time pending starts, follow; future timestamps also count as unknown. Equal timestamps use ascending thread ID. The header identifies the oldest-first view. The selected order is retained across pagination, asynchronous session-name updates, and the fresh list after a successful Closed or idle Open deletion.
-
-The footer is a single inline-keyboard row containing available pagination buttons followed by Close: Next/Close on the first page, Previous/Next/Close on middle pages, Previous/Close on the last page, or only Close for a single-page list.
-
-After a successful confirmed deletion of either a Closed or idle Open binding, the requesting worker reads and sends a fresh `/bindings` list with a new token, retaining the source page and selected order. If the source page disappeared, the page is clamped to the new last page; if no bindings remain, it reports an empty list. Failure retains the existing error reply without presenting a stale list.
-
-`/queue` shows the current worker's running state, pending count, attachment preparation state, and up to six pending tasks per page. Task previews are bounded text or `Preparing attachment...`; callback data carries a random menu token plus `cancel:<inbox_id>`. The worker re-scans its live queue when handling the callback. If the task was dispatched meanwhile, it answers `Task is no longer queued.` and never converts the request into an active abort. An empty queue shows only the header, running state, and pending count, without a page number, keyboard, or token; when canceling the final task, the edited status uses an empty inline keyboard to remove the old buttons.
-
-The `/queue` and `/bindings` viewers' Close actions differ from choices with side effects: they consume the token and answer `Closed` only after `editMessageReplyMarkup` succeeds. If Telegram rejects or times out the edit, the token remains actionable for another Close attempt until expiry; queued tasks and bindings remain unchanged.
-
-`last_used_at` is Unix time and starts at zero for migrated rows. It is touched after explicit `/new` or `/resume`, accepted root/review/attachment prompts, and successful native session-changing commands including name, model, thinking, fast mode, compact, handoff, and abort. Startup binding recovery, lazy runtime resume itself, `/status`, `/bindings`, `/help`, and viewer pagination do not touch it. The worker uses one timestamp for both the persisted update and its in-memory binding, avoiding a one-second discrepancy at clock boundaries. A touch failure is logged as metadata failure and never changes an already accepted task's outcome. Startup recovery retains the existing binding generation and timestamp.
-
-`DeleteClosedBinding` and `PrepareStart` use generation-fenced transactions over the same binding and intent rows. Deletion succeeds only when the target is closed and has no startup intent; a closed-binding start must first confirm its expected row and insert the intent in that transaction. Therefore an intent committed first rejects deletion, while a deletion committed first rejects the stale start. Successful deletion removes bridge history snapshots and session favorites and advances the non-persisted bridge-wide binding mutation epoch, so menus held by other workers become stale. It never deletes the workspace, native session file, or omp native history. The current worker clears its in-memory binding identity if a deletion ever targets itself; the UI normally disables that action.
-
-For an Open binding, the confirmed request is routed through the bridge to the target worker before deletion. The worker rejects stale generations, startup intents, active tasks, pending prompts, queued work, and in-progress session operations. Otherwise, when idle, it fences new input, closes its OMP process and persists the closed binding before calling `DeleteClosedBinding`; a failed deletion leaves the binding closed. The forget operation replies only to the requesting conversation and creates no target-topic message; previously queued outbox deliveries are unchanged.
-
-After a valid terminal choice or cancellation, the confirmation token is consumed first. Native OMP `select` dialogs, including `/review` commit choices, replace the original menu text with `Selected: <option>` or `Cancel` and remove its inline keyboard in the same edit. The displayed option is bounded without changing the original value returned to OMP.
-
-Native confirmation/select tokens also capture the originating client ID. Selection and cancellation use only that connected client; they never call lazy resume to deliver a dialog response. A token from a retired client becomes invalid even when the logical binding generation is unchanged, and cannot send a selection or cancellation to a replacement process. The bridge assigns no expiry to native confirm/select tokens, including after select pagination. OMP owns plugin-specified dialog deadlines and emits `extension_ui_request(method="cancel", targetId=...)` on timeout or native cancellation; the bridge then invalidates its token without echoing a cancellation response. With no native deadline, the dialog stays actionable until a user decision or native/task/runtime invalidation. Bridge-owned menus retain their existing expiry, and RPC submission and transport deadlines remain unchanged.
-
-Every runtime-stop transition removes native `action="ui"` tokens before detaching the client and queues their keyboard cleanup without sending another RPC to the closing process. This prevents non-expiring dialogs from retaining stale permission state or blocking a replacement runtime's later idle release. Independent resume/queue/export pickers are not removed by this native-only cleanup; full worker/session teardown retains its broader cleanup. Process termination releases OMP's pending dialog state, and releasing a process slot remains separate from retaining the logical session binding and history.
-
-When a current-session export blocks a native UI response, the callback rejects it before recording any selection or confirmation. The original menu shows the export-wait reason, its token is consumed, and no UI response is sent to OMP. This preserves the existing export guard for both submission and cancellation.
-
-Model, thinking, and fast selections first show the selected option and `Applying...`. The originating message ID travels with the existing fenced operation; only a confirmed RPC result replaces this with the actual model and chosen role, verified effective thinking level (including any native adjustment), or returned fast setting/activity. Admission rejection, failed requests, and unconfirmed results replace the pending text with a failure notice, never success. Cancellation shows `Cancel` without starting a settings operation. Existing durable result replies remain unchanged.
-
-The worker retains the originating message ID for its single admitted settings control until terminal handling. Closing, replacing, or releasing the runtime ends a still-pending menu with an interrupted, unconfirmed-result notice before discarding native calls. Successful and failed completions clear this tracking before any runtime release, so later teardown cannot overwrite their terminal menus. Late results remain subject to the existing generation/client fencing.
-
-Resume and export choices replace the original picker with a bounded session title and full native ID; export also shows the SESSION or HTML format. These are selection receipts, not claims that restore or export succeeded. Their existing validation, failure notices, and completion paths remain authoritative. Cancellation shows `Cancel`. Pin/Unpin and pagination continue to refresh the list.
-
-New, compact, native confirm, autoresearch clear, native session Delete, and binding Delete confirmations show `Confirmed` plus the original request details after approval, or `Cancel` after cancellation. `Confirmed` records the decision only; it does not claim that the requested operation succeeded. Queue and binding viewer Close behavior and progress Stop controls are unchanged.
-
-Menu edits are bounded, best-effort UI with a five-second request timeout. A failed text edit queues keyboard removal through the existing bounded cleanup consumer instead of awaiting a second HTTP request in the worker actor. Blocked or failed cleanup does not prevent the requested operation or make its consumed token actionable; queue overflow or shutdown may abandon best-effort cleanup. Pagination edits the existing menu directly. Native select dialogs display eight options per page; navigation rotates the token without answering the native dialog, and lists longer than 20 options are no longer canceled. Known expired menus retain their keyboard-only cleanup; unauthorized users and unknown stale tokens cannot clear menus, so an old page callback cannot erase a newer page's buttons. Menu message IDs are held only in memory, not persisted across restarts.
-
-Timer-driven expiry invalidates tokens in the worker and queues keyboard removal without waiting for Telegram. Each worker has one cleanup consumer and at most 32 pending message IDs; a full queue drops the best-effort removal, not the token invalidation. Each cleanup request has a five-second timeout and worker cancellation stops the consumer, so stalled UI cleanup cannot hold up control commands or terminal events. Explicit user selections attempt the decision edit before executing the requested operation; a failed edit only queues its fallback cleanup.
-
-Programmatic invalidation uses the same bounded cleanup queue: canceling a resume list, native UI cancellation, closing or replacing an instance, and terminal task completion remove their applicable tokens and enqueue their known menu IDs. Terminal completion leaves an independent `/queue` viewer token valid for the current generation, so a callback racing with dispatch can re-scan the live queue and report `Task is no longer queued.` rather than aborting the active task. Runtime-bound confirmations for model, thinking, fast, compact, new, and native UI choices keep the connected runtime active and are not invalidated by normal idle release. Bridge-owned menus retain their existing expiry; native UI has no bridge timer and follows the lifecycle above. An independent `/resume` picker may outlive a released runtime and remains actionable. Explicit runtime teardown still invalidates old runtime menus, while `/close` and worker teardown clear all confirmations. Cleanup remains best-effort and is not guaranteed after worker-context cancellation or queue overflow.
-
-`/model` reads `cycleOrder` and `modelRoles` through read-only `omp config get ... --json` processes in the worker workspace. Runtime `--config` files are appended to the query child's permitted parent `PI_CONFIG_FILES` in argument order, letting OMP perform its own overlay merge; allowlist mode treats a parent value absent from `allow` as unavailable, but still applies explicit `omp.args` overlays. Both flag forms, workspace-relative paths, and `~/` expansion are supported. Paths containing the environment list separator are passed through inherited read-only file descriptors so they are not split into different files. No configuration files or parent environment are modified. The bridge does not enumerate roles by switching models or duplicate selector resolution. Selecting a role sends the native local `/model @role` command and verifies its success identity against `get_state`; raw command output is never forwarded. Selection requires native and bridge idle state with an empty bridge queue. Unsupported `--profile`, `--smol`, `--slow`, and `--plan` overrides still disable the role picker; manual selection remains available. Uncertain native role-command completion invalidates the client.
-
-`/args` is a bot-global local control, available while conversations are busy or have no running OMP process. Its Telegram picker uses `omp.args_labels` only when there is one nonblank label per configured preset; otherwise it shows generic `Preset N` names and logs a startup warning without failing startup. The current choice is marked with a leading `*` in its button. Raw argv is never shown. Labels are literal and visible to anyone who can read the conversation, so credentials must not be placed in them. Selecting a preset commits its one-based index and current fingerprint to SQLite before publishing the new in-memory selection; a failed write leaves the old selection active. Startup restores the saved index only when the fingerprint and index still match the loaded configuration; otherwise it persists preset 1 before restoring workers. Labels do not affect the SHA-256 fingerprint over normalized preset strings and expanded argv. Legacy scalar `omp.args` normalizes to a one-item preset array, so rewriting it as a one-item array does not reset selection. A configuration change resets selection after daemon restart; changes to files referenced by arguments are not tracked. The database stores neither raw arguments nor a per-session preset mapping. Each OMP process keeps its launch-argument snapshot for its lifetime and related `/model` role queries; later launches, including after release and lazy resume, use the current global selection. The attachment janitor checks session visibility across configured presets and retains files when any required listing fails, so a changed profile or session directory cannot make an old session appear absent.
-
-`/thinking` uses the same owner/generation/expiry and idle guards as model selection. It sends `set_thinking_level` only after a valid button is consumed, then reads `get_state.thinkingLevel` to report native adjustment rather than echoing the request. This command changes session state through OMP's existing RPC; it does not edit OMP configuration files or start an agent turn.
-
-`/fast` opens an owner-bound on/off menu; `/fast on` and `/fast off` call native `set_fast_mode` only while idle with an empty queue. Replies use its returned `enabled` and `active` values separately, rather than assuming the requested setting is active. Unsupported models and failed requests do not produce success notices. `/fast status` reads the native settings without changing them and is available during a task. Provider support and service-tier behavior remain OMP-owned.
-
-`/status` decodes only a safe whitelist from `get_state`. Workspace paths below the current user's home are abbreviated with `~`; session titles retain a short native ID. Thinking reports the effective level, not whether auto mode is configured. Fast reports actual activity and shows the setting separately when they differ. Context displays OMP's native `contextUsage.percent` as its reported percentage, using token usage/window only when that value is absent; speed uses native `tokensPerSecond`. Absent metrics are `n/a`, distinct from zero. `Queued` counts only bridge-deferred prompts. `OMP` reports whether the process remains connected after the query; other native fields are the queried process's snapshot, not a retained snapshot from before release. Raw model configuration, headers, system prompts, and native queue counts are never rendered.
-
-For an eligible released session, `/status` uses the normal lazy restore path, process-slot limit, and session identity/workspace checks without submitting a prompt or replaying work. Its temporary process is released after a successful query only if the local lifecycle is quiescent, the saved history file still exists, native output has been consumed, and native state confirms idle, settled, and no pending work. Incoming prompts, pending permissions, unsettled work, or unknown native settlement keep the process connected. Query failures also release the temporary process when the local lifecycle is quiescent, history is durable, and the same native-event checks permit release. Already-connected processes are not released by `/status`, and closed sessions are not reopened. Failure to restore is reported without creating a replacement session.
-
-The temporary status query arms its in-memory client-ID release fence before the actor resumes consuming inputs or native events. The worker cannot release the process while that query is in progress. The response may consume a surviving fence but never recreate one invalidated while the RPC was pending, so an already-consumed native task start cannot be hidden by an older idle snapshot or failed query. Before release, the actor handles at most 32 ready native events per pass, then checks stdout byte credit for queued or partially read frames. Native idle/settled flags do not prove that no UI request is waiting. If only startup metadata remains, cleanup is deferred to subsequent actor iterations, with the existing worker tick providing a wakeup when necessary; no extra RPC or busy wait is introduced. Session/catalog metadata, advisor-cost updates, and nonblocking startup widget updates may drain without cancelling cleanup, including before the response is handled. New input, a new RPC operation, other native events, session identity changes, or runtime retirement invalidate the fence. A confirm/select request therefore reaches the normal UI path and keeps its originating process connected. Ordinary idle cleanup cannot bypass a deferred status release's pending-output guard.
-
-Temporary `/status` release checks cover only currently observed bridge/native state: `isSettled` and event draining cannot prove completion of extension callbacks that have emitted no event and are not tracked by OMP, so releasing the runtime terminates any such callbacks still waiting inside the process rather than proving they finished naturally.
-
-Before querying native state, `/status` checks the retained binding's native session ID against other workers' logical session claims. If another conversation owns it, including after the original conversation was closed and the session resumed elsewhere, the reply explains the conflict and directs the user to run `/status` there or close that instance before explicitly resuming here. It does not start a process, inspect the other worker's native state, or change either binding. An idle-released owner still holds its logical claim, so it produces the same ownership notice.
-
-`/doctor` is an asynchronous bridge control-plane check. It does not call `ensureRuntime`, start or replace an OMP process, join the prompt queue, or mutate the binding. It checks configuration, Telegram `getMe`, SQLite `quick_check`, data-directory write/delete access, `omp --version`, the committed workspace and session file, runtime state, uncertain inbox/outbox counts, and free disk space. Reports use fixed safe summaries and never include tokens, headers, prompts, raw RPC state, or full local paths. A binding and runtime snapshot fence discards results if the conversation changes during the checks; a second request while one is active is rejected.
- A connected or starting binding whose native history file has not been persisted yet is reported as `WARN`; a released running binding with a missing file is `FAIL`, while a closed binding with a missing file is `WARN`.
-
-`/name <title>` uses native `set_session_name` on the running instance. It is a control command, so naming does not wait behind prompts or interrupt active work. It neither changes the session identity/workspace nor renames the Telegram topic. OMP remains responsible for title persistence, including its handling of fresh sessions whose history has not yet been written; the bridge keeps no shadow title in SQLite. `/status` reads the title back from native state.
-
-`/handoff [instructions]` directly calls native `handoff` with optional `customInstructions`; summary generation and context maintenance remain OMP-owned. It requires an idle instance and empty bridge queue, uses the existing asynchronous maintenance-result channel, and fences results by generation. The bridge does not create a replacement session or synthesize a handoff document, and does not replay failed or uncertain operations. Local `/help` and `/close` remain processable while awaiting the result. Other RPC commands follow OMP's own serialization; immediate `/stop` interruption of a handoff is not promised.
-
-### Startup recovery and crash semantics
-
-An uncommitted startup intent records an unfinished transition, not permission to start another omp process. Recovery retains unexpired intents and the saved binding for explicit operator recovery, requiring `/close` followed by `/new` or `/resume` before another transition. Retention may expire an old intent without proving that native startup failed; inspect OMP history before starting again.
-
-Every user-requested start first commits a `startup_intents` record with the frozen operation, target, and next generation. In the same transaction, any prior running binding becomes ineligible for on-demand restoration. Only after native identity validation and host-tool registration does a second transaction publish the binding and delete the intent. This is a bridge-level two-phase commit: durable intent first, live binding publication second; it does not make process startup exactly once. `/close` deletes a pending intent before closing the current binding.
-
-`running` is restoration eligibility, not a live PID indicator:
-
-| Event | Persisted behavior |
+| State or transition | Contract |
 | --- | --- |
-| Successful start/resume | Publish native identity, delete intent, and set `running=1` |
-| Normal daemon shutdown | Preserve committed restoration eligibility; mark an active task as interrupted |
-| `/stop` | Preserve session identity and eligibility; retire the stopped runtime and clear waiting prompts |
-| `/close` | Delete a pending intent, persist `running=0`, then close the instance |
-| Runtime retired after failure | Preserve identity and restoration eligibility; active task becomes uncertain without replay |
-| Missing native session file or working directory during startup binding recovery | Persist `running=0`, log an informational skip, and tell the user to use `/new`; never create a replacement |
-| Failed on-demand runtime resume | Preserve saved identity and eligibility; do not submit or replay the prompt |
+| Unbound | No committed workspace/session; `/new` or explicit `/resume ID` selects one. |
+| Open, connected | A validated runtime holds a process slot and the conversation's native session claim. |
+| Open, released | The binding and logical claim remain, but no runtime or process slot is held. Work requiring OMP restores the exact saved session first. |
+| Pending start | A durable startup intent exists, but the requested transition has not published its validated binding. This is not permission to retry automatically. |
+| Closed | `/close` cancels a pending intent, persists `running=false`, and tears down runtime/task state and the claim. Workspace, native history and the saved binding are retained. |
+| Unexpected runtime exit | The active task is uncertain, queued work is cancelled, and the runtime is retired. The logical binding remains open; no task is replayed. |
 
-### Idle runtime release
+[`worker.ensureRuntime`, `closeLogicalSession`, `failed` and runtime transitions](../internal/bridge/bridge.go) separate these states. Explicit successful `/new` and `/resume` transitions advance the binding generation; lazy restoration does not.
 
-`worker.idle_timeout` defaults to `30m`; set it to `0` or `disabled` to turn it off. With a positive duration, the worker releases only a connected process that has been inactive for the full interval and has no active task, queue entry (including attachment preparation), compaction or handoff operation, finishing preview, host request, session-list request, startup intent, or runtime-bound confirmation. Runtime-bound confirmations for model, thinking, fast, compact, new, and native UI choices prevent idle release until they are consumed or otherwise invalidated. The independent `/resume` picker does not block release and may remain actionable after the runtime is released. Once eligible, the worker closes the client and returns its global process slot. It does not alter the binding, generation, validated session-file identity, session claim, workspace path, or native history. Idle release is process management only; it does not lock shared files.
-Before an idle release, the current binding's session path must be absolute, exist, and refer to a regular file. A fresh native session may have an ID and committed binding before OMP writes its history file; it remains connected in that state so the bridge cannot destroy the only recoverable copy. This is an in-memory release guard and adds no database durability flag.
+### Workspace selection and native ownership
 
-The next ordinary prompt, attachment, `/review`, or native control that requires OMP state lazily restores the persisted session with the normal native identity and workspace checks before queue admission or the RPC call. A failed lazy restore does not submit or replay a root task. `/help`, `/stop`, and `/close` do not wake a released runtime; `/stop` only clears bridge-deferred prompts and `/close` clears restoration eligibility directly. Explicit `/resume ID` replaces the logical binding and starts the requested native session. The actor removes the client and marks the runtime released before closing it, so stale close events cannot enter failure handling; actual OMP exits while still connected retain the existing uncertain/failure path. Events, confirmation display, and successful native calls refresh the inactivity clock.
+`/new <name>` places a single-component name below `storage.workspace_root`. Absolute paths and `~/path` select a project directory. The resolver rejects control characters, relative multi-component paths and named workspaces that are symlinks, while resolving existing project-path components through symlinks. Missing directories for a new session are created with mode `0700`, subject to the process umask. With no argument, `/new` reuses the saved conversation workspace; with none saved, it uses the workspace root itself, not a generated conversation subdirectory. A binding read failure does not silently fall back.
 
-Successful RPC calls refresh the idle clock and invalidate watchdog evidence. Failed RPC calls invalidate watchdog evidence, including in-flight probes, but do not refresh the idle clock.
+There is no workspace lease or admission lock. Different native sessions and workers may share a directory and modify the same files or Git state. Session claims prevent reuse of the same native conversation within this daemon, not concurrent access to the same filesystem. See [`resolveWorkspace`](../internal/bridge/workspace.go) and [`worker.newWorkspace`](../internal/bridge/bridge.go).
 
-After restart, the daemon rebuilds every eligible running binding's logical session claim from its persisted native session ID before polling begins. It validates the saved session file and working directory but starts no OMP processes and occupies no `worker.max_workers` slots. The next prompt or native control command starts OMP and validates the original session identity; this first request may take longer. `/status` can also restore the saved session on demand and normally releases its temporary process after reading state. An interrupted binding receives only an interruption warning and clears its marker without changing generation; explicit `/new` and `/resume` still send ready messages. An uncommitted new/resume intent does not launch another omp process: the prior start may already have created process state whose identity was never committed. The bridge creates an inactive worker, reports the uncertainty, and requires explicit `/close` followed by `/new` or `/resume`. This preserves the requested transition without replaying an uncertain operation. If the saved session file or working directory is unavailable at startup, the bridge persists `running=0`, logs `restore_runtime_skipped`, and tells the user to use `/new`; it never creates a replacement conversation. Failed on-demand reconnection retains the saved identity and does not submit or replay the request. A fresh omp session may report an identity before its history file exists.
+`/resume ID` delegates session lookup to OMP and may restore the session's original directory; it does not recreate a missing original directory. The bridge accepts hex/hyphen IDs or prefixes of 8-64 characters, rejects leading/trailing hyphens, and verifies the returned full native identity. Picker resumes additionally require the listed canonical workspace.
 
-The persisted logical session claim is the restore claim: it is rebuilt from the saved native session identity before any process starts and remains held while the runtime is released or worker capacity delays reconnection.
+### Start intent, validation and commit
 
-## Process and file safety
+A user-requested start follows two durable publication boundaries:
 
-- Launch argv directly, without a shell. Explicit `omp.args` cannot replace bridge-owned RPC, cwd, or session lifecycle options.
-- OMP RPC, ACP, model queries, render, HTML export, and doctor probes use `[omp.environment]`. The policy is generic: default `mode = "denylist"` passes present and future parent variables except names explicitly listed in `deny`. The bundled `config.toml` explicitly denies `OMP_TELEGRAM_BOT_TOKEN`; the loader does not add denied names. A custom variable referenced by `telegram.token` is not recognized by value and is inherited unless separately denied. Bridge-side TOML `${VAR}` expansion is independent of the OMP child policy. Explicit `mode = "allowlist"` passes only listed, present parent variables via required `allow`; `allow = []` passes none. Each mode rejects the other list even when empty. Allowlist mode passes a token variable only when explicitly listed. OMP and tools it starts may inherit passed credentials; use trusted OMP code and a dedicated test bot, and do not run another `getUpdates` poller with the same token. Explicit `omp.args` configuration overlays still apply without implicitly allowing unrelated parent variables. This is not a sandbox: omitting `HOME` does not block filesystem access or access to same-user processes and other token copies.
-- Linux RPC and ACP launches use parent-death SIGTERM. Because Linux ties this signal to the creating OS thread, that thread stays locked until `Wait` completes, costing one locked thread per live native child.
-- Parent-death signaling is not process-tree containment. Ignored signals, surviving descendants, escaped groups, or cleared parent-death settings require a deployment-level containment boundary. No systemd/supervisor configuration is imposed by the project.
-- Incoming attachments are stored in private directories under `storage.data_dir/attachments/inbox/`, which can also be inside a selected workspace if the paths overlap. Preparation writes a `.preparing` marker before downloading and removes it after recording the native session ID and workspace in `.owner.json`. Cleanup first requires the attachment directory to exceed the retention cutoff and not be in use. A valid owner is removed only when `session/list` confirms that its session is absent or reports `UpdatedAt` older than the same cutoff. The bridge lists sessions once per workspace in each cleanup pass. A current session claim, pending resume intent, export/delete operation, inaccessible workspace, failed listing, or invalid `UpdatedAt` preserves the owned directory. Missing or malformed owner metadata is preserved unless the preparation marker identifies an interrupted bridge download; only then is the old directory removed without a session lookup. Unmarked directories without valid owner metadata and legacy workspace `.telegram/incoming/` files are left untouched. Outgoing files are copied to private snapshots under `storage.data_dir/attachments/outbox/` before enqueueing; the bridge best-effort removes snapshots after any terminal outbox state, including failures, without modifying workspace sources.
-  For valid-owner directories, deletion rechecks current session/export/delete claims and pending resume intents under `sessionMu`, then removes the directory while holding that lock. `/resume` persists its startup intent under the same lock, so either the intent wins and the directory stays or deletion finishes before resume starts. Marked, ownerless interrupted preparations have no session identity to claim and are removed after the age and in-use checks. Listing runs outside the lock. An entire incoming cleanup pass has a 30-second deadline, including all workspaces; remaining directories wait for the next janitor pass.
-  The `.owner.json` and `.preparing` filenames are reserved for metadata; a single document with either name is stored under an `attachment-` prefix. Owner metadata is checked against the 16 KiB read limit before it is written, including the trailing newline.
-- Host tool calls are scoped to the active conversation/request and cannot select another Telegram destination. Whole RPC frames, provider headers, and system prompts are never logged or used as status fields. `verbose` is an explicit exception for bounded, unredacted tool argument/result payloads: they are not logged or persisted by the bridge, but may themselves contain credentials or other private data visible to topic readers.
+1. Reserve a runtime slot, unless replacing an already-connected runtime, and prepare the directory for `/new`.
+2. `PrepareStart` saves the target, kind and next generation in `startup_intents`. Its transaction checks the expected prior binding or genuinely unbound target and makes any prior running binding ineligible for lazy restore. Replacement tears down the old runtime only after this preparation succeeds.
+3. Start OMP using a frozen argv snapshot. Obtain `get_state` identity and local `/session info` metadata before submitting user work. Validate the native session ID, absolute session-file path and available CWD. Resume checks the requested ID prefix; lazy restore checks the original file identity and full ID; an expected workspace must match canonically.
+4. Acquire the validated native session claim, query optional configured thinking, and register mandatory Telegram host tools.
+5. `CommitStart` publishes the validated binding with `running=true` and removes the intent. Only then is the new logical session ready. Lazy restore instead retains the existing committed binding and generation.
 
-These are alternative configurations, not two tables in one file:
+[`startInternalWithArgs`](../internal/bridge/bridge.go) owns this sequence; [`Client.SessionInfo`](../internal/omp/session.go) obtains identity without an agent turn. A fresh native session may already have an ID and absolute file path without having written its history file; identity discovery does not create it.
 
-```toml
-[omp.environment]
-mode = "denylist"
-deny = ["OMP_TELEGRAM_BOT_TOKEN", "SOME_API_KEY"]
-```
+The transactions do not make subprocess startup exactly once. A launch failure can leave an unresolved intent because the native outcome is uncertain. A failed post-launch validation closes the failed runtime; lazy-restore failures preserve the saved binding and submit no prompt. Recovery retains unresolved, unexpired intents, reports uncertainty, and requires `/close` followed by an explicit `/new` or `/resume`. Intent retention can remove an old bridge intent, but cannot prove that OMP created no session or undo its effects.
 
-```toml
-[omp.environment]
-mode = "allowlist"
-allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
-```
+### Restart restoration and idle release
 
-## Configuration and path contracts
+Before polling, [`restoreWorkers`](../internal/bridge/recovery.go) rebuilds logical claims for authorized, supported running bindings. It launches no OMP processes and consumes no runtime slots. Saved session files must be regular files at absolute paths and saved workspaces must be available absolute directories. An unavailable file or directory closes that binding's restoration eligibility and reports the skip; it never creates a replacement session. Conflicting or unavailable saved claim identities fail restoration rather than sharing a session.
 
-Bridge defaults are relative to the real executable directory after symlink resolution, not the caller's cwd. Explicit relative `--config` paths are caller-relative; relative `storage.data_dir` and `storage.workspace_root` remain executable-relative even when the config file is elsewhere.
+An interrupted binding receives a warning and its interruption marker is cleared, without changing its generation. Submitted work is not replayed; pending prompt-like inputs are cancelled under the input-recovery policy. An unfinished start intent is reported, not resumed as another startup attempt. `/close` remains the explicit cancellation path.
 
-The root `config.toml` is embedded once. Only an absent implicit default file selects the embedded configuration; explicit missing files and unreadable/invalid files fail.
+Idle release is a runtime optimization. After the configured inactive interval, it requires no active task, deferred queue or preparation, session/control operation, unfinished preview, host request, listing/export/delete job, pending startup intent or runtime-bound confirmation. The saved session path must already be an existing regular file: an unsaved fresh session stays connected rather than losing its only in-memory state. Independent resume menus may survive release. Successful RPC activity refreshes the idle clock; failed calls invalidate watchdog evidence without extending that clock.
 
-The bridge configuration uses grouped TOML tables: `[telegram]`, `[omp]`, `[storage]`, `[worker]`, `[logging]`, and optional `[omp.environment]` and `[logging.component_levels]`. Flat root fields, the former `[log_component_levels]` table, fields in the wrong table, and mixed flat/grouped layouts are rejected. This intentional breaking cutover requires existing private configuration files to be migrated manually before upgrade; the service does not rewrite them automatically.
+Release detaches the old client before closing it and returns its process slot, while preserving the binding and claim. Consequently an intentional close notification cannot be mistaken for an unexpected exit. The next prompt, attachment or state-requiring native control restores and validates the saved session before submission. Capacity or restore failures submit nothing. `/help`, `/stop` and `/close` do not wake a released runtime. Stop/abort and compaction execution semantics belong to the execution subsystem, not a second session lifecycle.
 
-Environment expansion happens after TOML parsing and exactly once for configuration strings except `[omp.environment]` variable names and mode, which are literal. Component names are validated against the six supported names before override values are expanded. The optional `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` references may be unset. The bundled `telegram.progress_mode` reads `OMP_TELEGRAM_PROGRESS_MODE`; empty, missing, or invalid values fall back to `summary`. No dedicated logging environment variables are read. `logging.level` defaults to `info`, `logging.format` to `text`, and component overrides accept only the six fixed component names. `omp.args` uses quoting-aware tokenization, not shell execution. OMP's own model and approval settings remain untouched unless explicitly configured or changed through a user-requested RPC command. `[omp.environment]` defaults to denylist mode with no extra denied names; allowlist mode requires an explicit, possibly empty `allow` list of valid POSIX names and rejects `deny` even when empty. Denylist mode rejects `allow` even when empty and accepts an optional, possibly empty `deny` list of valid POSIX names.
-The display-only `omp.args_labels` field is literal and is not environment-expanded.
+### Session claims and destructive-operation fences
 
-The TOML `omp.args` field accepts either the legacy scalar string or an ordered array of preset strings; a scalar is normalized to a one-item array. The bundled default is `args = ["${OMP_TELEGRAM_ARGS}"]`. Each item is expanded once and shell-tokenized without shell execution, then every preset is validated. Empty entries represent a preset with no additional argv. The fingerprint covers both normalized preset text and parsed argv after expansion; only the SHA-256 fingerprint is persisted, never raw argument strings.
+[`session.go`](../internal/bridge/session.go) keeps claims under `sessionMu`. Each worker owns at most one native session claim, keyed by the returned file path and ID; successful claiming replaces its previous claim. Claims survive idle release and are reconstructed from committed bindings at restart. Prefix-aware, case-insensitive checks prevent an abbreviated requested ID from bypassing another owner's claim. These are daemon-local claims, not cross-process locks on OMP history.
 
-## Roadmap
+Export and delete have separate per-session reservations. Export excludes other logical owners and conflicting operations. Deletion distinguishes logical ownership from runtime activity: a released claim alone does not block deletion, but a connected or starting runtime, export or another deletion does. Pending resume intents also block matching deletion; legacy running bindings without a known ID conservatively block deletion in their own workspace only.
 
-- [ ] **Undo/rewind and redo.** Waiting for upstream OMP to provide both:
-  - Authoritative, durable `submissionId -> entryId` receipts linking Telegram inputs to persisted OMP entries, including queued input and reconnects. Track [#12991](https://github.com/can1357/oh-my-pi/issues/12991).
-  - An RPC operation for native rewind/redo, or at least in-place `navigateTree` for conversation-only undo. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) proposes read-only tree access and cannot move the session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) adds native TUI file-and-conversation rewind/redo but still needs RPC access for the bridge. Tree navigation alone does not restore files; the bridge will not implement its own file rollback engine.
-- [ ] **Reuse the OMP process after Stop.** Waiting for an upstream cancellation barrier that prevents stale callbacks from dispatching more work and old task events from affecting subsequent tasks. An idle `get_state` snapshot, including `isSettled=true`, is not that barrier. Until then, stopping an active task retires the process while preserving the session.
-- [ ] **Precise cancellation of native queued prompts.** Waiting for truthful, request-ID-correlated cancellation results for each removed prompt. In OMP 18.10.4, `remove_queued_message` can return `removed:true` while the removed prompt later receives `prompt_result(status="completed")`. `abort_and_restore_queue` already exists; another atomic queue-clearing RPC is not the missing capability. For now, `/queue` cancels only bridge-pending tasks; stopping unresolved native steering retires the process and leaves its execution status uncertain.
+Lazy restore holds `sessionMu` while rechecking the persisted binding generation, file, ID, workspace and running flag, checking reservations, and marking its claim as starting. A delete reservation won first prevents `omp.Start`; a restore won first blocks deletion during startup. Picker resume carries its mutation epoch into the locked `PrepareStart` boundary, closing the race between UI validation and deletion. Binding forgetting similarly uses a generation-fenced closed-binding transaction that refuses an outstanding startup intent.
 
-## Development and release
+## Session discovery and management
 
-The minimum Go version is 1.26.9, as declared in [go.mod](../go.mod), including the standard-library security fixes required by the vulnerability scan. CI selects its Go toolchain from that file for both architectures; when a standard-library advisory requires a newer patch, update the minimum version rather than bypassing `govulncheck`.
+### Native discovery, favorites and menus
 
-The saved-history regression keeps a fixture larger than the 64 MiB RPC reassembly limit and uses a one-minute test deadline to allow for race instrumentation overhead. This does not extend the bridge's five-second mode-query deadline.
+[`ListSessions`](../internal/omp/list.go) launches a short-lived `omp acp --cwd ...` child and negotiates ACP `initialize` and `session/list`. OMP supplies the list; bridge `history` is not a browser, and the bridge does not scan directories to synthesize one. The client validates protocol responses, follows bounded pagination, rejects repeated cursors and oversized/malformed results, deduplicates IDs, and filters to the canonical requested workspace. Listing has a 4 MiB frame limit and a 10,000-entry safety bound. Cancellation drains and reaps the child process group.
 
-```sh
-just build
-just check
-just install
-just deploy
-```
+[`resume_picker.go`](../internal/bridge/resume_picker.go) runs directory listing asynchronously with a deadline and a shared two-job listing/export limit. `/resume` requires a committed usable workspace and an idle conversation. Its eight-entry pages show native titles, full IDs, optional update times, current selection and in-use-elsewhere markers. Per-conversation, per-workspace favorites store identities only in `session_favorites`; pinned entries come first while preserving native ordering within each group. A pin absent from native listing remains hidden, not a synthetic result.
 
-`just test` runs unit tests without starting or restarting a service. `just check` runs unit tests, race checks, and vet. `just install` copies only the binary. `just deploy` installs the binary, then restarts the existing supervised daemon.
+Bridge selection tokens are random, owner-bound and generation-fenced, normally expire after two minutes, and are lost on restart. Session pickers and delete confirmations also bind the source message and bridge-wide mutation epoch. Selection rechecks persisted generation and canonical workspace; consumed tokens cannot replay a mutation. A resume picker retains its listing preset index/fingerprint, rejects a changed global selection, and launches with the verified argv snapshot. Later global changes cannot alter that already-admitted launch.
 
-Keep regression tests for observable behavior: atomic rollback, restart identity, authorization, cancellation, delivery uncertainty, and process ownership. Use isolated workspaces/databases for real omp smoke tests. Do not describe injected Telegram input or simulated callbacks as phone-originated end-to-end validation.
+A selection or `Confirmed` receipt records the user's decision, not restore/export/delete success. Settings menus show `Applying...` until a confirmed result; interruption is not presented as success. Decision edits and keyboard removal are bounded, best-effort UI; failing to edit does not reauthorize a consumed token or block the requested action.
 
-Current evidence includes transactional failure injection, index query plans, real omp restart recovery, and real Telegram file transfers with injected input. A parent-SIGKILL probe observed a cooperating native omp/tool tree exit, while isolated fixtures demonstrated that non-cooperating descendants can survive. Actual user-client input/clicks, the full live fault matrix, and successful long-session compaction still need acceptance.
+### Binding list and forgetting
 
-Phase 1 native-command smoke used a real OMP RPC process with simulated Telegram input/delivery: advertised `/usage` and `/rename`, bot-suffix normalization without quoted-reply wrapping, silent local submission completion, native rename state changes, and same-session lazy restore all passed. A normal agent turn created the resumable history required for idle release; local commands on an empty session alone did not create a session file. No live Telegram client interaction was exercised for this change.
+[`binding_list.go`](../internal/bridge/binding_list.go) implements `/bindings [old]` over committed bindings and unfinished startup intents for the current bot/chat, merged by conversation. An intent takes display precedence, giving `Pending new`, `Pending resume`, `Open` or `Closed`. Native titles are best-effort transient ACP metadata; fallback titles use the workspace basename, with no shadow title in SQLite.
 
-The lifecycle-command refusal smoke also passed against real OMP: `/move`, addressed `/wt@bot`, and colon-form `/worktree:branch` were cancelled with visible notices; native session identity/CWD and the persisted bridge binding stayed unchanged, and supported `/usage@bot` still completed. Deterministic subprocess regressions cover query creation after a session transition and a new-session caller joining an old pending query, including rejection scope and single-flight behavior.
+The normal six-entry view puts the current conversation first, pending starts next, then remaining entries by most recent known `last_used_at`. `old` sorts by oldest known usage instead. Zero/future times are unknown; thread ID breaks ties. Asynchronous name updates do not reorder the snapshot. Current and pending entries cannot be forgotten from this UI. Eligible entries from other conversations open a separate destructive confirmation.
 
-Application version comes from `Version` in [`cmd/omp-telegram/main.go`](../cmd/omp-telegram/main.go). `--version`/`-v` includes Git revision/dirty metadata when available; `-ldflags "-X main.Version=..."` can override the base version. The daemon passes that same display version to `/help` and `/start`; it does not infer a branch from its runtime working directory. Release builds already distinguish formal versions from `dev-latest` builds.
+Forgetting a Closed binding removes bridge binding/history/favorite metadata only. An Open binding is routed to its owning worker, which checks the target generation and rejects active tasks, queued or incoming work, startup intents and session operations. An idle target fences new input, persists closure, releases the runtime/claim, then deletes the closed binding. A deletion failure after closure leaves it closed. Success refreshes the requesting viewer with its ordering and page retained; it creates no target-conversation notification and does not cancel already-committed outbox deliveries. Workspace files, native session history and Telegram topics remain intact.
 
-The [release workflow](../.github/workflows/release.yaml) runs on `main` pushes, pull requests, and manual dispatch. All non-`main` branch changes must enter through a pull request. It builds/tests Linux amd64 and arm64 natively, with race checks on amd64. Every workflow from the repository publishes: a new source version on `main` creates a formal release without rewriting an existing version tag, while all other internal workflows update the `dev-latest` GitHub prerelease. Internal PRs publish the true head commit. External PRs only build and do not publish. The workflow can only update the `dev-latest` prerelease tag and a new source version tag; it never changes unrelated tags.
+`last_used_at` records explicit starts, accepted task submissions and confirmed native session-changing controls. Restore itself and read-only status/list/help operations do not refresh it. A failed timestamp update is a metadata failure, not a reversal of an accepted operation.
 
-Release archives contain the binary and LICENSE, with `SHA256SUMS` alongside them. Publishing uses `GITHUB_TOKEN` with write permission only in the release job. To release a new application version, update `Version` to `vMAJOR.MINOR.PATCH` and merge/push to `main`. This does not automatically change the database schema version.
+### Rename and export
+
+`/name <title>` calls native `set_session_name` through the control lane, including during an active task, without creating another agent turn, replacing identity, changing workspace or interrupting queued work. OMP persists the title; `/status` reads it back. It does not rename Telegram topics. Only the first successful `/new` in an unbound topic schedules a best-effort topic-title update to the workspace basename; failure does not undo the start.
+
+| Export entry point | Behavior |
+| --- | --- |
+| `/export` | Native session picker, JSONL snapshot by default. |
+| `/export html` | Same native picker, OMP-rendered HTML. |
+| `/export ID`, `/export html ID` | Direct selection, without listing. |
+
+Export uses the committed binding's workspace and identity without `ensureRuntime`, prompt submission, a startup intent, a normal runtime slot, generation changes or last-use updates. Listing may run while a task is busy; exporting the current session requires its task/queue/maintenance/finalization to be idle. Another unclaimed inactive session can be exported concurrently. An export reservation protects the selected native session until completion.
+
+For an exact committed session ID, export reads the committed session path even after idle release or `/close`. Other IDs are resolved by native `omp <args...> render ID -q -t`; [`ResolveSessionPath`](../internal/omp/render.go) validates the first native path diagnostic, a non-symlink regular file, and its native session header against the ID and canonical workspace. It does not implement OMP's store layout. Non-exact/inactive resolution is refused when permitted environment or argv selects a custom session directory, because native render cannot resolve that store safely.
+
+[`export.go`](../internal/bridge/export.go) copies JSONL read-only into a private, size-bounded, synced outbox snapshot. HTML first snapshots the main JSONL, then delegates to [`omp --export`](../internal/omp/export.go), without replaying RPC/cwd/resume/startup arguments into the exporter. The outbox never references the original history file. Completion rechecks request, generation, mutation epoch and committed binding identity; stale or failed jobs remove their private files instead of publishing them. Successful enqueue hands snapshot ownership to durable attachment delivery.
+
+Exports contain conversation/tool data and may contain secrets or local paths. They are not project archives: the bridge does not separately collect source files, Git state, configuration, credential files, or environment variables, but any such content already recorded in native history remains exportable. Source history is never deleted by export.
+
+### Native deletion
+
+The `/resume` Delete action is distinct from forgetting a binding. [`session_delete.go`](../internal/bridge/session_delete.go) validates the full listed ID and workspace, asks for destructive confirmation, then rechecks generation, epoch, runtime claims, pending resumes and reservations before starting a deadline-bounded isolated RPC child.
+
+[`DeleteSession`](../internal/omp/delete.go) resumes that exact ID, verifies its full identity, canonical workspace and existing regular file, and arms destructive shutdown before writing local `/session delete`. Success requires all of: explicit `agentInvoked=false`, native deletion output for that exact file, immediate process-group termination, and verified file absence afterwards. This local command has no `prompt_result`. Graceful EOF after deletion can recreate history, so every path after the destructive boundary hard-stops the child, including rejection, missing output, cancellation and protocol failure. The bridge never unlinks OMP history or computes native artifact paths itself, and never retries an uncertain deletion.
+
+After confirmed native deletion, `DeleteSessionReferences` atomically removes this bot's exact case-insensitive matching bindings, their bound-path history snapshots and matching pins across conversations/workspaces. Released claims are removed only after this transaction commits; active/starting claims are retained. The bridge advances its menu epoch even if reference cleanup fails, reports that failure separately from native success, and refreshes only a still-current picker. Native deletion cannot be rolled back by SQLite. Workspace files and Telegram topics are untouched.
+
+If an unconfirmed deletion leaves the verified file absent after hard stop, it still reports failure and retains references/pins, but advances the epoch before releasing its reservation. Old menus cannot resume the missing session. If the file remains, no epoch advance is inferred. Pin updates serialize with cleanup, and stale lazy restores recheck the database rather than trusting a worker snapshot removed by another conversation's deletion. Closing such a stale binding treats `ErrStaleBinding` as already closed.
+
+## Runtime settings and diagnostics
+
+### Global argument selection and runtime snapshots
+
+[`args.go`](../internal/bridge/args.go) owns a bot-global startup-preset selection, available while busy or without an OMP runtime. `/args [number]` commits a one-based index and configuration fingerprint to `omp_args_selection` before publishing the in-memory choice. Failed persistence leaves the previous choice active. Restart restores a matching, in-range selection; a changed fingerprint or invalid selection resets to preset 1. Raw argv is not stored in that table or shown in the picker. Valid configured labels are public menu text, not a place for secrets; absent/blank/mismatched labels fall back to `Preset N`.
+
+A connected runtime keeps its launch argv unchanged. New starts and lazy restores take the then-current global preset, while connected model-role configuration queries use that runtime's own launch snapshot. Listing/export/name lookups freeze their own starting arguments. Resume picker admission additionally checks that its selection still matches the listing preset. `/args` neither rewrites configuration nor changes a connected process.
+
+### Model, thinking and fast controls
+
+[`model_picker.go`](../internal/bridge/model_picker.go) serializes settings operations through the asynchronous RPC lane, fencing callbacks by generation/client/task context. Mutations require an idle native runtime and an empty bridge queue; `get_state` also rejects native streaming or compaction. State-requiring controls can lazily restore an open released session. `/fast status` is read-only and may run during a task, but does not bypass an already-active control operation.
+
+| Control | Native boundary |
+| --- | --- |
+| `/model` | Read `cycleOrder` and `modelRoles` through native read-only configuration queries; select a native `/model @role`. |
+| `/model provider/model` | Call `set_model` and use the returned native identity. |
+| `/thinking` | Call `set_thinking_level`, then verify `get_state.thinkingLevel`; report OMP's actual adjustment. |
+| `/fast [on\|off]` | Call `set_fast_mode` and report returned enabled and active values separately. |
+| `/fast status` | Read setting/activity without modifying them. |
+
+[`CycleRoles`](../internal/omp/model.go) retains native role ordering and default-role fallback. It applies the runtime's ordered `--config` overlays through native `PI_CONFIG_FILES` handling, honoring the child environment policy; explicit overlays still apply when inherited overlays are filtered out. It does not enumerate roles by switching models, duplicate selector resolution or modify configuration. A selected role is confirmed only after local-only acknowledgment, matching native success output and a matching `get_state` model. An unconfirmed role mutation retires the runtime. Explicit direct-setting RPC rejection is distinguished from an uncertain submission; uncertain mutations retire the process without changing the logical binding or replaying the mutation.
+
+Provider capabilities, role defaults, effective thinking adjustments and fast service-tier support belong to OMP. Pickers and receipts never turn an unsupported or failed request into success. Manual compact/handoff execution and its recovery boundaries are described with task execution rather than duplicated here.
+
+### Configured thinking and metadata failure classes
+
+Display thinking is not the effective level in `get_state`. After identity validation, a three-second local `/effort` query obtains the configured selector, preserving `auto`; model-default or non-adjustable results leave it unknown. The runtime-scoped cache drives detailed status and compact progress/final headers. It is cleared on runtime stop and reread on restore, not persisted. `thinking_level_changed` uses `configured` when present, otherwise `thinkingLevel`; confirmed model/role/thinking mutations resynchronize before queued work continues. Missing configured data displays `n/a` or omits the compact indicator, never substitutes the effective value. `/thinking` mutation receipts still report the verified effective level.
+
+[`SessionInfo`](../internal/omp/session.go), [`SetModelRole`](../internal/omp/model.go) and [`ConfiguredThinking`](../internal/omp/thinking.go) share an exclusive metadata lane because native `command_output` has no request correlation ID. Required output precedes acknowledgment; these methods do not wait for later unrelated output as a substitute. Intercepted metadata is not an ordinary Telegram reply. The failure boundaries deliberately differ:
+
+| Query/outcome | Policy |
+| --- | --- |
+| `/session info` incomplete after submission | Metadata becomes unavailable; startup identity validation fails and the bridge closes the failed runtime. |
+| `/model @role` unconfirmed at any mutation/verification step | Metadata becomes unavailable and the client stops; no switch success is claimed. |
+| `/effort` explicitly rejected | Safe query failure; metadata lane and usable client remain available. |
+| `/effort` acknowledged local, but output missing, malformed or over 4096 bytes | Safe bounded query failure; release the metadata lane without poisoning later session/role queries. |
+| `/effort` submission or local acknowledgment uncertain, including timeout | Disable metadata and stop the client; late output cannot authorize another query. |
+
+At startup, optional `/effort` failure leaves the cache empty and permits host-tool registration/binding commit only while the client remains usable. A stopping client aborts startup at this stage rather than misreporting an attachment-registration failure.
+
+After a confirmed model switch or mandatory effective-thinking verification, optional `/effort` failure cannot reverse that success. The receipt keeps the actual mutation result, adds `Thinking: n/a` and a safe follow-up-query notice, and clears the old cache. If the synchronous stopping signal is set, the actor retires the runtime before dispatching more work and reports that distinction; the binding/claim and queued work remain. Safe output failures keep the same client. There is no automatic metadata retry, mutation replay or invented configured value.
+
+### Status restoration and diagnostics
+
+The status field projection is described with progress and final replies above. Detailed `/status` uses native context percentage when available, otherwise valid token/window arithmetic; its title retains a short native ID and home-relative workspaces use `~`. A conflicting logical session owner is reported before any runtime start, even if that owner is idle-released.
+
+`/status` on an open released binding uses normal lazy restoration and capacity/identity checks. Its temporary client is released only with a surviving client-specific fence, durable history, quiescent local lifecycle and drained native output. A successful snapshot must explicitly be idle/settled without pending work. A failed query may also release the temporary client if local/event checks permit it; incoming work, dialogs, unknown settlement or a consumed native start retain it. The fence is armed before event handling and cannot be recreated by an older result. Already-connected clients are not released by status, and closed sessions are not opened. Observed settlement does not prove completion of unreported extension callbacks; process release terminates those callbacks.
+
+[`doctor.go`](../internal/bridge/doctor.go) is an asynchronous, ten-second control-plane diagnostic, not a prompt or lazy runtime start. It checks runtime configuration, Telegram `getMe`, SQLite `quick_check`, data-directory create/write/sync/delete access, `omp --version`, committed workspace/history availability, runtime state, uncertain inbox/outbox counts and available disk space. Telegram and binary probes each have five-second deadlines. It does not mutate the binding or repair uncertain work; its temporary storage probe is removed. Reports use fixed safe summaries rather than raw errors, credentials, prompts, RPC state or full paths.
+
+Only one doctor request runs per worker. Request identity plus a committed-binding/runtime/client snapshot fence rejects obsolete results; timeout or state change requests a fresh diagnostic rather than reporting a stale success. Missing history on a connected/starting open session is `WARN` because it may not yet be persisted; missing history on an open released session is `FAIL`, and on a closed binding is `WARN`. Disk availability is `WARN` below 1 GiB and `FAIL` below 128 MiB; unavailable platform probes report `WARN`. Linux uses available filesystem blocks in [`doctor_disk_linux.go`](../internal/bridge/doctor_disk_linux.go).
+
+## Persistence and recovery
+
+[`internal/store/store.go`](../internal/store/store.go) stores bridge metadata and Telegram input/output, not a second OMP transcript or model context. `storage.data_dir/omp-telegram.db` uses WAL, a 5-second busy timeout, and one open connection. The data directory must not be group- or world-writable; the database must be a regular file and is protected with mode `0600`.
+
+### Schema and migration boundary
+
+`PRAGMA user_version` is currently **18**, independently of the application version. A fresh empty database creates the schema, indexes, and version transactionally. Versions 1-17 follow the built-in migration chain; a populated unversioned database, negative version, or future version is rejected. Schema migration, session-ID backfill, and in-flight-state reconciliation commit together.
+
+| Table | Identity and retained data | Responsibility |
+| --- | --- | --- |
+| `meta` | `key`, integer `value` | Owning bot ID and next polling offset |
+| `bindings` | `(bot,chat,thread)`; workspace, native session path/ID, generation, last-use time, running/interrupted flags | Last validated logical session binding; `running` is restoration eligibility, not a live PID |
+| `startup_intents` | `(bot,chat,thread)`; new/resume kind, workspace, session target, next generation, creation time | Uncommitted startup transition; publishing a binding, archiving its predecessor, and deleting the matching intent are one transaction |
+| `history` | Bot/conversation, workspace, session path, generation | Previous binding snapshots, not a native session index or conversation transcript |
+| `session_favorites` | `(bot,chat,thread,workspace,session_id)` | Conversation-local pinned native session identities |
+| `omp_args_selection` | Singleton preset index and argument fingerprint | Global startup-preset selection; no raw arguments |
+| `inbox` | Update ID; typed-update JSON, state, reply target, progress message ID, creation/update times | Deduplication and durable input settlement |
+| `outbox` | Increasing ID; optional inbox ID, chat/thread/reply target, text or attachment kind/path/name, state, retry deadline/counters, timestamps | Ordered durable delivery; attachment bytes remain in the private filesystem spool |
+
+The migration scope is deliberately bridge-local. Earlier versions add startup metadata, input/output timestamps and reply/progress associations, native session IDs, last-use metadata, favorites, and retry scheduling. Legacy `last_used_at` remains zero; the separate server-rejection counter starts at zero rather than guessing from total delivery attempts. Versions 11/12 pass through removal of `activity_messages`; it is absent from the current schema. Legacy intents acquire their creation time at migration. Versions 14/15 advance without rebuilding obsolete workspace tables; version 17 adds the preset singleton, and version 18 drops `workspace_users` and `workspace_leases` if present. Native session files, selected workspace paths, and committed bindings are not migrated into a new storage model.
+
+### Input acceptance and settlement
+
+Authorization precedes payload persistence. `Accept` inserts a `pending` inbox row and advances the offset to at least `update_id + 1` in one transaction. `AcceptIgnored` instead stores an empty payload and `ignored` state for an unauthorized update. Both forms deduplicate by update ID without replacing the first durable decision; a failed insert or offset write rolls back both. Routing rechecks authorization, and changing an existing pending row to `ignored` clears its payload.
+
+| Input path | Durable contract |
+| --- | --- |
+| Ordinary root, attachment, review, or supported native submission | `Submit` records `submitted` and the originating Telegram message ID before RPC submission. Completion atomically changes the submitted inbox to `done`, `uncertain`, or `cancelled` and inserts all final text parts with the same inbox ID and persisted reply target. A failed transaction leaves both unchanged and stops the worker rather than claiming completion. |
+| Tracked steer | Uses the same pre-write `Submit`; `FinishSubmitted` settles exactly one submitted row as `done`, `cancelled`, `failed`, or `uncertain`. It creates no independent final-reply outbox; the root owns the reply. |
+| Managed research round | `AppendInboxReplies` atomically appends a round's text and original reply target while leaving its owner `submitted`. A visible round is not completion of the research owner; already committed output survives owner interruption. |
+| Bridge controls and callbacks | Use their own inbox marking and notification path. A control inbox reaching `done` is not a universal receipt for completion of an asynchronous native operation; correlated operation handling remains authoritative. `say()` enqueues notifications separately and is not the root completion transaction. |
+| Host-tool attachment or export | Enqueues a separate attachment outbox row after snapshot creation. It is not retroactively part of the root's final-text transaction and carries no root progress association. |
+
+| Inbox source | Allowed settlement |
+| --- | --- |
+| `pending` | `submitted`, or direct `done`, `cancelled`, `failed`, `ignored` |
+| `submitted` | Root completion: `done`, `uncertain`, `cancelled`; tracked submission settlement additionally supports `failed` |
+| Terminal state | No normal transition back to pending or automatic replay |
+
+On opening the database, `submitted` inputs become `uncertain` and `sending` outputs become `uncertain`. These conversions acknowledge missing evidence, not execution failure. Bridge startup/shutdown separately cancels deferred pending prompts, including attachments, review/followup, and native slash submissions; it does not reconstruct the runtime queue or albums. Remaining pending controls go through normal authorization/routing, and lost in-memory callback tokens are not restored. Durable input is therefore **not** permission to replay uncertain work. Pending outbox work, including durable retry deadlines, remains deliverable.
+
+### Retention
+
+`storage.database_retention_days` defaults to 90; `0` disables automatic message/attachment retention cleanup. The best-effort janitor runs at startup and every 24 hours, uses the latest state-transition time (`updated_at`), deletes in committed batches of 1000, and never automatically runs `VACUUM`.
+
+Only terminal inbox states (`done`, `cancelled`, `ignored`, `failed`, `uncertain`) and terminal outbox states (`done`, `failed`, `uncertain`, `cancelled`, legacy `sent`) expire. Pending/submitted inputs and pending/sending outputs do not. A retained progress association protects its inbox and related outbox records; after the cutoff, with no related pending/sending output, retention may clear only the local association and delete expired records without calling Telegram Delete. It does not remove bindings, binding history, favorites, workspaces, or native session data. Startup intents use their own `created_at` and generation-fenced retirement; their lifecycle and recovery rules belong to session management.
+
+Attachment cleanup follows separate filesystem ownership checks below. Failure of periodic cleanup is logged and retried later, not treated as task failure.
+
+## Telegram delivery and progress cleanup
+
+[`internal/bridge/bridge.go`](../internal/bridge/bridge.go) runs four delivery workers independently of RPC event consumption. `ClaimNextOutput` transactionally selects a due row and marks it `sending`, incrementing total `attempt_count`. At most one output per `(chat,thread)` is sending; an older pending row blocks later rows in that conversation even while waiting for a retry deadline. Other conversations can proceed. This is conversation ordering, not a global delivery barrier.
+
+### Delivery states and failure certainty
+
+[`internal/telegram/client.go`](../internal/telegram/client.go) and [`internal/telegram/media.go`](../internal/telegram/media.go) classify certainty at the HTTP boundary. A trustworthy rejection requires a complete explicit Telegram failure envelope with an error code and nonblank description; HTTP status alone does not establish non-delivery. Network interruption, truncated/malformed responses, invalid success results, and contradictory responses remain uncertain. Local failures before sending are definite. Earlier uncertainty is never erased by a later failure.
+
+| Outbox transition | Condition and policy |
+| --- | --- |
+| `pending -> sending -> done` | Telegram send succeeds and the terminal state is persisted |
+| `sending -> pending` | Definite 429: persist Telegram's `retry_after`, or one second when absent/invalid; no retry-count cap |
+| `sending -> pending` or `failed` | Definite 500/502/503/504 rejection: exponential delay from one second, capped at five minutes; the 12th server rejection atomically marks `failed` |
+| `sending -> failed` | Other definite failures, including permanent API rejection or local upload failure |
+| `sending -> uncertain` | Delivery may already have happened; no automatic resend |
+| `sending -> uncertain` on database reopen | The last network side effect cannot be reconstructed safely |
+| `sending -> cancelled` or legacy `sent` | Recognized store terminal states; normal delivery emits `done`, `failed`, or `uncertain` |
+
+`server_retry_count` counts only the listed definite server rejections; 429 and total claim count do not consume that budget. Retry scheduling survives restart and preserves conversation ordering. The client does not independently retry an ambiguous send or file upload. SQLite cannot atomically commit a Telegram side effect, so neither durable delivery nor completion transactions promise exactly-once network delivery. Persistence failures in claim, retry, or terminal state handling are fatal rather than silently losing state.
+
+The stored target is `(chat,thread,reply_to)`: every final part replies to the root's originating Telegram message, not the most recent steer. A definite unavailable-reply-target rejection permits one attempt without reply binding for text or attachments. A missing topic is not permission to send into another thread. This fallback changes presentation, not ownership or settlement.
+
+### Message rendering and progress association
+
+[`internal/telegram/markdown.go`](../internal/telegram/markdown.go) converts escaped Markdown into Telegram's HTML subset. Splitting measures rendered UTF-16 units against the 4096-unit message limit, retains block structure where possible, repeats oversized table headers, and splits oversized fences into valid fences. Wide tables degrade to labelled lines. HTML entity rejection falls back to plain text; a conversion whose rendered length exceeds the limit is sent plain rather than knowingly exceeding the limit.
+
+A successful initial progress send records its Telegram message ID on the root inbox; later edits cannot recreate a cleared association. Generation/turn fences prevent old previews from updating new tasks, while a late successful initial send can still be recorded for cleanup. Progress remains a best-effort UI lane rather than replayable outbox work. Its live rendering, Stop controls, and privacy limits are described with execution and status above.
+
+### Progress deletion
+
+Once a terminal inbox has associated outbox rows and all of them are terminal, progress deletion becomes eligible. Failed or uncertain final deliveries do not prevent cleanup; pending/sending deliveries do. Cleanup runs after terminal delivery, at startup, and every minute. Each delete has a five-second timeout.
+
+Success clears the matching local association. A confirmed permanent 4xx other than 429 abandons deletion and also clears it. A 429, 5xx, transport failure, or uncertain response retains it for another cleanup attempt. Cleanup never changes task or outbox results. Retention eventually drops expired local associations with no active delivery even if Telegram deletion never succeeds; it cannot guarantee that every preview disappears remotely.
+
+## Attachments and host-tool file boundaries
+
+[`internal/bridge/media.go`](../internal/bridge/media.go), [`internal/media/media.go`](../internal/media/media.go), and [`internal/media/incoming.go`](../internal/media/incoming.go) separate incoming originals, optional inline previews, and outgoing immutable snapshots. Files are not stored as database BLOBs. Preparation and snapshot work share two bounded media slots; preparation reserves its prompt queue position while running.
+
+### Incoming originals and albums
+
+Only authorized messages can trigger downloads. Originals are saved under private `storage.data_dir/attachments/inbox/incoming-*` directories with sanitized bounded filenames and exclusive `0600` files. If the data directory lies within a workspace, so do these attachments; this layout is not filesystem isolation. Telegram file paths must be relative ASCII path segments, redirects are refused, and both advertised and streamed size are bounded to 20,000,000 bytes. Partial downloads and failed preparations are removed. Prompt text explicitly labels filenames and contents as untrusted data.
+
+Decodable JPEG/PNG/GIF/WebP images are inspected within a 16-million-pixel limit. Inline image payloads are bounded to 512 KiB; larger originals may receive a JPEG preview with a longest side of 1280 pixels. Unsupported, invalid, or over-budget inline images keep their originals and a textual path. Submission includes only the leading inline images fitting the negotiated RPC frame, never discards originals to make a frame fit, and fails an oversized text-only pending prompt without submitting it.
+
+Albums are worker-local collections keyed by media group and sender. The first member reserves one queue slot and owns the input; consumed continuations become `done`. Collection seals after a 500 ms quiet period, no later than two seconds from the first member, with at most ten items. Members are ordered by Telegram message ID and prepared all-or-nothing into one directory with indexed filenames. One prompt uses the first nonempty caption and first available reply context; its final reply targets the first ordered message. Failure removes the directory and owner queue entry, marks the owner failed, and emits one album notice. Fenced timers and temporary suppression reject stale/late continuations; restart does not reconstruct an album.
+
+### Outgoing snapshots and target authority
+
+`telegram_send` is an essential host tool available only during an active Telegram request. Its arguments contain a workspace path, optional `photo`/`document` kind, and caption, never a Telegram destination. The bridge fixes the destination to the current conversation, defaults to `document`, rejects unknown fields/kinds, deduplicates outstanding request IDs, and bounds pending host requests to 16. Results are fenced by originating client and generation.
+
+| Boundary | Enforced contract |
+| --- | --- |
+| Source access | Absolute or relative paths must resolve inside the current workspace through `os.Root`; escaping symlinks, traversal, directories, FIFOs, and other nonregular files are rejected. Symlinks staying inside the workspace may be used. Nonblocking open plus post-open stat protects against file-type substitution. |
+| Snapshot | Copy into a random `attachment-*` spool file, enforce the byte limit while copying, and reject detected source size/mtime changes. Protect with `0400`, sync the file and containing directory, then enqueue. Later source edits cannot change the queued snapshot. |
+| Limits | Documents: 50,000,000 bytes. Photos: 10,000,000 bytes, fully decodable JPEG/PNG, at most 16 million pixels, dimension sum at most 10000 and aspect ratio at most 20. Caption: 1024 UTF-16 units. |
+| Upload | Stream multipart data instead of loading the whole file; reopen with no-follow/nonblocking semantics and verify regular-file identity and limits. |
+| Acknowledgment | Host-tool success means durably queued, not delivered. Failure to return the host result retires the affected runtime conservatively; the task is not replayed to manufacture an acknowledgment. |
+
+Confinement is a path-access boundary, not secret detection or a sandbox for OMP's other tools. A secret already inside the workspace is still a regular eligible file; the tool instruction not to send secrets does not inspect its contents.
+
+`/export` hands its completed private document snapshot to the same attachment outbox. Failed, canceled, or stale export results remove their temporary files; after enqueue, delivery owns cleanup. Export session resolution and native rendering remain session-management responsibilities.
+
+### Ownership and cleanup ordering
+
+Before incoming preparation, a durable `.preparing` marker identifies bridge-owned interrupted downloads. Successful preparation writes `.owner.json` with native session ID and workspace, then removes the marker. These names are reserved; a user document with either name receives an `attachment-` prefix. Metadata is bounded and validated on both write and read.
+
+Queued/active paths are retained in memory. Pre-submission cancellation and preparation failure remove them; task settlement refreshes directory mtime before releasing in-use protection. Retention considers only old, unused direct `incoming-*` directories. A valid owner requires successful native session listing across configured argument presets: the session must be absent or its last update older than the cutoff. Current session/export/delete claims, pending resume intents, failed listing, or invalid timestamps retain the directory. Final claim/intent checks and removal share the session mutex, so a concurrent resume cannot pass between the last ownership check and deletion. The whole incoming cleanup pass has a 30-second timeout.
+
+An old interrupted preparation with the exact bridge marker but no valid owner can be removed without session lookup. Unmarked directories with absent/invalid owners, symlink entries, unrelated paths, and legacy workspace `.telegram/incoming/` directories are preserved. Native history may retain a path after retention removes the file.
+
+For outgoing files, terminal outbox state is committed **before** best-effort snapshot removal, regardless of delivery success. A persistence failure therefore retains the snapshot; observing `done` alone is not proof that file removal has finished. A terminal attachment failure also queues a delivery notice without resending the attachment. Source workspace files are untouched. Retention removes remaining snapshots only after deleting their outbox rows and confines removal to `attachments/outbox`; the spool janitor also removes old, unreferenced regular `attachment-*` files. Referenced pending or uncertain snapshots are never blindly treated as orphan files.
+
+## Logging contract
+
+[`internal/logging`](../internal/logging/logging.go) creates one `slog` registry after configuration succeeds. It has exactly six components: `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. `logging.level` sets the default threshold; `[logging.component_levels]` overrides only these fixed names. Valid levels are `debug`, `info`, `warn`, and `error`. Configuration failures and early CLI output precede the registry and remain plain text.
+
+Both formats write to stderr through one synchronized writer:
+
+- `text`: `YYYY-MM-DD HH:MM:SS LEVEL [component] message key=value`, with escaping that prevents control characters from creating extra physical records.
+- `json`: standard `slog.JSONHandler` objects, including `component`, one record per line.
+
+There is no bridge log file, rotation, network exporter, asynchronous queue, or runtime policy reload. Deployment owns collection and rotation. The writer synchronizes this registry's output, not other processes. Sink failures do not change task state.
+
+### Events and correlation
+
+| Component | Logging boundary |
+| --- | --- |
+| `daemon` | Startup/stop, lock and initialization failures; startup includes effective limits and logging/progress policy, not raw configuration |
+| `bridge` | Worker/runtime/session lifecycle, accepted root tasks, durable completion, queue refusal and watchdog recovery |
+| `rpc` | Protocol/overflow/process failures and debug-level RPC lifecycle projection |
+| `telegram` | Polling, menu registration, delivery certainty, rate limits/retries and best-effort UI cleanup |
+| `store` | Durable read/write/commit failures and retention cleanup |
+| `media` | Preparation, snapshot, persistence and cleanup failures |
+
+Events use stable `snake_case` names and reviewed reason/error classifications. Successful lifecycle milestones are normally info, recoverable transport/UI failures warn, and protocol/overflow/durable-state failures error; ordinary user cancellation is not itself a warning. A failure is logged at the boundary that owns its policy rather than copied as raw errors through every caller. `task_complete` is emitted only after durable settlement and includes `result=done|cancelled|uncertain` and duration when available.
+
+Correlation fields include `chat_id`, `thread_id`, `generation`, `turn`, `inbox_id`, and `client_id` where applicable. `thread_id=0` is meaningful. Validated native session UUIDs may be logged; paths are never session log identities. Bot ID remains part of internal/database identity but is omitted from logs in this single-bot deployment. Outbox failures use `outbox_id`, kind, API code, retry metadata, and uncertainty rather than Telegram descriptions or bodies. Asynchronous operations capture their original identity; they do not read identity from a subsequently reused worker.
+
+RPC debug records use `event=rpc_lifecycle`, an allowlisted `rpc_event`, and a phase such as `received`, `event_queued`, `response_queued`, `response_ignored`, `rejected`, or bridge-side `handled`. Optional terminal metadata is classified as `absent|true|false|invalid`. Request IDs are logged only after safe decimal parsing. Set both `logging.component_levels.rpc` and `logging.component_levels.bridge` to `debug` to trace transport receipt through actor handling; this does not enable frame logging.
+
+### Confidentiality
+
+Log call sites project approved metadata; the handler is not a general secret scrubber. Do not pass prompts, output, reasoning, tokens, authentication headers, URLs, whole frames, raw errors, tool payloads, callback tokens, filenames, workspace/session paths, authorization lists, raw `omp.args`, or unreviewed configuration values to it. Chat/thread IDs are linkable identifiers: restrict log access and replace them consistently before public sharing.
+
+`telegram.progress_mode=verbose` is an explicit UI-only exception for bounded, unredacted tool arguments/results. These fields may contain credentials or private file content and are visible to conversation readers. The bridge does not log or persist that verbose tool history. It never renders raw reasoning, whole RPC frames, or provider headers as progress/status. Attachments and final answers have their separate explicit persistence policies.
+
+## Development, verification, and release
+
+### Verification boundaries
+
+The minimum Go toolchain comes from [go.mod](../go.mod). Use the repository's [justfile](../justfile):
+
+| Command | Effect |
+| --- | --- |
+| `just build` or `just` | Build the daemon |
+| `just fmt` | Format Go source and tests |
+| `just test` | Run unit tests without starting/restarting a service |
+| `just check` | Unit tests, race checks, and vet; no Telegram polling |
+| `just install` | Build and install only the binary; leave configuration/data user-managed |
+| `just deploy` | Install, then schedule a detached restart of the existing supervisor service after five seconds |
+
+For local configuration checks, build and run `./omp-telegram --check`; provide explicit `--config` when needed. It creates directories, so use disposable paths when testing configuration behavior.
+
+Regression coverage belongs at observable boundaries: authorization, request correlation, cancellation, stale callbacks, atomic completion, restart identity, delivery uncertainty, retention, and process ownership. Representative suites are [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go), and [`logging`](../internal/bridge/logging_test.go). Saved-history tests include histories larger than one RPC frame; their test deadlines do not change production query deadlines.
+
+A real OMP smoke must use isolated profiles, workspaces, databases, and explicit environment policy. A deterministic local provider verifies native RPC/model-tool interaction without proving production-provider compatibility. Injected Telegram updates or simulated callbacks verify bridge handling, not phone-originated input, button behavior, or live Bot API delivery. Real Telegram credentials and actual user-client interaction are required for those claims. Parent-death/process-group tests do not prove containment of arbitrary descendants. Do not retain per-fix smoke transcripts here or treat historical runs as current deployment certification.
+
+The implementation has no bridge-side undo/rewind/redo or file rollback engine. `/queue` controls bridge-pending work, not individual native queued prompts. Stop cannot rely on an idle snapshot as a cancellation barrier; runtime retirement and no-replay semantics remain architectural constraints, not promises of exactly-once native execution.
+
+### Build and publication
+
+The application version is `Version` in [`main.go`](../cmd/omp-telegram/main.go), optionally overridden by `-ldflags "-X main.Version=..."`. `--version`, `-v`, `/help`, and `/start` use the same display version, including Git revision/dirty metadata when available. Application and SQLite schema versions are independent.
+
+The [release workflow](../.github/workflows/release.yaml) runs on `main` pushes, pull requests, and manual dispatch. It selects Go from `go.mod`, checks formatting and dependency consistency, runs `govulncheck`, vet and tests on native Linux amd64/arm64 runners, and runs race checks on amd64. It then builds each architecture with CGO disabled, exercises version/help output, and packages the binary and LICENSE as `.txz`; `SHA256SUMS` accompanies published archives.
+
+A new source version on `main` creates a formal release without moving an existing version tag. Other eligible runs publish the moving `dev-latest` prerelease. Same-repository PRs build/publish the actual head commit; fork PRs build without publishing. Only the release job has repository-content write permission. Publishing is serialized, and the workflow only replaces the moving prerelease tag or creates a new version tag. Releasing requires an explicit source-version update, not a database schema bump.

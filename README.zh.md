@@ -111,6 +111,8 @@ format = "text"
 
 显式指定的文件不存在, 文件不可读或 TOML 无效时, 启动都会失败. 配置必须使用上面示例中的分组 table; 旧的 flat 字段和 flat/grouped 混合布局不再接受.
 
+显式相对 `--config` 路径以启动目录为基准. 相对 `storage.data_dir` 和 `storage.workspace_root` 始终以真实可执行文件目录为基准, 不以配置文件目录为基准.
+
 配置字符串支持 `$VAR` 和 `${VAR}`, 但 `[omp.environment]` 的模式与 `allow`/`deny` 变量名为字面值, 不展开引用. `$$` 表示字面美元符号. TOML 解析后其他环境变量引用只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置. `telegram.progress_mode` 为空或非法时回退到 `summary`. token 和白名单必须提供. 程序不会自动加载 `.env` 文件.
 仅用于显示的 `omp.args_labels` 按字面读取, 不展开环境变量.
 
@@ -122,24 +124,26 @@ format = "text"
 | --- | --- |
 | `telegram.token` | Telegram bot token. 推荐引用环境变量. |
 | `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单. 可直接填写整数, 或引用逗号分隔的环境变量值. |
-| `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见 [Progress UI](#progress-ui). |
+| `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见[进度界面](#进度界面). |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram picker 标签, 每个预设一个. 未设置、为空或数量不匹配时回退显示 `Preset N`, 并在启动时记录 warning. 过长标签会截短以适配按钮. 标签会展示给能查看对话的人, 不要填凭据. |
 | `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"` 会传递当前及未来新增的服务环境变量, 只排除显式列入 `deny` 的名称. 随附的 `config.toml` 设置了 `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` 只传递列出且已存在的变量. |
 | `storage.data_dir` | 数据库, lock 和输入/输出附件存储目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
-| `storage.database_retention_days` | bridge 终态消息 metadata 的保留期. 默认 `90` 天; `0` 关闭自动清理. 清理不会删除 workspace, OMP session 数据或已保存的 conversation binding. 见[数据与保留](#数据与保留). |
+| `storage.database_retention_days` | Bridge 终态消息和符合清理条件的附件缓存的保留期. 默认 `90` 天; `0` 关闭按保留期执行的自动清理. 不删除 workspace, OMP session 数据或已保存的对话 binding. 见[数据与保留](#数据与保留). |
 | `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `8`; 配置最大值 `64`. |
-| `worker.queue_capacity` | 每个对话最多等待的任务数. 默认 `16`; 配置最大值 `1024`. |
+| `worker.queue_capacity` | 每个对话中等待任务与未解决 steer 的共享上限. 默认 `16`; 配置最大值 `1024`. |
 | `worker.idle_timeout` | 保留 session 的同时释放持续空闲 OMP 进程前的时长. 默认 `30m`; `0` 或 `disabled` 关闭. |
 | `logging.level` | 全局日志级别: `debug`, `info`, `warn` 或 `error`. 默认 `info`. |
 | `logging.format` | 日志格式: `text` 或 `json`. 默认 `text`. |
 | `[logging.component_levels]` | 可选的组件级别覆盖: `daemon`, `bridge`, `rpc`, `telegram`, `store` 和 `media`. |
 
-`omp.args` 数组中的每项都是一套完整的 shell-style 参数字符串, 只用于引号分组, 最终直接传递且不经过 shell. 旧的单字符串格式仍作为单个预设接受. `/args` 仅在 `omp.args_labels` 为每个预设提供一个非空标签时才在 Telegram 菜单使用这些标签; 未设置、数量不匹配或有空标签时改用 `Preset N`, 并在启动时记录 warning, 不阻止启动. 不显示原始 argv. 标签按字面处理, 可见于能查看该对话的人, 不应包含凭据. OMP overlay 仍属于 OMP 自身配置; bridge 不会修改模型, 凭据, 工具或审批策略.
+`omp.args` 数组中的每项都是一套完整的 shell-style 参数字符串, 只解析引号分组, 直接传递且不经过 shell. 除非通过这些参数或用户请求的命令显式选择, 否则不改变 OMP 自身配置.
 
-要显式限制 OMP 子进程, 将该 table 配置为:
+`/args` 的选择作用于所有对话, 并跨服务重启保存. 修改预设定义或展开后的参数值会在启动时重置为预设 1; 仅修改展示标签不会重置. 已连接的 OMP 进程保留原启动参数.
+
+要显式限制 OMP 子进程, 用下面的内容替换已有 `[omp.environment]` table. 不要同时配置 `allow` 和 `deny`, 即使其中一个列表为空.
 
 ```toml
 [omp.environment]
@@ -200,7 +204,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 | 命令 | 用途 |
 | --- | --- |
-| `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. Topic 的首次 session 会将标题设为 workspace 名称. |
+| `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. Topic 的首次 session 会尝试将标题设为 workspace 名称. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session 供后续使用. |
 | `/queue` | 查看运行及排队任务. Cancel 按钮只删除选中的等待任务, 不中止当前任务. |
@@ -213,7 +217,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/export` | 选择已保存的 session, 导出原始 main-session JSONL. 导出当前 session 前需等待其空闲. |
 | `/export html` | 选择已保存的 session, 导出 standalone HTML viewer. |
 | `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
-| `/status` | 查看当前 workspace, session, model, thinking, fast mode, context, 活动任务和队列状态. |
+| `/status` | 查看当前 workspace, session, model, thinking, fast mode, context, runtime 和队列状态. |
 | `/args [预设编号]` | 查看预设标签并切换所有对话后续新启动进程使用的 OMP 参数. 不影响已运行的 OMP 进程. |
 | `/doctor` | 异步运行安全的 bridge 诊断, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
@@ -221,11 +225,13 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/model provider/model` | 空闲时切换到指定 model. |
 | `/thinking` | 空闲时选择 thinking level. |
 | `/fast [on\|off\|status]` | 选择 fast mode, 显式开启或关闭, 或查看状态. |
-| `/compact` | 空闲时经确认压缩当前 context. |
+| `/compact` | 空闲时直接压缩当前 context, 无需确认. 状态消息原位更新结果和 context 使用量. |
 | `/handoff [补充要求]` | 空闲且队列为空时运行 OMP 原生 handoff. |
 | `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. |
 | `/autoresearch [goal\|off\|clear]` | 当前 OMP 公布支持时控制原生 autoresearch. 安全边界和停止行为见下文. |
 | `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
+
+Model 或 thinking 修改成功后, 仍可能因无法读取配置等级而显示 `Thinking: n/a`. 这不会撤销修改; 如果必须关闭进程, 回执会说明 session 已保留.
 
 对话空闲时, 普通文字会启动任务. OMP 任务运行期间, OMP 可能接受普通文字作为 steer. 使用 `/followup <message>` 可明确排队一个独立任务. 附件、`/review` 和其他受支持的原生命令也进入对话队列并按顺序执行. 不同对话可以并行工作, 受 worker 配置上限影响.
 
@@ -244,7 +250,7 @@ Bridge 命令优先于 OMP 命令; 发给其他 bot 的命令会被忽略. Bridg
 | `/session delete` | 拒绝执行: 请用 `/resume` 的 **Delete**, 保留确认和 in-use 检查. |
 | `/plan`, `/plan-review` | 依赖上游 OMP RPC 支持. Bridge 不实现其 planning workflow; RPC 不支持时请使用交互式 OMP. |
 | 其他 extension 及 extension alias | 拒绝执行, 包括 autoresearch 的 alias: 未接入通用 extension session 生命周期变化. 请直接在 OMP 中使用. |
-| 无法识别来源的命令 | 拒绝执行, 不猜测安全性, 也不当作普通模型文字转发. |
+| 已公布但无法识别来源的命令 | 拒绝执行, 不猜测安全性, 也不当作普通模型文字转发. |
 
 Telegram 菜单列出 bridge 命令及当前可用的原生命令. Telegram 每份菜单最多 100 项, 且命令名字符受限; 未显示但受支持的命令仍可手动输入.
 
@@ -261,7 +267,7 @@ Telegram 菜单列出 bridge 命令及当前可用的原生命令. Telegram 每�
 - `/autoresearch <goal>` 开启研究模式并启动原生目标.
 - `/autoresearch` 切换模式. 开启新实验时只确认模式已启用; 下一条普通消息提供目标.
 - `/autoresearch off` 关闭研究并中断活动研究任务; 等待中的 bridge 任务保留. 使用 `/stop` 清空队列.
-- `/autoresearch clear [--keep-tree] [--reset-tree]` 要求实例空闲、队列为空并经确认. 它会删除研究 artifacts, 还可能重置 tracked 文件并删除 untracked 文件. 只在可接受这些改动的 workspace 中使用.
+- `/autoresearch clear [--keep-tree] [--reset-tree]` 要求实例空闲, 队列为空并经确认. OMP 会删除研究 artifacts, 还可能重置 tracked 文件或删除 untracked 文件. `--keep-tree` 跳过工作树 reset/clean, 但仍会删除研究产物; 它不是备份或无破坏模式. 只在可接受这些改动时使用.
 
 两步用法:
 
@@ -297,7 +303,7 @@ Bridge 不会在不同对话之间锁定或隔离 workspace. 使用同一 worksp
 omp --resume /path/to/session.jsonl
 ```
 
-如果 session 中记录的旧工作目录已经不存在, OMP 可能要求将 session re-root 到当前目录. Session 导出不包含 workspace 源码文件, 源码树, Git 状态, 未提交文件, credentials, OMP 配置或 shell environment. 项目文件需要单独通过 `git clone`, `git pull`, `scp`, `rsync` 或其他方式同步.
+如果 session 中记录的旧工作目录已经不存在, OMP 可能要求将 session re-root 到当前目录. 导出不是项目备份: 不额外收集 workspace 文件, Git 状态, OMP 配置, 凭据文件或环境变量. Transcript 中已记录的此类内容仍会被导出. 项目文件需要单独通过 `git clone`, `git pull`, `scp`, `rsync` 或其他方式同步.
 
 导出的 session 文件可能包含敏感的 conversation, tool, command 和 path 数据, 包括 prompts, assistant responses, tool calls, tool results, 本地路径, 命令输出, 源码片段以及意外出现在 transcript 中的 secrets. 只应将这些文件发送到可信的 Telegram 对话. 不会额外要求二次确认; 用户输入 `/export` 本身就是明确确认.
 
@@ -308,7 +314,7 @@ omp --resume /path/to/session.jsonl
 | 现象 | 检查项 |
 | --- | --- |
 | bot 没有反应 | 两个白名单, 群组 topic, 群隐私设置, 以及是否有其他 polling 服务或 webhook 占用 bot. |
-| `omp executable not found` | 服务进程的 `PATH`, 包括 omp 及其运行时. 它可能不同于交互式 shell. |
+| `omp.binary executable not found` | 配置的可执行文件和服务进程的 `PATH`, 包括 omp 及其运行时. 它可能不同于交互式 shell. |
 | `/resume` 列表为空 | 当前选择的目录以及 OMP 是否已经保存历史. 新 session 可能还没有可恢复文件. |
 | `/compact` 失败 | 短 session 可能没有可压缩内容. 如果本机 OMP 也失败, 检查其 model 配置. |
 | 数据库结构不支持 | 备份数据, 使用受支持的数据库或新数据目录; 不要手动修改版本号. |
@@ -329,7 +335,7 @@ omp --resume /path/to/session.jsonl
 
 Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变化, 也不影响任务执行或最终回复.
 
-最终文字回复可能附带简短的 model 和 context 状态信息.
+最终文字回复可能附带简短的 model 和 context 状态信息. 实时进度和回复头中的 thinking 图标, 以及 `/status` 的 `Thinking` 字段, 都表示配置等级, 不随每轮生效等级变化. 配置为 `auto` 时, `/status` 显示 `auto`, 精简状态头显示 `⟳`.
 
 ## 附件
 
@@ -343,7 +349,7 @@ Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变�
 | 发送文档 | 50 MB |
 | 发送照片 | 10 MB, JPEG 或 PNG |
 
-输入附件与项目文件分开保存, 并受配置的 retention 策略影响. 需要长期保留的文件请移入 workspace. 大图可能以预览或本地文件路径提供; 识图能力取决于模型, 文档读取能力取决于工具.
+输入附件保存到 `storage.data_dir/attachments/inbox/`, 并受配置的 retention 策略影响. 配置路径重叠时, 该目录也可能位于 workspace 内. 需要长期保留的文件请复制到附件缓存目录之外. 大图可能以预览或本地文件路径提供; 识图能力取决于模型, 文档读取能力取决于工具.
 
 ## Telegram 回复上下文
 
@@ -363,11 +369,13 @@ Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变�
 
 ## 数据与保留
 
-Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`. `storage.data_dir` 默认是解析符号链接后的真实二进制所在目录; 相对 storage 路径使用该目录, 不使用启动目录.
+Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 Telegram 输入内容, 待发送/已发送回复和消息 metadata. 附件以文件形式保存在同一数据目录下. 数据库, 附件缓存及其备份都应按敏感数据保护. `storage.data_dir` 默认是解析符号链接后的真实二进制所在目录; 相对 storage 路径使用该目录, 不使用启动目录.
 
-`storage.database_retention_days` 控制 bridge 终态消息 metadata 的保留时间. 默认 `90` 天; 设为 `0` 可关闭自动清理. 清理不会删除 workspace 文件、OMP session 数据或已保存的对话 binding.
+`storage.database_retention_days` 控制 bridge 终态消息和符合清理条件的附件缓存保留时间. 默认 `90` 天; 设为 `0` 可关闭按保留期执行的自动清理. 不删除 workspace 文件, OMP session 数据或已保存的对话 binding. 保留清理不会删除已送达的 Telegram 回复.
 
 升级前先停止服务, 备份数据目录、workspace 及 OMP 自己的 session 存储. 只备份 bridge 数据库不等于完整备份 OMP 对话.
+
+只授权可信用户. 服务使用其 OS 用户的文件系统权限和环境运行; 群成员即使无权控制 bot, 也可能看到 prompt 和回复. 请保护 bot token.
 
 ## 日志
 
@@ -391,7 +399,7 @@ just deploy
 - `just test` 运行单元测试, 不启动或重启服务.
 - `just check` 运行测试, race 检查和 `go vet`, 不启动 Telegram polling.
 - `just install` 只安装二进制, 配置和数据由用户管理.
-- `just deploy` 安装二进制并重启已有的 supervisor daemon.
+- `just deploy` 安装二进制, 然后安排五秒后在后台重启已有的 `supervisord` 服务. Recipe 返回不代表服务已经成功重启.
 
 ## 架构
 

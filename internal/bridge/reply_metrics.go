@@ -108,7 +108,7 @@ func replyHeader(s statusState, m replyMetrics) string {
 	if model := menuText(modelID, 256); model != "" {
 		thinking := ""
 		if matchesState && s.Model.ID != "" {
-			thinking = s.ThinkingLevel
+			thinking = s.ConfiguredThinking
 		}
 		identity := compactModelStatus(model, thinking)
 		if matchesState && s.Model.ID != "" {

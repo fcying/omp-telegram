@@ -17,6 +17,7 @@ type SessionInfo struct {
 type metadataQuery struct {
 	id        string
 	modelRole bool
+	thinking  bool
 	output    chan string
 }
 
@@ -112,6 +113,21 @@ func (c *Client) captureMetadata(frame json.RawMessage) bool {
 	}
 	if json.Unmarshal(frame, &event) != nil {
 		return false
+	}
+	if query.thinking {
+		if !strings.HasPrefix(event.Text, "Thinking: ") && !noThinkingOutput(event.Text) {
+			return false
+		}
+		// Keep private query output out of the event stream, including malformed
+		// or duplicate replies. Never retain an unbounded metadata payload.
+		if len(event.Text) > maxThinkingOutput {
+			event.Text = ""
+		}
+		select {
+		case query.output <- event.Text:
+		default:
+		}
+		return true
 	}
 	if query.modelRole {
 		if _, ok := parseModelOutput(event.Text); !ok {

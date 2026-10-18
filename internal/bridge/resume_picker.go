@@ -649,7 +649,11 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		w.showResumePage(c, c.page+1, messageID)
 		return
 	case "cancel":
-		w.finishMenu(messageID, "Cancel")
+		text := "Cancel\n" + command
+		if c.action == "export" {
+			text += " " + strings.ToUpper(c.exportFormat)
+		}
+		w.finishMenu(messageID, text)
 		return
 	case "toggle_pin":
 		w.togglePinnedSession(c, option.session, messageID)

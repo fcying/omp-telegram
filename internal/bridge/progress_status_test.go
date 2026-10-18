@@ -66,6 +66,46 @@ func TestProgressNativeStatusDistinguishesFastSettingAndUnknownMetrics(t *testin
 	}
 }
 
+func TestProgressNativeUsesConfiguredThinkingAcrossEffectiveLevels(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		configured string
+		symbol     string
+	}{
+		{"auto", "auto", "⟳"},
+		{"manual", "max", "◉"},
+		{"unknown", "", ""},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			w.b.cfg.ProgressMode = "summary"
+			command("/new " + t.TempDir())
+			w.configuredThinking = scenario.configured
+			w.taskState = taskState{active: 100, busy: true}
+			allowInitialProgress(w)
+			now := time.Now()
+			for _, effective := range []string{"low", "high"} {
+				nativeRPC(t, w, "set_thinking_level", map[string]any{"level": effective})
+				w.refreshProgressNative(now)
+				result := receiveProgressNative(t, w)
+				w.progressNativeFinished(result)
+				text := w.progress.NativeStatus
+				if !strings.Contains(text, "safe") || strings.ContainsAny(text, "◔◒") {
+					t.Fatalf("effective thinking replaced configured progress state: %s", text)
+				}
+				if scenario.symbol == "" {
+					if strings.ContainsAny(text, "⦸○◔◑◒◕◉⟳") {
+						t.Fatalf("unknown configured thinking displayed a symbol: %s", text)
+					}
+				} else if !strings.Contains(text, scenario.symbol) {
+					t.Fatalf("configured thinking %q lost its symbol: %s", scenario.configured, text)
+				}
+				now = now.Add(progressNativeInterval)
+			}
+		})
+	}
+}
+
 func TestProgressNativeRejectsStaleAndUnconfirmedSnapshots(t *testing.T) {
 	for _, scenario := range []struct {
 		name   string
@@ -88,6 +128,7 @@ func TestProgressNativeRejectsStaleAndUnconfirmedSnapshots(t *testing.T) {
 			client := w.client
 			defer func() { w.client = client }()
 			w.taskState = taskState{active: 100, busy: true}
+			w.configuredThinking = "auto"
 			allowInitialProgress(w)
 			w.refreshProgressNative(time.Now())
 			result := receiveProgressNative(t, w)

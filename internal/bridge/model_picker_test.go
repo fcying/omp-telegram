@@ -196,8 +196,8 @@ func TestModelPickerCancelAndCleanupFailure(t *testing.T) {
 				index, want = 0, "quick"
 			}
 			clickKeyboard(w, 7, buttons[index]["callback_data"].(string))
-			if scenario == "cancel" && settingsMenuResult(t, f, messageID) != "Cancel" {
-				t.Fatal("cancelled model picker retained its selection prompt")
+			if scenario == "cancel" && !strings.Contains(settingsMenuResult(t, f, messageID), "cycle role") {
+				t.Fatal("cancelled model picker lost its operation context")
 			}
 			assertPickerModel(t, w, "fixture", want)
 			if w.client == nil {
