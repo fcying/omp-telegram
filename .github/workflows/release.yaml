@@ -73,8 +73,19 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-build-${{ hashFiles('go.mod', 'go.sum') }}-${{ needs.prepare.outputs.target }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ runner.arch }}-build-${{ hashFiles('go.mod', 'go.sum') }}-
 
       - name: Check format
+        if: matrix.arch == 'amd64'
         run: |
           unformatted=$(gofmt -l .)
           if [[ -n "$unformatted" ]]; then
@@ -83,6 +94,7 @@ jobs:
           fi
 
       - name: Check dependencies
+        if: matrix.arch == 'amd64'
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
@@ -94,11 +106,7 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test -count=1 ./...
-
-      - name: Race test
-        if: matrix.arch == 'amd64'
-        run: go test -race ./...
+        run: go test -vet=off -count=1 ./...
 
       - name: Build and smoke test
         run: |
@@ -118,20 +126,44 @@ jobs:
           path: dist/omp-telegram-linux-${{ matrix.arch }}.txz
           if-no-files-found: error
 
+  race:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.target }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-race-${{ hashFiles('go.mod', 'go.sum') }}-${{ needs.prepare.outputs.target }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ runner.arch }}-race-${{ hashFiles('go.mod', 'go.sum') }}-
+
+      - name: Race test
+        run: go test -race -vet=off ./...
+
   CI:
     name: CI
-    needs: build
+    needs: [build, race]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: Require build matrix success
-        if: always() && needs.build.result != 'success'
+      - name: Require build and race success
+        if: always() && (needs.build.result != 'success' || needs.race.result != 'success')
         run: exit 1
 
   # Same-repository pull requests intentionally publish the moving "dev-latest" prerelease
   # so contributors can test the exact PR build; fork pull requests remain build-only below.
   release:
-    needs: [prepare, build]
+    needs: [prepare, build, race]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     concurrency:

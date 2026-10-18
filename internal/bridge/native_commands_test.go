@@ -762,7 +762,7 @@ func TestNativeCommandOldSessionWaitErrorKeepsNewRoot(t *testing.T) {
 			nativeInput(t, w, 101, "wait", false)
 			nativeUntil(t, w, func() bool { return w.busy && !w.rpcOperationActive })
 			switch kind {
-			case "cancelled":
+			case "timeout", "cancelled":
 				w.nativeCatalog.cancel()
 			case "transport":
 				ctx, cancel := context.WithTimeout(w.ctx, 3*time.Second)
@@ -774,14 +774,18 @@ func TestNativeCommandOldSessionWaitErrorKeepsNewRoot(t *testing.T) {
 			var result commandCatalogResult
 			select {
 			case result = <-w.nativeCatalog.results:
-			case <-time.After(17 * time.Second):
+			case <-time.After(3 * time.Second):
 				t.Fatal("catalog wait did not return")
 			}
 			if result.epoch != oldEpoch || result.err == nil {
 				t.Fatal("failed wait lost its old query scope")
 			}
-			if kind == "timeout" && !errors.Is(result.err, context.DeadlineExceeded) || kind == "cancelled" && !errors.Is(result.err, context.Canceled) {
+			if kind != "transport" && !errors.Is(result.err, context.Canceled) {
 				t.Fatalf("unexpected wait error: %v", result.err)
+			}
+			if kind == "timeout" {
+				// Preserve the real waiter's request and epoch while simulating its deadline edge.
+				result.err = context.DeadlineExceeded
 			}
 			w.commandCatalogFinished(result)
 			if kind == "transport" {
@@ -820,7 +824,7 @@ func TestNativeCommandCurrentSessionDiscoveryFailurePreservesRootAndQueue(t *tes
 			nativeInput(t, w, 101, "/extension_alias private", false)
 			nativeInput(t, w, 102, "/followup after discovery", false)
 			switch kind {
-			case "cancelled":
+			case "timeout", "cancelled":
 				w.nativeCatalog.cancel()
 			case "rejected":
 				nativeRPC(t, w, "fixture_catalog_update", map[string]any{"skipUpdate": true})
@@ -828,11 +832,19 @@ func TestNativeCommandCurrentSessionDiscoveryFailurePreservesRootAndQueue(t *tes
 			var result commandCatalogResult
 			select {
 			case result = <-w.nativeCatalog.results:
-			case <-time.After(17 * time.Second):
+			case <-time.After(3 * time.Second):
 				t.Fatal("current-session discovery did not return")
 			}
-			if result.epoch != client.CommandCatalog().Epoch || omp.ClassifyError(result.err) != kind {
+			wantError := kind
+			if kind == "timeout" {
+				wantError = "cancelled"
+			}
+			if result.epoch != client.CommandCatalog().Epoch || omp.ClassifyError(result.err) != wantError {
 				t.Fatalf("discovery returned the wrong scope or error: %v", result.err)
+			}
+			if kind == "timeout" {
+				// Preserve the real waiter's request and epoch while simulating its deadline edge.
+				result.err = context.DeadlineExceeded
 			}
 			w.commandCatalogFinished(result)
 			assertNativeSessionPreserved(t, w, before, client, claimed, sessionID)

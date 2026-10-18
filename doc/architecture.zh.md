@@ -167,7 +167,7 @@ Root 请求发送前, inbox 必须已持久标记为 `submitted`. Steer 先验�
 | Assistant error stop reason, 非空 `errorMessage`/`errorClassificationMessage`, 或非零 `errorStatus` | `uncertain`, 保留已有部分文本和安全通知. |
 | terminal 事件没有确认文本 | `uncertain`, 明确完成的本地原生命令除外. |
 
-Terminal 消息优先于 `message_end` 缓存. RPC v2 可从压缩后的 terminal 帧中省略已发出的消息, 因此 worker 保留 finalized assistant 文本和最新终结元数据. `agent_start`, 任务结算和 teardown 清空这些缓存. 没有活动桥接 owner 的迟到/主动 `agent_start` 不能重启 typing 或卡住队列.
+Terminal 消息优先于当前 agent run 的 `message_end` 缓存, 不覆盖同一普通 root 中此前已完成轮次的输出. RPC v2 可从压缩后的 terminal 帧中省略已发出的消息, 因此 worker 保留 finalized assistant 文本, 必要时回退到当前轮缓存. Continuation 的 `agent_start` 开启新轮, 不丢弃此前已确认的输出; 每轮只重置最新终结 metadata. 任务结算和 teardown 才清空任务输出缓存. 没有活动桥接 owner 的迟到/主动 `agent_start` 不能重启 typing 或卡住队列. 托管研究仍使用独立的逐轮交付生命周期.
 
 [`steerFence`](../internal/bridge/steer.go) 要求 root terminal 事件, 所有 steer 的 terminal 结果以及当前 session settlement 全部成立后才最终结算. Steer 状态 `completed` 映射为 `done`, `aborted` 为 `cancelled`, `error` 为 `failed`; 未知状态为 uncertain. 明确拒绝只使该 steer 失败, 不声称其指令已生效; 未确认传输结果会退役 runtime. 仅本地的 `agentInvoked:false` acknowledgment 可完成该 steer, 但 root 仍须有静止证据.
 
@@ -697,6 +697,8 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
 
+Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 request 和 epoch, 再注入 deadline 错误; 根任务, session 和队列断言仍然适用. RPC 测试单独覆盖真实 context deadline, 合并发现请求和迟到响应. 不为测试提速缩短生产查询 deadline.
+
 真实 OMP smoke 必须使用隔离的 profile, workspace, 数据库和显式 environment 策略. 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 
 当前实现没有 bridge 侧 undo/rewind/redo 或文件回滚引擎. `/queue` 管理 bridge-pending 工作, 不逐条控制原生排队 prompt. Stop 不能把 idle 快照当作取消 barrier; runtime 退役和不重放仍是架构约束, 不承诺原生任务 exactly-once 执行.
@@ -705,6 +707,8 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 
 应用版本来自 [`main.go`](../cmd/omp-telegram/main.go) 的 `Version`, 可用 `-ldflags "-X main.Version=..."` 覆盖. `--version`, `-v`, `/help`, `/start` 使用同一 display version, 构建信息可用时附带 Git revision/dirty 标记. 应用版本与 SQLite schema 版本独立.
 
-[发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 检查格式和依赖一致性, 在 Linux amd64/arm64 原生 runner 上运行 `govulncheck`, vet, 测试, amd64 额外执行 race. 随后以 CGO disabled 构建各架构, 实跑 version/help, 将二进制和 LICENSE 打包为 `.txz`; 发布包附带 `SHA256SUMS`.
+[发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 格式和依赖一致性检查只在 amd64 执行一次, 在 Linux amd64/arm64 原生 runner 上运行 `govulncheck`, vet 和普通测试. 完整 amd64 race 测试独立为一个 job, 与两个架构构建并行. 测试命令使用 `-vet=off` 避免重复执行自动 vet 子集; 两个原生构建仍分别执行独立的完整 vet 检查. 各架构以 CGO disabled 构建, 实跑 version/help, 将二进制和 LICENSE 打包为 `.txz`; 发布包附带 `SHA256SUMS`. CI 门禁和发布都要求两个原生构建及 race job 成功.
+
+缓存 action 固定到 commit SHA, 使用 Node.js 24. Go module 和编译缓存按 runner OS/架构, build/race job 及依赖文件 hash 隔离. 每个源码 revision 使用新缓存键, 恢复前一个兼容缓存, 无需等待 `go.sum` 变化才能更新编译产物. 新缓存前缀的首次运行是冷缓存; 普通测试不会因缓存而跳过执行.
 
 `main` 上的新源码版本创建正式 release, 不移动已有版本 tag. 其他符合条件的运行发布滚动 `dev-latest` prerelease. 同仓库 PR 构建/发布真实 head commit; fork PR 只构建, 不发布. 只有 release job 有仓库内容写权限. 发布串行化, workflow 只替换滚动 prerelease tag 或创建新版本 tag. 发布要求显式更新源码版本, 不等于升级数据库 schema.

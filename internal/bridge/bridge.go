@@ -288,6 +288,7 @@ type worker struct {
 	idleProbe           idleProbeState
 	lastAssistant       *terminalAssistant
 	finalAssistantTexts []string
+	assistantRunStart   int
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
 	keyboardCleanup     chan int64
@@ -1933,7 +1934,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.finalizedStreamBytes = 0
 	w.finalOutputTruncated = false
 	w.activeReplyTo = 0
-	w.finalAssistantTexts = nil
+	w.finalAssistantTexts, w.assistantRunStart = nil, 0
 	w.lastAssistant = nil
 	w.stream.Reset()
 	w.clearConfirmations()
@@ -3245,7 +3246,7 @@ func (w *worker) finish() {
 		}
 	}
 	w.lastAssistant = nil
-	w.finalAssistantTexts = nil
+	w.finalAssistantTexts, w.assistantRunStart = nil, 0
 	w.finalAssistantBytes = 0
 	w.finalOutputTruncated = false
 	w.finishProgressWhenReady()
@@ -3265,7 +3266,7 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.clearAwaitingContinuation()
 	if w.active == 0 {
 		w.lastAssistant = nil
-		w.finalAssistantTexts = nil
+		w.finalAssistantTexts, w.assistantRunStart = nil, 0
 		return false
 	}
 	taskID := w.active
@@ -3291,7 +3292,7 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.clearTask()
 	w.preview = ""
 	w.lastAssistant = nil
-	w.finalAssistantTexts = nil
+	w.finalAssistantTexts, w.assistantRunStart = nil, 0
 	w.finalAssistantBytes = 0
 	w.finalOutputTruncated = false
 	w.stream.Reset()
@@ -3324,16 +3325,12 @@ func assistantText(m message) string {
 	return strings.Join(texts, "\n")
 }
 
-func boundedAssistantTexts(messages []message, limit int) (string, bool, bool) {
+func boundedAssistantTexts(messages []message, priorTexts, currentTexts []string, limit int) (string, bool, bool) {
 	var preview strings.Builder
 	found := false
-	for _, m := range messages {
-		if m.Role != "assistant" {
-			continue
-		}
-		text := assistantText(m)
+	appendText := func(text string) bool {
 		if text == "" {
-			continue
+			return true
 		}
 		found = true
 		separator := ""
@@ -3346,10 +3343,37 @@ func boundedAssistantTexts(messages []message, limit int) (string, bool, bool) {
 				preview.WriteString(separator)
 				preview.WriteString(truncateUTF8(text, remaining-len(separator)))
 			}
-			return preview.String(), found, true
+			return false
 		}
 		preview.WriteString(separator)
 		preview.WriteString(text)
+		return true
+	}
+	for _, text := range priorTexts {
+		if !appendText(text) {
+			return preview.String(), found, true
+		}
+	}
+	terminalFound := false
+	for _, m := range messages {
+		if m.Role != "assistant" {
+			continue
+		}
+		text := assistantText(m)
+		if text == "" {
+			continue
+		}
+		terminalFound = true
+		if !appendText(text) {
+			return preview.String(), found, true
+		}
+	}
+	if !terminalFound {
+		for _, text := range currentTexts {
+			if !appendText(text) {
+				return preview.String(), found, true
+			}
+		}
 	}
 	return preview.String(), found, false
 }
@@ -3596,8 +3620,12 @@ func (w *worker) event(raw []byte) {
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)
 		w.lastAssistant = nil
-		w.finalAssistantTexts = nil
-		w.finalAssistantBytes = 0
+		if w.research.root {
+			w.finalAssistantTexts, w.assistantRunStart = nil, 0
+			w.finalAssistantBytes = 0
+		} else {
+			w.assistantRunStart = len(w.finalAssistantTexts)
+		}
 		w.finalizedStreamBytes = w.stream.Len()
 		w.routeDeferredResearchToggle()
 	case "message_end":
@@ -3635,16 +3663,28 @@ func (w *worker) event(raw []byte) {
 			return
 		}
 		if e.IsTerminal != nil && !*e.IsTerminal {
+			text, found, truncated := boundedAssistantTexts(e.Messages, nil, nil, maxAssistantOutputBytes)
+			if found {
+				priorBytes := w.finalAssistantBytes
+				for _, cached := range w.finalAssistantTexts[w.assistantRunStart:] {
+					priorBytes -= len(cached)
+				}
+				if truncated || len(text) > maxAssistantOutputBytes-priorBytes {
+					w.assistantBudgetExceeded()
+					return
+				}
+				clear(w.finalAssistantTexts[w.assistantRunStart:])
+				w.finalAssistantTexts = append(w.finalAssistantTexts[:w.assistantRunStart], text)
+				w.finalAssistantBytes = priorBytes + len(text)
+			}
 			w.awaitTaskContinuation()
 			return
 		}
 		w.clearAwaitingContinuation()
-		text, found, truncated := boundedAssistantTexts(e.Messages, maxFinalReplyBytes)
+		text, found, truncated := boundedAssistantTexts(e.Messages, w.finalAssistantTexts[:w.assistantRunStart], w.finalAssistantTexts[w.assistantRunStart:], maxFinalReplyBytes)
 		if found {
 			w.preview = text
 			w.finalOutputTruncated = truncated
-		} else if len(w.finalAssistantTexts) > 0 {
-			w.preview = strings.Join(w.finalAssistantTexts, "\n\n")
 		}
 		if w.steerFence.active {
 			w.deferSteeredTerminal(e)

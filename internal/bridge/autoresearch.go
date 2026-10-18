@@ -196,11 +196,9 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 	if !w.research.root || !w.taskActive() || !w.research.roundOpen {
 		return
 	}
-	text, found, truncated := boundedAssistantTexts(e.Messages, maxFinalReplyBytes)
+	text, found, truncated := boundedAssistantTexts(e.Messages, nil, w.finalAssistantTexts, maxFinalReplyBytes)
 	if found {
 		w.preview, w.finalOutputTruncated = text, truncated
-	} else if len(w.finalAssistantTexts) != 0 {
-		w.preview = strings.Join(w.finalAssistantTexts, "\n\n")
 	}
 	if w.preview != "" && w.terminalState(e) == terminalDone {
 		w.finishReplyWithStatus(true)
@@ -220,7 +218,7 @@ func (w *worker) commitResearchRound() {
 	w.research.roundOpen = false
 	w.preview = ""
 	w.stream.Reset()
-	w.finalAssistantTexts = nil
+	w.finalAssistantTexts, w.assistantRunStart = nil, 0
 	w.finalAssistantBytes, w.finalizedStreamBytes = 0, 0
 	w.finalOutputTruncated = false
 	w.lastAssistant = nil
