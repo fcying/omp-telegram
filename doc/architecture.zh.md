@@ -193,6 +193,18 @@ Catalog 结果和 reader update 通知在内存中发布权威 snapshot. Session
 
 Bridge 不持久化菜单状态. 发布的命令名称对 Telegram chat 成员可见, 包括没有 bot 操作权限的成员. 日志只包含有界的 chat/language/error metadata (`telegram_chat_commands_failed`), 不记录原生名称, 描述, 参数或原始 RPC 数据.
 
+### 手动压缩
+
+手动压缩要求逻辑 session 空闲, 不要求进程已经连接. 已释放的 session 会在确认前恢复, 确认时再次检查. 启动/恢复失败保留对应恢复错误, 不再误报为未空闲.
+
+Compact operation 的 deadline 为 180 秒; 同一 RPC lane 中的其他 operation 保持 30 秒. Worker 取消仍可提前中断两者. 压缩后的 usage 查询仍最多等待三秒, 且不能超出 compact operation 的剩余 deadline.
+
+手动 `compact` RPC 成功后, 同一异步 operation 查询 `get_state`. 只显示匹配原生 session 的安全 `contextUsage` 投影, 复用 `/status` 的百分比和已用/容量格式. Usage 缺失或无效, session 不匹配或查询失败时显示 `n/a`, 不将已确认成功的压缩误判为失败. 如果返回了不同的非空原生 session ID, 同时退役 runtime, 保留原 binding 和 session claim, 后续请求必须恢复已保存的 session, 不能继续使用已切换的进程. 既有 client/generation fencing 丢弃过时的 operation 结果.
+
+成功结果替换原确认消息并移除键盘, 不再同时留下确认回执和独立完成消息. 原消息不可用或编辑失败时, 完成结果改走持久化 outbox. 真实 OMP 18.12.0 smoke 使用隔离 agent 目录/环境, 本地确定性 provider 和模拟 Telegram, 确认原位完成回执显示压缩后使用量, 且原生 compaction entry 已落盘; 未验证真实 Telegram 交付.
+
+真实 OMP 18.12.1 smoke 将一次本地摘要响应延迟 31 秒. 手动压缩在 31.06 秒后成功, 原 runtime 和 binding 保持不变, 原生 compaction entry 已落盘, 模拟 Telegram 的确认消息显示压缩后使用量. 确定性的虚拟时钟回归覆盖 compact 的 180 秒上限, 其他 operation 保持的 30 秒 deadline, 以及 worker 取消. Session 切换回归覆盖 runtime 退役, 并验证下一条请求恢复原生 session 的原 ID. 未验证真实 Telegram 交付.
+
 ### Prompt 和 interrupt 语义
 
 bridge 使用公开 RPC v2. 根任务在发送前持久化 inbox; 接受和 `agentInvoked=false` 保持原有终态处理. 根任务提交失败或无法确认时关闭 client, 取消 bridge 队列, 不重放. 对于运行中的文字, worker 先验证 frame 大小, 预留 RPC request ID, 将 steer inbox 持久化为 `submitted`, 按当前 root/client/generation/turn 登记请求, 然后发送带 `streamingBehavior: "steer"` 的 `prompt`. 按 request ID 关联 `prompt_result` 和 settlement 证据要求 OMP >= 18.3.2. steer 不拥有最终回复, 不创建独立 progress, 也不进入 bridge 队列. `/followup` 则创建排入 bridge 队列的独立 root; 附件及 `/review` 保持排队. 排队根任务与未决 steer 总数受 `worker.queue_capacity` 限制.

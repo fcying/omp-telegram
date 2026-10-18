@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf16"
 
@@ -3727,6 +3728,64 @@ func TestStartOperationWaitsForPreviousAcknowledgement(t *testing.T) {
 		t.Fatalf("second RPC result kind = %q", result.kind)
 	} else {
 		w.operationReturned(result)
+	}
+}
+
+func TestRPCOperationTimeouts(t *testing.T) {
+	for _, scenario := range []struct {
+		name        string
+		kind        string
+		work        time.Duration
+		cancelAfter time.Duration
+		wantErr     error
+		wantElapsed time.Duration
+	}{
+		{name: "compact exceeds ordinary deadline", kind: "compact", work: 31 * time.Second, wantElapsed: 31 * time.Second},
+		{name: "compact remains bounded", kind: "compact", work: 181 * time.Second, wantErr: context.DeadlineExceeded, wantElapsed: 180 * time.Second},
+		{name: "other operations retain deadline", kind: "status", work: 31 * time.Second, wantErr: context.DeadlineExceeded, wantElapsed: 30 * time.Second},
+		{name: "compact respects worker cancellation", kind: "compact", work: 31 * time.Second, cancelAfter: time.Second, wantErr: context.Canceled, wantElapsed: time.Second},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				w := testWorker(t, &worker{ctx: ctx, rpcOperations: []rpcOperation{{
+					kind: scenario.kind,
+					call: func(ctx context.Context) (json.RawMessage, error) {
+						select {
+						case <-time.After(scenario.work):
+							return nil, nil
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+					},
+				}}})
+				if scenario.cancelAfter > 0 {
+					go func() {
+						time.Sleep(scenario.cancelAfter)
+						cancel()
+					}()
+				}
+				started := time.Now()
+				w.dispatchRPCOperation()
+				w.background.Wait()
+				if time.Since(started) != scenario.wantElapsed {
+					t.Fatalf("operation took %v, want %v", time.Since(started), scenario.wantElapsed)
+				}
+				var result operationResult
+				select {
+				case result = <-w.operations:
+				default:
+					if scenario.wantErr != context.Canceled {
+						t.Fatal("operation completed without delivering its result")
+					}
+					return
+				}
+				if !errors.Is(result.err, scenario.wantErr) {
+					t.Fatalf("operation returned %v, want %v", result.err, scenario.wantErr)
+				}
+			})
+		})
 	}
 }
 

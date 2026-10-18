@@ -1810,7 +1810,22 @@ func (w *worker) operationFinished(result operationResult) {
 			w.say("Compaction was canceled. The instance was closed and will resume on the next request.")
 		} else {
 			w.touchBinding()
-			w.say("Compaction completed.")
+			var state statusState
+			if json.Unmarshal(result.data, &state) != nil {
+				state = statusState{}
+			}
+			if state.SessionID != w.sessionID {
+				if state.SessionID != "" {
+					// Resume the saved binding before another request can use this runtime.
+					w.releaseRuntimeWithReason(true, "failure")
+				}
+				state = statusState{}
+			}
+			message := "Compaction completed.\nContext: " + state.contextText()
+			messageID, _ := result.meta.(int64)
+			if !w.finishMenu(messageID, message) {
+				w.say(message)
+			}
 		}
 	case "abort":
 		if result.err != nil || result.cancelled {
@@ -2159,7 +2174,11 @@ func (w *worker) dispatchRPCOperation() {
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
-		ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+		timeout := 30 * time.Second
+		if request.kind == "compact" {
+			timeout = 180 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(w.ctx, timeout)
 		defer cancel()
 		data, err := request.call(ctx)
 		result := operationResult{
@@ -2769,7 +2788,7 @@ func (w *worker) handle(in incoming) {
 			return
 		}
 		if _, err := w.ensureRuntime(); err != nil {
-			w.say("An idle instance is required.")
+			w.say(err.Error())
 			return
 		}
 		w.confirm(confirmation{action: "compact", user: in.msg.From.ID}, "Compact the current session?", []string{"Confirm", "Cancel"})
@@ -4391,14 +4410,24 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		client, err := w.ensureRuntime()
 		if err != nil {
-			w.say("The instance is not idle. Compaction was canceled.")
+			w.say(err.Error())
 			return callbackDone
 		}
 		w.beginSessionOperation(sessionOperationCompact)
 		w.touchActivity()
 		w.startOperation("compact", client, func(ctx context.Context) (json.RawMessage, error) {
-			return client.Call(ctx, "compact", nil)
-		}, 0, "")
+			if _, err := client.Call(ctx, "compact", nil); err != nil {
+				return nil, err
+			}
+			stateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			// Usage lookup cannot turn confirmed compaction into a failure.
+			state, err := client.Call(stateCtx, "get_state", nil)
+			if err != nil {
+				return nil, nil
+			}
+			return state, nil
+		}, 0, "", c.messageID)
 	}
 	return callbackDone
 }
@@ -4426,16 +4455,18 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 	w.finishMenu(c.messageID, text)
 }
 
-func (w *worker) finishMenu(messageID int64, text string) {
+func (w *worker) finishMenu(messageID int64, text string) bool {
 	if messageID == 0 {
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 	keyboard := &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}}
 	if w.b.tg.Edit(ctx, w.key.chat, messageID, truncateUTF8(text, 3700), keyboard) != nil {
 		w.queueKeyboardCleanup(messageID)
+		return false
 	}
+	return true
 }
 
 func (w *worker) clearKeyboard(messageID int64) {

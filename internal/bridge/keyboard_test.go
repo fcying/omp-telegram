@@ -417,30 +417,120 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 }
 
-func TestCompactConfirmationDisplaysReceiptBeforeCompletion(t *testing.T) {
-	w, f, command := setupWorkspaceWorker(t)
-	command("/new " + t.TempDir())
-	before := w.binding
-	w.operations = make(chan operationResult, 1)
-	command("/compact")
-	data := resumeButtons(t, f)[0]["callback_data"].(string)
-	messageID := f.messageCount()
-	clickKeyboard(w, 7, data)
-	text := assertFinishedMenu(t, f, messageID, "Confirmed")
-	if w.sessionOp != sessionOperationCompact || w.taskActive() || !sameBindingIdentity(w.binding, before) {
-		t.Fatal("compaction confirmation did not start compaction in the current session")
-	}
-	select {
-	case result := <-w.operations:
-		if result.err != nil {
-			t.Fatalf("compaction failed: %v", result.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("compaction did not finish")
-	}
-	clickKeyboard(w, 7, data)
-	if after := assertFinishedMenu(t, f, messageID, "Confirmed"); after != text {
-		t.Fatal("a consumed compact confirmation changed its receipt")
+func TestCompactCompletionUsesOneMessageAndFreshUsage(t *testing.T) {
+	for _, scenario := range []struct {
+		name        string
+		missing     bool
+		timeout     bool
+		newSession  bool
+		editFailure bool
+	}{
+		{name: "post-compaction usage"},
+		{name: "usage unavailable", missing: true},
+		{name: "usage query timeout", timeout: true},
+		{name: "different native session", newSession: true},
+		{name: "menu edit failure", editFailure: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			before, client := w.binding, w.client
+			w.operations = make(chan operationResult, 1)
+			command("/compact")
+			data := resumeButtons(t, f)[0]["callback_data"].(string)
+			messageID := f.messageCount()
+			var outboxBefore int
+			if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxBefore); err != nil {
+				t.Fatal(err)
+			}
+			w.progress.NativeStatus = "Context: 90% (9k / 10k)"
+			if !scenario.missing {
+				nativeRPC(t, w, "fixture_get_state_update", map[string]any{
+					"contextUsage": map[string]any{"tokens": 2500, "contextWindow": 10000},
+					"newSession":   scenario.newSession,
+				})
+			}
+			if scenario.timeout {
+				nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "get_state"})
+			}
+			clickKeyboard(w, 7, data)
+			if w.sessionOp != sessionOperationCompact || w.taskActive() || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("confirmation did not start compaction in the current session")
+			}
+			result := waitOperation(t, w)
+			if result.err != nil {
+				t.Fatalf("compaction failed: %v", result.err)
+			}
+			if scenario.editFailure {
+				http.DefaultTransport = &failedMenuHTTP{
+					base: f, clearStarted: make(chan struct{}, 4), clearFinished: make(chan struct{}, 4),
+				}
+			}
+			w.operationReturned(result)
+			if w.sessionOperationActive() || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("completed compaction left the session busy or changed its binding")
+			}
+			if scenario.newSession {
+				if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 {
+					t.Fatal("native session mismatch retained the wrong runtime")
+				}
+				select {
+				case <-client.Done():
+				default:
+					t.Fatal("native session mismatch did not close the old process")
+				}
+			} else if w.client != client {
+				t.Fatal("completed compaction unnecessarily retired its runtime")
+			}
+			var outboxAfter int
+			if err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxAfter); err != nil {
+				t.Fatal(err)
+			}
+			var text string
+			if scenario.editFailure {
+				if outboxAfter != outboxBefore+1 {
+					t.Fatal("failed menu edit lost the compaction result")
+				}
+				if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if outboxAfter != outboxBefore {
+					t.Fatal("successful compaction queued a duplicate result message")
+				}
+				text = assertFinishedMenu(t, f, messageID, "Context:")
+			}
+			wantUsage := "25% (2.5k / 10k)"
+			if scenario.missing || scenario.timeout || scenario.newSession {
+				wantUsage = "n/a"
+			}
+			if !strings.Contains(text, "Compaction completed.") || !strings.Contains(text, "Context: "+wantUsage) {
+				t.Fatalf("compaction result did not show confirmed usage %q: %s", wantUsage, text)
+			}
+			if strings.Contains(text, "PRIVATE") || strings.Contains(text, "SECRET") || strings.Contains(text, "90%") {
+				t.Fatalf("compaction result exposed raw state or stale usage: %s", text)
+			}
+			if !scenario.editFailure {
+				clickKeyboard(w, 7, data)
+				if after := assertFinishedMenu(t, f, messageID, "Context:"); after != text || w.sessionOperationActive() {
+					t.Fatal("replayed compact confirmation changed the completed result")
+				}
+			}
+			if scenario.newSession {
+				command("/name restored original session")
+				if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {
+					t.Fatal("next request did not resume the preserved session")
+				}
+				data, err := w.client.Call(w.ctx, "get_state", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var state statusState
+				if json.Unmarshal(data, &state) != nil || state.SessionID != before.SessionID {
+					t.Fatal("next request reached a different native session")
+				}
+			}
+		})
 	}
 }
 

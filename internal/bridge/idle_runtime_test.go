@@ -42,6 +42,51 @@ func releasedIdleWorker(t *testing.T) (*worker, *fakeHTTP, func(string), store.B
 	}
 	return w, f, command, before
 }
+func TestCompactResumesReleasedSession(t *testing.T) {
+	w, f, command, before := releasedIdleWorker(t)
+	command("/compact")
+	messageID := f.messageCount()
+	if w.client == nil || w.runtime != runtimeConnected || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("compact did not restore the released session")
+	}
+	w.operations = make(chan operationResult, 1)
+	clickKeyboard(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
+	w.operationReturned(waitOperation(t, w))
+	if w.sessionOperationActive() || !sameBindingIdentity(w.binding, before) {
+		t.Fatal("compaction changed the restored session or left it busy")
+	}
+	assertFinishedMenu(t, f, messageID, "Compaction completed.")
+}
+
+func TestCompactReportsResumeFailureInsteadOfBusy(t *testing.T) {
+	for _, phase := range []string{"command", "confirmation"} {
+		t.Run(phase, func(t *testing.T) {
+			w, f, command, before := releasedIdleWorker(t)
+			var button string
+			if phase == "confirmation" {
+				command("/compact")
+				button = resumeButtons(t, f)[0]["callback_data"].(string)
+				w.releaseRuntime(true)
+			}
+			w.b.cfg.OMP = t.TempDir() + "/missing-omp"
+			if phase == "command" {
+				command("/compact")
+			} else {
+				clickKeyboard(w, 7, button)
+			}
+			if w.client != nil || w.sessionOperationActive() || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("failed resume changed the saved session or began compaction")
+			}
+			var text string
+			if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(text, "Failed to resume") || strings.Contains(text, "idle") {
+				t.Fatalf("runtime startup failure was misreported as busy: %q", text)
+			}
+		})
+	}
+}
 
 func TestDisabledIdleTimeoutNeverReleasesRuntime(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
