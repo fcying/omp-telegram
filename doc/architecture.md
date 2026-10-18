@@ -194,6 +194,18 @@ An uncertain publication invalidates the last successful cache entry for that ch
 
 Menu state is not persisted by the bridge. Published command names are visible to Telegram chat members, including those not authorized to operate the bot. Logs contain only bounded chat/language/error metadata (`telegram_chat_commands_failed`), never native names, descriptions, arguments, or raw RPC data.
 
+### Manual compaction
+
+Manual compaction requires an idle logical session, not an already-connected process. A released session is resumed before confirmation and rechecked when confirmed. Startup/resume failures retain their recovery error instead of being reported as an idle-state violation.
+
+The compact operation has a 180-second deadline; other operations dispatched through the same RPC lane retain their 30-second deadline. Worker cancellation still interrupts either deadline. The post-compaction usage query remains capped at three seconds and cannot outlive the compact operation's remaining deadline.
+
+After a successful manual `compact` RPC, the same asynchronous operation queries `get_state`. Only the matching native session's safe `contextUsage` projection is displayed, using the `/status` percentage and used/capacity format. Missing or invalid usage, a session mismatch, or a failed query displays `n/a` without reclassifying confirmed compaction as failed. A different nonempty native session ID also retires the runtime while preserving the original binding and session claim, so subsequent requests must resume the saved session instead of using the switched process. Existing client/generation fencing rejects stale operation results.
+
+Success replaces the original confirmation message and removes its keyboard, rather than leaving a confirmation receipt plus a separate completion message. If the original message is unavailable or its edit fails, the completion goes through durable outbox instead. A real OMP 18.12.0 smoke with an isolated agent directory/environment, a local deterministic provider, and simulated Telegram confirmed the in-place completion with post-compaction usage and a persisted native compaction entry; live Telegram delivery was not exercised.
+
+A real OMP 18.12.1 smoke delayed one local summary response by 31 seconds. Manual compaction completed after 31.06 seconds, retained the original runtime and binding, persisted the native compaction entry, and updated the simulated Telegram confirmation with post-compaction usage. Deterministic virtual-clock regression coverage checks the 180-second compact limit, the unchanged 30-second deadline for other operations, and worker cancellation. Session-switch regression coverage checks runtime retirement and restoration of the original native session on the next request. Live Telegram delivery was not exercised.
+
 ### Prompt and interrupt semantics
 
 The bridge uses public RPC v2. Root prompts persist their inbox before sending; acceptance and `agentInvoked=false` retain the existing terminal handling. A failed or unconfirmed root submission closes its client and cancels the bridge queue without replay. For running text, the worker validates the frame, reserves an RPC request ID, persists the steer inbox as `submitted`, registers the request under the current root/client/generation/turn, then sends `prompt` with `streamingBehavior: "steer"`. OMP >= 18.3.2 is required for correlated `prompt_result` and settlement evidence. A steer does not own a final reply, create progress, or enter the bridge queue. `/followup` instead creates a separate bridge-queued root; attachments and `/review` remain queued. The combined number of queued roots and unresolved steers is bounded by `worker.queue_capacity`.
