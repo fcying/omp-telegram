@@ -102,8 +102,9 @@ func TestAutoresearchModeLargeSavedHistoryUsesCurrentRPCBranch(t *testing.T) {
 	write(map[string]any{"type": "title", "title": "native title"})
 	write(map[string]any{"type": "session", "version": 3, "id": "native-id"})
 	parent := any(nil)
-	padding := strings.Repeat("opaque history ", 20<<10)
-	for i := range 256 {
+	const messageCount = 256
+	padding := strings.Repeat("x", maxLogical/messageCount)
+	for i := range messageCount {
 		id := fmt.Sprintf("m%d", i)
 		write(map[string]any{"type": "message", "id": id, "parentId": parent, "message": map[string]any{"role": "user", "content": padding}})
 		parent = id

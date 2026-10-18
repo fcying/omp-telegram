@@ -3005,21 +3005,29 @@ func TestStreamedAssistantMessageEndReplacesPendingBudget(t *testing.T) {
 }
 
 func TestFinalizedAssistantAndNewStreamShareBudget(t *testing.T) {
-	w, _, command := setupWorkspaceWorker(t)
-	command("/new " + t.TempDir())
-	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
-	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
-	w.active, w.busy = 10, true
-	message, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2<<20)}}}})
-	requireStoreOK(t, err)
-	w.event(message)
-	delta, err := json.Marshal(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": strings.Repeat("y", (2<<20)+1)}})
-	requireStoreOK(t, err)
-	w.event(delta)
-	var state string
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
-	if state != "uncertain" {
-		t.Fatalf("combined assistant output over budget finished as %s", state)
+	for _, continued := range []bool{false, true} {
+		t.Run(fmt.Sprintf("continued=%t", continued), func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
+			requireStoreOK(t, w.b.db.Mark(10, "submitted"))
+			w.active, w.busy = 10, true
+			message, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": strings.Repeat("x", 2<<20)}}}})
+			requireStoreOK(t, err)
+			w.event(message)
+			if continued {
+				w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":[]}`))
+				w.event([]byte(`{"type":"agent_start"}`))
+			}
+			delta, err := json.Marshal(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": strings.Repeat("y", (2<<20)+1)}})
+			requireStoreOK(t, err)
+			w.event(delta)
+			var state string
+			requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+			if state != "uncertain" {
+				t.Fatalf("combined assistant output over budget finished as %s", state)
+			}
+		})
 	}
 }
 
@@ -3082,6 +3090,56 @@ func TestNormalTerminalCompletionIsDone(t *testing.T) {
 	o, err := db.NextOutput()
 	if err != nil || o.Text != "final answer" {
 		t.Fatalf("normal terminal output = %q, error %v", o.Text, err)
+	}
+}
+
+func TestContinuationRepliesPreserveEarlierRounds(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstText, firstEnd, lastText, lastEnd string
+	}{
+		{"compacted", "complete result", `[]`, "follow-up", `[]`},
+		{"terminal messages", "complete result", `[]`, "follow-up", `[{"role":"assistant","content":[{"type":"text","text":"follow-up"}]}]`},
+		{"rewritten earlier round", "obsolete draft", `[{"role":"assistant","content":[{"type":"text","text":"complete result"}]}]`, "follow-up", `[]`},
+		{"rewritten current round", "complete result", `[]`, "obsolete follow-up", `[{"role":"assistant","content":[{"type":"text","text":"follow-up"}]}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			requireStoreOK(t, err)
+			defer db.Close()
+			requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
+			requireStoreOK(t, db.Mark(10, "submitted"))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
+			w.event([]byte(`{"type":"agent_start"}`))
+			w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"` + tc.firstText + `"}]}}`))
+			w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":` + tc.firstEnd + `}`))
+			var count int
+			requireStoreOK(t, db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=10").Scan(&count))
+			if count != 0 {
+				t.Fatal("nonterminal round settled the root early")
+			}
+			w.event([]byte(`{"type":"agent_start"}`))
+			w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"` + tc.lastText + `"}]}}`))
+			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":` + tc.lastEnd + `}`))
+			output, err := db.NextOutput()
+			requireStoreOK(t, err)
+			if body := replyBody(output.Text); body != "complete result\n\nfollow-up" {
+				t.Fatalf("continued task reply = %q", body)
+			}
+			requireStoreOK(t, db.MarkOutput(output.ID, "sending"))
+			requireStoreOK(t, db.MarkOutput(output.ID, "done"))
+			requireStoreOK(t, db.Accept(11, []byte(`{"update_id":11}`)))
+			requireStoreOK(t, db.Mark(11, "submitted"))
+			w.beginTask(queued{id: 11})
+			w.event([]byte(`{"type":"agent_start"}`))
+			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"next task"}]}]}`))
+			output, err = db.NextOutput()
+			requireStoreOK(t, err)
+			if body := replyBody(output.Text); body != "next task" {
+				t.Fatalf("previous task output leaked into next root: %q", body)
+			}
+		})
 	}
 }
 

@@ -605,42 +605,57 @@ func (ctx catalogWaitContext) Done() <-chan struct{} {
 }
 
 func TestCommandCatalogCancellationDoesNotOverlapDiscovery(t *testing.T) {
-	client := catalogFixture(t, "deferred")
-	client.InvalidateCommandCatalog()
-	queryEpoch := client.CommandCatalog().Epoch
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := startCatalogRefresh(t, client, ctx)
-	cancel()
-	if epoch, err := finishCatalogRefresh(t, finished); !errors.Is(err, context.Canceled) || epoch != queryEpoch {
-		t.Fatalf("refresh lost cancellation or its query scope: epoch=%d want=%d err=%v", epoch, queryEpoch, err)
-	}
-	// An already-cancelled waiter does not abandon the sent request or issue another.
-	if epoch, err := client.RefreshCommandCatalog(ctx); !errors.Is(err, context.Canceled) || epoch != 0 {
-		t.Fatalf("cancelled refresh selected a query: epoch=%d err=%v", epoch, err)
-	}
-	// A live concurrent waiter must join discovery, not issue a second request.
-	waitCtx, stopWait := context.WithTimeout(context.Background(), 5*time.Second)
-	defer stopWait()
-	waiting := make(chan struct{}, 1)
-	joined := make(chan catalogRefreshResult, 1)
-	go func() {
-		epoch, err := client.RefreshCommandCatalog(catalogWaitContext{Context: waitCtx, waiting: waiting})
-		joined <- catalogRefreshResult{epoch: epoch, err: err}
-	}()
-	select {
-	case <-waiting:
-	case <-waitCtx.Done():
-		t.Fatal("concurrent waiter never entered discovery")
-	}
-	data := catalogCall(t, client, "catalog_release", nil)
-	if epoch, err := finishCatalogRefresh(t, joined); err != nil || epoch != queryEpoch {
-		t.Fatalf("concurrent refresh did not join the original discovery scope: epoch=%d want=%d err=%v", epoch, queryEpoch, err)
-	}
-	var counts struct {
-		Queries int `json:"queries"`
-	}
-	if json.Unmarshal(data, &counts) != nil || counts.Queries != 1 || !client.CommandCatalog().HasCommand("queried") {
-		t.Fatal("cancellation overlapped discovery or lost its late response")
+	for _, kind := range []string{"cancelled", "deadline"} {
+		t.Run(kind, func(t *testing.T) {
+			client := catalogFixture(t, "deferred")
+			client.InvalidateCommandCatalog()
+			queryEpoch := client.CommandCatalog().Epoch
+			var ctx context.Context
+			var cancel context.CancelFunc
+			wantErr := context.Canceled
+			if kind == "deadline" {
+				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+				wantErr = context.DeadlineExceeded
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+			}
+			defer cancel()
+			finished := startCatalogRefresh(t, client, ctx)
+			if kind == "cancelled" {
+				cancel()
+			}
+			if epoch, err := finishCatalogRefresh(t, finished); !errors.Is(err, wantErr) || epoch != queryEpoch {
+				t.Fatalf("refresh lost cancellation or its query scope: epoch=%d want=%d err=%v", epoch, queryEpoch, err)
+			}
+			// An expired waiter does not abandon the sent request or issue another.
+			if epoch, err := client.RefreshCommandCatalog(ctx); !errors.Is(err, wantErr) || epoch != 0 {
+				t.Fatalf("expired refresh selected a query: epoch=%d err=%v", epoch, err)
+			}
+			// A live concurrent waiter must join discovery, not issue a second request.
+			waitCtx, stopWait := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stopWait()
+			waiting := make(chan struct{}, 1)
+			joined := make(chan catalogRefreshResult, 1)
+			go func() {
+				epoch, err := client.RefreshCommandCatalog(catalogWaitContext{Context: waitCtx, waiting: waiting})
+				joined <- catalogRefreshResult{epoch: epoch, err: err}
+			}()
+			select {
+			case <-waiting:
+			case <-waitCtx.Done():
+				t.Fatal("concurrent waiter never entered discovery")
+			}
+			data := catalogCall(t, client, "catalog_release", nil)
+			if epoch, err := finishCatalogRefresh(t, joined); err != nil || epoch != queryEpoch {
+				t.Fatalf("concurrent refresh did not join the original discovery scope: epoch=%d want=%d err=%v", epoch, queryEpoch, err)
+			}
+			var counts struct {
+				Queries int `json:"queries"`
+			}
+			if json.Unmarshal(data, &counts) != nil || counts.Queries != 1 || !client.CommandCatalog().HasCommand("queried") {
+				t.Fatal("cancellation overlapped discovery or lost its late response")
+			}
+		})
 	}
 }
 
