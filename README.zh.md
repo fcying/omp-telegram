@@ -226,7 +226,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/model` | 用按钮选择 OMP 配置的 model role. |
 | `/model provider/model` | 空闲时切换到指定 model. |
 | `/thinking` | 空闲时选择 thinking level. |
-| `/fast [on\|off\|status]` | 选择 fast mode, 显式开启或关闭, 或查看状态. |
+| `/fast [on\|ultra\|off\|status]` | 转发 OMP 原生 fast 控制, 任务运行中也可执行. 裸 `/fast` 直接切换开关, 不弹选择器. |
 | `/compact` | 空闲时直接压缩当前 context, 无需确认. 状态消息原位更新结果和 context 使用量. |
 | `/handoff [补充要求]` | 空闲且队列为空时运行 OMP 原生 handoff, deadline 为 180 秒. |
 | `/migrate` | 在同一 workspace 中将 handoff 上下文迁入新 session. 先启用 `omp.migration_extension`. |
@@ -237,7 +237,9 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 Model 或 thinking 修改成功后, 仍可能因无法读取配置等级而显示 `Thinking: n/a`. 这不会撤销修改; 如果必须关闭进程, 回执会说明 session 已保留.
 
-对话空闲时, 普通文字会启动任务. OMP 任务运行期间, OMP 可能接受普通文字作为 steer. 使用 `/followup <message>` 可明确排队一个独立任务. 附件、`/review` 和其他受支持的原生命令也进入对话队列并按顺序执行. 不同对话可以并行工作, 受 worker 配置上限影响.
+`/fast` 绕过 prompt 队列和 steer 路径. 参数解释, provider/model 支持和输出由 OMP 决定; 回执独立于当前任务答案. 修改影响后续 provider 请求, 不改变已经发出的请求. 未确认的控制不会自动重放; 状态不确定的 runtime 会关闭.
+
+对话空闲时, 普通文字会启动任务. OMP 任务运行期间, OMP 可能接受普通文字作为 steer. 使用 `/followup <message>` 可明确排队一个独立任务. 附件, `/review` 和没有专用控制处理的原生命令进入对话队列并按顺序执行. 不同对话可以并行工作, 受 worker 配置上限影响.
 
 ### OMP 原生命令
 

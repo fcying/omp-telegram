@@ -500,7 +500,6 @@ func TestUncertainModelMutationsRetireRuntime(t *testing.T) {
 	}{
 		{name: "switch", kind: "model_set_model", method: "set_model", fields: map[string]any{"provider": "fixture", "modelId": "changed"}, request: modelOperationRequest{action: "model_switch"}},
 		{name: "thinking", kind: "model_set_thinking", method: "set_thinking_level", fields: map[string]any{"level": "high"}, request: modelOperationRequest{action: "thinking_select", requested: "high"}},
-		{name: "fast", kind: "model_set_fast", method: "set_fast_mode", fields: map[string]any{"enabled": true}, request: modelOperationRequest{action: "fast_select", enabled: true}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			_, trace := fixtureRPCControlFiles(t, scenario.method)
@@ -728,7 +727,6 @@ func TestMalformedModelMutationResultsRetireRuntime(t *testing.T) {
 	}{
 		{name: "model identity", kind: "model_set_model", action: "model_switch", data: json.RawMessage(`{"provider":"fixture"}`)},
 		{name: "thinking level", kind: "model_verify_thinking", action: "thinking_select", data: json.RawMessage(`{}`)},
-		{name: "fast state", kind: "model_set_fast", action: "fast_select", data: json.RawMessage(`{"enabled":true}`)},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, _, command := setupWorkspaceWorker(t)

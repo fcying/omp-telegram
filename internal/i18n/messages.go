@@ -144,8 +144,7 @@ var Msg = struct {
 	ChooseThinkingLevelCurrentEffectiveLevelOMPMayAdjust                      Message
 	ChooseOMPCycleRoleCurrentModel                                            Message
 	ChooseOption                                                              Message
-	ChooseFastMode                                                            Message
-	ChooseFastModeFastOnOffStatus                                             Message
+	ToggleNativeFastMode                                                      Message
 	ChoosePinOmpSessionWorkingDirectory                                       Message
 	ChooseThinkingLevelSession                                                Message
 	ClearAutoresearch                                                         Message
@@ -194,7 +193,6 @@ var Msg = struct {
 	FailedDisplayNativeSelectionMenuDialogCanceled                            Message
 	FailedDisplayQueueUseQueueTryAgain                                        Message
 	FailedDisplaySessionSelectionMenuUseTryAgain                              Message
-	FailedReadFastModeState                                                   Message
 	FailedReadModelSettings                                                   Message
 	FailedReadPinnedSessions                                                  Message
 	FailedReadSavedBindings                                                   Message
@@ -209,7 +207,6 @@ var Msg = struct {
 	FailedSendConfirmationOperationCanceled                                   Message
 	FailedStartOmpStartupOutcomeUncertainUseCloseBefore                       Message
 	FailedUpdatePinnedSessions                                                Message
-	FastSettingFastActive                                                     Message
 	ForgetSavedBindingWorkspaceNativeOMPSessionHistoryWill                    Message
 	FormatLine                                                                Message
 	HandoffCanceledWithoutResultInstanceClosedWillResumeOn                    Message
@@ -238,6 +235,8 @@ var Msg = struct {
 	NativeCommandCompletionCouldNotConfirmedTaskOutcomeUncertain              Message
 	NativeCommandDiscoveryUnavailableWaitingSlashCommandsNotSubmitted         Message
 	NativeCommandFailedBeforeProducingConfirmedResultTaskOutcome              Message
+	NativeControlUnavailable                                                  Message
+	NativeControlUnconfirmed                                                  Message
 	NativeDiagnosticNotificationOmitted                                       Message
 	NativeOmpSessionListingFailed                                             Message
 	NewSessionNewNameProjectPath                                              Message
@@ -252,7 +251,6 @@ var Msg = struct {
 	OMPArgumentPresetChangedUseResumeAgain                                    Message
 	OMPBinary                                                                 Message
 	OMPDidNotReportThinkingLevelSession                                       Message
-	OMPDidNotReportFastModeSupportSession                                     Message
 	OMPDidNotReportResultingThinkingLevelChangeCould                          Message
 	OMPDoesNotSupportNativeCommandDiscoverySlashInput                         Message
 	OMPAlreadyStarting                                                        Message
@@ -344,8 +342,6 @@ var Msg = struct {
 	ConfirmationCouldNotDeliveredOmpStateUncertainWillNot                     Message
 	ConversationBecameBusyUseResumeAgainWhenIdle                              Message
 	ConversationBusyUseAgainAfterTaskQueueFinish                              Message
-	FastModeChangeCouldNotConfirmedMayUnsupportedModel                        Message
-	FastModeSelectionUnavailableOpenFastChooseAgain                           Message
 	InstanceClosedSessionPreserved                                            Message
 	MigrationOperationStillRunningUseStopStopRuntimeBefore                    Message
 	ModelSelectionUnavailableOpenModelChooseAgain                             Message
@@ -401,7 +397,6 @@ var Msg = struct {
 	UsageCompact                                                              Message
 	UsageDoctor                                                               Message
 	UsageExportHtmlSessionId                                                  Message
-	UsageFastOnOffStatus                                                      Message
 	UsageFollowupMessage                                                      Message
 	UsageMigrateMigrateRecoverOldMigrateRecoverSessionId                      Message
 	UsageModelModelProviderModel                                              Message
@@ -627,8 +622,7 @@ var Msg = struct {
 	ChooseThinkingLevelCurrentEffectiveLevelOMPMayAdjust:         message("Choose a thinking level\nCurrent effective level: %s\nOMP may adjust the requested level to match the model's capabilities.", "选择思考级别\n当前有效级别: %s\nOMP 可能根据模型能力调整请求的级别."),
 	ChooseOMPCycleRoleCurrentModel:                               message("Choose an OMP cycle role\nCurrent model: %s", "选择 OMP 循环角色\n当前模型: %s"),
 	ChooseOption:                                                 message("Choose an option", "请选择一个选项"),
-	ChooseFastMode:                                               message("Choose fast mode\n%s", "选择快速模式\n%s"),
-	ChooseFastModeFastOnOffStatus:                                message("Choose fast mode: /fast [on|off|status]", "选择快速模式: /fast [on|off|status]"),
+	ToggleNativeFastMode:                                         message("Toggle native fast mode: /fast [on|ultra|off|status]", "切换原生快速模式: /fast [on|ultra|off|status]"),
 	ChoosePinOmpSessionWorkingDirectory:                          message("Choose or pin an omp session in this working directory", "选择或置顶当前工作目录中的 omp 会话"),
 	ChooseThinkingLevelSession:                                   message("Choose the thinking level for this session", "选择当前会话的思考级别"),
 	ClearAutoresearch:                                            message("Clear autoresearch", "清理自动研究"),
@@ -677,7 +671,6 @@ var Msg = struct {
 	FailedDisplayNativeSelectionMenuDialogCanceled:         message("Failed to display the native selection menu. The dialog was canceled.", "无法显示原生选择菜单. 对话框已取消."),
 	FailedDisplayQueueUseQueueTryAgain:                     message("Failed to display the queue. Use /queue to try again.", "显示队列失败. 请使用 /queue 重试."),
 	FailedDisplaySessionSelectionMenuUseTryAgain:           message("Failed to display the session selection menu. Use %s to try again.", "显示会话选择菜单失败. 请使用 %s 重试."),
-	FailedReadFastModeState:                                message("Failed to read fast mode state.", "读取快速模式状态失败."),
 	FailedReadModelSettings:                                message("Failed to read model settings.", "读取模型设置失败."),
 	FailedReadPinnedSessions:                               message("Failed to read pinned sessions.", "读取置顶会话失败."),
 	FailedReadSavedBindings:                                message("Failed to read saved bindings.", "读取已保存绑定失败."),
@@ -692,7 +685,6 @@ var Msg = struct {
 	FailedSendConfirmationOperationCanceled:                message("Failed to send the confirmation. The operation was canceled.", "无法发送确认消息. 操作已取消."),
 	FailedStartOmpStartupOutcomeUncertainUseCloseBefore:    message("Failed to start omp. The startup outcome is uncertain; use /close before retrying.", "无法启动 omp. 启动结果不确定; 请先使用 /close 再重试."),
 	FailedUpdatePinnedSessions:                             message("Failed to update pinned sessions.", "更新置顶会话失败."),
-	FastSettingFastActive:                                  message("Fast setting: %s\nFast active: %s", "快速模式设置: %s\n快速模式生效: %s"),
 	ForgetSavedBindingWorkspaceNativeOMPSessionHistoryWill: message("Forget saved binding for %s?\nWorkspace and native OMP session history will NOT be deleted.", "忘记 %s 的已保存绑定?\n工作目录和原生 OMP 会话历史不会被删除."),
 	FormatLine: message("Format: %s\n", "格式: %s\n"),
 	HandoffCanceledWithoutResultInstanceClosedWillResumeOn: message("Handoff canceled without a result. The instance was closed and will resume on the next request.", "交接已取消且没有结果. 实例已关闭, 将在下次请求时恢复."),
@@ -721,21 +713,22 @@ var Msg = struct {
 	NativeCommandCompletionCouldNotConfirmedTaskOutcomeUncertain:      message("Native command completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.", "无法确认原生命令完成. 任务结果不确定, 不会自动重放."),
 	NativeCommandDiscoveryUnavailableWaitingSlashCommandsNotSubmitted: message("Native command discovery is unavailable. Waiting slash commands were not submitted; the running task and runtime were preserved. Use /queue and Cancel on the waiting slash item to let later tasks continue.", "原生命令发现不可用. 未提交等待中的斜杠命令; 当前任务和运行时保持不变. 使用 /queue 并取消等待中的斜杠命令, 让后续任务继续."),
 	NativeCommandFailedBeforeProducingConfirmedResultTaskOutcome:      message("Native command failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically.", "原生命令在产生确认结果前失败. 任务结果不确定, 不会自动重放."),
-	NativeDiagnosticNotificationOmitted:                               message("Native diagnostic notification omitted.", "已省略原生诊断通知."),
-	NativeOmpSessionListingFailed:                                     message("Native omp session listing failed: %s", "原生 omp 会话列表读取失败: %s"),
-	NewSessionNewNameProjectPath:                                      message("New session: /new <name or project path>", "新建会话: /new <名称或项目路径>"),
-	Next:                                                              message("Next", "下一页"),
-	NoActiveTaskQueuedPromptsCleared:                                  message("No active task. Queued prompts cleared.", "没有活动任务. 已清空排队提示词."),
-	NoCycleRolesConfiguredOMPUseModelProviderModel:                    message("No cycle roles are configured in OMP. Use /model provider/model.", "OMP 未配置循环角色. 请使用 /model provider/model."),
-	NoInstanceRunningConversationStartNewNameProjectPath:              message("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.", "当前对话没有运行中的实例. 使用 /new <名称或项目路径> 创建, 或用 /resume 恢复已保存的会话."),
-	NoInstanceRunningGlobalUncertainRecordsUseResumeRestore:           message("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", "没有运行中的实例. 全局不确定记录: %d. 使用 /resume 恢复会话; 任务不会自动重放."),
-	NoSavedConversationBindings:                                       message("No saved conversation bindings.", "没有已保存的会话绑定."),
-	NoWorkingDirectorySelectedUseNewNamePathResume:                    message("No working directory is selected. Use /new <name or path>, or /resume first.", "尚未选择工作目录. 请先使用 /new <名称或路径> 或 /resume."),
+	NativeControlUnavailable:                                message("The native control command is unavailable in this session. No command was submitted.", "此会话的原生控制命令不可用. 未提交命令."),
+	NativeControlUnconfirmed:                                message("The native control result could not be confirmed and will not be replayed automatically. Use /fast status to check before retrying.", "无法确认原生控制结果, 不会自动重放. 请先使用 /fast status 检查, 再重试."),
+	NativeDiagnosticNotificationOmitted:                     message("Native diagnostic notification omitted.", "已省略原生诊断通知."),
+	NativeOmpSessionListingFailed:                           message("Native omp session listing failed: %s", "原生 omp 会话列表读取失败: %s"),
+	NewSessionNewNameProjectPath:                            message("New session: /new <name or project path>", "新建会话: /new <名称或项目路径>"),
+	Next:                                                    message("Next", "下一页"),
+	NoActiveTaskQueuedPromptsCleared:                        message("No active task. Queued prompts cleared.", "没有活动任务. 已清空排队提示词."),
+	NoCycleRolesConfiguredOMPUseModelProviderModel:          message("No cycle roles are configured in OMP. Use /model provider/model.", "OMP 未配置循环角色. 请使用 /model provider/model."),
+	NoInstanceRunningConversationStartNewNameProjectPath:    message("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.", "当前对话没有运行中的实例. 使用 /new <名称或项目路径> 创建, 或用 /resume 恢复已保存的会话."),
+	NoInstanceRunningGlobalUncertainRecordsUseResumeRestore: message("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", "没有运行中的实例. 全局不确定记录: %d. 使用 /resume 恢复会话; 任务不会自动重放."),
+	NoSavedConversationBindings:                             message("No saved conversation bindings.", "没有已保存的会话绑定."),
+	NoWorkingDirectorySelectedUseNewNamePathResume:          message("No working directory is selected. Use /new <name or path>, or /resume first.", "尚未选择工作目录. 请先使用 /new <名称或路径> 或 /resume."),
 	OK:                                     message("OK", "正常"),
 	OMPArgumentPresetChangedUseResumeAgain: message("OMP argument preset changed. Use /resume again.", "OMP 参数预设已更改. 请重新使用 /resume."),
 	OMPBinary:                              message("OMP binary", "OMP 程序"),
 	OMPDidNotReportThinkingLevelSession:    message("OMP did not report a thinking level for this session.", "OMP 未报告此会话的思考级别."),
-	OMPDidNotReportFastModeSupportSession:  message("OMP did not report fast mode support for this session.", "OMP 未报告此会话是否支持快速模式."),
 	OMPDidNotReportResultingThinkingLevelChangeCould:  message("OMP did not report the resulting thinking level. The change could not be confirmed.", "OMP 未报告修改后的思考级别. 无法确认修改结果."),
 	OMPDoesNotSupportNativeCommandDiscoverySlashInput: message("OMP does not support native command discovery. Slash input was cancelled because its command source cannot be verified. Use an OMP version with command discovery, or send ordinary text without a leading slash.", "OMP 不支持原生命令发现. 无法验证命令来源, 已取消斜杠输入. 请使用支持命令发现的 OMP 版本, 或发送不以斜杠开头的普通文本."),
 	OMPAlreadyStarting:            message("OMP is already starting.", "OMP 已在启动中."),
@@ -827,8 +820,6 @@ var Msg = struct {
 	ConfirmationCouldNotDeliveredOmpStateUncertainWillNot:                 message("The confirmation could not be delivered to omp. Its state is uncertain and will not be replayed automatically. The session was kept open.", "无法向 omp 发送确认. 状态不确定, 不会自动重放. 会话保持打开."),
 	ConversationBecameBusyUseResumeAgainWhenIdle:                          message("The conversation became busy. Use /resume again when it is idle.", "会话已变为忙碌状态. 请在空闲时重新使用 /resume."),
 	ConversationBusyUseAgainAfterTaskQueueFinish:                          message("The conversation is busy. Use %s again after the task and queue finish.", "会话忙碌中. 请在任务和队列完成后重新使用 %s."),
-	FastModeChangeCouldNotConfirmedMayUnsupportedModel:                    message("The fast mode change could not be confirmed. It may be unsupported by this model. Use /fast status to check before retrying.", "无法确认快速模式修改结果. 此模型可能不支持快速模式. 请先使用 /fast status 检查, 再重试."),
-	FastModeSelectionUnavailableOpenFastChooseAgain:                       message("The fast mode selection is unavailable. Open /fast to choose again.", "快速模式选项不可用. 请打开 /fast 重新选择."),
 	InstanceClosedSessionPreserved:                                        message("The instance is closed. The session has been preserved.", "实例已关闭. 会话已保留."),
 	MigrationOperationStillRunningUseStopStopRuntimeBefore:                message("The migration operation is still running. Use /stop to stop the runtime before explicitly recovering.", "迁移操作仍在执行. 先使用 /stop 停止 Runtime, 再显式恢复."),
 	ModelSelectionUnavailableOpenModelChooseAgain:                         message("The model selection is unavailable. Open /model to choose again.", "模型选项不可用. 请打开 /model 重新选择."),
@@ -884,7 +875,6 @@ var Msg = struct {
 	UsageCompact:                             message("Usage: /compact", "用法: /compact"),
 	UsageDoctor:                              message("Usage: /doctor", "用法: /doctor"),
 	UsageExportHtmlSessionId:                 message("Usage: /export [html] [session-id].", "用法: /export [html] [会话 ID]."),
-	UsageFastOnOffStatus:                     message("Usage: /fast [on|off|status]", "用法: /fast [on|off|status]"),
 	UsageFollowupMessage:                     message("Usage: /followup <message>", "用法: /followup <消息>"),
 	UsageMigrateMigrateRecoverOldMigrateRecoverSessionId:  message("Usage: /migrate, /migrate recover old, or /migrate recover <session-id or absolute file path>.", "用法: /migrate, /migrate recover old, 或 /migrate recover <session-id 或绝对文件路径>."),
 	UsageModelModelProviderModel:                          message("Usage: /model or /model provider/model", "用法: /model 或 /model provider/model"),

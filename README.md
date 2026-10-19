@@ -226,7 +226,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/model` | Choose a configured OMP model role with buttons. |
 | `/model provider/model` | Switch to a specific model while idle. |
 | `/thinking` | Choose the thinking level while idle. |
-| `/fast [on\|off\|status]` | Choose fast mode, explicitly enable or disable it, or inspect its status. |
+| `/fast [on\|ultra\|off\|status]` | Forward OMP's native fast control, including while a task is running. Bare `/fast` toggles the setting without a picker. |
 | `/compact` | Compact the current context immediately while idle, without confirmation. The status message updates with the result and context usage. |
 | `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue, with a 180-second deadline. |
 | `/migrate` | Move handoff context to a fresh session in the same workspace. Enable `omp.migration_extension` first. |
@@ -237,7 +237,9 @@ A named workspace is created when it does not exist. Existing files are not copi
 
 A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
 
-Ordinary text starts a task when the conversation is idle. While an OMP task is active, OMP may accept ordinary text as a steer. Use `/followup <message>` to queue a separate prompt instead. Attachments, `/review`, and other supported native commands also use the conversation queue and run sequentially. Different conversations can run concurrently up to the configured worker capacity.
+`/fast` bypasses the prompt queue and steer path. OMP interprets its arguments, provider/model support, and output; receipts are separate from the running task's answer. Changes apply to subsequent provider requests, not a request already in flight. An unconfirmed control is never replayed automatically; an uncertain runtime is closed.
+
+Ordinary text starts a task when the conversation is idle. While an OMP task is active, OMP may accept ordinary text as a steer. Use `/followup <message>` to queue a separate prompt instead. Attachments, `/review`, and native commands without dedicated control handling use the conversation queue and run sequentially. Different conversations can run concurrently up to the configured worker capacity.
 
 ### Native OMP commands
 

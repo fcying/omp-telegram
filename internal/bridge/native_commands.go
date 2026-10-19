@@ -131,6 +131,10 @@ func (w *worker) commandCatalogFinished(result commandCatalogResult) {
 }
 
 func (w *worker) commandCatalogUpdated() {
+	if c := w.nativeControl; c != nil && c.phase == "catalog" && c.client.CommandCatalog().State != omp.CatalogUnknown {
+		// A reader-published update is authoritative even if discovery is still pending.
+		c.lookupCancel()
+	}
 	w.resolveSlashInputs()
 	if client, ok := w.runtimeClient(); ok && client.CommandCatalog().State != omp.CatalogUnknown {
 		w.nativeCatalog.pausedClientID = 0
