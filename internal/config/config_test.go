@@ -285,6 +285,66 @@ func TestOMPArgsEnvironmentQuotingWithoutShellExpansion(t *testing.T) {
 	}
 }
 
+func TestMigrationExtensionDisabledDoesNotRequireCacheDirectory(t *testing.T) {
+	path, source := configFixture(t)
+	base, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base.DataDir, ".bridge-extensions"), []byte("unavailable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []string{source, setTOMLField(source, "omp", "migration_extension", "false")} {
+		if _, err := loadSource(t, path, input); err != nil {
+			t.Fatalf("disabled migration unexpectedly required its cache directory: %v", err)
+		}
+	}
+	_, err = loadSource(t, path, setTOMLField(source, "omp", "migration_extension", "true"))
+	if err == nil || strings.Contains(err.Error(), base.DataDir) {
+		t.Fatalf("enabled migration did not fail safely with an unavailable cache: %v", err)
+	}
+}
+
+func TestMigrationExtensionRejectsCacheSymlinks(t *testing.T) {
+	for _, kind := range []string{"directory", "file"} {
+		t.Run(kind, func(t *testing.T) {
+			path, source := configFixture(t)
+			source = setTOMLField(source, "omp", "migration_extension", "true")
+			c, err := loadSource(t, path, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			asset := c.OMPArgs[0][len(c.OMPArgs[0])-1]
+			outside := t.TempDir()
+			protected := filepath.Join(outside, filepath.Base(asset))
+			const secret = "private user extension must not be replaced"
+			if err := os.WriteFile(protected, []byte(secret), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(asset); err != nil {
+				t.Fatal(err)
+			}
+			link, target := asset, protected
+			if kind == "directory" {
+				link, target = filepath.Dir(asset), outside
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSource(t, path, source); err == nil || strings.Contains(err.Error(), protected) {
+				t.Fatalf("cache symlink did not fail safely: %v", err)
+			}
+			contents, err := os.ReadFile(protected)
+			if err != nil || string(contents) != secret {
+				t.Fatalf("preparing migration changed a file outside its cache: %v", err)
+			}
+		})
+	}
+}
+
 func TestOMPArgsLegacyScalarAndArrayFingerprint(t *testing.T) {
 	path, source := configFixture(t)
 	scalar, err := loadSource(t, path, setTOMLField(source, "omp", "args", `'--model scalar'`))

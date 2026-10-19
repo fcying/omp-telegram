@@ -240,6 +240,14 @@ type worker struct {
 	configuredThinking     string
 	binding                store.Binding
 	startIntent            *store.StartIntent
+	migration              *store.Migration
+	migrationCancel        context.CancelFunc
+	migrationClientID      uint64
+	migrationAttempt       uint64
+	migrationStartup       *migrationStartup
+	migrationRuntimeCancel context.CancelFunc
+	migrationRun           *migrationRun
+	migrationResults       chan migrationResult
 	sessionID              string
 	claimedSession         string
 	runtimeLifecycle
@@ -503,6 +511,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "fast", Description: "Choose fast mode: /fast [on|off|status]"},
 	{Command: "compact", Description: "Compact context while idle"},
 	{Command: "handoff", Description: "Run native handoff: /handoff [instructions]"},
+	{Command: "migrate", Description: "Migrate context, or /migrate recover old|session-id|session-file"},
 	{Command: "help", Description: "Show usage help"},
 }
 
@@ -1238,7 +1247,7 @@ func (w *worker) clearFailedHostOperation() {
 }
 
 func (w *worker) sessionControlBusy() bool {
-	return w.taskOrSessionBusy() || w.controlInProgress() || w.compacting || w.finishing || w.exportingSession != ""
+	return w.migrationLocked() || w.taskOrSessionBusy() || w.controlInProgress() || w.compacting || w.finishing || w.exportingSession != ""
 }
 
 func (w *worker) canDispatch() bool {
@@ -1246,7 +1255,7 @@ func (w *worker) canDispatch() bool {
 }
 
 func (w *worker) canReleaseRuntime() bool {
-	return w.runtime == runtimeConnected && w.client != nil &&
+	return !w.migrationLocked() && w.runtime == runtimeConnected && w.client != nil &&
 		!w.taskActive() && !w.taskOrSessionBusy() && !w.controlInProgress() &&
 		!w.compacting && !w.finishing && !w.previewBusy &&
 		len(w.queue) == 0 && len(w.hostRequests) == 0 &&
@@ -1255,7 +1264,7 @@ func (w *worker) canReleaseRuntime() bool {
 }
 
 func (w *worker) lifecycleIdle() bool {
-	return !w.binding.Running && w.runtime == runtimeReleased && w.client == nil &&
+	return !w.migrationLocked() && !w.binding.Running && w.runtime == runtimeReleased && w.client == nil &&
 		!w.restoring && !w.runtimeResuming && !w.taskActive() &&
 		!w.taskOrSessionBusy() && !w.controlInProgress() &&
 		!w.compacting && !w.finishing && !w.previewBusy &&
@@ -1403,6 +1412,10 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 		}
 		w.log.LogAttrs(context.Background(), slog.LevelInfo, "runtime released", attrs...)
 	}
+	if w.migrationRuntimeCancel != nil {
+		w.migrationRuntimeCancel()
+		w.migrationRuntimeCancel = nil
+	}
 	if w.steerFence.active {
 		w.settleOutstandingSteers()
 	}
@@ -1429,6 +1442,9 @@ func (w *worker) closeFailedStart() {
 }
 
 func (w *worker) ensureRuntime() (*omp.Client, error) {
+	if w.migrationLocked() {
+		return nil, errors.New("会话迁移尚未解决. 使用 /migrate recover 显式恢复.")
+	}
 	if client, ok := w.runtimeClient(); ok {
 		return client, nil
 	}
@@ -1490,6 +1506,7 @@ func (w *worker) run() {
 	defer func() {
 		w.cancel()
 		w.background.Wait()
+		w.drainMigrationResults()
 		w.drainMediaResults()
 		w.drainExportResults()
 		w.drainDeleteResults()
@@ -1498,6 +1515,9 @@ func (w *worker) run() {
 		w.teardownWorker(true)
 		w.log.Info("worker stopped", "event", "worker_stop")
 	}()
+	if w.migration != nil {
+		w.say(w.migrationStatus())
+	}
 	if w.startIntent != nil {
 		w.say("A requested " + w.startIntent.Kind + " session start was interrupted before omp identity was saved. The outcome is uncertain. Use /close to cancel it, then use /new or /resume explicitly.")
 	} else if w.restoring {
@@ -1550,6 +1570,9 @@ func (w *worker) run() {
 		case result := <-w.nativeCatalog.results:
 			w.commandCatalogFinished(result)
 			w.dispatch()
+			continue
+		case result := <-w.migrationResults:
+			w.migrationFinished(result)
 			continue
 		case result := <-w.operations:
 			w.operationReturned(result)
@@ -1656,6 +1679,8 @@ func (w *worker) run() {
 			w.exportFinished(result)
 		case result := <-w.deleteResults:
 			w.sessionDeleteFinished(result)
+		case result := <-w.migrationResults:
+			w.migrationFinished(result)
 		case result := <-w.bindingNameResults:
 			w.bindingNamesLoaded(result)
 		case result := <-w.doctorResults:
@@ -1905,6 +1930,9 @@ func (w *worker) operationFinished(result operationResult) {
 }
 
 func (w *worker) teardownWorker(releaseSlot bool) {
+	if w.migrationRun != nil {
+		w.cancelMigration("shutdown", false)
+	}
 	w.flushReplyStatus()
 	w.interruptModelMenu()
 	w.b.removeCommandMenu(w)
@@ -1961,6 +1989,10 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 }
 
 func (w *worker) closeLogicalSession() bool {
+	if w.migrationLocked() {
+		w.cancelMigration("closed", false)
+		return true
+	}
 	if !w.cancelStart() || !w.persistClosed() {
 		return false
 	}
@@ -1989,6 +2021,10 @@ func (w *worker) closeLogicalSession() bool {
 }
 
 func (w *worker) failed() {
+	if w.migrationLocked() {
+		w.cancelMigration("runtime_exit", true)
+		return
+	}
 	w.flushReplyStatus()
 	if w.ctx.Err() != nil {
 		return
@@ -2065,6 +2101,10 @@ func (w *worker) clearQueue() {
 }
 
 func (w *worker) stop() {
+	if w.migrationLocked() {
+		w.cancelMigration("cancelled", true)
+		return
+	}
 	if w.research.control != nil {
 		w.handleResearchStop()
 		w.clearQueue()
@@ -2187,7 +2227,7 @@ func (w *worker) dispatchRPCOperation() {
 	go func() {
 		defer w.background.Done()
 		timeout := 30 * time.Second
-		if request.kind == "compact" {
+		if request.kind == "compact" || request.kind == "handoff" {
 			timeout = 180 * time.Second
 		}
 		ctx, cancel := context.WithTimeout(w.ctx, timeout)
@@ -2355,6 +2395,9 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 }
 
 func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64, argsOverride *[]string) string {
+	if w.migrationLocked() {
+		return "会话迁移尚未解决. 不能新建或切换绑定."
+	}
 	if _, connected := w.runtimeClient(); connected && !replace {
 		return "An instance is already running. Use /new for a fresh session, or /close before resuming another session."
 	}
@@ -2611,6 +2654,9 @@ func (w *worker) handle(in incoming) {
 	w.flushReplyStatus()
 	w.statusReleaseClientID = 0
 	w.touchLogicalActivity()
+	if w.handleMigrationIncoming(in) {
+		return
+	}
 	if in.callback != nil {
 		if !w.mark(in.id, "submitted") {
 			return
@@ -3528,6 +3574,12 @@ func (w *worker) event(raw []byte) {
 	var e rpcEvent
 	if json.Unmarshal(raw, &e) != nil {
 		w.statusReleaseClientID = 0
+		return
+	}
+	if w.migrationLocked() {
+		if e.Type == "agent_start" || e.Type == "tool_execution_start" || e.Type == "host_tool_call" {
+			w.cancelMigration("unexpected_activity", true)
+		}
 		return
 	}
 	if w.replyStatusEvent(e) {

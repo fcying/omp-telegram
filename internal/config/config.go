@@ -65,10 +65,11 @@ type telegramFileConfig struct {
 }
 
 type ompFileConfig struct {
-	Binary      string                   `toml:"binary"`
-	Args        any                      `toml:"args"`
-	ArgsLabels  []string                 `toml:"args_labels"`
-	Environment ompEnvironmentFileConfig `toml:"environment"`
+	Binary             string                   `toml:"binary"`
+	Args               any                      `toml:"args"`
+	ArgsLabels         []string                 `toml:"args_labels"`
+	MigrationExtension bool                     `toml:"migration_extension"`
+	Environment        ompEnvironmentFileConfig `toml:"environment"`
 }
 
 type ompEnvironmentFileConfig struct {
@@ -225,7 +226,6 @@ func load(path, baseDir string) (Config, error) {
 		}
 		c.OMPArgs[i] = args
 	}
-	c.OMPArgsFingerprint = fingerprintOMPArgs(argSources, c.OMPArgs)
 	c.OMPArgsLabels = append([]string(nil), raw.OMP.ArgsLabels...)
 	mode := raw.OMP.Environment.Mode
 	var allow []string
@@ -343,6 +343,16 @@ func load(path, baseDir string) (Config, error) {
 	if err = os.MkdirAll(c.DataDir, 0700); err != nil {
 		return c, errors.New("storage.data_dir must be a writable directory")
 	}
+	if raw.OMP.MigrationExtension {
+		path, err := prepareMigrationExtension(c.DataDir)
+		if err != nil {
+			return c, errors.New("omp.migration_extension: cannot prepare bundled Extension in storage.data_dir")
+		}
+		for i := range c.OMPArgs {
+			c.OMPArgs[i] = append(c.OMPArgs[i], "-e", path)
+		}
+	}
+	c.OMPArgsFingerprint = fingerprintOMPArgs(argSources, c.OMPArgs)
 	return c, nil
 }
 

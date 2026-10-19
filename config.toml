@@ -25,6 +25,8 @@ binary = "omp"
 args = ["${OMP_TELEGRAM_ARGS}"]
 # Picker labels are visible in Telegram; use non-secret names, one per args preset.
 args_labels = ["Default"]
+# Load the bundled migration Extension for /migrate on every OMP startup.
+migration_extension = false
 # Example custom preset: args = ['--config "${HOME}/.config/omp/telegram.yml" --model @default']
 
 [omp.environment]

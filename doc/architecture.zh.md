@@ -241,7 +241,7 @@ Session/catalog 失效清空旧 contribution. 逻辑 close/replacement/failure/s
 
 手动 `/compact` 要求逻辑 session 空闲, 不要求进程已连接; 恢复已释放 runtime 后直接开始, 无需确认. 它尝试用五秒超时发送无按钮 `Compacting...`, 再以 180 秒 deadline 在 operation 通道执行原生 `compact`. 成功后 `get_state` 在剩余 deadline 内最多再用三秒. 缺失/非法 usage 或采样失败显示 `n/a`, 不把确认完成的 compaction 改为失败. 不同且非空的原生 session ID 还会退役 runtime, 保留原绑定/claim. 完成后替换状态消息; 状态消息不存在或 edit 失败则经持久 outbox 发送结果.
 
-`/handoff` 要求 session 控制空闲且队列为空, 将可选 `customInstructions` 传给原生 RPC, 并阻止后续队列在结果返回前派发. 正常 operation deadline 为 30 秒. Compact/handoff 明确拒绝保留可复用 runtime; 错误, 超时, 取消及未确认结果释放 runtime 供 lazy resume. 两者都不创建模型 root, 不借用其 progress/Stop 键盘. Session/model/argument 选择及原生 export/path resolution 是独立生命周期接口; [`render.go`](../internal/omp/render.go) 通过 `omp render` 解析原生历史路径, 不负责 Telegram 最终答案格式化.
+`/handoff` 要求 session 控制空闲且队列为空, 将可选 `customInstructions` 传给原生 RPC, 并阻止后续队列在结果返回前派发. Operation deadline 为 180 秒. Compact/handoff 明确拒绝保留可复用 runtime; 错误, 超时, 取消及未确认结果释放 runtime 供 lazy resume. 两者都不创建模型 root, 不借用其 progress/Stop 键盘. Session/model/argument 选择及原生 export/path resolution 是独立生命周期接口; [`render.go`](../internal/omp/render.go) 通过 `omp render` 解析原生历史路径, 不负责 Telegram 最终答案格式化.
 
 ## Progress, status 与最终回复
 
@@ -411,6 +411,33 @@ Clear 要求实例空闲, 队列为空, 没有未解决引导, 并取得绑定�
 
 这些事务不保证子进程恰好启动一次. 启动失败可能留下未解决意图, 因为原生结果仍不确定. 启动后验证失败会关闭失败运行时; 惰性恢复失败保留已保存绑定, 不提交提示词. 恢复流程保留未过期且未解决的意图, 报告不确定状态, 要求先 `/close` 再显式 `/new` 或 `/resume`. 保留策略可以移除陈旧的桥接意图, 但不能证明 OMP 未创建会话, 也不能撤销其效果.
 
+### 事务化上下文迁移
+
+[`migration.go`](../internal/bridge/migration.go), [`migration_claims.go`](../internal/bridge/migration_claims.go), [`Store` 迁移事务](../internal/store/migration.go) 和内嵌的 [Extension Command](../extensions/omp-telegram-migrate.ts) 实现 `/migrate`. 命令名为 `omp_telegram_migrate_v1`, 不是 Hook 命令: 所需 `reload` 由 `ExtensionCommandContext` 提供. 不修改 OMP 核心, 不改变审批策略, 初始化不启动模型回合. Bridge 只在 `omp.migration_extension = true` 时加载该 Extension, 默认为 `false`.
+
+[`config.go`](../config.go) 内嵌 Extension. 启用时, [`prepareMigrationExtension`](../internal/config/migration_extension.go) 在 `<storage.data_dir>/.bridge-extensions/` 中以内容寻址文件名原子释放 `.ts` 文件, 使用私有目录/文件权限, 拒绝缓存符号链接. 使用与 worker workspace 无关的绝对路径, 内容版本化使另一个二进制或 `--check` 不会替换现有 runtime 使用的代码. 配置加载器向每个解析后的预设追加独立的 `-e` 和路径 argv, 再计算参数指纹. 普通启动, 惰性/显式 resume, 迁移恢复和原生发现复用这些有效预设. 不重写用户参数或 OMP 配置文件. 缓存是 bridge 拥有的生成资源, 不是 workspace 或 session 历史; 仅安装二进制即可使用.
+
+原生迁移兼容已验证 OMP 18.12.2; 不能仅凭支持 RPC v2 就推定其他版本兼容. 可选的 [`TestRealOMPMigrationCompatibility`](../internal/config/migration_integration_test.go) 实跑内嵌 Extension, handoff 被拒绝后的预算清理, 严格 journal/实时上下文验证, 非默认模型跨进程恢复, configured thinking `auto` 和 Fast `false`. 新增或变化的初始化记录在语义验证前必须安全拒绝, 不应只为通过升级而扩大 metadata 白名单. 该测试不覆盖 Fast 已启用的 provider 或生产 provider 行为.
+
+Worker 首先检查精确源身份, 原生已静止状态, 空 bridge 队列及没有竞争控制, 冻结 provider/model, configured thinking 和 fast-mode 设置. `PrepareMigration` 用 CAS 核对源并排斥待定启动/迁移, 不修改源 binding 或 `running` 标记. 持久阶段为 `prepared`, `handoff`, `initialize`, `verify`; 未解决失败保留阶段及有界错误分类. 每个有副作用步骤之前先持久化阶段. Handoff deadline 为 180 秒, 其他迁移 RPC 阶段分别有界.
+
+迁移前置检查要求 Extension 命令目录同时包含 `omp_telegram_migrate_v1` 和 `omp_telegram_migrate_handoff_v1`. 调用原生 handoff RPC 前, 后者核对迁移/源/workspace 身份, 仅在当前进程内将 `compaction.keepRecentTokens` 临时覆盖为 `0`, 避免正常近期历史预算拒绝短会话. 保存此前有效值及是否已有 runtime override. 原生 `session_compact` 事件在 handoff 提交后恢复预算, shutdown 也执行恢复. Bridge 在成功和失败路径还会提交核对所有者的恢复命令; 即使 handoff context 已取消, 清理仍有独立的五秒 deadline. 原先没有 runtime override 时清除临时覆盖, 不把原值写入持久配置. 不写任何配置文件, 新 session 初始化拒绝仍有活动预算 lease 的状态. 恢复未确认时关闭 runtime 并保留迁移锁; 进程停止会丢弃内存覆盖. 普通 `/handoff` 行为不变. 原生 handoff 仍要求已有对话消息; 空 session 没有可迁移上下文.
+
+Handoff 捕获只读源 header 和 EOF 前 4 KiB 栅栏, 再读最多 2 MiB 的本次新增 JSONL, 摘要上限 128 KiB. 文件替换, 截断, 栅栏变化, 非法记录和不唯一 handoff 都拒绝继续. 不扫描旧历史找摘要, 但 OMP 自身仍可能加载旧历史. Handoff 原位改变源上下文; 保留源不等于按字节回滚.
+
+JSON 请求携带协议版本, 随机迁移 ID, 源 session/generation, workspace, 精确摘要和 SHA-256. 提交前检查完整编码 RPC 大小. Extension 在切换前捕获当前模型, 在 `newSession.setup` 中先通过 `appendModelChange` 写入明确的 `provider/model` selector, 再写 user 摘要. 这让原生 resume 能恢复模型, 不只依赖当前 runtime. Flush 和 reload 后再追加并 flush 名为 `omp-telegram.migration.complete` 的 `custom` 记录. 标记包含版本, 迁移/源/目标身份, workspace, 摘要 entry ID/hash 及 `reloadCompleted=true`. 该 metadata 不进入模型上下文. 它只证明 Extension 初始化完成, 不证明 Bridge 已发布绑定或已独立检查实时消息. SHA-256 校验一致性, 不认证 Extension 身份; 显式加载的 Extension 是受信任本地代码.
+
+Bridge 独立比较原生身份/CWD, 有界新 journal, RPC entries 和 active leaf, 精确 seed 原文/hash, 实时 `get_messages` 及冻结配置. 初始化有效链中只允许唯一摘要 seed 位于完成 marker 之前; 两者周围只允许 `model_change`, `thinking_level_change` 和 `service_tier_change` metadata. 链上最终持久模型 selector 必须匹配冻结的 provider/model, 实时消息必须只有精确摘要. 离线检查不声称已确定原生 active leaf, 但也拒绝 marker 后代中的非预期记录. 重复/冲突标记, 孤立或成环父链接, 不在有效链上的标记, 被改写的 seed 边界, 额外消息及未知链记录都阻止发布. 文件其他位置出现同一字符串不是证据. 普通 RPC success, `prompt_result`, 通知或会话切换事件均不能提交迁移.
+
+源和候选在 `sessionMu` 下同时预留. 候选观察先检查冲突, 再持久化不可变身份并登记双预留, 不调用会替换旧认领的 `claimSession`. 已观察身份在可取消的结果交接前持久化, 包括关机期间. 异步尝试除迁移 ID 和 client lease 外另有独立 token. 普通消息/附件, callback, new/resume, binding 替换/遗忘, export/delete, idle release 及普通重启恢复均不能绕过活动迁移. Stop/close 取消 runtime 工作但保留持久锁和双身份, 保留清理也保留解决迁移所需的原始 inbox.
+
+`CommitMigration` CAS 检查源与迁移记录, 在同一事务中归档源 binding, 发布 generation + 1 的已验证目标, 删除活动迁移并结算 inbox 和关联 outbox 通知. 提交成功后才将双认领提升为目标认领. 通知失败不回滚绑定, 不重跑初始化. 启动时先于普通 running binding claim 加载活动迁移, 源已关闭也恢复迁移锁; 不过期, 不自动恢复工作.
+
+恢复必须显式请求. `old` 选择保存的源; 完整候选 ID 通过原生接口解析路径, 自定义存储也可由用户给出绝对文件路径. 启动候选 runtime 前先有界离线检查, 排他预留并持久化. 恢复不调用 handoff/newSession, 不按目录顺序猜未知候选. 恢复启动阶段的 45 秒取消会传到实际进程启动 context; 启动成功后先解除短阶段关联, 再接管 runtime. 已取消的启动保留独立 cancel/reap 所有权, 回收前拒绝另一次恢复; 成功接管后取消权转入 runtime 生命周期, 提交迁移不会杀死已发布进程. 所有未解决或模糊结果保持锁定. Flush 和进程崩溃恢复只提供软件级持久化证据, 不表示已验证断电保证.
+
+操作上, `/status` 显示迁移 ID, 持久阶段, 源 ID, 且只在候选身份已持久化时显示其完整 ID. 原生初始化完成但尚未观察候选就崩溃, 因而可能留下完整原生 session, 但 bridge 数据库与崩溃前日志均没有候选身份. 日志不是候选索引. 此窗口中恢复源不需要发现候选; 恢复候选则必须由外部明确提供准确 ID/路径, 并通过相同严格证据校验. 重启和恢复都不会扫描最新文件, 不会再次生成 handoff/session. 已知候选在重启后仍可从 `/status` 识别, 即使普通日志不包含其 ID.
+
+
 ### 重启恢复与空闲释放
 
 轮询前, [`restoreWorkers`](../internal/bridge/recovery.go)为已授权且受支持的运行中绑定重建逻辑认领. 此时不启动保存会话的 OMP 进程, 不占运行时名额; 独立的临时菜单发现进程已经退出. 保存的会话文件必须是绝对路径上的普通文件, 工作目录必须是可用的绝对目录. 文件或目录不可用时, 关闭该绑定的恢复资格并报告跳过, 不创建替代会话. 已保存认领身份冲突或不可用时使恢复失败, 而不是共享会话.
@@ -423,7 +450,7 @@ Clear 要求实例空闲, 队列为空, 没有未解决引导, 并取得绑定�
 
 ### 会话认领与破坏性操作栅栏
 
-[`session.go`](../internal/bridge/session.go)在 `sessionMu` 下管理认领. 每个 worker 最多持有一个以原生返回文件路径和 ID 标识的认领; 成功认领替换它之前的认领. 空闲释放保留认领, 重启时从已提交绑定重建. 不区分大小写且感知前缀的检查防止缩写 ID 绕过其他所有者. 这是守护进程内的认领, 不是对 OMP 历史的跨进程锁.
+[`session.go`](../internal/bridge/session.go) 在 `sessionMu` 下管理认领. 普通认领替换 worker 之前的原生文件/ID 认领; 迁移预留则保留源和候选直到持久化解决. 空闲释放保留认领, 重启时从已提交 binding 和活动迁移重建. 不区分大小写且感知前缀的检查防止缩写 ID 绕过其他所有者. 这是守护进程内的认领, 不是对 OMP 历史的跨进程锁.
 
 导出和删除另有按会话保留的 reservation. 导出排斥其他逻辑所有者及冲突操作. 删除区分逻辑所有权与运行时活动: 只有已释放认领不阻止删除, 已连接或正在启动的运行时, 导出及其他删除则阻止删除. 待定恢复意图也阻止匹配删除; 缺失原生 ID 的旧运行中绑定只保守阻止其工作目录内的删除.
 
@@ -537,13 +564,14 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 ### Schema 与迁移边界
 
-`PRAGMA user_version` 当前为 **18**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-17 按内置迁移链升级; 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
+`PRAGMA user_version` 当前为 **19**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-18 按内置迁移链升级; 版本 19 增加持久化上下文迁移. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
 
 | 表 | 身份与保留内容 | 职责 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和下次 polling offset |
 | `bindings` | `(bot,chat,thread)`; workspace, 原生 session 路径/ID, generation, 最近使用时间, running/interrupted 标记 | 最后验证的逻辑 session binding; `running` 表示恢复资格, 不是实时 PID |
 | `startup_intents` | `(bot,chat,thread)`; new/resume 类型, workspace, session 目标, 下一代 generation, 创建时间 | 尚未提交的启动转换; 发布 binding, 归档旧 binding 和删除匹配 intent 在同一事务中完成 |
+| `migrations` | `(bot,chat,thread)` 和唯一操作 ID; 不可变源/配置, 阶段/错误, 源摘要 entry/hash, 可选候选身份, 原始 inbox | 持久迁移锁与显式恢复证据; 不保存摘要副本或 PID, 不自动过期 |
 | `history` | Bot/对话, workspace, session 路径, generation | 旧 binding 快照, 不是原生 session 索引或对话 transcript |
 | `session_favorites` | `(bot,chat,thread,workspace,session_id)` | 当前对话收藏的原生 session identity |
 | `omp_args_selection` | 单行预设索引和参数指纹 | 全局启动预设选择, 不保存原始参数 |
@@ -709,6 +737,15 @@ Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 reques
 
 会进入原生启动路径的单元测试必须使用 RPC 子进程 fixture 的绝对可执行路径和隔离 workspace. 启动取消及菜单注册拒绝场景在 `PATH` 中没有 `omp` 的环境下验证; 只有显式真实 OMP smoke 可以依赖本机安装的 OMP.
 
+显式验证某个已安装的 OMP 版本:
+
+```sh
+OMP_TELEGRAM_TEST_OMP=/absolute/path/to/omp \
+  GOFLAGS='-run=^TestRealOMPMigrationCompatibility$ -count=1 -v' just test
+```
+
+未设置 `OMP_TELEGRAM_TEST_OMP` 时跳过原生兼容测试, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本及 journal 记录类型. Profile, workspace, session, data 和子进程环境均隔离, 不需要 provider 请求或 Telegram 交付. 这是开发和维护人员的可选检查: 部署新版 OMP 前, 使用候选版本的可执行文件运行测试. 不是普通用户升级 OMP 的必需步骤.
+
 真实 OMP smoke 必须使用隔离的 profile, workspace, 数据库和显式 environment 策略. 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 
 当前实现没有 bridge 侧 undo/rewind/redo 或文件回滚引擎. `/queue` 管理 bridge-pending 工作, 不逐条控制原生排队 prompt. Stop 不能把 idle 快照当作取消 barrier; runtime 退役和不重放仍是架构约束, 不承诺原生任务 exactly-once 执行.
@@ -717,7 +754,7 @@ Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 reques
 
 应用版本来自 [`main.go`](../cmd/omp-telegram/main.go) 的 `Version`, 可用 `-ldflags "-X main.Version=..."` 覆盖. `--version`, `-v`, `/help`, `/start` 使用同一 display version, 构建信息可用时附带 Git revision/dirty 标记. 应用版本与 SQLite schema 版本独立.
 
-[发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 格式和依赖一致性检查只在 amd64 执行一次, 在 Linux amd64/arm64 原生 runner 上运行 `govulncheck`, vet 和普通测试. 完整 amd64 race 测试独立为一个 job, 与两个架构构建并行. 测试命令使用 `-vet=off` 避免重复执行自动 vet 子集; 两个原生构建仍分别执行独立的完整 vet 检查. 各架构以 CGO disabled 构建, 实跑 version/help, 将二进制和 LICENSE 打包为 `.txz`; 发布包附带 `SHA256SUMS`. CI 门禁和发布都要求两个原生构建及 race job 成功.
+[发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 格式和依赖一致性检查只在 amd64 执行一次, 在 Linux amd64/arm64 原生 runner 上运行 `govulncheck`, vet 和普通测试. 完整 amd64 race 测试独立为一个 job, 与两个架构构建并行. 测试命令使用 `-vet=off` 避免重复执行自动 vet 子集; 两个原生构建仍分别执行独立的完整 vet 检查. 各架构以 CGO disabled 构建, 实跑 version/help, 将二进制和 LICENSE 打包为 `.txz`; 发布包附带 `SHA256SUMS`. 迁移 Extension 内嵌于二进制, 只在配置开关启用时加载. CI 门禁和发布都要求两个原生构建及 race job 成功.
 
 缓存 action 固定到 commit SHA, 使用 Node.js 24. Go module 和编译缓存按 runner OS/架构, build/race job 及依赖文件 hash 隔离. 每个源码 revision 使用新缓存键, 恢复前一个兼容缓存, 无需等待 `go.sum` 变化才能更新编译产物. 新缓存前缀的首次运行是冷缓存; 普通测试不会因缓存而跳过执行.
 

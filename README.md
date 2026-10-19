@@ -23,7 +23,7 @@ Each ordinary private chat or topic has its own OMP session. Different conversat
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
 
-Tested with OMP 18.10.3. See the [architecture document](doc/architecture.md) for verification scenarios and limitations.
+Tested with OMP 18.12.2. See the [architecture document](doc/architecture.md) for verification scenarios and limitations.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -38,7 +38,7 @@ mkdir -p "$HOME/tool/omp-telegram"
 tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 ```
 
-For arm64, use `omp-telegram-linux-arm64.txz`. Archives contain the binary and LICENSE; omp itself is installed separately. Each release includes `SHA256SUMS`.
+For arm64, use `omp-telegram-linux-arm64.txz`. Archives contain the binary and LICENSE; omp itself is installed separately. The optional migration Extension is embedded in the binary. Each release includes `SHA256SUMS`.
 
 Development builds are published as the [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev-latest). They are prereleases and may be unstable.
 
@@ -73,6 +73,7 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 binary = "omp"
 args = ["${OMP_TELEGRAM_ARGS}"]
 args_labels = ["Default"]
+migration_extension = false
 
 [omp.environment]
 mode = "denylist"
@@ -128,8 +129,9 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
 | `omp.args_labels` | Optional literal Telegram picker labels, one per preset. Missing, blank, or mismatched labels fall back to `Preset N` and log a startup warning. Long labels are shortened to fit buttons. Labels are visible in the conversation; never put credentials in them. |
+| `omp.migration_extension` | Load the bundled migration Extension on every OMP startup, including resume, for all argument presets. Default: `false`. No separate Extension installation is required. |
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
-| `storage.data_dir` | Database, lock, and incoming/outgoing attachment storage. Default: the executable directory. |
+| `storage.data_dir` | Database, lock, incoming/outgoing attachment storage, and generated bridge Extension cache. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
 | `storage.database_retention_days` | Retention period for terminal bridge messages and eligible attachment caches. Default: `90` days; `0` disables automatic retention cleanup. Workspaces, OMP session data, and saved conversation bindings are not removed. See [Data and Retention](#data-and-retention). |
 | `worker.max_workers` | Maximum number of connected OMP processes. Default: `8`; maximum: `64`. |
@@ -226,7 +228,8 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/thinking` | Choose the thinking level while idle. |
 | `/fast [on\|off\|status]` | Choose fast mode, explicitly enable or disable it, or inspect its status. |
 | `/compact` | Compact the current context immediately while idle, without confirmation. The status message updates with the result and context usage. |
-| `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue. |
+| `/handoff [instructions]` | Run OMP's native handoff while idle with an empty queue, with a 180-second deadline. |
+| `/migrate` | Move handoff context to a fresh session in the same workspace. Enable `omp.migration_extension` first. |
 | `/review [arguments]` | Run OMP's native `/review` command as a queued task. |
 | `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
@@ -372,6 +375,27 @@ Interrupted and uncertain work is not automatically replayed. Waiting tasks are 
 `/stop` ends the active task and keeps the session available. `/close` closes it while preserving workspace files and OMP history. If `/new` or `/resume` is interrupted, use `/close` before retrying.
 
 Each conversation has its own session, but sessions using the same workspace share files. Conversations are not filesystem or credential sandboxes.
+
+### Migrate a large session
+
+`/migrate` generates a handoff, initializes a fresh small session without another model turn, verifies its context and settings, then switches this conversation. The old session and workspace remain available. Handoff itself uses the model and can take up to 180 seconds. Model, configured thinking (including `auto`), and fast-mode settings must match before switching. The selected model is saved in native session history so it also survives process restart and resume.
+
+Short conversations are supported without changing OMP's retention configuration.
+
+Enable the bundled migration Extension in the existing `[omp]` table, then restart the bridge:
+
+```toml
+[omp]
+migration_extension = true
+```
+
+The default is `false`. When enabled, all OMP argument presets load the embedded Extension without a separate `.ts` installation. Existing `omp.args` remain unchanged; if you previously added `-e` for this migration Extension manually, remove that entry to avoid loading two copies. Migration requires an idle session and empty queue. Other Extension commands and aliases remain blocked.
+
+If migration fails, times out, or is interrupted, ordinary input stays locked; it is not queued or replayed. `/status` shows the operation and any known candidate. `/stop` and `/close` stop the runtime but do not clear the migration lock. Explicitly use `/migrate recover old` to restore the source, or `/migrate recover <full-session-id>` / `/migrate recover <absolute-session-file>` to verify a candidate. Recovery never reruns handoff or creates another session. Unknown candidates are never guessed from the newest file.
+
+A missing candidate in `/status` means its identity is unknown, not that no session was created. Ordinary logs cannot reconstruct an unrecorded candidate. If you do not independently know its full ID or absolute file path, use `/migrate recover old`.
+
+This transfers summarized text, not live tools, eval state, or all session-specific artifacts. The bridge reads only bounded newly appended handoff records; OMP may still need to load the old history when restoring it.
 
 ## Data and Retention
 
