@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/logging"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
@@ -31,36 +32,38 @@ import (
 )
 
 type Bridge struct {
-	cfg             config.Config
-	version         string
-	db              *store.Store
-	tg              *telegram.Client
-	bot             telegram.User
-	log             *slog.Logger
-	telegramLog     *slog.Logger
-	storeLog        *slog.Logger
-	mediaLog        *slog.Logger
-	rpcLog          *slog.Logger
-	slots           chan struct{}
-	argsMu          sync.Mutex
-	argsPresets     [][]string
-	argsFingerprint string
-	argsIndex       int
-	wg              sync.WaitGroup
-	fatal           chan error
-	mediaSlots      chan struct{}
-	resumeSlots     chan struct{}
-	sessionMu       sync.Mutex
-	sessionClaims   map[string]sessionClaim
-	exportClaims    map[*worker]string
-	deleteClaims    map[*worker]string
-	bindingsEpoch   atomic.Uint64
-	incomingMu      sync.Mutex
-	incomingInUse   map[string]struct{}
-	ctx             context.Context
-	workerExits     chan workerExit
-	forgetRequests  chan bindingForgetRequest
-	commandMenus    commandMenuState
+	cfg               config.Config
+	version           string
+	db                *store.Store
+	tg                *telegram.Client
+	bot               telegram.User
+	log               *slog.Logger
+	telegramLog       *slog.Logger
+	storeLog          *slog.Logger
+	mediaLog          *slog.Logger
+	rpcLog            *slog.Logger
+	slots             chan struct{}
+	argsMu            sync.Mutex
+	argsPresets       [][]string
+	argsFingerprint   string
+	argsIndex         int
+	wg                sync.WaitGroup
+	fatal             chan error
+	mediaSlots        chan struct{}
+	resumeSlots       chan struct{}
+	sessionMu         sync.Mutex
+	sessionClaims     map[string]sessionClaim
+	exportClaims      map[*worker]string
+	deleteClaims      map[*worker]string
+	bindingsEpoch     atomic.Uint64
+	incomingMu        sync.Mutex
+	incomingInUse     map[string]struct{}
+	ctx               context.Context
+	workerExits       chan workerExit
+	forgetRequests    chan bindingForgetRequest
+	commandMenus      commandMenuState
+	languageMu        sync.Mutex
+	interfaceLanguage atomic.Uint32
 }
 type incoming struct {
 	id       int64
@@ -81,7 +84,7 @@ type bindingForgetRequest struct {
 }
 
 type bindingForgetResult struct {
-	status string
+	status i18n.Message
 	ok     bool
 }
 
@@ -90,7 +93,6 @@ const deliveryWorkerCount = 4
 const maxAssistantOutputBytes = 4 << 20
 const maxFinalReplyBytes = 1 << 20
 const maxFinalReplyMessages = 32
-const replyTruncatedNotice = "Reply truncated because it exceeded the Telegram display budget."
 
 func supportedConversation(m *telegram.Message) bool {
 	return m != nil && (m.MessageThreadID != 0 || m.Chat.Type == "private")
@@ -377,7 +379,7 @@ type progressTool struct {
 	Name       string
 	Args       string
 	Detail     string
-	DetailKind string
+	DetailKind i18n.Message
 	StartedAt  time.Time
 }
 
@@ -385,7 +387,7 @@ type progressToolResult struct {
 	Name       string
 	Args       string
 	Detail     string
-	DetailKind string
+	DetailKind i18n.Message
 	Duration   time.Duration
 	Failed     bool
 }
@@ -492,27 +494,31 @@ const (
 	terminalCancelled
 )
 
-var botCommands = []telegram.BotCommand{
-	{Command: "new", Description: "New session: /new <name or project path>"},
-	{Command: "stop", Description: "Stop task and clear queue"},
-	{Command: "followup", Description: "Queue a prompt after the current task"},
-	{Command: "queue", Description: "Show and cancel pending bridge tasks"},
-	{Command: "resume", Description: "Choose or pin an omp session in this working directory"},
-	{Command: "args", Description: "Select OMP argument preset: /args [number]"},
-	{Command: "review", Description: "Run omp review: /review [arguments]"},
-	{Command: "close", Description: "Close omp, keep workspace and session"},
-	{Command: "export", Description: "Export an omp session: /export [html] [session-id]"},
-	{Command: "bindings", Description: "List saved bindings: /bindings [old]"},
-	{Command: "status", Description: "Show session, model, context, speed and queue"},
-	{Command: "doctor", Description: "Run safe diagnostics"},
-	{Command: "name", Description: "Name the omp session: /name <title>"},
-	{Command: "model", Description: "Choose a cycle role or /model provider/model"},
-	{Command: "thinking", Description: "Choose the thinking level for this session"},
-	{Command: "fast", Description: "Choose fast mode: /fast [on|off|status]"},
-	{Command: "compact", Description: "Compact context while idle"},
-	{Command: "handoff", Description: "Run native handoff: /handoff [instructions]"},
-	{Command: "migrate", Description: "Migrate context, or /migrate recover old|session-id|session-file"},
-	{Command: "help", Description: "Show usage help"},
+var botCommands = []struct {
+	Command     string
+	Description i18n.Message
+}{
+	{Command: "new", Description: i18n.Msg.NewSessionNewNameProjectPath},
+	{Command: "stop", Description: i18n.Msg.StopTaskClearQueue},
+	{Command: "followup", Description: i18n.Msg.QueuePromptAfterCurrentTask},
+	{Command: "queue", Description: i18n.Msg.ShowCancelPendingBridgeTasks},
+	{Command: "resume", Description: i18n.Msg.ChoosePinOmpSessionWorkingDirectory},
+	{Command: "args", Description: i18n.Msg.SelectOMPArgumentPresetArgsNumber},
+	{Command: "review", Description: i18n.Msg.RunOmpReviewReviewArguments},
+	{Command: "close", Description: i18n.Msg.CloseOmpKeepWorkspaceSession},
+	{Command: "export", Description: i18n.Msg.ExportOmpSessionExportHtmlSessionId},
+	{Command: "bindings", Description: i18n.Msg.ListSavedBindingsBindingsOld},
+	{Command: "status", Description: i18n.Msg.ShowSessionModelContextSpeedQueue},
+	{Command: "doctor", Description: i18n.Msg.RunSafeDiagnostics},
+	{Command: "name", Description: i18n.Msg.NameOmpSessionNameTitle},
+	{Command: "model", Description: i18n.Msg.ChooseCycleRoleModelProviderModel},
+	{Command: "thinking", Description: i18n.Msg.ChooseThinkingLevelSession},
+	{Command: "fast", Description: i18n.Msg.ChooseFastModeFastOnOffStatus},
+	{Command: "compact", Description: i18n.Msg.CompactContextWhileIdle},
+	{Command: "handoff", Description: i18n.Msg.RunNativeHandoffHandoffInstructions},
+	{Command: "migrate", Description: i18n.Msg.MigrateContextMigrateRecoverOldSessionIdSessionFile},
+	{Command: "lang", Description: i18n.Msg.Language.CommandDescription},
+	{Command: "help", Description: i18n.Msg.CommandHelp},
 }
 
 const pendingInputBatchSize = 256
@@ -545,11 +551,16 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		storeLog.Error("OMP argument selection load failed", "event", "omp_args_selection_failed", "error_kind", "persistence")
 		return err
 	}
+	if err := b.initializeLanguage(); err != nil {
+		cancel()
+		storeLog.Error("interface language read failed", "event", "language_read_failed", "error_kind", "persistence")
+		return err
+	}
 	b.bootstrapCommandMenus(ctx)
 	// Command menus improve discoverability but are not required for polling.
 	registered := 0
 	for _, language := range []string{"", "zh"} {
-		if err = tg.SetCommands(ctx, botCommands, language); err != nil {
+		if err = tg.SetCommands(ctx, localizedCommands(nil, b.language()), language); err != nil {
 			if ctx.Err() == nil {
 				logTelegramFailure(telegramLog, slog.LevelWarn, "telegram_commands_failed", "telegram command registration failed", err, slog.String("language_code", language))
 			}
@@ -717,7 +728,8 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 				continue
 			}
 			if !supportedConversation(m) {
-				if err = db.Enqueue(m.Chat.ID, 0, "This bot supports private chats and Telegram topics. In groups, use it inside a topic."); err != nil {
+				notice := b.tr(i18n.Msg.BotSupportsPrivateChatsTelegramTopicsGroupsUseInside)
+				if err = db.Enqueue(m.Chat.ID, 0, notice); err != nil {
 					b.storeLog.Error("unsupported conversation reply failed", "event", "outbox_write_failed")
 					return err
 				}
@@ -755,7 +767,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 		select {
 		case request := <-b.forgetRequests:
 			if target := workers[request.key]; target == nil || !target.tryForget(request) {
-				request.reply(bindingForgetResult{status: "Binding changed or busy. Use /bindings to refresh."})
+				request.reply(bindingForgetResult{status: i18n.Msg.BindingChangedBusyUseBindingsRefresh})
 			}
 		case exit := <-b.workerExits:
 			removeExitedWorker(workers, exit)
@@ -1043,7 +1055,12 @@ func (b *Bridge) deliver(ctx context.Context) error {
 				b.storeLog.Warn("attachment cleanup failed", "event", "snapshot_cleanup_failed")
 			}
 			if state != store.OutboxDone {
-				if err = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+string(state)+". It will not be replayed automatically."); err != nil {
+				source := i18n.Msg.AttachmentDeliveryFailedWillNotReplayedAutomatically
+				if state == store.OutboxUncertain {
+					source = i18n.Msg.AttachmentDeliveryUncertainWillNotReplayedAutomatically
+				}
+				notice := b.tr(source)
+				if err = b.db.Enqueue(o.Chat, o.Thread, notice); err != nil {
 					b.storeLog.Error("delivery failure notice persistence failed", "event", "outbox_write_failed")
 					return err
 				}
@@ -1443,16 +1460,16 @@ func (w *worker) closeFailedStart() {
 
 func (w *worker) ensureRuntime() (*omp.Client, error) {
 	if w.migrationLocked() {
-		return nil, errors.New("会话迁移尚未解决. 使用 /migrate recover 显式恢复.")
+		return nil, newMessageError(i18n.Msg.SessionMigrationUnresolvedUseMigrateRecoverRecoverExplicitly)
 	}
 	if client, ok := w.runtimeClient(); ok {
 		return client, nil
 	}
 	if w.runtime == runtimeStarting {
-		return nil, errors.New("OMP is starting. Try again after it is ready.")
+		return nil, newMessageError(i18n.Msg.OMPStartingTryAgainAfterReady)
 	}
 	if !w.binding.Running || w.binding.Session == "" || !filepath.IsAbs(w.binding.Session) || !filepath.IsAbs(w.binding.Workspace) {
-		return nil, errors.New("No instance is running in this conversation. Start with /new <name or project path>, or use /resume for a saved session.")
+		return nil, newMessageError(i18n.Msg.NoInstanceRunningConversationStartNewNameProjectPath)
 	}
 	w.beginRuntimeResume()
 	failure := w.start(true, w.binding.Session, w.binding.Workspace, false)
@@ -1467,7 +1484,7 @@ func (w *worker) ensureRuntime() (*omp.Client, error) {
 	if failure != "" {
 		return nil, errors.New(failure)
 	}
-	return nil, errors.New("Failed to resume the released OMP session. No prompt was submitted.")
+	return nil, newMessageError(i18n.Msg.FailedResumeReleasedOMPSessionNoPromptSubmitted)
 }
 
 func (w *worker) submit(q queued) bool {
@@ -1519,7 +1536,14 @@ func (w *worker) run() {
 		w.say(w.migrationStatus())
 	}
 	if w.startIntent != nil {
-		w.say("A requested " + w.startIntent.Kind + " session start was interrupted before omp identity was saved. The outcome is uncertain. Use /close to cancel it, then use /new or /resume explicitly.")
+		kind := w.startIntent.Kind
+		switch kind {
+		case "new":
+			kind = w.tr(i18n.Msg.New)
+		case "resume":
+			kind = w.tr(i18n.Msg.Resume)
+		}
+		w.say(w.tr(i18n.Msg.RequestedSessionStartInterruptedBeforeOmpIdentitySavedOutcome, kind))
 	} else if w.restoring {
 		w.restoreBinding()
 	}
@@ -1757,15 +1781,15 @@ func (w *worker) operationFinished(result operationResult) {
 	}
 	if result.kind == "prompt" || result.kind == "native_prompt" {
 		if w.steerFence.active && result.err != nil {
-			w.retireTaskRuntime("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.")
+			w.retireTaskRuntime(w.tr(i18n.Msg.Task.SubmissionUncertain))
 			return
 		}
 		if errors.Is(result.err, omp.ErrRequestTooLarge) {
-			w.finishCancelled("Prompt exceeds the omp RPC frame limit. No task was submitted.")
+			w.finishCancelled(w.tr(i18n.Msg.PromptExceedsOmpRPCFrameLimitNoTaskSubmitted))
 			return
 		}
 		if result.err != nil {
-			notice := "Submission failed or its outcome is uncertain. This task will not be replayed automatically. The session was kept open."
+			notice := w.tr(i18n.Msg.SubmissionFailedOutcomeUncertainTaskWillNotReplayedAutomatically)
 			w.clearQueue()
 			w.retireTaskRuntime(notice)
 			return
@@ -1815,17 +1839,17 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 		if result.err != nil {
 			if uncertain {
-				w.say("Handoff failed or its outcome is uncertain. The instance was closed and will resume on the next request.")
+				w.say(w.tr(i18n.Msg.HandoffFailedOutcomeUncertainInstanceClosedWillResumeOn))
 			} else {
-				w.say("omp rejected the handoff.")
+				w.say(w.tr(i18n.Msg.OmpRejectedHandoff))
 			}
 		} else if cancelled {
-			w.say("Handoff canceled without a result. The instance was closed and will resume on the next request.")
+			w.say(w.tr(i18n.Msg.HandoffCanceledWithoutResultInstanceClosedWillResumeOn))
 		} else if uncertain {
-			w.say("Handoff result could not be confirmed. The instance was closed and will resume on the next request.")
+			w.say(w.tr(i18n.Msg.HandoffResultCouldNotConfirmedInstanceClosedWillResume))
 		} else {
 			w.touchBinding()
-			w.say("Handoff completed.")
+			w.say(w.tr(i18n.Msg.HandoffCompleted))
 		}
 	case "compact", "":
 		w.completeSessionOperation()
@@ -1836,12 +1860,12 @@ func (w *worker) operationFinished(result operationResult) {
 		var message string
 		if result.err != nil {
 			if uncertain {
-				message = "Compaction failed or its outcome is uncertain. The instance was closed and will resume on the next request."
+				message = w.tr(i18n.Msg.CompactionFailedOutcomeUncertainInstanceClosedWillResumeOn)
 			} else {
-				message = "omp rejected compaction."
+				message = w.tr(i18n.Msg.OmpRejectedCompaction)
 			}
 		} else if result.cancelled {
-			message = "Compaction was canceled. The instance was closed and will resume on the next request."
+			message = w.tr(i18n.Msg.CompactionCanceledInstanceClosedWillResumeOnNextRequest)
 		} else {
 			w.touchBinding()
 			var state statusState
@@ -1855,7 +1879,7 @@ func (w *worker) operationFinished(result operationResult) {
 				}
 				state = statusState{}
 			}
-			message = "Compaction completed.\nContext: " + state.contextText()
+			message = w.tr(i18n.Msg.CompactionCompletedContext, state.contextText(w.b.language()))
 		}
 		messageID, _ := result.meta.(int64)
 		if !w.finishMenu(messageID, message) {
@@ -1866,11 +1890,11 @@ func (w *worker) operationFinished(result operationResult) {
 			if uncertainOperationOutcome(result.err, result.cancelled) {
 				w.releaseRuntimeWithReason(true, "failure")
 				if w.active != 0 {
-					w.finishUncertain("Abort outcome is uncertain. The active task will not be replayed automatically.")
+					w.finishUncertain(w.tr(i18n.Msg.AbortOutcomeUncertainActiveTaskWillNotReplayedAutomatically))
 				}
 			}
 			w.endControlOperation()
-			w.say("The abort request failed.")
+			w.say(w.tr(i18n.Msg.AbortRequestFailed))
 		} else {
 			w.completeAbort(true, result.message)
 		}
@@ -1884,7 +1908,7 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 		pending = pending || len(w.hostRequests) != 0 || w.client.BufferedOutput()
 		if result.err == nil && !result.cancelled && idle && settled && !pending && !w.taskActive() && !w.taskOrSessionBusy() && !w.compacting {
-			w.completeAbort(false, "No active task. Queued prompts cleared.")
+			w.completeAbort(false, w.tr(i18n.Msg.NoActiveTaskQueuedPromptsCleared))
 		} else {
 			client := w.client
 			w.startOperation("abort", client, func(ctx context.Context) (json.RawMessage, error) {
@@ -1906,7 +1930,7 @@ func (w *worker) operationFinished(result operationResult) {
 		}
 		if !valid {
 			w.releaseStatusRuntime(result, false)
-			w.say("Failed to read the session state.")
+			w.say(w.tr(i18n.Msg.FailedReadSessionState))
 			return
 		}
 		if state.SessionID == w.binding.SessionID {
@@ -1915,11 +1939,11 @@ func (w *worker) operationFinished(result operationResult) {
 		research := w.researchStatus()
 		w.releaseStatusRuntime(result, true)
 		home, _ := os.UserHomeDir()
-		w.say(formatRuntimeStatus(state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity), w.runtime == runtimeConnected) + research)
+		w.say(formatRuntimeStatus(w.b.language(), state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity), w.runtime == runtimeConnected) + research)
 	case "name":
 		w.endControlOperation()
 		if result.err != nil {
-			w.say("The session name change could not be confirmed. Use /status to check before retrying.")
+			w.say(w.tr(i18n.Msg.SessionNameChangeCouldNotConfirmedUseStatusCheck))
 			return
 		}
 		w.touchBinding()
@@ -2048,15 +2072,15 @@ func (w *worker) failed() {
 	}
 	w.rpcExitPendingClientID = 0
 	if w.research.root {
-		w.retireResearch("omp exited during autoresearch. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.OmpExitedDuringAutoresearchTaskOutcomeUncertainWillNot))
 		return
 	}
 	if w.steerFence.active {
-		w.retireTaskRuntime("omp exited while steering. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.OmpExitedWhileSteeringTaskOutcomeUncertainWillNot))
 		return
 	}
 	w.clearQueue()
-	w.retireTaskRuntime("omp exited. The task outcome is uncertain and will not be replayed automatically. The session was kept open.")
+	w.retireTaskRuntime(w.tr(i18n.Msg.OmpExitedTaskOutcomeUncertainWillNotReplayedAutomatically))
 }
 func (w *worker) cancelQueuedTask(id int64) bool {
 	for i := range w.queue {
@@ -2115,7 +2139,7 @@ func (w *worker) stop() {
 	pendingMode := w.research.admission != nil && !w.research.admission.ready && w.researchAvailable(w.research.admission.client)
 	w.clearQueue()
 	if pendingMode {
-		w.retireResearch("Autoresearch admission was interrupted. Its task outcome is uncertain and will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchAdmissionInterruptedTaskOutcomeUncertainWillNotReplayed))
 		w.disableResearch(0)
 		return
 	}
@@ -2126,7 +2150,7 @@ func (w *worker) stop() {
 		w.stopSteeredRoot()
 		return
 	}
-	w.requestAbort("Abort requested and queued prompts cleared.")
+	w.requestAbort(w.tr(i18n.Msg.AbortRequestedQueuedPromptsCleared))
 }
 
 func (w *worker) stopActiveTask() {
@@ -2137,21 +2161,21 @@ func (w *worker) stopActiveTask() {
 		w.stopSteeredRoot()
 		return
 	}
-	w.requestAbort("Abort requested for the current task. Queued prompts will continue.")
+	w.requestAbort(w.tr(i18n.Msg.AbortRequestedCurrentTaskQueuedPromptsWillContinue))
 }
 
 func (w *worker) requestAbort(notice string) {
 	if w.runtime == runtimeReleased {
-		w.say("No active task. Queued prompts cleared.")
+		w.say(w.tr(i18n.Msg.NoActiveTaskQueuedPromptsCleared))
 		return
 	}
 	if w.controlInProgress() {
-		w.say("The session operation is still loading.")
+		w.say(w.tr(i18n.Msg.SessionOperationStillLoading))
 		return
 	}
 	client, connected := w.runtimeClient()
 	if !connected {
-		w.say("The abort request failed.")
+		w.say(w.tr(i18n.Msg.AbortRequestFailed))
 		return
 	}
 	w.beginControlOperation(controlAbort)
@@ -2177,7 +2201,7 @@ func (w *worker) completeAbort(retire bool, notice string) {
 	w.endControlOperation()
 	if retire {
 		if w.taskActive() {
-			if !w.finishCancelled("Task was cancelled before completion.") {
+			if !w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion)) {
 				return
 			}
 		} else {
@@ -2272,12 +2296,12 @@ func (w *worker) operationReturned(result operationResult) {
 
 func (w *worker) beginControl(kind string, call func(*omp.Client, context.Context) (json.RawMessage, error), message string) bool {
 	if w.controlInProgress() {
-		w.say("The session operation is still loading.")
+		w.say(w.tr(i18n.Msg.SessionOperationStillLoading))
 		return false
 	}
 	client, err := w.ensureRuntime()
 	if err != nil {
-		w.say(err.Error())
+		w.say(w.errorText(err))
 		return false
 	}
 	switch kind {
@@ -2332,10 +2356,10 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 		return resolveWorkspace(w.b.cfg.WorkspaceRoot, w.b.cfg.WorkspaceRoot)
 	}
 	if err != nil {
-		return "", errors.New("Failed to read the session binding.")
+		return "", newMessageError(i18n.Msg.FailedReadSessionBinding)
 	}
 	if !filepath.IsAbs(old.Workspace) {
-		return "", errors.New("Cannot determine the working directory. Use /new <name or project path>.")
+		return "", newMessageError(i18n.Msg.CannotDetermineWorkingDirectoryUseNewNameProjectPath)
 	}
 	return old.Workspace, nil
 }
@@ -2387,7 +2411,7 @@ func (w *worker) topicRenameFinished(result topicRenameResult) {
 	}
 	info := telegram.ClassifyError(result.err)
 	w.log.Warn("new topic rename failed", "event", "topic_rename_failed", "error_kind", info.Reason)
-	w.say("The session started, but the Telegram topic title could not be updated.")
+	w.say(w.tr(i18n.Msg.SessionStartedButTelegramTopicTitleCouldNotUpdated))
 }
 
 func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64) string {
@@ -2396,23 +2420,23 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 
 func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64, argsOverride *[]string) string {
 	if w.migrationLocked() {
-		return "会话迁移尚未解决. 不能新建或切换绑定."
+		return w.tr(i18n.Msg.SessionMigrationUnresolvedCannotCreateSwitchBindings)
 	}
 	if _, connected := w.runtimeClient(); connected && !replace {
-		return "An instance is already running. Use /new for a fresh session, or /close before resuming another session."
+		return w.tr(i18n.Msg.InstanceAlreadyRunningUseNewFreshSessionCloseBefore)
 	}
 	if w.runtime == runtimeStarting {
-		return "OMP is already starting."
+		return w.tr(i18n.Msg.OMPAlreadyStarting)
 	}
 	if w.startIntent != nil && !w.restoring {
-		return "A previous session start is still uncertain. Use /close before starting another session."
+		return w.tr(i18n.Msg.PreviousSessionStartStillUncertainUseCloseBeforeStarting)
 	}
 	if (w.exportCancel != nil || w.deleteCancel != nil) && !w.restoring {
-		return "The omp session operation is still loading. Wait for it to finish."
+		return w.tr(i18n.Msg.OmpSessionOperationStillLoadingWaitFinish)
 	}
 	old, e := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if e != nil && !errors.Is(e, sql.ErrNoRows) {
-		return "Failed to read the session."
+		return w.tr(i18n.Msg.FailedReadSession)
 	}
 	oldMissing := errors.Is(e, sql.ErrNoRows)
 	renameTopic := !resume && !w.restoring && w.key.thread != 0 && oldMissing
@@ -2430,23 +2454,23 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	if resume {
 		if w.restoring {
 			if !savedSessionAvailable(target, expectedCWD) {
-				return "Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session."
+				return w.tr(i18n.Msg.Session.RestoreFailed)
 			}
 			cwd = expectedCWD
 		} else if !validSessionID(target) {
-			return "Usage: /resume, or /resume <omp session ID>."
+			return w.tr(i18n.Msg.UsageResumeResumeOmpSessionID)
 		}
 		if !w.restoring {
 			cwd = expectedCWD
 		}
 		if !w.runtimeResuming && w.b.sessionInUseByOther(w, target) {
-			return "This session is already running in another conversation. Close that instance first, or use a full session ID."
+			return w.tr(i18n.Msg.SessionAlreadyRunningAnotherConversationCloseInstanceFirstUse)
 		}
 		session = target
 	} else {
 		cwd = target
 		if !filepath.IsAbs(cwd) {
-			return "Invalid working directory."
+			return w.tr(i18n.Msg.InvalidWorkingDirectory)
 		}
 	}
 	reuseSlot := replace && w.runtime == runtimeConnected && w.client != nil
@@ -2456,7 +2480,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		case w.b.slots <- struct{}{}:
 			reserved = true
 		default:
-			return "The active instance limit has been reached."
+			return w.tr(i18n.Msg.InstanceLimitReached)
 		}
 	}
 	if !resume {
@@ -2464,7 +2488,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			if reserved {
 				<-w.b.slots
 			}
-			return "Failed to create the working directory."
+			return w.tr(i18n.Msg.FailedCreateWorkingDirectory)
 		}
 	}
 	if !w.restoring {
@@ -2489,14 +2513,14 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			if reserved {
 				<-w.b.slots
 			}
-			return "The session list changed. Use /resume again."
+			return w.tr(i18n.Msg.SessionListChangedUseResumeAgain)
 		}
 		if resume && w.b.deleteMatchesLocked(session) {
 			w.b.sessionMu.Unlock()
 			if reserved {
 				<-w.b.slots
 			}
-			return "This session is being deleted. Try again after the operation finishes."
+			return w.tr(i18n.Msg.SessionDeletedTryAgainAfterOperationFinishes)
 		}
 		e = w.b.db.PrepareStart(previous, intent)
 		w.b.sessionMu.Unlock()
@@ -2504,7 +2528,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			if reserved {
 				<-w.b.slots
 			}
-			return "Failed to save the startup intent: " + e.Error()
+			return w.tr(i18n.Msg.FailedSaveStartupIntent, e.Error())
 		}
 		w.startIntent = &intent
 		w.binding = old
@@ -2522,7 +2546,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		if reserved {
 			<-w.b.slots
 		}
-		return "The saved session is being deleted or used elsewhere. No OMP process was started."
+		return w.tr(i18n.Msg.SavedSessionDeletedUsedElsewhereNoOMPProcessStarted)
 	}
 	w.beginRuntimeStart()
 	var launchArgs []string
@@ -2544,12 +2568,12 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			w.sessionRuntimeActive.Store(false)
 		}
 		if w.runtimeResuming {
-			return "Failed to resume the released OMP session. No prompt was submitted."
+			return w.tr(i18n.Msg.FailedResumeReleasedOMPSessionNoPromptSubmitted)
 		}
 		if resume {
-			return "Failed to resume omp. The startup outcome is uncertain; use /close before retrying."
+			return w.tr(i18n.Msg.FailedResumeOmpStartupOutcomeUncertainUseCloseBefore)
 		}
-		return "Failed to start omp. The startup outcome is uncertain; use /close before retrying."
+		return w.tr(i18n.Msg.FailedStartOmpStartupOutcomeUncertainUseCloseBefore)
 	}
 	w.runtimeStarted(c, launchArgs)
 	w.initMedia()
@@ -2559,30 +2583,30 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	if e != nil {
 		w.logRuntimeEvent(slog.LevelError, "runtime_identity_invalid", "failure", "runtime session identity unavailable", "")
 		w.closeFailedStart()
-		return "Cannot obtain omp session identity and working directory. The instance has been closed."
+		return w.tr(i18n.Msg.CannotObtainOmpSessionIdentityWorkingDirectoryInstanceClosed)
 	}
 	if resume && !w.restoring && !strings.HasPrefix(strings.ToLower(info.ID), strings.ToLower(target)) {
 		w.closeFailedStart()
-		return "The resumed session did not match the requested omp session ID."
+		return w.tr(i18n.Msg.ResumedSessionDidNotMatchRequestedOmpSessionID)
 	}
 	if w.restoring && !sameSessionFile(info.File, target) {
 		w.closeFailedStart()
-		return "omp did not restore the saved session file. The instance has been closed."
+		return w.tr(i18n.Msg.OmpDidNotRestoreSavedSessionFileInstanceClosed)
 	}
 	if w.runtimeResuming && !strings.EqualFold(info.ID, old.SessionID) {
 		w.closeFailedStart()
-		return "omp did not restore the saved session identity. The instance has been closed."
+		return w.tr(i18n.Msg.OmpDidNotRestoreSavedSessionIdentityInstanceClosed)
 	}
 	if !resume {
 		expectedCWD = cwd
 	}
 	if expectedCWD != "" && !sameWorkspace(info.CWD, expectedCWD) {
 		w.closeFailedStart()
-		return "omp selected a different working directory. The instance has been closed."
+		return w.tr(i18n.Msg.OmpSelectedDifferentWorkingDirectoryInstanceClosed)
 	}
 	if !w.claimSession(info.File, info.ID) {
 		w.closeFailedStart()
-		return "This omp session is unavailable or already in use by another conversation."
+		return w.tr(i18n.Msg.OmpSessionUnavailableAlreadyUseAnotherConversation)
 	}
 	ctx, cancel = context.WithTimeout(w.ctx, 3*time.Second)
 	configuredThinking, thinkingErr := c.ConfiguredThinking(ctx)
@@ -2590,7 +2614,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	if thinkingErr != nil {
 		if c.Stopping() {
 			w.closeFailedStart()
-			return "Cannot query omp thinking configuration. The instance has been closed."
+			return w.tr(i18n.Msg.CannotQueryOmpThinkingConfigurationInstanceClosed)
 		}
 		configuredThinking = ""
 	}
@@ -2599,7 +2623,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	cancel()
 	if e != nil {
 		w.closeFailedStart()
-		return "Cannot register Telegram attachment delivery. The instance has been closed."
+		return w.tr(i18n.Msg.CannotRegisterTelegramAttachmentDeliveryInstanceClosed)
 	}
 	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: nextGeneration, LastUsedAt: old.LastUsedAt, Running: true}
 
@@ -2613,7 +2637,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	if e != nil {
 		w.b.storeLog.Error("session binding persistence failed", "event", "binding_write_failed", "reason", "commit_start", "error_kind", "persistence")
 		w.closeFailedStart()
-		return "Failed to save the session binding. The instance has been closed."
+		return w.tr(i18n.Msg.FailedSaveSessionBindingInstanceClosed)
 	}
 	w.binding = binding
 	w.configuredThinking = configuredThinking
@@ -2646,7 +2670,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		w.renameNewTopic(info.CWD)
 	}
 	if !w.runtimeResuming {
-		w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
+		w.say(w.tr(i18n.Msg.OmpReadyWorkspaceSession, info.CWD, info.ID))
 	}
 	return ""
 }
@@ -2686,12 +2710,12 @@ func (w *worker) handle(in incoming) {
 			if w.ctx.Err() != nil {
 				return
 			}
-			w.say(err.Error())
+			w.say(w.errorText(err))
 			w.mark(in.id, "done")
 			return
 		}
 		if w.pendingInputFull() {
-			w.say("The queue is full. This message was not submitted.")
+			w.say(w.tr(i18n.Msg.Queue.Full))
 			if w.mark(in.id, "cancelled") {
 				w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
 			}
@@ -2704,7 +2728,7 @@ func (w *worker) handle(in incoming) {
 		if w.taskActive() {
 			if _, err := w.ensureRuntime(); err != nil {
 				if w.ctx.Err() == nil {
-					w.say(err.Error())
+					w.say(w.errorText(err))
 					w.mark(in.id, store.InboxCancelled)
 				}
 				return
@@ -2733,7 +2757,7 @@ func (w *worker) handle(in incoming) {
 	}
 	if cmd == "/followup" {
 		if arg == "" {
-			w.say("Usage: /followup <message>")
+			w.say(w.tr(i18n.Msg.UsageFollowupMessage))
 			w.mark(in.id, "done")
 			return
 		}
@@ -2746,15 +2770,17 @@ func (w *worker) handle(in incoming) {
 	defer w.mark(in.id, "done")
 	switch cmd {
 	case "/help", "/start":
-		w.say(commandHelp(w.b.version))
+		w.say(w.commandHelp())
+	case "/lang":
+		w.handleLanguageCommand(arg)
 	case "/new":
 		workspace, err := w.newWorkspace(arg)
 		if err != nil {
-			w.say(err.Error())
+			w.say(w.errorText(err))
 			return
 		}
 		if w.binding.Running {
-			w.confirm(confirmation{action: "new", workspace: workspace, user: in.msg.From.ID}, "Start a new omp session in: "+workspace+"?\nExisting files and session history will be preserved.", []string{"Confirm", "Cancel"})
+			w.confirm(confirmation{action: "new", workspace: workspace, user: in.msg.From.ID}, w.tr(i18n.Msg.StartNewOmpSessionExistingFilesSessionHistoryWill, workspace), []string{w.tr(i18n.Msg.Confirm), w.tr(i18n.Msg.Cancel)})
 		} else {
 			w.start(false, workspace, "", false)
 		}
@@ -2769,7 +2795,7 @@ func (w *worker) handle(in incoming) {
 	case "/export":
 		format, sessionID, ok := parseExportArgs(arg)
 		if !ok {
-			w.say("Usage: /export [html] [session-id].")
+			w.say(w.tr(i18n.Msg.UsageExportHtmlSessionId))
 			return
 		}
 		if sessionID == "" {
@@ -2779,7 +2805,7 @@ func (w *worker) handle(in incoming) {
 		}
 	case "/bindings":
 		if arg != "" && arg != "old" {
-			w.say("Usage: /bindings [old]")
+			w.say(w.tr(i18n.Msg.UsageBindingsOld))
 			return
 		}
 		w.showBindings(in.msg.From.ID, arg == "old", 0)
@@ -2787,12 +2813,12 @@ func (w *worker) handle(in incoming) {
 		if !w.closeLogicalSession() {
 			return
 		}
-		w.say("The instance is closed. The session has been preserved.")
+		w.say(w.tr(i18n.Msg.InstanceClosedSessionPreserved))
 	case "/stop":
 		w.stop()
 	case "/queue":
 		if arg != "" {
-			w.say("Usage: /queue")
+			w.say(w.tr(i18n.Msg.UsageQueue))
 			return
 		}
 		w.showQueue(in.msg.From.ID)
@@ -2800,23 +2826,23 @@ func (w *worker) handle(in incoming) {
 		w.status()
 	case "/doctor":
 		if arg != "" {
-			w.say("Usage: /doctor")
+			w.say(w.tr(i18n.Msg.UsageDoctor))
 			return
 		}
 		w.runDoctor()
 	case "/name":
 		if arg == "" {
-			w.say("Usage: /name <session title>")
+			w.say(w.tr(i18n.Msg.UsageNameSessionTitle))
 			return
 		}
 		if w.exportingSession != "" {
-			w.say("Wait for the current session export to finish before changing its name.")
+			w.say(w.tr(i18n.Msg.WaitCurrentSessionExportFinishBeforeChangingName))
 			return
 		}
 		name := menuText(arg, 160)
 		w.beginControl("name", func(client *omp.Client, ctx context.Context) (json.RawMessage, error) {
 			return client.Call(ctx, "set_session_name", map[string]any{"name": arg})
-		}, "Session named: "+name)
+		}, w.tr(i18n.Msg.SessionNamed, name))
 	case "/model":
 		if arg == "" {
 			w.showModelPicker(in.msg.From.ID)
@@ -2824,13 +2850,13 @@ func (w *worker) handle(in incoming) {
 		}
 		provider, model, ok := strings.Cut(arg, "/")
 		if !ok || provider == "" || model == "" {
-			w.say("Usage: /model or /model provider/model")
+			w.say(w.tr(i18n.Msg.UsageModelModelProviderModel))
 			return
 		}
 		w.switchModel(provider, model)
 	case "/thinking":
 		if arg != "" {
-			w.say("Usage: /thinking")
+			w.say(w.tr(i18n.Msg.UsageThinking))
 			return
 		}
 		w.showThinkingPicker(in.msg.From.ID)
@@ -2843,29 +2869,29 @@ func (w *worker) handle(in incoming) {
 		case "status":
 			w.showFastStatus()
 		default:
-			w.say("Usage: /fast [on|off|status]")
+			w.say(w.tr(i18n.Msg.UsageFastOnOffStatus))
 		}
 	case "/handoff":
 		w.handoff(arg)
 	case "/compact":
 		if arg != "" {
-			w.say("Usage: /compact")
+			w.say(w.tr(i18n.Msg.UsageCompact))
 			return
 		}
 		if w.sessionControlBusy() {
-			w.say("An idle instance is required.")
+			w.say(w.tr(i18n.Msg.IdleInstanceRequired))
 			return
 		}
 		client, err := w.ensureRuntime()
 		if err != nil {
-			w.say(err.Error())
+			w.say(w.errorText(err))
 			return
 		}
 		w.beginSessionOperation(sessionOperationCompact)
 		w.touchActivity()
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		var messageID int64
-		if message, err := w.b.tg.Send(ctx, w.key.chat, w.key.thread, "Compacting...", telegram.SendOptions{}); err == nil {
+		if message, err := w.b.tg.Send(ctx, w.key.chat, w.key.thread, w.tr(i18n.Msg.Compacting), telegram.SendOptions{}); err == nil {
 			messageID = message.MessageID
 		}
 		cancel()
@@ -2886,12 +2912,12 @@ func (w *worker) handle(in incoming) {
 }
 func (w *worker) handoff(instructions string) {
 	if w.sessionControlBusy() || len(w.queue) != 0 {
-		w.say("Wait for the current task and queue to finish before handoff.")
+		w.say(w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeHandoff))
 		return
 	}
 	client, err := w.ensureRuntime()
 	if err != nil {
-		w.say(err.Error())
+		w.say(w.errorText(err))
 		return
 	}
 	var fields map[string]any
@@ -2903,18 +2929,18 @@ func (w *worker) handoff(instructions string) {
 	w.startOperation("handoff", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.Call(ctx, "handoff", fields)
 	}, 0, "")
-	w.say("Handoff requested.")
+	w.say(w.tr(i18n.Msg.HandoffRequested))
 }
 func (w *worker) status() {
 	if w.controlInProgress() {
-		w.say("The session operation is still loading.")
+		w.say(w.tr(i18n.Msg.SessionOperationStillLoading))
 		return
 	}
 	w.b.sessionMu.Lock()
 	occupied := w.binding.SessionID != "" && w.b.sessionMatchesLocked(w, w.binding.SessionID)
 	w.b.sessionMu.Unlock()
 	if occupied {
-		w.say("This saved session is in use by another conversation. Run /status there, or /close that instance before using /resume here.")
+		w.say(w.tr(i18n.Msg.SavedSessionUseAnotherConversationRunStatusThereClose))
 		return
 	}
 	temporary := w.runtime == runtimeReleased && w.binding.Running
@@ -2922,13 +2948,13 @@ func (w *worker) status() {
 	if !connected {
 		if !temporary {
 			n, _ := w.b.db.Uncertain()
-			w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
+			w.say(w.tr(i18n.Msg.NoInstanceRunningGlobalUncertainRecordsUseResumeRestore, n))
 			return
 		}
 		var err error
 		client, err = w.ensureRuntime()
 		if err != nil {
-			w.say(err.Error())
+			w.say(w.errorText(err))
 			return
 		}
 	}
@@ -2990,7 +3016,7 @@ func (w *worker) dispatch() {
 	client, err := w.ensureRuntime()
 	if err != nil {
 		w.resumeFailed = true
-		w.say(err.Error())
+		w.say(w.errorText(err))
 		return
 	}
 	if w.queue[0].preparing {
@@ -3014,7 +3040,7 @@ func (w *worker) dispatch() {
 		w.b.discardIncoming(q.directory, w.mediaTaskLogger(q.id))
 		if w.mark(q.id, "failed") {
 			w.logQueuedTaskComplete(q.id, "failed")
-			w.say("Prompt exceeds the omp RPC frame limit. No task was submitted.")
+			w.say(w.tr(i18n.Msg.PromptExceedsOmpRPCFrameLimitNoTaskSubmitted))
 		}
 		return
 	}
@@ -3072,12 +3098,12 @@ func (w *worker) enqueuePreparedPrompt(in incoming, prompt, displayText string) 
 		if w.ctx.Err() != nil {
 			return
 		}
-		w.say(err.Error())
+		w.say(w.errorText(err))
 		w.mark(in.id, "done")
 		return
 	}
 	if w.pendingInputFull() {
-		w.say("The queue is full. This message was not submitted.")
+		w.say(w.tr(i18n.Msg.Queue.Full))
 		if w.mark(in.id, "cancelled") {
 			w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
 		}
@@ -3182,7 +3208,8 @@ func splitTaskText(text string, maxParts int) ([]string, bool) {
 	}
 }
 
-func fitTaskReplyBudget(parts []string, finalNotice string, truncated bool) []string {
+func fitTaskReplyBudget(language i18n.Language, parts []string, finalNotice string, truncated bool) []string {
+	truncationNotice := i18n.Text(language, i18n.Msg.ReplyTruncated)
 	totalBytes := len(finalNotice)
 	for _, part := range parts {
 		totalBytes += len(part)
@@ -3196,7 +3223,7 @@ func fitTaskReplyBudget(parts []string, finalNotice string, truncated bool) []st
 	}
 	if truncated {
 		maxTextParts--
-		totalBytes += len(replyTruncatedNotice)
+		totalBytes += len(truncationNotice)
 	}
 	for len(parts) > maxTextParts || totalBytes > maxFinalReplyBytes {
 		last := len(parts) - 1
@@ -3204,7 +3231,7 @@ func fitTaskReplyBudget(parts []string, finalNotice string, truncated bool) []st
 		parts = parts[:last]
 	}
 	if truncated {
-		parts = append(parts, replyTruncatedNotice)
+		parts = append(parts, truncationNotice)
 	}
 	if finalNotice != "" {
 		parts = append(parts, finalNotice)
@@ -3212,7 +3239,7 @@ func fitTaskReplyBudget(parts []string, finalNotice string, truncated bool) []st
 	return parts
 }
 
-func taskReplies(text, finalNotice string, truncated bool) []string {
+func taskReplies(language i18n.Language, text, finalNotice string, truncated bool) []string {
 	if finalNotice != "" && !truncated && len(text)+len(finalNotice)+2 <= maxFinalReplyBytes {
 		combined := finalNotice
 		if text != "" {
@@ -3229,7 +3256,7 @@ func taskReplies(text, finalNotice string, truncated bool) []string {
 			}
 		}
 	}
-	budget := maxFinalReplyBytes - len(replyTruncatedNotice) - len(finalNotice)
+	budget := maxFinalReplyBytes - len(i18n.Text(language, i18n.Msg.ReplyTruncated)) - len(finalNotice)
 	if len(text) > maxFinalReplyBytes-len(finalNotice) || truncated && len(text) > budget {
 		text = truncateUTF8(text, budget)
 		truncated = true
@@ -3249,21 +3276,21 @@ func taskReplies(text, finalNotice string, truncated bool) []string {
 	if len(parts) > maxTextParts {
 		parts = parts[:maxTextParts]
 	}
-	return fitTaskReplyBudget(parts, finalNotice, truncated)
+	return fitTaskReplyBudget(language, parts, finalNotice, truncated)
 }
 
 func (w *worker) assistantBudgetExceeded() {
 	if w.research.root {
-		w.retireResearch("Autoresearch output exceeded the bridge resource budget. Its outcome is uncertain and it will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchOutputExceededBridgeResourceBudgetOutcomeUncertainWill))
 		return
 	}
 	w.logRuntimeEvent(slog.LevelWarn, "assistant_output_overflow", "resource_limit", "assistant output exceeded bridge budget", w.sessionID)
 	if w.steerFence.active {
-		w.retireTaskRuntime("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.AssistantOutputBudgetExceeded))
 		return
 	}
 	w.clearQueue()
-	w.retireTaskRuntime("Assistant output exceeded the bridge resource budget before task completion. The task outcome is uncertain and will not be replayed automatically. The session was kept open.")
+	w.retireTaskRuntime(w.tr(i18n.Msg.AssistantOutputBudgetExceededSessionKept))
 }
 
 func (w *worker) finish() {
@@ -3273,7 +3300,7 @@ func (w *worker) finish() {
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		taskID := w.active
-		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, replyTaskReplies(w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
+		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, replyTaskReplies(w.b.language(), w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
@@ -3289,7 +3316,7 @@ func (w *worker) finish() {
 		w.finalizedStreamBytes = 0
 		w.clearTaskConfirmations()
 	} else if w.preview != "" {
-		for _, part := range taskReplies(w.preview, "", w.finalOutputTruncated) {
+		for _, part := range taskReplies(w.b.language(), w.preview, "", w.finalOutputTruncated) {
 			w.say(part)
 		}
 	}
@@ -3321,9 +3348,9 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	var err error
 	switch state {
 	case "uncertain":
-		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.preview, notice, w.finalOutputTruncated))
+		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.b.language(), w.preview, notice, w.finalOutputTruncated))
 	case "cancelled":
-		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.preview, notice, w.finalOutputTruncated))
+		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.b.language(), w.preview, notice, w.finalOutputTruncated))
 	default:
 		panic("invalid terminal state")
 	}
@@ -3530,13 +3557,12 @@ func (w *worker) terminalFailureNotice(e rpcEvent) string {
 		classification = m.ErrorMessage
 	}
 	if m.ErrorStatus == http.StatusTooManyRequests || isRateLimitedError(classification) {
-		return "omp reported that the task was rate-limited by the model provider. The task outcome is uncertain and will not be replayed automatically."
+		return w.tr(i18n.Msg.OmpReportedTaskRateLimitedModelProviderTaskOutcome)
 	}
-	notice := "omp reported that the task failed before producing a confirmed result."
 	if detail := terminalFailureDetail(m.ErrorMessage); detail != "" {
-		notice += " Reason: " + detail
+		return w.tr(i18n.Msg.OmpReportedTaskFailedBeforeProducingConfirmedResultReason, detail)
 	}
-	return notice + " The task outcome is uncertain and will not be replayed automatically."
+	return w.tr(i18n.Msg.OmpReportedTaskFailedBeforeProducingConfirmedResultTask)
 }
 
 func (w *worker) finishTerminal(e rpcEvent) {
@@ -3544,10 +3570,10 @@ func (w *worker) finishTerminal(e rpcEvent) {
 	case terminalUncertain:
 		w.finishUncertain(w.terminalFailureNotice(e))
 	case terminalCancelled:
-		w.finishCancelled("Task was cancelled before completion.")
+		w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion))
 	case terminalDone:
 		if w.preview == "" {
-			w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically.")
+			w.finishUncertain(w.tr(i18n.Msg.OmpEndedWithoutConfirmedTextResultTaskOutcomeUncertain))
 			return
 		}
 		w.finishReplyWithStatus(false)
@@ -3714,7 +3740,7 @@ func (w *worker) event(raw []byte) {
 			terminal := w.terminalState(e)
 			w.flushResearchRound(e)
 			if terminal != terminalDone {
-				w.retireResearch("Autoresearch ended with an interrupted or failed round. It will not be replayed automatically.")
+				w.retireResearch(w.tr(i18n.Msg.AutoresearchEndedInterruptedFailedRoundWillNotReplayedAutomatically))
 			}
 			return
 		}
@@ -3760,7 +3786,7 @@ func (w *worker) event(raw []byte) {
 		}
 		if w.research.root {
 			if e.Status == "aborted" || e.Status == "error" {
-				w.retireResearch("Autoresearch was interrupted or failed. Its outcome is uncertain and it will not be replayed automatically.")
+				w.retireResearch(w.tr(i18n.Msg.AutoresearchInterruptedFailedOutcomeUncertainWillNotReplayedAutomatically))
 			}
 			return
 		}
@@ -3776,11 +3802,11 @@ func (w *worker) event(raw []byte) {
 				case "completed":
 					w.finishLocalCommandSubmission()
 				case "aborted":
-					w.finishCancelled("Task was cancelled before completion.")
+					w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion))
 				case "error":
-					w.finishUncertain("Native command failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically.")
+					w.finishUncertain(w.tr(i18n.Msg.NativeCommandFailedBeforeProducingConfirmedResultTaskOutcome))
 				default:
-					w.finishUncertain("Native command completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+					w.finishUncertain(w.tr(i18n.Msg.NativeCommandCompletionCouldNotConfirmedTaskOutcomeUncertain))
 				}
 				return
 			}
@@ -3793,7 +3819,7 @@ func (w *worker) event(raw []byte) {
 	case "response":
 		if !e.Success {
 			w.clearQueue()
-			w.retireTaskRuntime("The omp request failed. The task outcome is uncertain and will not be replayed automatically. The session was kept open.")
+			w.retireTaskRuntime(w.tr(i18n.Msg.OmpRequestFailedTaskOutcomeUncertainWillNotReplayed))
 		}
 	case "extension_ui_request":
 		if w.researchNotify(e) {
@@ -3926,12 +3952,12 @@ func (w *worker) recordProgressToolPayload(id, eventType string, raw []byte) {
 	case "tool_execution_update":
 		if payload.PartialResult != "" {
 			tool.Detail = string(payload.PartialResult)
-			tool.DetailKind = "Update"
+			tool.DetailKind = i18n.Msg.Update
 		}
 	case "tool_execution_end":
 		if payload.Result != "" {
 			tool.Detail = string(payload.Result)
-			tool.DetailKind = "Result"
+			tool.DetailKind = i18n.Msg.Result
 		}
 	}
 	w.progress.ActiveTools[id] = tool
@@ -3982,22 +4008,22 @@ func sortedProgressTools(tools map[string]progressTool) []progressTool {
 	return out
 }
 
-func progressToolLine(tool progressTool) string {
-	return "- " + tool.Name + ": running"
+func progressToolLine(language i18n.Language, tool progressTool) string {
+	return i18n.Text(language, i18n.Msg.RunningTool, tool.Name)
 }
 
 func (w *worker) progressStatus() string {
 	switch {
 	case w.progress.Retrying:
-		return "Retrying automatically..."
+		return w.tr(i18n.Msg.RetryingAutomatically)
 	case w.compacting:
-		return "Compacting context..."
+		return w.tr(i18n.Msg.CompactingContext)
 	case len(w.progress.ActiveTools) > 1:
-		return "Running tools..."
+		return w.tr(i18n.Msg.RunningTools)
 	case len(w.progress.ActiveTools) == 1:
-		return "Running tool..."
+		return w.tr(i18n.Msg.ToolRunningPhase)
 	case w.busy:
-		return "Running"
+		return w.tr(i18n.Msg.Running)
 	default:
 		return ""
 	}
@@ -4040,53 +4066,53 @@ func (w *worker) renderProgress() string {
 	if w.progress.NativeStatus != "" {
 		sections = append(sections, w.progress.NativeStatus)
 	}
-	sections = append(sections, "Processing...")
+	sections = append(sections, w.tr(i18n.Msg.Processing))
 	if status := w.progressStatus(); status != "" {
-		sections = append(sections, "Status: "+status)
+		sections = append(sections, w.tr(i18n.Msg.StatusValue, status))
 	}
 	verbose := w.b != nil && w.b.cfg.ProgressMode == "verbose"
 	detailBudget := max(0, maxToolDetailsUnits-utf16Length(w.progress.NativeStatus))
 	active := sortedProgressTools(w.progress.ActiveTools)
 	if len(active) > 0 {
-		lines := []string{"Tools:"}
+		lines := []string{w.tr(i18n.Msg.Tools)}
 		for i, tool := range active {
 			if i == maxActiveTools {
-				lines = append(lines, fmt.Sprintf("- %d more", len(active)-i))
+				lines = append(lines, w.tr(i18n.Msg.More, len(active)-i))
 				break
 			}
-			lines = append(lines, progressToolLine(tool))
+			lines = append(lines, progressToolLine(w.b.language(), tool))
 			if verbose {
-				lines = appendProgressToolDetail(lines, "Args", tool.Args, &detailBudget)
-				lines = appendProgressToolDetail(lines, tool.DetailKind, tool.Detail, &detailBudget)
+				lines = appendProgressToolDetail(lines, w.tr(i18n.Msg.Args), tool.Args, &detailBudget)
+				lines = appendProgressToolDetail(lines, w.tr(tool.DetailKind), tool.Detail, &detailBudget)
 			}
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
 	if verbose && len(w.progress.RecentTools) > 0 {
-		lines := []string{"Recent tools:"}
+		lines := []string{w.tr(i18n.Msg.RecentTools)}
 		if w.progress.EarlierTools > 0 {
-			lines = append(lines, fmt.Sprintf("- %d earlier omitted", w.progress.EarlierTools))
+			lines = append(lines, w.tr(i18n.Msg.EarlierOmitted, w.progress.EarlierTools))
 		}
 		for i := range w.progress.RecentTools {
 			tool := w.progress.RecentTools[(w.progress.EarlierTools+i)%len(w.progress.RecentTools)]
-			status := "completed"
+			status := w.tr(i18n.Msg.Completed)
 			if tool.Failed {
-				status = "failed"
+				status = w.tr(i18n.Msg.Failed)
 			}
-			lines = append(lines, fmt.Sprintf("- %s: %s (%s)", tool.Name, status, tool.Duration))
-			lines = appendProgressToolDetail(lines, "Args", tool.Args, &detailBudget)
-			lines = appendProgressToolDetail(lines, tool.DetailKind, tool.Detail, &detailBudget)
+			lines = append(lines, w.tr(i18n.Msg.RecentToolOutcome, tool.Name, status, tool.Duration))
+			lines = appendProgressToolDetail(lines, w.tr(i18n.Msg.Args), tool.Args, &detailBudget)
+			lines = appendProgressToolDetail(lines, w.tr(tool.DetailKind), tool.Detail, &detailBudget)
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
 	text := strings.Join(sections, "\n\n")
 	if w.preview != "" {
-		available := maxProgressUnits - utf16Length(text) - utf16Length("\n\nOutput:\n")
+		available := maxProgressUnits - utf16Length(text) - utf16Length(w.tr(i18n.Msg.Output))
 		if available > 0 {
 			if available > maxPreviewUnits {
 				available = maxPreviewUnits
 			}
-			text += "\n\nOutput:\n" + tailUTF16(w.preview, available)
+			text += w.tr(i18n.Msg.Output) + tailUTF16(w.preview, available)
 		}
 	}
 	return text
@@ -4105,7 +4131,7 @@ func (w *worker) newProgressStopToken() string {
 
 func (w *worker) progressKeyboard(token string) *telegram.Keyboard {
 	if token != "" && token != w.previewStopToken {
-		return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: "Stop", CallbackData: token + ":0"}}}}
+		return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: w.tr(i18n.Msg.Stop), CallbackData: token + ":0"}}}}
 	}
 	if token == "" {
 		token = w.previewStopToken
@@ -4114,7 +4140,7 @@ func (w *worker) progressKeyboard(token string) *telegram.Keyboard {
 	if !ok || c.action != "stop" || c.generation != w.binding.Generation || c.turn != w.turn || c.active != w.active {
 		return nil
 	}
-	return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: "Stop", CallbackData: token + ":0"}}}}
+	return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: w.tr(i18n.Msg.Stop), CallbackData: token + ":0"}}}}
 }
 
 func progressStopTokenOwner(token string) (int64, bool) {
@@ -4260,7 +4286,7 @@ func (w *worker) flushPreview() {
 func (w *worker) confirm(c confirmation, title string, options []string) {
 	parts := split(title, 3800)
 	if len(parts) == 0 {
-		title = "Confirmation required"
+		title = w.tr(i18n.Msg.ConfirmationRequired)
 	} else {
 		title = parts[0]
 	}
@@ -4302,7 +4328,7 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	message, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, telegram.SendOptions{Keyboard: k})
 	if e != nil {
 		w.cancelUI(c)
-		w.say("Failed to send the confirmation. The operation was canceled.")
+		w.say(w.tr(i18n.Msg.FailedSendConfirmationOperationCanceled))
 		return
 	}
 	c.messageID = message.MessageID
@@ -4314,44 +4340,44 @@ func (w *worker) queueCallback(ctx context.Context, q *telegram.CallbackQuery, t
 		if q.Message != nil && q.Message.MessageID == c.messageID {
 			w.clearKeyboard(c.messageID)
 		}
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	switch {
 	case action == "close":
 		if err := w.b.tg.ClearKeyboard(ctx, w.key.chat, c.messageID); err != nil {
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Could not close the queue menu. Tap Close again.")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.CouldNotCloseQueueMenuTapCloseAgain))
 			return callbackDone
 		}
 		delete(w.confirms, token)
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Closed")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Closed))
 	case action == "previous":
 		delete(w.confirms, token)
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Received))
 		w.showQueuePage(c, c.page-1, c.messageID)
 	case action == "next":
 		delete(w.confirms, token)
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Received))
 		w.showQueuePage(c, c.page+1, c.messageID)
 	case strings.HasPrefix(action, "cancel:"):
 		id, err := strconv.ParseInt(strings.TrimPrefix(action, "cancel:"), 10, 64)
 		if err != nil || id <= 0 {
 			delete(w.confirms, token)
 			w.clearKeyboard(c.messageID)
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 			return callbackDone
 		}
 		delete(w.confirms, token)
 		if w.cancelQueuedTask(id) {
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Cancelled queued task.")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.CancelledQueuedTask))
 		} else {
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Task is no longer queued.")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.TaskNoLongerQueued))
 		}
 		w.showQueuePage(c, c.page, c.messageID)
 	default:
 		delete(w.confirms, token)
 		w.clearKeyboard(c.messageID)
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 	}
 	return callbackDone
 }
@@ -4365,30 +4391,30 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		if owner, isStop := progressStopTokenOwner(token); isStop && owner == q.From.ID && q.Message != nil {
 			w.clearKeyboard(q.Message.MessageID)
 		}
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if c.user != q.From.ID {
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if c.uiSelectMenu && (q.Message == nil || q.Message.MessageID != c.messageID) {
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if c.action == "ui" && (w.client == nil || c.uiClientID != w.client.ID()) {
 		delete(w.confirms, token)
 		w.queueKeyboardCleanup(c.messageID)
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if c.action == "autoresearch_clear" && !researchCallbackMessage(q, c, w.key) {
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if (c.action == "resume" || c.action == "export" || c.action == "session_delete") && (q.Message == nil || q.Message.MessageID != c.messageID) {
 		delete(w.confirms, token)
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if c.action == "queue" {
@@ -4406,7 +4432,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		if w.previewStopToken == token {
 			w.previewStopToken = ""
 		}
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		w.clearKeyboard(messageID)
 		if c.generation == w.binding.Generation {
 			w.cancelUI(c)
@@ -4420,12 +4446,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize
 		if page < 0 || page >= pages {
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 			return callbackDone
 		}
 		if w.showUISelectPage(c, page, c.messageID) {
 			delete(w.confirms, token)
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Received))
 		} else {
 			delete(w.confirms, token)
 			w.clearKeyboard(c.messageID)
@@ -4439,7 +4465,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	if c.uiSelectMenu && n < len(c.options) {
 		start := c.page * uiSelectPageSize
 		if n < start || n >= min(start+uiSelectPageSize, len(c.options)) {
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 			return callbackDone
 		}
 	}
@@ -4449,7 +4475,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			if w.previewStopToken == token {
 				w.previewStopToken = ""
 			}
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 			w.clearKeyboard(messageID)
 			return callbackDone
 		}
@@ -4457,12 +4483,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		if w.previewStopToken == token {
 			w.previewStopToken = ""
 		}
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, "Stopping")
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Stopping))
 		w.clearKeyboard(messageID)
 		w.stopActiveTask()
 		return callbackDone
 	}
-	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+	_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Received))
 	if c.action == "resume" || c.action == "export" {
 		delete(w.confirms, token)
 		messageID := c.messageID
@@ -4478,7 +4504,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	if c.action == "ui" && w.exportingSession != "" {
-		text := "Wait for the current session export to finish."
+		text := w.tr(i18n.Msg.WaitCurrentSessionExportFinish)
 		w.finishMenu(c.messageID, text)
 		w.say(text)
 		return callbackDone
@@ -4510,7 +4536,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		client, connected := w.runtimeClient()
 		if !connected || client.Send(ctx, frame) != nil {
 			w.clearQueue()
-			w.retireTaskRuntime("The confirmation could not be delivered to omp. Its state is uncertain and will not be replayed automatically. The session was kept open.")
+			w.retireTaskRuntime(w.tr(i18n.Msg.ConfirmationCouldNotDeliveredOmpStateUncertainWillNot))
 			return callbackUncertain
 		}
 		w.touchActivity()
@@ -4538,11 +4564,11 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	switch c.action {
 	case "new":
 		if !filepath.IsAbs(c.workspace) {
-			w.say("Invalid working directory. The existing instance is still running.")
+			w.say(w.tr(i18n.Msg.InvalidWorkingDirectoryExistingInstanceStillRunning))
 			return callbackDone
 		}
 		if err := os.MkdirAll(c.workspace, 0700); err != nil {
-			w.say("Cannot create the working directory. The existing instance is still running.")
+			w.say(w.tr(i18n.Msg.CannotCreateWorkingDirectoryExistingInstanceStillRunning))
 			return callbackDone
 		}
 		w.start(false, c.workspace, "", true)
@@ -4556,19 +4582,19 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 	if c.method == "select" {
 		cancelled = index == len(c.options)
 	}
-	text := "Cancel"
+	text := w.tr(i18n.Msg.Cancel)
 	if cancelled {
 		if c.uiTitle != "" {
 			text += "\n" + c.uiTitle
 		}
 	} else {
 		if c.method == "select" {
-			text = "Selected: " + c.options[index]
+			text = w.tr(i18n.Msg.Selected, c.options[index])
 			if c.action == "model" || c.action == "thinking" || c.action == "fast" {
-				text += "\nApplying..."
+				text += w.tr(i18n.Msg.Applying)
 			}
 		} else {
-			text = "Confirmed"
+			text = w.tr(i18n.Msg.Confirmed)
 			if c.uiTitle != "" {
 				text += "\n" + c.uiTitle
 			}
@@ -4669,13 +4695,13 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		w.cancelUI(c)
-		w.say("Cannot create the native selection menu. The dialog was canceled.")
+		w.say(w.tr(i18n.Msg.CannotCreateNativeSelectionMenuDialogCanceled))
 		return false
 	}
 	token := hex.EncodeToString(random[:])
 	text := c.uiTitle
 	if pages > 1 {
-		text += fmt.Sprintf("\nPage %d/%d", page+1, pages)
+		text += w.tr(i18n.Msg.Page, page+1, pages)
 	}
 	keyboard := &telegram.Keyboard{}
 	start, end := page*uiSelectPageSize, min((page+1)*uiSelectPageSize, len(c.options))
@@ -4684,12 +4710,12 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	}
 	var navigation []telegram.Button
 	if page > 0 {
-		navigation = append(navigation, telegram.Button{Text: "Previous", CallbackData: token + ":previous"})
+		navigation = append(navigation, telegram.Button{Text: w.tr(i18n.Msg.Previous), CallbackData: token + ":previous"})
 	}
 	if page+1 < pages {
-		navigation = append(navigation, telegram.Button{Text: "Next", CallbackData: token + ":next"})
+		navigation = append(navigation, telegram.Button{Text: w.tr(i18n.Msg.Next), CallbackData: token + ":next"})
 	}
-	navigation = append(navigation, telegram.Button{Text: "Cancel", CallbackData: fmt.Sprintf("%s:%d", token, len(c.options))})
+	navigation = append(navigation, telegram.Button{Text: w.tr(i18n.Msg.Cancel), CallbackData: fmt.Sprintf("%s:%d", token, len(c.options))})
 	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
@@ -4703,7 +4729,7 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	}
 	if err != nil {
 		w.cancelUI(c)
-		w.say("Failed to display the native selection menu. The dialog was canceled.")
+		w.say(w.tr(i18n.Msg.FailedDisplayNativeSelectionMenuDialogCanceled))
 		return false
 	}
 	c.page, c.messageID = page, messageID
@@ -4723,24 +4749,24 @@ func (w *worker) ui(e rpcEvent) {
 		_ = json.Unmarshal(e.Message, &msg)
 		c := confirmation{action: "ui", uiID: e.ID, uiClientID: client.ID(), method: e.Method, options: e.Options}
 		if e.Method == "confirm" {
-			w.confirm(c, e.Title+"\n"+msg, []string{"Confirm", "Cancel"})
+			w.confirm(c, e.Title+"\n"+msg, []string{w.tr(i18n.Msg.Confirm), w.tr(i18n.Msg.Cancel)})
 			return
 		}
 		if len(e.Options) == 0 {
 			w.cancelUI(c)
-			w.say("The number of options is unsupported. The dialog was canceled.")
+			w.say(w.tr(i18n.Msg.NumberOptionsUnsupportedDialogCanceled))
 			return
 		}
 		c.user, c.generation, c.uiSelectMenu = w.owner, w.binding.Generation, true
 		parts := split(e.Title+"\n"+msg, 3700)
-		c.uiTitle = "Choose an option"
+		c.uiTitle = w.tr(i18n.Msg.ChooseOption)
 		if len(parts) != 0 {
 			c.uiTitle = parts[0]
 		}
 		w.showUISelectPage(c, 0, 0)
 	case "input", "editor":
 		w.cancelUI(confirmation{uiID: e.ID, uiClientID: client.ID()})
-		w.say("Input dialogs are not supported and have been canceled. Provide the information in a normal message.")
+		w.say(w.tr(i18n.Msg.InputDialogsNotSupportedCanceledProvideInformationNormalMessage))
 	case "cancel":
 		for token, c := range w.confirms {
 			if c.action == "ui" && c.uiID != "" && c.uiID == e.TargetID {

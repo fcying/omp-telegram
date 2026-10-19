@@ -44,7 +44,7 @@ Development builds are published as the [Development build](https://github.com/f
 
 ### Build from source
 
-Requires the Go version in [go.mod](go.mod) and [just](https://github.com/casey/just):
+Requires Go 1.27.2 or later (see [go.mod](go.mod)) and [just](https://github.com/casey/just):
 
 ```sh
 git clone https://github.com/fcying/omp-telegram.git
@@ -232,6 +232,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/migrate` | Move handoff context to a fresh session in the same workspace. Enable `omp.migration_extension` first. |
 | `/review [arguments]` | Run OMP's native `/review` command as a queued task. |
 | `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
+| `/lang [en\|zh]` | Show the global Bridge interface language, or switch it to English or Chinese for all chats and topics. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
 
 A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
@@ -265,7 +266,11 @@ Native text output, including `/shake` summaries, is delivered as separate messa
 
 Command recognition and source restrictions are documented in [Architecture](doc/architecture.md#native-command-recognition-and-submission).
 
-All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.
+All commands work in ordinary private chats and topics. Bridge-generated menus, buttons, and service messages default to English. `/lang` shows the global setting; `/lang zh` selects Chinese and `/lang en` selects English. Any authorized user can change it for all chats and topics, and the setting survives daemon restarts. Changes apply to newly generated Bridge text and refreshed command menus; previously rendered messages are not rewritten. OMP replies, native dialog content and command descriptions, model/tool content, user captions, session titles, and paths are not translated. Prompts may use any language.
+
+A task started with the English interface can finish with a Chinese Bridge receipt or reply header if `/lang zh` is used while it runs. This does not translate the OMP reply or rewrite earlier messages.
+
+Telegram command menus update asynchronously. Temporary API failures and rate limits trigger retries with backoff using the latest global language; already acknowledged scopes are not resent. A language-change receipt confirms the saved setting, not that every menu has already updated. Permanent API rejections do not trigger continuous background retries.
 
 In a group topic, all allowed users share that topic's OMP session and workspace, including its context and command effects. Telegram group membership is not restricted by the bot's user allowlist: other members who can view the topic can also see bot replies and exported files. Use a trusted group topic for sensitive work.
 
@@ -425,11 +430,13 @@ just deploy
 ```
 
 - `just build` builds the binary.
-- `just fmt` formats all Go source and test files.
+- `just fmt` formats all Go source and test files with the Go version declared in `go.mod`, matching CI even when the default local Go version is newer.
 - `just test` runs unit tests without starting or restarting a service.
 - `just check` runs tests, race checks, and `go vet` without starting Telegram polling.
 - `just install` installs only the binary; configuration and data remain user-managed.
 - `just deploy` installs the binary, then schedules a background restart of the existing `supervisord` service after five seconds. Returning from the recipe does not confirm that the restart succeeded.
+
+`just test` and `just check` use a recipe-local `umask 0077` so test data directories are private even when the invoking shell uses a group-writable mask such as `0002`. This does not change your terminal's umask or relax production data-directory permission checks.
 
 ## Architecture
 

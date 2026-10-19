@@ -6,12 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 )
@@ -67,17 +67,17 @@ func (w *worker) migrationLocked() bool { return w.migration != nil || w.migrati
 
 func (w *worker) migrationStatus() string {
 	if w.migration == nil {
-		return "正在检查迁移前置条件."
+		return w.tr(i18n.Msg.CheckingMigrationPrerequisites)
 	}
 	m := w.migration
-	text := fmt.Sprintf("迁移尚未解决.\n操作: %s\n阶段: %s\n源 Session: %s", m.ID, m.Phase, m.Source.SessionID)
+	text := w.tr(i18n.Msg.MigrationUnresolvedOperationPhaseSourceSession, m.ID, m.Phase, m.Source.SessionID)
 	if m.CandidateID != "" {
-		text += "\n候选 Session: " + m.CandidateID
+		text += w.tr(i18n.Msg.CandidateSession, m.CandidateID)
 	}
 	if m.ErrorKind != "" {
-		text += "\n状态: " + m.ErrorKind
+		text += w.tr(i18n.Msg.AppendStatus, m.ErrorKind)
 	}
-	return text + "\n普通输入已锁定. 使用 /migrate recover old 恢复源会话, 或 /migrate recover <session-id 或绝对文件路径> 核验候选. 不会自动重新创建 Session."
+	return text + w.tr(i18n.Msg.NormalInputLockedUseMigrateRecoverOldRestoreSource)
 }
 
 // This gate precedes media preparation, slash routing and callback execution.
@@ -88,7 +88,7 @@ func (w *worker) handleMigrationIncoming(in incoming) bool {
 		}
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 		defer cancel()
-		_ = w.b.tg.AnswerCallback(ctx, in.callback.ID, "会话迁移尚未解决.")
+		_ = w.b.tg.AnswerCallback(ctx, in.callback.ID, w.tr(i18n.Msg.SessionMigrationUnresolved))
 		w.mark(in.id, store.InboxCancelled)
 		return true
 	}
@@ -112,7 +112,7 @@ func (w *worker) handleMigrationIncoming(in incoming) bool {
 		} else if action == "recover" && strings.TrimSpace(target) != "" {
 			w.recoverMigration(in.id, strings.TrimSpace(target))
 		} else {
-			w.say("用法: /migrate, /migrate recover old, 或 /migrate recover <session-id 或绝对文件路径>.")
+			w.say(w.tr(i18n.Msg.UsageMigrateMigrateRecoverOldMigrateRecoverSessionId))
 			w.mark(in.id, store.InboxDone)
 		}
 		return true
@@ -122,12 +122,16 @@ func (w *worker) handleMigrationIncoming(in incoming) bool {
 	}
 	if !attached {
 		switch command {
+		case "/lang":
+			w.handleLanguageCommand(slashCommandArguments(tail))
+			w.mark(in.id, store.InboxDone)
+			return true
 		case "/status":
 			w.say(w.migrationStatus())
 			w.mark(in.id, store.InboxDone)
 			return true
 		case "/help", "/start":
-			w.say(commandHelp(w.b.version))
+			w.say(w.commandHelp())
 			w.mark(in.id, store.InboxDone)
 			return true
 		case "/stop", "/close":
@@ -140,7 +144,7 @@ func (w *worker) handleMigrationIncoming(in incoming) bool {
 		}
 	}
 	w.mark(in.id, store.InboxCancelled)
-	w.say("迁移尚未解决, 本条输入未排队也未提交. 使用 /status 查看显式恢复方式.")
+	w.say(w.tr(i18n.Msg.MigrationUnresolvedInputNeitherQueuedNorSubmittedUseStatus))
 	return true
 }
 
@@ -161,19 +165,19 @@ func (w *worker) beginMigration(inboxID int64) {
 	if w.sessionControlBusy() || w.taskActive() || len(w.queue) != 0 || len(w.albums) != 0 ||
 		w.previewBusy || len(w.hostRequests) != 0 || w.startIntent != nil || w.resumeCancel != nil ||
 		w.exportCancel != nil || w.deleteCancel != nil || w.hasRuntimeConfirmation() || w.rpcOperationActive || len(w.rpcOperations) != 0 {
-		w.say("仅允许在任务、队列及会话控制全部空闲时迁移.")
+		w.say(w.tr(i18n.Msg.MigrationOnlyAllowedWhenTasksQueueSessionControlsAll))
 		w.mark(inboxID, store.InboxDone)
 		return
 	}
 	client, err := w.ensureRuntime()
 	if err != nil {
-		w.say("无法恢复源 Session, 未开始迁移.")
+		w.say(w.tr(i18n.Msg.CannotRestoreSourceSessionMigrationNotStarted))
 		w.finishMigrationInput(inboxID, store.InboxFailed)
 		return
 	}
 	id, err := newMigrationID()
 	if err != nil {
-		w.say("无法创建迁移操作 ID.")
+		w.say(w.tr(i18n.Msg.CannotCreateMigrationOperationID))
 		w.finishMigrationInput(inboxID, store.InboxFailed)
 		return
 	}
@@ -311,7 +315,7 @@ func (w *worker) migrationFinished(result migrationResult) {
 			return
 		}
 		w.clearConfirmations()
-		w.say("开始迁移. Handoff 最多等待 180s, 完成验证前不会切换绑定.")
+		w.say(w.tr(i18n.Msg.MigrationStartedHandoffMayTakeUpSBindingWill))
 		source := m.Source
 		w.startMigrationJob("handoff", 180*time.Second, func(ctx context.Context) migrationResult {
 			cursor, err := omp.CaptureHandoff(source.Session, source.SessionID, source.Workspace)
@@ -452,10 +456,10 @@ func (w *worker) commitMigration(info omp.SessionInfo) {
 	target.Session, target.SessionID, target.Workspace = info.File, info.ID, info.CWD
 	target.Generation++
 	target.Running, target.Interrupted, target.LastUsedAt = true, false, time.Now().Unix()
-	notice := "迁移完成.\nWorkspace: " + info.CWD + "\nSession: " + info.ID + "\n旧 Session 已保留, 可通过 /resume 恢复."
+	notice := w.tr(i18n.Msg.MigrationCompleteWorkspaceSessionOldSessionPreservedCanRestored, info.CWD, info.ID)
 	var err error
 	if run.recovery {
-		notice = "迁移已显式恢复.\nWorkspace: " + info.CWD + "\nSession: " + info.ID
+		notice = w.tr(i18n.Msg.MigrationExplicitlyRecoveredWorkspaceSession, info.CWD, info.ID)
 		err = w.b.db.ResolveMigration(m, target, notice)
 	} else {
 		err = w.b.db.CommitMigration(m, target, notice)
@@ -514,9 +518,9 @@ func (w *worker) cancelMigration(kind string, notify bool) {
 	w.releaseRuntimeWithReason(true, "migration")
 	if notify && w.ctx.Err() == nil {
 		if w.migration != nil {
-			w.say("迁移未确认, Runtime 已停止, 绑定和迁移锁已保留. 不会自动重试.\n" + w.migrationStatus())
+			w.say(w.tr(i18n.Msg.MigrationNotConfirmedRuntimeStoppedBindingMigrationLockPreserved) + w.migrationStatus())
 		} else {
-			w.say("未开始迁移. 请确认已通过 omp.args 显式加载 omp_telegram_migrate_v1 Extension, 且源 Session 可恢复并已完全空闲.")
+			w.say(w.tr(i18n.Msg.MigrationNotStartedCheckOmpTelegramMigrateV1Extension))
 		}
 	}
 }
@@ -546,27 +550,27 @@ func (w *worker) recordMigrationCandidate(info omp.SessionInfo) bool {
 
 func (w *worker) recoverMigration(inboxID int64, target string) {
 	if w.migration == nil {
-		w.say("没有待解决的迁移.")
+		w.say(w.tr(i18n.Msg.ThereNoUnresolvedMigration))
 		w.mark(inboxID, store.InboxDone)
 		return
 	}
 	if w.migrationRun != nil {
-		w.say("迁移操作仍在执行. 先使用 /stop 停止 Runtime, 再显式恢复.")
+		w.say(w.tr(i18n.Msg.MigrationOperationStillRunningUseStopStopRuntimeBefore))
 		w.mark(inboxID, store.InboxDone)
 		return
 	}
 	if w.migrationStartup != nil {
-		w.say("上一次恢复进程仍在退出. 等待回收后再显式恢复, 不会并发启动同一 Session.")
+		w.say(w.tr(i18n.Msg.PreviousRecoveryProcessStillExitingWaitReapedBeforeExplicitly))
 		w.mark(inboxID, store.InboxDone)
 		return
 	}
 	if target != "old" && !validSessionID(target) && !filepath.IsAbs(target) {
-		w.say("请提供 old, 完整 Session ID, 或新 JSONL 的绝对路径.")
+		w.say(w.tr(i18n.Msg.ProvideOldFullSessionIDAbsolutePathNewJSONL))
 		w.mark(inboxID, store.InboxDone)
 		return
 	}
 	if strings.EqualFold(target, w.migration.Source.SessionID) {
-		w.say("恢复源 Session 请使用 /migrate recover old.")
+		w.say(w.tr(i18n.Msg.UseMigrateRecoverOldRestoreSourceSession))
 		w.mark(inboxID, store.InboxDone)
 		return
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
@@ -302,11 +303,47 @@ func TestBindingForgetRequestReturnsWhenTargetExits(t *testing.T) {
 	b.runWorker(target)
 	select {
 	case result := <-source.forgetResults:
-		if result.ok || result.status == "" {
+		if result.ok || result.status != i18n.Msg.BindingChangedUseBindingsRefresh {
 			t.Fatalf("exited target reported success: %+v", result)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("exited target lost the pending deletion request")
 	}
 	b.wg.Wait()
+}
+
+func TestBindingForgetResultUsesCurrentGlobalLanguage(t *testing.T) {
+	for _, language := range []string{"zh", "en"} {
+		t.Run(language, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			requireStoreOK(t, err)
+			defer db.Close()
+			source, _ := newBindingTestWorker(t, db)
+			source.forgetResults = make(chan bindingForgetResult, 1)
+			target := &worker{b: source.b, ctx: source.ctx, migration: &store.Migration{ID: "locked"}}
+			if language == "zh" {
+				source.b.setLanguage("en")
+			} else {
+				source.b.setLanguage("zh")
+			}
+			target.forgetBinding(bindingForgetRequest{source: source})
+			result := <-source.forgetResults
+			if result.ok || result.status != i18n.Msg.MigrationUnresolvedCannotDeleteBinding {
+				t.Fatal("unresolved migration did not retain the typed binding deletion failure")
+			}
+			if language == "zh" {
+				source.b.setLanguage("zh")
+			} else {
+				source.b.setLanguage("en")
+			}
+			source.forgetFinished(result)
+			want := "Session migration is unresolved."
+			if language == "zh" {
+				want = "会话迁移尚未解决"
+			}
+			if !strings.Contains(latestLanguageOutput(t, source), want) {
+				t.Fatal("forget failure did not use the current global language")
+			}
+		})
+	}
 }

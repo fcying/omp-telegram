@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/telegram"
 )
 
@@ -96,7 +97,7 @@ func (m replyMetrics) speedText() string {
 	return statusDecimal(speed) + " tok/s"
 }
 
-func replyHeader(s statusState, m replyMetrics) string {
+func replyHeader(language i18n.Language, s statusState, m replyMetrics) string {
 	modelID := m.modelID
 	matchesState := true
 	if modelID == "" {
@@ -112,7 +113,7 @@ func replyHeader(s statusState, m replyMetrics) string {
 		}
 		identity := compactModelStatus(model, thinking)
 		if matchesState && s.Model.ID != "" {
-			if fast := compactFastStatus(s); fast != "" {
+			if fast := compactFastStatus(language, s); fast != "" {
 				identity += " " + fast
 			}
 		}
@@ -126,18 +127,19 @@ func replyHeader(s statusState, m replyMetrics) string {
 		parts = append(parts, fmt.Sprintf("◫ %.0f%% (%s)", percent, statusTokens(window)))
 	}
 	if speed := m.speedText(); speed != "" {
-		parts = append(parts, "avg "+speed)
+		parts = append(parts, i18n.Text(language, i18n.Msg.Avg, speed))
 	}
 	return strings.Join(parts, " | ")
 }
 
-func replyTaskReplies(text, header string, truncated bool) []string {
+func replyTaskReplies(language i18n.Language, text, header string, truncated bool) []string {
 	if header == "" {
-		return taskReplies(text, "", truncated)
+		return taskReplies(language, text, "", truncated)
 	}
 	// Bound and split the body first: prepending the small header must never
 	// copy the entire, potentially 4 MiB, assistant output.
-	budget := maxFinalReplyBytes - len(header) - 2 - len(replyTruncatedNotice)
+	notice := i18n.Text(language, i18n.Msg.ReplyTruncated)
+	budget := maxFinalReplyBytes - len(header) - 2 - len(notice)
 	if len(text) > maxFinalReplyBytes-len(header)-2 || truncated && len(text) > budget {
 		text = truncateUTF8(text, budget)
 		truncated = true
@@ -155,7 +157,7 @@ func replyTaskReplies(text, header string, truncated bool) []string {
 		// Raw fence repair can exceed the byte budget despite fitting on screen.
 		if len(first) == 0 {
 			first = []string{header}
-		} else if len(first[0]) > maxFinalReplyBytes-len(header)-2-len(replyTruncatedNotice) {
+		} else if len(first[0]) > maxFinalReplyBytes-len(header)-2-len(notice) {
 			first = append([]string{header}, first...)
 		} else {
 			first[0] = header + "\n\n" + first[0]
@@ -169,5 +171,5 @@ func replyTaskReplies(text, header string, truncated bool) []string {
 		}
 	}
 	truncated = truncated || overflow || len(parts) > maxFinalReplyMessages
-	return fitTaskReplyBudget(parts, "", truncated)
+	return fitTaskReplyBudget(language, parts, "", truncated)
 }

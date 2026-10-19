@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 )
 
@@ -39,49 +40,49 @@ type statusModeResult struct {
 	temporary bool
 }
 
-func formatStatus(s statusState, workspace, sessionID, home string, queued int) string {
+func formatStatus(language i18n.Language, s statusState, workspace, sessionID, home string, queued int) string {
 	if s.SessionID != "" {
 		sessionID = s.SessionID
 	}
 	session := menuText(sessionID, 128)
 	if session == "" {
-		session = "n/a"
+		session = i18n.Text(language, i18n.Msg.Unavailable)
 	}
 	if name := menuText(s.SessionName, 160); name != "" {
-		shortID := "n/a"
+		shortID := i18n.Text(language, i18n.Msg.Unavailable)
 		if sessionID != "" {
 			shortID = menuText(sessionID, 8)
 		}
-		session = name + "\nSession ID: " + shortID
+		session = i18n.Text(language, i18n.Msg.NamedSessionIdentity, name, shortID)
 	}
-	return fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s\nThinking: %s\nFast: %s\nContext: %s\nRunning: %s\nCompacting: %s\nQueued: %d\nSpeed: %s",
-		clipUTF16(statusWorkspace(workspace, home), 1024), session, s.modelText(), s.thinkingText(), s.fastText(), s.contextText(),
-		statusBool(s.IsStreaming, "yes", "no"), statusBool(s.IsCompacting, "yes", "no"), queued, s.speedText())
+	return i18n.Text(language, i18n.Msg.DetailedStatus,
+		clipUTF16(statusWorkspace(workspace, home), 1024), session, s.modelText(language), s.thinkingText(language), s.fastText(language), s.contextText(language),
+		statusBoolText(language, s.IsStreaming, i18n.Msg.Yes, i18n.Msg.No), statusBoolText(language, s.IsCompacting, i18n.Msg.Yes, i18n.Msg.No), queued, s.speedText(language))
 }
 
-func (s statusState) modelText() string {
+func (s statusState) modelText(language i18n.Language) string {
 	if s.Model.Provider != "" && s.Model.ID != "" {
 		return menuText(s.Model.Provider+"/"+s.Model.ID, 256)
 	}
-	return "n/a"
+	return i18n.Text(language, i18n.Msg.Unavailable)
 }
 
-func (s statusState) thinkingText() string {
+func (s statusState) thinkingText(language i18n.Language) string {
 	if thinking := menuText(s.ConfiguredThinking, 32); thinking != "" {
 		return thinking
 	}
-	return "n/a"
+	return i18n.Text(language, i18n.Msg.Unavailable)
 }
 
-func (s statusState) fastText() string {
-	fast := statusBool(s.FastModeActive, "on", "off")
+func (s statusState) fastText(language i18n.Language) string {
+	fast := statusBoolText(language, s.FastModeActive, i18n.Msg.On, i18n.Msg.Off)
 	if s.FastModeEnabled != nil && (s.FastModeActive == nil || *s.FastModeActive != *s.FastModeEnabled) {
-		fast += " (setting: " + statusBool(s.FastModeEnabled, "on", "off") + ")"
+		fast = i18n.Text(language, i18n.Msg.Setting, fast, statusBoolText(language, s.FastModeEnabled, i18n.Msg.On, i18n.Msg.Off))
 	}
 	return fast
 }
 
-func (s statusState) contextText() string {
+func (s statusState) contextText(language i18n.Language) string {
 	if usage := s.ContextUsage; usage != nil && usage.Tokens != nil && usage.ContextWindow != nil && *usage.Tokens >= 0 && *usage.ContextWindow > 0 {
 		percent := float64(*usage.Tokens) / float64(*usage.ContextWindow) * 100
 		if usage.Percent != nil && validStatusNumber(*usage.Percent) {
@@ -89,22 +90,22 @@ func (s statusState) contextText() string {
 		}
 		return fmt.Sprintf("%.0f%% (%s / %s)", percent, statusTokens(*usage.Tokens), statusTokens(*usage.ContextWindow))
 	}
-	return "n/a"
+	return i18n.Text(language, i18n.Msg.Unavailable)
 }
 
-func (s statusState) speedText() string {
+func (s statusState) speedText(language i18n.Language) string {
 	if s.TokensPerSecond != nil && validStatusNumber(*s.TokensPerSecond) {
 		return statusDecimal(*s.TokensPerSecond) + " tok/s"
 	}
-	return "n/a"
+	return i18n.Text(language, i18n.Msg.Unavailable)
 }
 
-func formatRuntimeStatus(s statusState, workspace, sessionID, home string, queued int, idle time.Duration, connected bool) string {
-	runtime := "released"
+func formatRuntimeStatus(language i18n.Language, s statusState, workspace, sessionID, home string, queued int, idle time.Duration, connected bool) string {
+	runtime := i18n.Msg.RuntimeReleased
 	if connected {
-		runtime = "connected"
+		runtime = i18n.Msg.RuntimeConnected
 	}
-	return formatStatus(s, workspace, sessionID, home, queued) + "\nOMP: " + runtime + "\nIdle: " + statusIdle(idle)
+	return formatStatus(language, s, workspace, sessionID, home, queued) + i18n.Text(language, i18n.Msg.RuntimeStatus, i18n.Text(language, runtime), statusIdle(language, idle))
 }
 
 func (w *worker) releaseStatusRuntime(result operationResult, valid bool) {
@@ -166,9 +167,9 @@ drained:
 	w.releaseRuntimeWithReason(true, "explicit")
 }
 
-func statusIdle(idle time.Duration) string {
+func statusIdle(language i18n.Language, idle time.Duration) string {
 	if idle < 0 {
-		return "n/a"
+		return i18n.Text(language, i18n.Msg.Unavailable)
 	}
 	if idle < time.Minute {
 		return idle.Round(time.Second).String()
@@ -190,14 +191,14 @@ func statusWorkspace(workspace, home string) string {
 	return workspace
 }
 
-func statusBool(value *bool, yes, no string) string {
+func statusBoolText(language i18n.Language, value *bool, yes, no i18n.Message) string {
 	if value == nil {
-		return "n/a"
+		return i18n.Text(language, i18n.Msg.Unavailable)
 	}
 	if *value {
-		return yes
+		return i18n.Text(language, yes)
 	}
-	return no
+	return i18n.Text(language, no)
 }
 
 func validStatusNumber(n float64) bool {

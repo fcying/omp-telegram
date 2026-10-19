@@ -482,7 +482,7 @@ func TestMigrationWorkflowPendingLockBlocksPublicInputsAndIdleRelease(t *testing
 	}
 	fake.mu.Lock()
 	fileRequests, downloads := fake.fileRequests, fake.downloadRequests
-	callbackAnswered := len(fake.callbacks) == 1 && strings.Contains(fake.callbacks[0], "迁移")
+	callbackAnswered := len(fake.callbacks) == 1 && fake.callbacks[0] != ""
 	fake.mu.Unlock()
 	if !callbackAnswered {
 		t.Fatal("locked callback was not explicitly acknowledged to Telegram")
@@ -720,4 +720,48 @@ func TestMigrationWorkflowStopCancelsStartupBeforeReadyAndRequiresReaping(t *tes
 	migrationWorkflowStep(t, w, "recover-start")
 	migrationWorkflowStep(t, w, "recover-verify")
 	migrationWorkflowCommitted(t, w, source, source.SessionID, source.Session)
+}
+
+func TestMigrationGateAllowsLanguageChangesWithoutUnlocking(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	w, _ := newBindingTestWorker(t, db)
+	w.migration = &store.Migration{ID: "language-gate", Phase: "verify", Source: w.binding}
+	locked := w.migration
+	for index, language := range []string{"zh", "en"} {
+		id := int64(800 + index)
+		requireStoreOK(t, db.Accept(id, []byte(`{"update_id":800}`)))
+		if !w.handleMigrationIncoming(incoming{id: id, msg: &telegram.Message{Text: "/lang " + language}}) {
+			t.Fatal("migration gate did not handle the language command")
+		}
+		saved, err := db.Language()
+		requireStoreOK(t, err)
+		if string(saved) != language || string(w.b.language()) != language {
+			t.Fatalf("language was not saved under migration lock: saved=%q runtime=%q", saved, w.b.language())
+		}
+		migrationWorkflowInbox(t, w, id, store.InboxDone)
+		if !w.migrationLocked() || w.migration != locked || len(w.queue) != 0 {
+			t.Fatal("language change disturbed the migration lock or queue")
+		}
+	}
+	if !strings.Contains(latestLanguageOutput(t, w), "Global language set to English") {
+		t.Fatal("language acknowledgement did not use the selected language")
+	}
+}
+
+func TestMigrationNoticeUsesSelectedLanguageAndPreservesIdentity(t *testing.T) {
+	w, _, _ := migrationWorkflowWorker(t, "success")
+	source, migration := migrationWorkflowToVerify(t, w)
+	requireStoreOK(t, w.b.db.Accept(801, []byte(`{"update_id":801}`)))
+	if !w.handleMigrationIncoming(incoming{id: 801, msg: &telegram.Message{Text: "/lang zh"}}) {
+		t.Fatal("migration gate did not accept the language change")
+	}
+	migrationWorkflowStep(t, w, "verify")
+	migrationWorkflowCommitted(t, w, source, migration.CandidateID, migration.CandidateFile)
+	var notice string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=100").Scan(&notice))
+	if !strings.HasPrefix(notice, "迁移完成.") || !strings.Contains(notice, source.Workspace) || !strings.Contains(notice, migration.CandidateID) {
+		t.Fatalf("durable migration notice missed the selected language or changed native identity: %q", notice)
+	}
 }

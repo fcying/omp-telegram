@@ -50,6 +50,7 @@ Core invariants:
 | [`session.go`](../internal/bridge/session.go), [`resume_picker.go`](../internal/bridge/resume_picker.go), [`binding_list.go`](../internal/bridge/binding_list.go), [`session_delete.go`](../internal/bridge/session_delete.go), [`export.go`](../internal/bridge/export.go) | Session transitions, listings, reservations, favorites, deletion, export |
 | [`args.go`](../internal/bridge/args.go), [`model_picker.go`](../internal/bridge/model_picker.go), [`doctor.go`](../internal/bridge/doctor.go) | Startup presets, runtime settings, session-preserving diagnostics |
 | [`progress_status.go`](../internal/bridge/progress_status.go), [`reply_status.go`](../internal/bridge/reply_status.go), [`reply_metrics.go`](../internal/bridge/reply_metrics.go), [`watchdog.go`](../internal/bridge/watchdog.go) | Best-effort live state, bounded final headers, conservative missing-completion recovery |
+| [`internal/i18n`](../internal/i18n/i18n.go), [`language.go`](../internal/bridge/language.go) | English/Chinese Bridge templates and global language selection |
 | [`internal/omp`](../internal/omp/client.go) | RPC v2 framing and correlation, process supervision, native metadata, ACP session listing, export/render/delete delegation |
 | [`internal/store`](../internal/store/store.go) | SQLite schema, inbox/outbox, bindings, startup intents, atomic transitions and retention |
 | [`internal/telegram`](../internal/telegram/client.go) | Bot API, Markdown-to-HTML rendering, reply fallback, transport/delivery classification |
@@ -102,7 +103,7 @@ Normal startup performs:
 
 1. Configuration loading and logger creation, then restrictive umask and exclusive `daemon.lock` acquisition.
 2. SQLite initialization/migration and runtime-state reconciliation.
-3. Telegram `getMe`, database bot-ownership check, and persisted argument-preset selection initialization.
+3. Telegram `getMe`, database bot-ownership check, and persisted argument-preset and global interface-language initialization.
 4. Best-effort default command registration for the default and `zh` language scopes.
 5. Progress-cleanup reconciliation, restoration of eligible session claims/workers, and retention cleanup.
 6. Polling, actor routing, four delivery workers, command-menu updates, progress cleanup, and the optional daily retention janitor.
@@ -231,7 +232,23 @@ Executable native commands and aliases use OMP-provided descriptions, normalized
 
 Session/catalog invalidation clears old contributions. Logical close/replacement/failure/shutdown removes only that worker's contribution; idle process release retains it. Pointer ownership and inactive tombstones prevent late updates/removals from retired workers. Startup publishes the discovered builtin fallback without first replacing chat menus with a bridge-only list, and preserves early authoritative catalogs.
 
-One background publisher coalesces dirty chats and writes both default-language and `zh` scopes with 20-second deadlines outside actors/readers. It caches acknowledged lists per chat/language. Failure does not fail tasks; later contribution changes can retry, without an independent retry loop. Uncertain publication invalidates the prior successful cache because Telegram may have applied the update; definite rejection retains it. Menu state is not persisted locally, and published native names and descriptions are visible to chat members even if they cannot operate the bot. Raw catalogs, descriptions and arguments do not enter menu diagnostics.
+One background publisher coalesces dirty chats and writes both default-language and `zh` scopes with 20-second deadlines outside actors/readers. It caches acknowledged lists per chat/language and skips unchanged successful scopes. Publication failures do not fail tasks. Uncertain publication invalidates the prior successful cache because Telegram may have applied the update; definite rejection retains it. Menu state is not persisted locally, and published native names and descriptions are visible to chat members even if they cannot operate the bot. Raw catalogs, descriptions and arguments do not enter menu diagnostics.
+
+Network uncertainty, request timeouts, HTTP 5xx errors and rate limits requeue the failed chat through the existing dirty/pending/wake mechanism. Per-chat exponential backoff starts at one second and caps at one minute; a longer Telegram `retry_after` is respected. These intervals are not delivery deadlines. The publisher reuses one cancellable timer, rotates deferred chats behind ready work, and recomputes the latest language and catalog when eligible. Repeated updates coalesce without bypassing backoff. Only the first failed pass for a chat emits warnings until a full pass succeeds. Definite non-429 HTTP 4xx rejections do not schedule automatic retries, but later contributions/language updates can trigger a new attempt subject to the same backoff. Tests use `testing/synctest` to cover persisted-language recovery, partial scope success, latest-state selection, retry bounds, log suppression, cancellation, and permanent rejection.
+
+### Interface language
+
+[`internal/i18n`](../internal/i18n/i18n.go) localizes only Bridge-owned templates, with English as the default and Chinese selected by `/lang zh`. `/lang en` switches back, and `/lang` reports the current setting. The setting is global across all chats and topics, not inferred from Telegram user locale and not attached to an OMP session or binding. Any otherwise authorized caller may change it. The command remains available during tasks and unresolved migrations without submitting OMP work or clearing a migration lock.
+
+[`language.go`](../internal/bridge/language.go) loads the singleton preference before workers and recovery notices start. A mutex orders database writes and atomic in-memory publication, so concurrent changes cannot leave persisted and live settings reversed. Workers read the shared atomic preference rather than retaining independent copies. Failed persistence leaves the active language unchanged. Session close, replacement, and binding removal do not reset it. Both default and `zh` Telegram menu scopes use the selected global language; changes dirty the global menu and all known/configured chat menus for the existing background publisher.
+
+[`Message`](../internal/i18n/i18n.go) is a struct with private English/Chinese fields. The static [`Msg` catalog](../internal/i18n/messages.go) gives each bilingual object a stable semantic name. Small `Task`, `Session`, `Queue`, and `Language` groups hold related entries, for example `i18n.Msg.Task.SubmissionUncertain` and `i18n.Msg.Queue.Full`; other entries remain flat until needed. Names do not depend on English wording, and removed flat names have no aliases. English text is no longer a lookup key. `Text` and both Bridge `tr` helpers accept only `Message`, so raw strings, nonexistent catalog names, and missing constructor arguments fail compilation. Changing English wording requires editing the same entry as its Chinese text, not updating a separate lookup key. Typed Bridge errors and stable media/store sentinels select explicit messages; opaque errors are not classified by their English wording. Call sites select the language before formatting user/native values, rather than translating assembled output or intercepting generic delivery. Native OMP text and dialog content, model replies, tool arguments/results, paths, session titles, and user captions remain untranslated. Existing rendering limits and sanitization remain in force. Queued media keeps captions separate from Bridge fallback labels so newly rendered queues follow the latest language. Already rendered outbox text and delivered messages are not rewritten.
+
+Telegram scope updates are separate requests, not an atomic multi-scope operation. An older in-flight publication may briefly remain visible before the queued language refresh converges. Regression tests block publication during a language change and verify every default/chat scope eventually reaches Chinese, then English after rapid switches. A task does not retain its startup language: newly generated Bridge receipts use the current global setting while previously rendered outbox text and OMP reply bodies remain unchanged.
+
+`progress.NativeStatus` caches rendered Bridge status text. Switching languages does not eagerly rebuild it: the next accepted native-status result uses the global language at completion, including a switch while its RPC query was pending. Sampling normally runs every five seconds and still depends on a successful RPC response and identity fencing; this is not a five-second refresh guarantee. Existing progress messages are edited on the next normal update, without a new cache epoch or task-local language field. Native OMP extension text is outside this guarantee.
+
+The message constructor rejects empty language text. Test-only reflection recursively traverses flat entries and nested groups in `Msg`, checking both languages and the ordered formatting directives, including argument count, verb, width, and precision; no separate runtime registry is maintained. A nested-message regression covers missing translations and mismatched format arguments. The checker understands sequential `%s`, `%d`, and `%f` directives and ignores escaped `%%`; unsupported syntax fails rather than being silently skipped. New formatting syntax must extend the checker before use. `formatDirectives` stays in `_test.go`. This guards the typed translation path, not arbitrary raw text deliberately sent outside it.
 
 ### Native dialogs and session operations
 
@@ -564,7 +581,7 @@ Only one doctor request runs per worker. Request identity plus a committed-bindi
 
 ### Schema and migration boundary
 
-`PRAGMA user_version` is currently **19**, independently of the application version. A fresh empty database creates the schema, indexes, and version transactionally. Versions 1-18 follow the built-in migration chain; version 19 adds durable context migrations. A populated unversioned database, negative version, or future version is rejected. Schema migration, session-ID backfill, and in-flight-state reconciliation commit together.
+`PRAGMA user_version` is currently **20**, independently of the application version. A fresh empty database creates the schema, indexes, and version transactionally. Versions 1-19 follow the built-in migration chain; version 19 adds durable context migrations and version 20 adds the global interface-language singleton. A populated unversioned database, negative version, or future version is rejected. Schema migration, session-ID backfill, and in-flight-state reconciliation commit together.
 
 | Table | Identity and retained data | Responsibility |
 | --- | --- | --- |
@@ -575,6 +592,7 @@ Only one doctor request runs per worker. Request identity plus a committed-bindi
 | `history` | Bot/conversation, workspace, session path, generation | Previous binding snapshots, not a native session index or conversation transcript |
 | `session_favorites` | `(bot,chat,thread,workspace,session_id)` | Conversation-local pinned native session identities |
 | `omp_args_selection` | Singleton preset index and argument fingerprint | Global startup-preset selection; no raw arguments |
+| `interface_language` | Singleton `id=1`, language `en` or `zh` | Global Bridge interface language; absent row means English |
 | `inbox` | Update ID; typed-update JSON, state, reply target, progress message ID, creation/update times | Deduplication and durable input settlement |
 | `outbox` | Increasing ID; optional inbox ID, chat/thread/reply target, text or attachment kind/path/name, state, retry deadline/counters, timestamps | Ordered durable delivery; attachment bytes remain in the private filesystem spool |
 
@@ -718,22 +736,26 @@ Log call sites project approved metadata; the handler is not a general secret sc
 
 ### Verification boundaries
 
-The minimum Go toolchain comes from [go.mod](../go.mod). Use the repository's [justfile](../justfile):
+The minimum Go toolchain is Go 1.27.2, declared in [go.mod](../go.mod). CI and `just fmt` select that version from the module file. Use the repository's [justfile](../justfile):
 
 | Command | Effect |
 | --- | --- |
 | `just build` or `just` | Build the daemon |
-| `just fmt` | Format Go source and tests |
+| `just fmt` | Format Go source and tests using the `go.mod` Go version, matching CI |
 | `just test` | Run unit tests without starting/restarting a service |
 | `just check` | Unit tests, race checks, and vet; no Telegram polling |
 | `just install` | Build and install only the binary; leave configuration/data user-managed |
 | `just deploy` | Install, then schedule a detached restart of the existing supervisor service after five seconds |
+
+`just test` and `just check` set `umask 0077` in their own recipe shell. Go's `testing.T.TempDir` creates numbered subdirectories with mode `0777` filtered by the process umask, so a caller mask such as `0002` otherwise makes store fixtures group-writable and fails initialization before behavioral assertions. The recipe-local mask does not alter the caller's shell or chmod existing directories. Keep the store's rejection of group/world-writable data directories unchanged.
 
 For local configuration checks, build and run `./omp-telegram --check`; provide explicit `--config` when needed. It creates directories, so use disposable paths when testing configuration behavior.
 
 Regression coverage belongs at observable boundaries: authorization, request correlation, cancellation, stale callbacks, atomic completion, restart identity, delivery uncertainty, retention, and process ownership. Representative suites are [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go), and [`logging`](../internal/bridge/logging_test.go). Saved-history tests include histories larger than one RPC frame; their test deadlines do not change production query deadlines.
 
 Worker lifecycle tests may cancel a real command-discovery waiter and inject a deadline error while preserving its request and epoch; root, session, and queue assertions still apply. RPC tests separately exercise real context deadlines, coalesced discovery, and late responses. Production query deadlines are not shortened for test performance.
+
+Recovery tests wait for a newly delivered status reply identifying the saved session, not a transient `OMP: released` label. A temporary status runtime may still be connected while buffered metadata drains. Dedicated released-runtime tests cover eventual process release and preservation of incoming work.
 
 Unit tests that reach native startup must use the RPC subprocess fixture by absolute executable path and an isolated workspace. Startup cancellation and registration-rejection coverage runs with no `omp` on `PATH`; only explicit real-OMP smoke checks may depend on an installed OMP.
 
@@ -755,6 +777,8 @@ The implementation has no bridge-side undo/rewind/redo or file rollback engine. 
 The application version is `Version` in [`main.go`](../cmd/omp-telegram/main.go), optionally overridden by `-ldflags "-X main.Version=..."`. `--version`, `-v`, `/help`, and `/start` use the same display version, including Git revision/dirty metadata when available. Application and SQLite schema versions are independent.
 
 The [release workflow](../.github/workflows/release.yaml) runs on `main` pushes, pull requests, and manual dispatch. It selects Go from `go.mod`, checks formatting and dependency consistency once on amd64, and runs `govulncheck`, vet and ordinary tests on native Linux amd64/arm64 runners. The full amd64 race suite runs in a separate job, concurrently with both native builds. Test commands use `-vet=off` to avoid repeating the automatic vet subset; independent full vet checks still run on both native builds. Each build uses CGO disabled, exercises version/help output, and packages the binary and LICENSE as `.txz`; `SHA256SUMS` accompanies published archives. The migration Extension is embedded in the binary and loaded only when its config switch is enabled. Both the CI gate and publishing require all native builds and the race job to succeed.
+
+`govulncheck` is version-pinned in the workflow. Go upgrades must also select a scanner whose `x/tools` SSA implementation supports the new Go syntax. Scanner crashes remain CI failures; do not suppress them or reduce scan depth to bypass compatibility problems.
 
 The cache action is SHA-pinned and uses Node.js 24. Go module and build caches are separated by runner OS/architecture, build versus race job, and dependency-file hash. Each source revision gets a new cache key and restores the preceding compatible cache, so compiled packages are refreshed without waiting for a `go.sum` change. The first run with a new cache prefix is cold; caching does not skip ordinary test execution.
 

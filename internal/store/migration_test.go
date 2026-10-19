@@ -68,15 +68,15 @@ func TestMigrationSchema18Upgrade(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	m := migrationFixture(t, s)
-	// Remove only the schema-19 additions to construct a populated schema-18 database.
-	_, err := s.DB.Exec("DROP TABLE migrations; PRAGMA user_version=18")
+	// Remove later additions to construct a populated schema-18 database.
+	_, err := s.DB.Exec("DROP TABLE interface_language; DROP TABLE migrations; PRAGMA user_version=18")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
 	var version int
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
-	if version != 19 {
-		t.Fatalf("upgraded version = %d, want 19", version)
+	if version != schemaVersion {
+		t.Fatalf("upgraded version = %d, want %d", version, schemaVersion)
 	}
 	binding, err := s.Binding(1, 2, 3)
 	requireStoreOK(t, err)

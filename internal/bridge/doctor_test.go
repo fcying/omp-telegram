@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -104,10 +105,10 @@ func TestDoctorChecksReportSafeState(t *testing.T) {
 	}, newTestTelegram(t), db, binding, runtimeReleased)
 	for _, check := range checks {
 		if check.Level != doctorOK {
-			t.Fatalf("check %s = %#v, want OK", check.Name, check)
+			t.Fatalf("check %s = %#v, want OK", i18n.Text(i18n.English, check.Name), check)
 		}
 	}
-	report := formatDoctorReport(checks)
+	report := formatDoctorReport("en", checks)
 	if !strings.Contains(report, "omp-telegram diagnostics") || !strings.Contains(report, "Result: OK") {
 		t.Fatalf("unexpected report: %q", report)
 	}
@@ -148,11 +149,15 @@ func TestDoctorReportsUncertainRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	inbox, outbox := checkDoctorUncertain(context.Background(), db)
-	if inbox.Level != doctorWarn || inbox.Message != "1 uncertain" {
+	if inbox.Level != doctorWarn {
 		t.Fatalf("inbox check = %#v", inbox)
 	}
-	if outbox.Level != doctorWarn || outbox.Message != "1 uncertain" {
+	if outbox.Level != doctorWarn {
 		t.Fatalf("outbox check = %#v", outbox)
+	}
+	report := formatDoctorReport("zh", []doctorCheck{inbox, outbox})
+	if strings.Contains(report, "%!d") || strings.Contains(report, "uncertain") || strings.Count(report, "1 条结果不确定") != 2 {
+		t.Fatalf("uncertain record counts were not localized before formatting: %q", report)
 	}
 }
 
@@ -243,16 +248,16 @@ func TestDoctorFreshConnectedSessionIsWarning(t *testing.T) {
 		running:   true,
 	}
 	connected := checkDoctorSession(binding, runtimeConnected)
-	if connected.Level != doctorWarn || connected.Message != "session history not persisted yet" {
+	if connected.Level != doctorWarn || connected.Message != i18n.Msg.SessionHistoryNotPersistedYet {
 		t.Fatalf("connected fresh session = %#v", connected)
 	}
 	released := checkDoctorSession(binding, runtimeReleased)
-	if released.Level != doctorFail || released.Message != "released session file unavailable" {
+	if released.Level != doctorFail || released.Message != i18n.Msg.ReleasedSessionFileUnavailable {
 		t.Fatalf("released fresh session = %#v", released)
 	}
 	binding.running = false
 	closed := checkDoctorSession(binding, runtimeReleased)
-	if closed.Level != doctorWarn || closed.Message != "saved session file is unavailable" {
+	if closed.Level != doctorWarn || closed.Message != i18n.Msg.SavedSessionFileUnavailable {
 		t.Fatalf("closed missing session = %#v", closed)
 	}
 }
@@ -454,7 +459,23 @@ func TestDoctorStopsChecksAfterCancellation(t *testing.T) {
 		return 0, nil
 	}
 	checks := runDoctorChecks(ctx, config.Config{OMP: "fixture", DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 1, ProgressMode: "summary"}, newTestTelegram(t), db, doctorBindingSnapshot{}, runtimeReleased)
-	if len(checks) != 1 || checks[0].Name != "Config" {
+	if len(checks) != 1 || checks[0].Name != i18n.Msg.Config {
 		t.Fatalf("checks after cancellation = %#v", checks)
+	}
+}
+
+func TestTypedDoctorReportPreservesOpaqueValues(t *testing.T) {
+	report := formatDoctorReport(i18n.Chinese, []doctorCheck{
+		{Name: i18n.Msg.Session.Label, Level: doctorOK, Opaque: "Connected"},
+		{Name: i18n.Msg.Runtime, Level: doctorOK, Message: i18n.Msg.Connected},
+		{Name: i18n.Msg.Database, Level: doctorFail, Message: i18n.Msg.SQLiteQuickCheckFailed},
+	})
+	for _, want := range []string{"omp-telegram 诊断", "会话", "正常 - Connected", "运行时", "已连接", "数据库", "SQLite 快速检查失败", "结果: 失败"} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("localized diagnostic report omitted %q: %q", want, report)
+		}
+	}
+	if strings.Contains(report, "%!") {
+		t.Fatalf("localized diagnostics contain a formatting error: %q", report)
 	}
 }

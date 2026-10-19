@@ -36,6 +36,20 @@ const (
 	maxPixels              = 16_000_000
 )
 
+// Stable preparation failures allow callers to localize only media-owned errors.
+var (
+	ErrAlbumNoAttachments                            = errors.New("album has no attachments")
+	ErrAlbumMemberNotPhotoDocument                   = errors.New("album member is not a photo or document")
+	ErrCannotOpenIncomingAttachmentDirectory         = errors.New("cannot open incoming attachment directory")
+	ErrCannotCreateAttachmentDirectory               = errors.New("cannot create attachment directory")
+	ErrCannotOpenAttachmentDirectory                 = errors.New("cannot open attachment directory")
+	ErrCannotMarkAttachmentDirectory                 = errors.New("cannot mark attachment directory")
+	ErrCannotPersistAttachmentPreparationMarker      = errors.New("cannot persist attachment preparation marker")
+	ErrAttachmentMissingFileIDExceedsMBDownloadLimit = errors.New("attachment is missing a file ID or exceeds the 20 MB download limit")
+	ErrCannotReadDownloadedAttachment                = errors.New("cannot read downloaded attachment")
+	ErrCannotSaveIncomingAttachmentSessionOwner      = errors.New("cannot save incoming attachment session owner")
+)
+
 type Image struct {
 	Type     string `json:"type"`
 	Data     string `json:"data"`
@@ -67,7 +81,7 @@ func Prepare(ctx context.Context, client *telegram.Client, dataDir string, messa
 // private data-directory folder. The caller owns Directory after success.
 func PrepareAlbum(ctx context.Context, client *telegram.Client, dataDir string, messages []telegram.Message) (Input, error) {
 	if len(messages) == 0 {
-		return Input{}, errors.New("album has no attachments")
+		return Input{}, ErrAlbumNoAttachments
 	}
 	return prepareMessages(ctx, client, dataDir, messages, true)
 }
@@ -80,7 +94,7 @@ type preparedAttachment struct {
 func prepareMessages(ctx context.Context, client *telegram.Client, dataDir string, messages []telegram.Message, album bool) (result Input, err error) {
 	for _, message := range messages {
 		if len(message.Photo) == 0 && message.Document == nil {
-			return Input{}, errors.New("album member is not a photo or document")
+			return Input{}, ErrAlbumMemberNotPhotoDocument
 		}
 	}
 	if err = ctx.Err(); err != nil {
@@ -88,12 +102,12 @@ func prepareMessages(ctx context.Context, client *telegram.Client, dataDir strin
 	}
 	root, inboxRoot, err := openIncomingRoot(dataDir, true)
 	if err != nil {
-		return Input{}, errors.New("cannot open incoming attachment directory")
+		return Input{}, ErrCannotOpenIncomingAttachmentDirectory
 	}
 	defer root.Close()
 	rel := incomingDirectoryPrefix + rand.Text()
 	if err = root.Mkdir(rel, 0700); err != nil {
-		return Input{}, errors.New("cannot create attachment directory")
+		return Input{}, ErrCannotCreateAttachmentDirectory
 	}
 	defer func() {
 		if err != nil {
@@ -102,12 +116,12 @@ func prepareMessages(ctx context.Context, client *telegram.Client, dataDir strin
 	}()
 	dir, err := root.Open(rel)
 	if err != nil {
-		return Input{}, errors.New("cannot open attachment directory")
+		return Input{}, ErrCannotOpenAttachmentDirectory
 	}
 	defer dir.Close()
 	marker, err := root.OpenFile(filepath.Join(rel, incomingPreparingFilename), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		return Input{}, errors.New("cannot mark attachment directory")
+		return Input{}, ErrCannotMarkAttachmentDirectory
 	}
 	written, writeErr := io.WriteString(marker, incomingPreparingContents)
 	if writeErr == nil {
@@ -115,7 +129,7 @@ func prepareMessages(ctx context.Context, client *telegram.Client, dataDir strin
 	}
 	closeErr := marker.Close()
 	if writeErr != nil || written != len(incomingPreparingContents) || closeErr != nil || dir.Sync() != nil {
-		return Input{}, errors.New("cannot persist attachment preparation marker")
+		return Input{}, ErrCannotPersistAttachmentPreparationMarker
 	}
 
 	images := make([]Image, 0, len(messages))
@@ -123,7 +137,7 @@ func prepareMessages(ctx context.Context, client *telegram.Client, dataDir strin
 	for index, message := range messages {
 		id, name, size := attachmentInfo(message)
 		if id == "" || size > MaxDownloadBytes {
-			return Input{}, errors.New("attachment is missing a file ID or exceeds the 20 MB download limit")
+			return Input{}, ErrAttachmentMissingFileIDExceedsMBDownloadLimit
 		}
 		if album {
 			name = fmt.Sprintf("%03d-%s", index+1, name)
@@ -137,7 +151,7 @@ func prepareMessages(ctx context.Context, client *telegram.Client, dataDir strin
 		}
 		file, openErr := os.Open(destination)
 		if openErr != nil {
-			return Input{}, errors.New("cannot read downloaded attachment")
+			return Input{}, ErrCannotReadDownloadedAttachment
 		}
 		fileImages, note := imageInput(ctx, file)
 		file.Close()

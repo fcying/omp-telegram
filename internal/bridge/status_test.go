@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"omp-telegram/internal/i18n"
 )
 
 func statusFields(text string) map[string]string {
@@ -29,7 +32,7 @@ func TestStatusDisplaysWhitelistedNativeMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.ConfiguredThinking = "auto"
-	text := formatStatus(state, "/home/test/project/foo", "saved-id", "/home/test", 2)
+	text := formatStatus("en", state, "/home/test/project/foo", "saved-id", "/home/test", 2)
 	fields := statusFields(text)
 	for key, want := range map[string]string{
 		"Workspace": "~/project/foo", "Session": "Bugfix HAL", "Model": "openai/gpt-5.6",
@@ -59,7 +62,7 @@ func TestStatusUsesConfiguredThinkingInsteadOfEffectiveLevel(t *testing.T) {
 					t.Fatal(err)
 				}
 				state.ConfiguredThinking = scenario.configured
-				if got := statusFields(formatStatus(state, "/work", "session", "", 0))["Thinking"]; got != scenario.want {
+				if got := statusFields(formatStatus("en", state, "/work", "session", "", 0))["Thinking"]; got != scenario.want {
 					t.Fatalf("configured %q with effective %q displayed %q", scenario.configured, effective, got)
 				}
 			})
@@ -78,10 +81,10 @@ func TestNativeStatusCannotSupplyConfiguredThinking(t *testing.T) {
 	if state.ConfiguredThinking != "" {
 		t.Fatal("native JSON supplied the actor-owned thinking projection")
 	}
-	if got := statusFields(formatStatus(state, "/work", "session", "", 0))["Thinking"]; got != "n/a" {
+	if got := statusFields(formatStatus("en", state, "/work", "session", "", 0))["Thinking"]; got != "n/a" {
 		t.Fatalf("native state supplied configured thinking to detailed status: %q", got)
 	}
-	for _, text := range []string{compactProgressStatus(state), replyHeader(state, replyMetrics{})} {
+	for _, text := range []string{compactProgressStatus("en", state), replyHeader("en", state, replyMetrics{})} {
 		if !strings.Contains(text, "answer-model") || strings.ContainsAny(text, "⦸○◔◑◒◕◉⟳") || strings.Contains(text, "high") {
 			t.Fatalf("unknown configured thinking inferred a native level: %s", text)
 		}
@@ -93,13 +96,13 @@ func TestStatusRendersNativeContextPercentage(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"contextUsage":{"tokens":67300,"contextWindow":272000,"percent":24.74}}`), &state); err != nil {
 		t.Fatal(err)
 	}
-	if got := statusFields(formatStatus(state, "/work", "id", "", 0))["Context"]; got != "25% (67.3k / 272k)" {
+	if got := statusFields(formatStatus("en", state, "/work", "id", "", 0))["Context"]; got != "25% (67.3k / 272k)" {
 		t.Fatalf("native context percentage rendered as %q, want 25%% (67.3k / 272k)", got)
 	}
 }
 
 func TestStatusDistinguishesMissingMetricsFromZero(t *testing.T) {
-	missing := statusFields(formatStatus(statusState{}, "/work", "saved-id", "", 0))
+	missing := statusFields(formatStatus("en", statusState{}, "/work", "saved-id", "", 0))
 	for _, key := range []string{"Thinking", "Fast", "Context", "Speed", "Running", "Compacting"} {
 		if missing[key] != "n/a" {
 			t.Errorf("absent %s was reported as %q", key, missing[key])
@@ -112,7 +115,7 @@ func TestStatusDistinguishesMissingMetricsFromZero(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"fastModeActive":false,"isStreaming":false,"isCompacting":false,"tokensPerSecond":0,"contextUsage":{"tokens":0,"contextWindow":128000}}`), &zero); err != nil {
 		t.Fatal(err)
 	}
-	fields := statusFields(formatStatus(zero, "/work", "saved-id", "", 0))
+	fields := statusFields(formatStatus("en", zero, "/work", "saved-id", "", 0))
 	if fields["Context"] != "0% (0 / 128k)" || fields["Speed"] != "0 tok/s" || fields["Fast"] != "off" || fields["Running"] != "no" {
 		t.Fatalf("valid zero metrics became missing: %v", fields)
 	}
@@ -128,7 +131,7 @@ func TestStatusKeepsFastSettingSeparateFromActualState(t *testing.T) {
 		if err := json.Unmarshal([]byte(scenario.raw), &state); err != nil {
 			t.Fatal(err)
 		}
-		if got := statusFields(formatStatus(state, "/work", "id", "", 0))["Fast"]; got != scenario.want {
+		if got := statusFields(formatStatus("en", state, "/work", "id", "", 0))["Fast"]; got != scenario.want {
 			t.Fatalf("fast state=%q, want=%q", got, scenario.want)
 		}
 	}
@@ -141,7 +144,7 @@ func TestStatusHomeAbbreviationRespectsDirectoryBoundaries(t *testing.T) {
 		{"/home/test-other/project", "/home/test-other/project"},
 		{"/var/project", "/var/project"},
 	} {
-		if got := statusFields(formatStatus(statusState{}, scenario.path, "id", "/home/test", 0))["Workspace"]; got != scenario.want {
+		if got := statusFields(formatStatus("en", statusState{}, scenario.path, "id", "/home/test", 0))["Workspace"]; got != scenario.want {
 			t.Errorf("workspace %q rendered as %q, want %q", scenario.path, got, scenario.want)
 		}
 	}
@@ -177,5 +180,68 @@ func TestClosedStatusDoesNotRestartRuntime(t *testing.T) {
 	command("/status")
 	if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 || w.binding != before {
 		t.Fatal("status restarted or changed a closed session")
+	}
+}
+
+func TestChineseStatusPreservesNativeIdentityAndPaths(t *testing.T) {
+	state := statusState{}
+	state.Model.Provider = "Workspace"
+	state.Model.ID = "on"
+	state.SessionName = "Session ID: on 中文"
+	text := formatStatus("zh", state, "/Workspace/on", "session-id", "", 3)
+	for _, native := range []string{"/Workspace/on", "Workspace/on", "Session ID: on 中文", "session-"} {
+		if !strings.Contains(text, native) {
+			t.Fatalf("localized status changed native data %q: %q", native, text)
+		}
+	}
+	if !strings.Contains(text, "工作区: ") || !strings.Contains(text, "排队: 3") || strings.Contains(text, "%!s") {
+		t.Fatalf("status labels or formatted arguments were not localized: %q", text)
+	}
+}
+
+func TestChineseStatusLocalizesMissingValuesWithoutTranslatingNativeSentinels(t *testing.T) {
+	missing := formatRuntimeStatus("zh", statusState{}, "/work", "", "", 0, -1, false)
+	if strings.Contains(missing, "n/a") || !strings.Contains(missing, "空闲: 不可用") {
+		t.Fatalf("Bridge-owned missing values were not localized: %q", missing)
+	}
+	state := statusState{SessionName: "n/a", ConfiguredThinking: "n/a"}
+	state.Model.Provider = "on"
+	state.Model.ID = "off"
+	text := formatStatus("zh", state, "/n/a", "n/a", "", 0)
+	for _, native := range []string{"/n/a", "on/off", "会话: n/a", "思考: n/a"} {
+		if !strings.Contains(text, native) {
+			t.Fatalf("native value %q was translated: %q", native, text)
+		}
+	}
+}
+
+func TestTypedStatusValuesRenderAtTheirSource(t *testing.T) {
+	active, inactive := true, false
+	for _, scenario := range []struct {
+		language         i18n.Language
+		yes, no, missing string
+	}{
+		{i18n.English, "yes", "no", "n/a"},
+		{i18n.Chinese, "是", "否", "不可用"},
+	} {
+		for _, item := range []struct {
+			value *bool
+			want  string
+		}{
+			{&active, scenario.yes}, {&inactive, scenario.no}, {nil, scenario.missing},
+		} {
+			if got := statusBoolText(scenario.language, item.value, i18n.Msg.Yes, i18n.Msg.No); got != item.want {
+				t.Fatalf("boolean in %s = %q, want %q", scenario.language, got, item.want)
+			}
+		}
+		state := statusState{}
+		for _, got := range []string{state.contextText(scenario.language), state.speedText(scenario.language), statusIdle(scenario.language, -time.Second)} {
+			if got != scenario.missing {
+				t.Fatalf("missing status in %s = %q, want %q", scenario.language, got, scenario.missing)
+			}
+		}
+		if got := statusIdle(scenario.language, 90*time.Second); got != "2m0s" {
+			t.Fatalf("valid idle duration in %s = %q", scenario.language, got)
+		}
 	}
 }

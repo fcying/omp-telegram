@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 19
+const schemaVersion = 20
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -50,6 +50,7 @@ var (
 	ErrInboxStateTransition  = errors.New("inbox state transition rejected")
 	ErrOutboxStateTransition = errors.New("outbox state transition rejected")
 	ErrStaleBinding          = errors.New("stale binding")
+	ErrQuickCheckFailed      = errors.New("sqlite quick check failed")
 )
 
 type Store struct {
@@ -120,7 +121,7 @@ func (s *Store) QuickCheck(ctx context.Context) error {
 		return quickCheckError(err)
 	}
 	if result != "ok" {
-		return errors.New("sqlite quick check failed")
+		return ErrQuickCheckFailed
 	}
 	if rows.Next() {
 		return errors.New("sqlite quick check unavailable")
@@ -385,6 +386,12 @@ CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));
 			return e
 		}
 		version = 19
+	}
+	if version == 19 {
+		if _, e = tx.Exec(`CREATE TABLE interface_language(id INTEGER PRIMARY KEY CHECK(id=1),language TEXT NOT NULL CHECK(language IN ('en','zh')))`); e != nil {
+			return e
+		}
+		version = 20
 	}
 
 	if e = backfillSessionIDs(tx); e != nil {

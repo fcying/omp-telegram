@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -247,7 +248,7 @@ func TestMigrationLockedWorkerRefusesForgetResumeDeleteAndExport(t *testing.T) {
 			requester := &worker{ctx: w.ctx, forgetResults: make(chan bindingForgetResult, 1)}
 			w.forgetBinding(bindingForgetRequest{generation: source.Generation, source: requester})
 			result := <-requester.forgetResults
-			if result.ok || !strings.Contains(result.status, "/migrate recover") || w.canForgetBinding() {
+			if result.ok || result.status != i18n.Msg.MigrationUnresolvedCannotDeleteBinding || w.canForgetBinding() {
 				t.Fatalf("locked binding forget result = %+v", result)
 			}
 			w.touchBinding()

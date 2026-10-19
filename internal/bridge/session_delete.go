@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 )
 
@@ -45,11 +46,11 @@ func (w *worker) sessionDeleteAvailable(sessionID, workspace string) (bool, erro
 func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageID int64) {
 	w.clearKeyboard(messageID)
 	if c.epoch != w.b.bindingsEpoch.Load() || !w.persistedBindingGenerationMatches(c.generation) {
-		w.say("The saved binding changed. Use /resume again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseResumeAgain))
 		return
 	}
 	if w.resumeBusy() {
-		w.say("Wait for the current task and queue to finish before deleting a session.")
+		w.say(w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeDeletingSession))
 		return
 	}
 	if sessionIndex < 0 || sessionIndex >= len(c.sessions) {
@@ -57,60 +58,60 @@ func (w *worker) confirmSessionDelete(c confirmation, sessionIndex int, messageI
 	}
 	selected := c.sessions[sessionIndex]
 	if !sameWorkspace(selected.CWD, c.workspace) {
-		w.say("The selected session is not in this working directory.")
+		w.say(w.tr(i18n.Msg.SelectedSessionNotWorkingDirectory))
 		return
 	}
 	if !validSessionID(selected.ID) {
-		w.say("omp returned an unsupported session ID.")
+		w.say(w.tr(i18n.Msg.OmpReturnedUnsupportedSessionID))
 		return
 	}
 	busy, elsewhere := w.b.sessionDeleteStatus(w, selected.ID)
 	if busy {
 		if elsewhere {
-			w.say("This session is currently active or being processed in another conversation. No deletion was started. Stop or close it there, or wait for the operation to finish, then retry.")
+			w.say(w.tr(i18n.Msg.SessionCurrentlyActiveProcessedAnotherConversationNoDeletionStarted))
 		} else {
-			w.say("This session is currently active or being processed in this conversation. No deletion was started. Stop or close it, or wait for the operation to finish, then retry.")
+			w.say(w.tr(i18n.Msg.SessionCurrentlyActiveProcessedConversationNoDeletionStartedStop))
 		}
 		return
 	}
 	available, err := w.sessionDeleteAvailable(selected.ID, c.workspace)
 	if err != nil {
-		w.say("Failed to check the session state. No session was deleted.")
+		w.say(w.tr(i18n.Msg.FailedCheckSessionStateNoSessionDeleted))
 		return
 	}
 	if !available {
-		w.say("An OMP session is still starting or being restored in this workspace. Wait for that operation to finish before deleting.")
+		w.say(w.tr(i18n.Msg.OMPSessionStillStartingRestoredWorkspaceWaitOperationFinish))
 		return
 	}
-	title := "Delete omp session?\n\nTitle: " + menuText(selected.Title, 80) + "\nID: " + selected.ID + "\n\nThis deletes the saved OMP session and its artifacts.\nThe workspace files will not be deleted."
-	w.confirm(confirmation{action: "session_delete", workspace: c.workspace, epoch: c.epoch, user: c.user, sessions: []omp.SessionSummary{selected}, ompArgs: c.ompArgs}, title, []string{"Delete", "Cancel"})
+	title := w.tr(i18n.Msg.DeleteOmpSessionTitleIDDeletesSavedOMPSession, menuText(selected.Title, 80), selected.ID)
+	w.confirm(confirmation{action: "session_delete", workspace: c.workspace, epoch: c.epoch, user: c.user, sessions: []omp.SessionSummary{selected}, ompArgs: c.ompArgs}, title, []string{w.tr(i18n.Msg.Delete), w.tr(i18n.Msg.Cancel)})
 }
 
 func (w *worker) beginSessionDelete(c confirmation) {
 	if c.epoch != w.b.bindingsEpoch.Load() || !w.persistedBindingGenerationMatches(c.generation) {
-		w.say("The saved binding changed. Use /resume again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseResumeAgain))
 		return
 	}
 	if w.resumeBusy() || len(c.sessions) != 1 {
-		w.say("Wait for the current task and queue to finish before deleting a session.")
+		w.say(w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeDeletingSession))
 		return
 	}
 	selected := c.sessions[0]
 	if !validSessionID(selected.ID) || !sameWorkspace(selected.CWD, c.workspace) {
-		w.say("The selected session is not in this working directory.")
+		w.say(w.tr(i18n.Msg.SelectedSessionNotWorkingDirectory))
 		return
 	}
 	if !w.b.reserveDelete(w, selected.ID) {
-		w.say("This session is currently active or being processed in another conversation or operation. No deletion was started. Stop or close it, or wait for the work to finish, then retry.")
+		w.say(w.tr(i18n.Msg.SessionCurrentlyActiveProcessedAnotherConversationOperationNoDeletion))
 		return
 	}
 	available, err := w.sessionDeleteAvailable(selected.ID, c.workspace)
 	if err != nil || !available {
 		w.b.releaseDelete(w)
 		if err != nil {
-			w.say("Failed to check the session state. No session was deleted.")
+			w.say(w.tr(i18n.Msg.FailedCheckSessionStateNoSessionDeleted))
 		} else {
-			w.say("This session is active or its identity is still being restored. Wait for that work to finish before deleting it.")
+			w.say(w.tr(i18n.Msg.SessionActiveIdentityStillRestoredWaitWorkFinishBefore))
 		}
 		return
 	}
@@ -149,7 +150,7 @@ func (w *worker) sessionDeleteFinished(result sessionDeleteResult) {
 			w.b.sessionMu.Unlock()
 		}
 		w.log.Warn("native session deletion failed", "event", "session_delete", "session_id", result.sessionID, "result", "failed")
-		w.say("Failed to delete the omp session. Use /resume to check its status before trying again.")
+		w.say(w.tr(i18n.Msg.FailedDeleteOmpSessionUseResumeCheckStatusBefore))
 		return
 	}
 	w.b.sessionMu.Lock()
@@ -170,10 +171,10 @@ func (w *worker) sessionDeleteFinished(result sessionDeleteResult) {
 	w.b.sessionMu.Unlock()
 	if cleanupErr != nil {
 		w.b.storeLog.Error("session reference cleanup failed", "event", "session_delete", "session_id", result.sessionID, "error_kind", "persistence")
-		w.say("Session deleted, but failed to clear saved bindings and pins.")
+		w.say(w.tr(i18n.Msg.SessionDeletedButFailedClearSavedBindingsPins))
 	} else {
 		w.log.Info("native session deleted", "event", "session_delete", "session_id", result.sessionID, "bindings_removed", deletedBindings, "result", "done")
-		w.say("Session deleted.")
+		w.say(w.tr(i18n.Msg.SessionDeleted))
 	}
 	if refresh && epoch == w.b.bindingsEpoch.Load() && result.generation == w.binding.Generation && w.persistedBindingGenerationMatches(result.generation) {
 		w.requestSessionList(result.user, "delete_refresh", "")

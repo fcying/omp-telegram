@@ -31,6 +31,7 @@ import (
 )
 
 const testAppVersion = "dev-latest (abcdef012345)"
+const replyTruncatedNotice = "Reply truncated because it exceeded the Telegram display budget."
 
 func requireStoreOK(t *testing.T, err error) {
 	t.Helper()
@@ -3509,7 +3510,7 @@ func TestTerminalFailureNoticeRedactsSensitiveDetails(t *testing.T) {
 
 func TestTerminalFailureNoticeRedactsJSONCredentials(t *testing.T) {
 	detail := `Model not found; quota exceeded; capacity unavailable; invalid parameters; API_KEY=key0; API_KEY: key1; api-token=key2; api_token=key3; token=key4; access_token=key5; refresh_token=key6; Authorization: Bearer key7; Authorization: Basic dXNlcjpwYXNz; Authorization: Token token0; Authorization: ApiKey api-key0; password=key8; secret=key9; client_secret=key10; JSON {"api_key":"json0","Authorization":"Bearer json1","access_token":"json2","refresh_token":"json3","password":"json4","client_secret":"json5"}; 'api_key':'single0'`
-	notice := (&worker{}).terminalFailureNotice(rpcEvent{Messages: []message{{Role: "assistant", StopReason: "error", ErrorMessage: detail}}})
+	notice := (&worker{b: &Bridge{}}).terminalFailureNotice(rpcEvent{Messages: []message{{Role: "assistant", StopReason: "error", ErrorMessage: detail}}})
 	for _, useful := range []string{"Model not found", "quota exceeded", "capacity unavailable", "invalid parameters"} {
 		if !strings.Contains(notice, useful) {
 			t.Errorf("terminal failure detail lost %q: %q", useful, notice)

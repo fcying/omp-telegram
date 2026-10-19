@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/telegram"
 )
@@ -63,6 +64,61 @@ func TestProgressNativeStatusDistinguishesFastSettingAndUnknownMetrics(t *testin
 		if strings.Contains(text, secret) {
 			t.Fatalf("progress exposed raw configuration or interpreted model markup: %s", text)
 		}
+	}
+}
+
+func TestProgressNativeRefreshUsesLatestGlobalLanguage(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.ProgressMode = "summary"
+	w.b.cfg.QueueCapacity = 1
+	w.previewResult = make(chan previewResult, 1)
+	command("/new " + t.TempDir())
+	nativeRPC(t, w, "set_model", map[string]any{"provider": "**fixture**", "modelId": "fast-fallback"})
+	nativeRPC(t, w, "set_fast_mode", map[string]any{"enabled": true})
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	allowInitialProgress(w)
+	w.refreshProgressNative(time.Now())
+	w.progressNativeFinished(receiveProgressNative(t, w))
+	flush := func(language, previous i18n.Language) previewResult {
+		t.Helper()
+		w.flushPreview()
+		select {
+		case result := <-w.previewResult:
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			w.previewFinished(result)
+			f.mu.Lock()
+			text, _ := f.messages[len(f.messages)-1]["text"].(string)
+			f.mu.Unlock()
+			want := i18n.Text(language, i18n.Msg.Fast, "")
+			if !strings.Contains(w.progress.NativeStatus, want) || !strings.Contains(text, want) {
+				t.Fatalf("refreshed native status did not reach progress in %s: cache=%q, delivered=%q", language, w.progress.NativeStatus, text)
+			}
+			if previous != "" && strings.Contains(text, i18n.Text(previous, i18n.Msg.Fast, "")) {
+				t.Fatalf("refreshed progress retained the previous native status language: %q", text)
+			}
+			return result
+		case <-time.After(5 * time.Second):
+			t.Fatal("native status refresh did not reach Telegram progress")
+			return previewResult{}
+		}
+	}
+	initial := flush(i18n.English, "")
+	previous := i18n.English
+	for _, language := range []i18n.Language{i18n.Chinese, i18n.English} {
+		w.refreshProgressNative(w.progressNative.next)
+		result := receiveProgressNative(t, w)
+		// Switch after sampling starts; completion must read the current preference.
+		command("/lang " + string(language))
+		w.progressNativeFinished(result)
+		edit := flush(language, previous)
+		if edit.created || edit.id != initial.id {
+			t.Fatalf("language refresh replaced the existing progress message: initial=%d, edit=%+v", initial.id, edit)
+		}
+		previous = language
 	}
 }
 

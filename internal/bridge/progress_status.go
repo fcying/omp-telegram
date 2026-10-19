@@ -95,5 +95,5 @@ func (w *worker) progressNativeFinished(result progressNativeResult) {
 		return
 	}
 	result.state.ConfiguredThinking = w.configuredThinking
-	w.progress.NativeStatus = compactProgressStatus(result.state)
+	w.progress.NativeStatus = compactProgressStatus(w.b.language(), result.state)
 }

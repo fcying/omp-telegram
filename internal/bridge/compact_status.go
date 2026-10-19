@@ -3,6 +3,8 @@ package bridge
 import (
 	"fmt"
 	"strings"
+
+	"omp-telegram/internal/i18n"
 )
 
 func compactModelStatus(model, thinking string) string {
@@ -36,12 +38,12 @@ func compactModelStatus(model, thinking string) string {
 	return label
 }
 
-func compactFastStatus(s statusState) string {
+func compactFastStatus(language i18n.Language, s statusState) string {
 	if s.FastModeActive == nil {
 		return ""
 	}
 	if s.FastModeEnabled != nil && *s.FastModeActive != *s.FastModeEnabled {
-		return "fast " + s.fastText()
+		return i18n.Text(language, i18n.Msg.Fast, s.fastText(language))
 	}
 	if *s.FastModeActive {
 		return "⚡"
@@ -61,12 +63,12 @@ func compactContextStatus(s statusState) string {
 	return fmt.Sprintf("◫ %.0f%% (%s)", percent, statusTokens(*usage.ContextWindow))
 }
 
-func compactProgressStatus(s statusState) string {
+func compactProgressStatus(language i18n.Language, s statusState) string {
 	identity := ""
 	if model := menuText(s.Model.ID, 128); model != "" {
 		identity = compactModelStatus(model, s.ConfiguredThinking)
 	}
-	if fast := compactFastStatus(s); fast != "" {
+	if fast := compactFastStatus(language, s); fast != "" {
 		if identity != "" {
 			identity += " "
 		}
@@ -79,8 +81,8 @@ func compactProgressStatus(s statusState) string {
 	if context := compactContextStatus(s); context != "" {
 		parts = append(parts, context)
 	}
-	if speed := s.speedText(); speed != "n/a" {
-		parts = append(parts, speed)
+	if s.TokensPerSecond != nil && validStatusNumber(*s.TokensPerSecond) {
+		parts = append(parts, s.speedText(language))
 	}
 	return strings.Join(parts, " | ")
 }

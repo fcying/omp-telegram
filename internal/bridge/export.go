@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
 	"os"
@@ -247,20 +248,20 @@ func shortSessionID(id string) string {
 	return id
 }
 
-func sessionExportMessage(result exportResult) string {
+func sessionExportMessage(language i18n.Language, result exportResult) string {
 	if errors.Is(result.err, omp.ErrCustomSessionDir) {
-		return "Cannot export an inactive session when omp uses a custom session directory."
+		return i18n.Text(language, i18n.Msg.CannotExportInactiveSessionWhenOmpUsesCustomSession)
 	}
 	if errors.Is(result.err, errSessionExportTooLarge) {
-		return "Session export is too large to send through Telegram."
+		return i18n.Text(language, i18n.Msg.SessionExportTooLargeSendThroughTelegram)
 	}
 	if errors.Is(result.err, errSessionHTMLTimeout) {
-		return "Session HTML export timed out."
+		return i18n.Text(language, i18n.Msg.SessionHTMLExportTimedOut)
 	}
 	if result.format == "html" {
-		return "Session HTML export failed."
+		return i18n.Text(language, i18n.Msg.SessionHTMLExportFailed)
 	}
-	return "Session export failed."
+	return i18n.Text(language, i18n.Msg.SessionExportFailed)
 }
 
 func sessionExportReason(err error) string {

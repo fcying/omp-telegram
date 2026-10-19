@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/telegram"
@@ -121,9 +122,6 @@ func (w *worker) queueMedia(in incoming) {
 	w.initMedia()
 	message := *in.msg
 	displayText := strings.TrimSpace(message.Caption)
-	if displayText == "" {
-		displayText = "Queued attachment"
-	}
 	user := int64(0)
 	if message.From != nil {
 		user = message.From.ID
@@ -179,22 +177,19 @@ func (w *worker) collectAlbum(in incoming) {
 			return
 		}
 		w.suppressAlbum(key)
-		w.say(err.Error())
+		w.say(w.errorText(err))
 		w.mark(in.id, "done")
 		return
 	}
 	if w.pendingInputFull() {
 		w.suppressAlbum(key)
-		w.say("The queue is full. This album was not submitted.")
+		w.say(w.tr(i18n.Msg.Queue.AlbumFull))
 		if w.mark(in.id, "cancelled") {
 			w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
 		}
 		return
 	}
 	displayText := strings.TrimSpace(message.Caption)
-	if displayText == "" {
-		displayText = "Queued album"
-	}
 	album := &pendingAlbum{
 		key:       key,
 		ownerID:   in.id,
@@ -254,7 +249,7 @@ func (w *worker) rejectAlbum(album *pendingAlbum) {
 		break
 	}
 	w.mark(album.ownerID, "failed")
-	w.say("Album contains too many items.")
+	w.say(w.tr(i18n.Msg.AlbumContainsTooManyItems))
 	w.log.Warn("album rejected", "event", "album_rejected", "inbox_id", album.ownerID, "count", len(album.messages)+1, "reason", "too_many_items")
 }
 
@@ -350,9 +345,6 @@ func (w *worker) sealAlbum(result albumEvent) {
 	q.replyTo = messages[0].MessageID
 	q.reply = reply
 	q.displayText = strings.TrimSpace(caption)
-	if q.displayText == "" {
-		q.displayText = "Queued album"
-	}
 	w.startMediaPreparation(album.ownerID, messages, true)
 }
 
@@ -413,7 +405,7 @@ func (w *worker) startMediaPreparation(id int64, messages []telegram.Message, al
 			if ownerErr := media.WriteIncomingOwner(dataDir, prepared.Directory, owner); ownerErr != nil {
 				w.b.discardIncoming(prepared.Directory, mediaLogger)
 				prepared = media.Input{}
-				err = errors.New("cannot save incoming attachment session owner")
+				err = media.ErrCannotSaveIncomingAttachmentSessionOwner
 			}
 		}
 		result := mediaResult{id: id, generation: generation, input: prepared, err: err, logger: mediaLogger, album: album, count: len(members)}
@@ -608,6 +600,33 @@ func removeMediaSnapshot(path string, logger *slog.Logger) {
 	}
 }
 
+func mediaPreparationError(language i18n.Language, err error) string {
+	switch {
+	case errors.Is(err, media.ErrAlbumNoAttachments):
+		return i18n.Text(language, i18n.Msg.AlbumNoAttachments)
+	case errors.Is(err, media.ErrAlbumMemberNotPhotoDocument):
+		return i18n.Text(language, i18n.Msg.AlbumMemberNotPhotoDocument)
+	case errors.Is(err, media.ErrCannotOpenIncomingAttachmentDirectory):
+		return i18n.Text(language, i18n.Msg.CannotOpenIncomingAttachmentDirectory)
+	case errors.Is(err, media.ErrCannotCreateAttachmentDirectory):
+		return i18n.Text(language, i18n.Msg.CannotCreateAttachmentDirectory)
+	case errors.Is(err, media.ErrCannotOpenAttachmentDirectory):
+		return i18n.Text(language, i18n.Msg.CannotOpenAttachmentDirectory)
+	case errors.Is(err, media.ErrCannotMarkAttachmentDirectory):
+		return i18n.Text(language, i18n.Msg.CannotMarkAttachmentDirectory)
+	case errors.Is(err, media.ErrCannotPersistAttachmentPreparationMarker):
+		return i18n.Text(language, i18n.Msg.CannotPersistAttachmentPreparationMarker)
+	case errors.Is(err, media.ErrAttachmentMissingFileIDExceedsMBDownloadLimit):
+		return i18n.Text(language, i18n.Msg.AttachmentMissingFileIDExceedsMBDownloadLimit)
+	case errors.Is(err, media.ErrCannotReadDownloadedAttachment):
+		return i18n.Text(language, i18n.Msg.CannotReadDownloadedAttachment)
+	case errors.Is(err, media.ErrCannotSaveIncomingAttachmentSessionOwner):
+		return i18n.Text(language, i18n.Msg.CannotSaveIncomingAttachmentSessionOwner)
+	default:
+		return err.Error()
+	}
+}
+
 func (w *worker) preparedMedia(result mediaResult) {
 	index := -1
 	// Preparation belongs to the logical session's queue, not its current process.
@@ -639,9 +658,10 @@ func (w *worker) preparedMedia(result mediaResult) {
 		w.mark(result.id, "failed")
 		if !mediaCancellation(result.err) {
 			result.logger.Warn("attachment preparation failed", "event", "prepare_failed", "error_kind", mediaErrorKind(result.err))
-			message := "Attachment could not be prepared: " + result.err.Error()
+			detail := mediaPreparationError(w.b.language(), result.err)
+			message := w.tr(i18n.Msg.AttachmentCouldNotPrepared, detail)
 			if q.album {
-				message = "Album could not be prepared: " + result.err.Error()
+				message = w.tr(i18n.Msg.AlbumCouldNotPrepared, detail)
 			}
 			w.say(message)
 		}
@@ -689,13 +709,13 @@ func (w *worker) hostResultFailed(client *omp.Client, err error) {
 	w.cancelHostRequests()
 	if w.steerFence.active {
 		w.clearFailedHostOperation()
-		w.retireTaskRuntime("A host tool result could not be delivered to omp. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.HostToolResultCouldNotDeliveredOmpTaskOutcome))
 		return
 	}
 	if w.taskActive() {
-		w.finishUncertain("A host tool result could not be delivered to omp. The instance was closed; the task outcome is uncertain and will not be replayed automatically.")
+		w.finishUncertain(w.tr(i18n.Msg.HostResultDeliveryFailedRuntimeClosedTaskUncertain))
 	} else {
-		w.say("A host tool result could not be delivered to omp. The instance was closed.")
+		w.say(w.tr(i18n.Msg.HostResultDeliveryFailedRuntimeClosed))
 	}
 	w.clearFailedHostOperation()
 	w.releaseRuntimeWithReason(true, "failure")

@@ -139,8 +139,26 @@ func (d *recoveryDaemon) outputCount(thread int64) int {
 
 func (d *recoveryDaemon) cold(before store.Binding) store.Binding {
 	d.t.Helper()
+	d.fake.mu.Lock()
+	firstOutput := len(d.fake.messages)
+	d.fake.mu.Unlock()
 	d.command(before.Thread, "/status")
-	waitFor(d.t, func() bool { return d.fake.has(before.Thread, "OMP: released") })
+	// A temporary status runtime may still be draining metadata when rendered.
+	waitFor(d.t, func() bool {
+		d.fake.mu.Lock()
+		defer d.fake.mu.Unlock()
+		for _, message := range d.fake.messages[firstOutput:] {
+			thread, _ := message["message_thread_id"].(float64)
+			text, _ := message["text"].(string)
+			if int64(thread) != before.Thread || !strings.Contains(text, before.SessionID) {
+				continue
+			}
+			if strings.Contains(text, "\nOMP: ") {
+				return true
+			}
+		}
+		return false
+	})
 	after := d.binding(before.Thread)
 	if after != before {
 		d.t.Fatalf("startup changed saved binding: before=%+v after=%+v", before, after)

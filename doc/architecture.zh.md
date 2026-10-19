@@ -50,6 +50,7 @@ Daemon 将 Telegram 对话桥接到原生 OMP session. 它负责鉴权, 路由, 
 | [`session.go`](../internal/bridge/session.go), [`resume_picker.go`](../internal/bridge/resume_picker.go), [`binding_list.go`](../internal/bridge/binding_list.go), [`session_delete.go`](../internal/bridge/session_delete.go), [`export.go`](../internal/bridge/export.go) | Session 转换, 列表, reservation, 收藏, 删除, 导出 |
 | [`args.go`](../internal/bridge/args.go), [`model_picker.go`](../internal/bridge/model_picker.go), [`doctor.go`](../internal/bridge/doctor.go) | 启动预设, 运行设置, 不改变 session 的诊断 |
 | [`progress_status.go`](../internal/bridge/progress_status.go), [`reply_status.go`](../internal/bridge/reply_status.go), [`reply_metrics.go`](../internal/bridge/reply_metrics.go), [`watchdog.go`](../internal/bridge/watchdog.go) | 尽力而为的实时状态, 有界最终回复状态头, 保守的终结信号缺失恢复 |
+| [`internal/i18n`](../internal/i18n/i18n.go), [`language.go`](../internal/bridge/language.go) | Bridge 中英模板与全局语言切换 |
 | [`internal/omp`](../internal/omp/client.go) | RPC v2 分帧与关联, 进程管理, 原生 metadata, ACP session 列表, export/render/delete 委托 |
 | [`internal/store`](../internal/store/store.go) | SQLite schema, inbox/outbox, binding, startup intent, 原子转换与保留清理 |
 | [`internal/telegram`](../internal/telegram/client.go) | Bot API, Markdown 转 HTML, reply fallback, transport/交付确定性分类 |
@@ -102,7 +103,7 @@ Polling 失败采用可取消的指数退避, 从一秒增加到 30 秒. Telegra
 
 1. 加载配置并创建 logger, 然后设置严格 umask, 获取独占 `daemon.lock`.
 2. 初始化/迁移 SQLite, 整理上次运行遗留状态.
-3. Telegram `getMe`, 数据库 Bot 所有权检查, 初始化持久化参数预设选择.
+3. Telegram `getMe`, 数据库 Bot 所有权检查, 初始化持久化参数预设选择和全局界面语言.
 4. 尽力注册 default 和 `zh` 语言范围的默认命令菜单.
 5. 整理 progress 清理关联, 恢复符合条件的 session claim/worker, 执行保留清理.
 6. 运行 polling, actor 路由, 四个交付 worker, 命令菜单更新, progress 清理以及可选的每日保留清理任务.
@@ -231,7 +232,23 @@ RPC client 消费私有元数据查询回复后, 已连接 runtime 的 `command_
 
 Session/catalog 失效清空旧 contribution. 逻辑 close/replacement/failure/shutdown 只移除该 worker 的 contribution; 空闲进程释放保留它. 指针 owner 与 inactive tombstone 阻止退役 worker 的迟到更新/移除. 启动时直接发布发现的 builtin 回退目录, 不先把 chat 菜单替换为仅含 bridge 命令的列表, 同时保留早到的权威目录.
 
-单一后台 publisher 合并 dirty chat, 在 actor/reader 外以 20 秒 deadline 写入默认语言和 `zh` scope. 每 chat/language 缓存已确认列表. 失败不使任务失败; 后续 contribution 改变可重试, 没有独立重试循环. 不确定发布会清空先前成功缓存, 因 Telegram 可能已应用更新; 明确拒绝保留缓存. 菜单状态不在本地持久化, 已发布原生名称和说明对 chat 成员可见, 包括无权操作 bot 的成员. 原始目录, 描述和参数不进入菜单诊断.
+单一后台 publisher 合并 dirty chat, 在 actor/reader 外以 20 秒 deadline 写入默认语言和 `zh` scope. 每 chat/language 缓存已确认列表, 跳过未变化的成功 scope. 发布失败不使任务失败. 不确定发布会清空先前成功缓存, 因 Telegram 可能已应用更新; 明确拒绝保留缓存. 菜单状态不在本地持久化, 已发布原生名称和说明对 chat 成员可见, 包括无权操作 bot 的成员. 原始目录, 描述和参数不进入菜单诊断.
+
+网络不确定结果, 请求超时, HTTP 5xx 和限流通过既有 dirty/pending/wake 机制重新排入失败 chat. 每 chat 的指数退避从一秒起步, 上限一分钟; Telegram 的 `retry_after` 更长时遵守其要求. 这些间隔不是交付 deadline. Publisher 复用一个可取消 timer, 将退避中的 chat 轮转到就绪工作之后, 到期时重新计算最新语言和目录. 重复更新只合并, 不绕过退避. 每 chat 连续失败只在首轮记录 warning, 完整成功后重置. 明确的非 429 HTTP 4xx 拒绝不安排自动重试, 但后续 contribution/语言更新仍可在相同退避约束下触发新尝试. 测试使用 `testing/synctest` 覆盖持久化语言恢复, scope 部分成功, 最新状态选择, 重试边界, 日志抑制, 取消和永久拒绝.
+
+### 界面语言
+
+[`internal/i18n`](../internal/i18n/i18n.go) 只本地化 Bridge 自有模板, 默认英文, `/lang zh` 切换中文, `/lang en` 切回英文, `/lang` 查看当前设置. 语言设置在所有私聊和 topic 之间全局共享, 不根据 Telegram 用户语言推断, 不附着于 OMP session 或 binding. 通过原有鉴权的调用者均可修改. 任务执行及迁移未解决期间也能使用该命令, 不提交 OMP 工作, 不清除迁移锁.
+
+[`language.go`](../internal/bridge/language.go) 在 worker 启动及恢复通知之前读取单例设置. 互斥锁串行化数据库写入和内存原子发布, 避免并发切换造成持久值与运行值顺序倒置. Worker 读取共享的原子设置, 不保留独立副本. 持久化失败时保持当前语言. 关闭或替换 session, 删除 binding 均不重置语言. Telegram 默认及 `zh` 菜单 scope 都使用选定的全局语言; 切换会将全局菜单和所有已知/配置的 chat 菜单标为 dirty, 由既有后台 publisher 刷新.
+
+[`Message`](../internal/i18n/i18n.go) 是英中字段私有的结构体. 静态 [`Msg` 目录](../internal/i18n/messages.go) 为每个双语对象提供稳定的语义名称. 小范围 `Task`, `Session`, `Queue`, `Language` 分组收纳相关词条, 例如 `i18n.Msg.Task.SubmissionUncertain` 和 `i18n.Msg.Queue.Full`; 其余词条保持扁平, 按需迁移. 名称不依赖英文措辞, 移除的扁平名称不保留别名. 英文文本不再作为查找 key. `Text` 和 Bridge 的两个 `tr` helper 只接受 `Message`, 因而原始字符串, 不存在的词条名及缺少构造参数都会编译失败. 修改英文措辞时在同一词条中维护中文, 不再同步另一份查找 key. 类型化 Bridge 错误和稳定的 media/store sentinel 显式选择词条, 不按英文措辞识别不透明错误. 调用点先选择语言模板, 再填入用户/原生值, 不翻译拼接后的输出, 不在通用交付层拦截翻译. 原生 OMP 文字及交互内容, 模型回复, 工具参数/结果, 路径, session 标题和用户 caption 均不翻译. 既有渲染限制和脱敏行为保持不变. 排队媒体将 caption 与 Bridge 默认标签分开, 新渲染的队列使用最新语言. 不重写已经渲染的 outbox 文本或已交付消息.
+
+Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言的在途发布可能短暂可见, 随后由已排队的语言刷新收敛. 回归测试在语言切换时阻塞发布, 确认所有默认/chat scope 最终使用中文, 再快速切换并确认收敛到英文. Task 不保存启动时的语言: 新生成的 Bridge 回执使用当前全局设置, 此前已渲染的 outbox 文本和 OMP 回复正文不变.
+
+`progress.NativeStatus` 缓存已渲染的 Bridge 状态文本. 切换语言不会立即重建缓存: 下一次通过校验的原生状态结果按完成时的全局语言生成, 包括 RPC 查询在途期间发生的切换. 正常采样间隔为五秒, 但仍受 RPC 成功及身份 fencing 约束, 不保证五秒内刷新. 已有进度消息在下一次正常更新时编辑, 不增加缓存 epoch 或 task 语言字段. 原生 OMP 扩展文本不在此保证范围内.
+
+词条构造函数拒绝空语言文本. 测试使用反射递归遍历 `Msg` 的扁平词条和嵌套分组, 检查英中两种文本及有序格式指令, 包括参数数量, verb, width 和 precision; 不维护另一份运行时注册表. 嵌套词条回归覆盖缺少翻译和格式参数不匹配. 检查器理解顺序 `%s`, `%d`, `%f` 指令, 忽略转义的 `%%`; 不支持的语法会失败, 不会被静默跳过. 使用新的格式语法前需先扩展检查器. `formatDirectives` 保持在 `_test.go` 中. 这保护类型化翻译路径, 不检查主动绕过该路径发送的任意原始文本.
 
 ### 原生对话与 session operation
 
@@ -564,7 +581,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 ### Schema 与迁移边界
 
-`PRAGMA user_version` 当前为 **19**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-18 按内置迁移链升级; 版本 19 增加持久化上下文迁移. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
+`PRAGMA user_version` 当前为 **20**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-19 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
 
 | 表 | 身份与保留内容 | 职责 |
 | --- | --- | --- |
@@ -575,6 +592,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 | `history` | Bot/对话, workspace, session 路径, generation | 旧 binding 快照, 不是原生 session 索引或对话 transcript |
 | `session_favorites` | `(bot,chat,thread,workspace,session_id)` | 当前对话收藏的原生 session identity |
 | `omp_args_selection` | 单行预设索引和参数指纹 | 全局启动预设选择, 不保存原始参数 |
+| `interface_language` | 单行 `id=1`, 语言为 `en` 或 `zh` | 全局 Bridge 界面语言; 没有记录时使用英文 |
 | `inbox` | Update ID; typed update JSON, 状态, reply target, progress message ID, 创建/更新时间 | 去重和输入的持久化结算 |
 | `outbox` | 递增 ID; 可选 inbox ID, chat/thread/reply target, 文本或附件类型/路径/名称, 状态, 重试时间/计数, 时间戳 | 有序的持久化交付; 附件字节保存在私有文件 spool |
 
@@ -718,22 +736,26 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 
 ### 验证边界
 
-最低 Go 工具链由 [go.mod](../go.mod) 指定. 使用仓库 [justfile](../justfile):
+最低 Go 工具链为 Go 1.27.2, 由 [go.mod](../go.mod) 指定. CI 和 `just fmt` 从该模块文件选择版本. 使用仓库 [justfile](../justfile):
 
 | 命令 | 效果 |
 | --- | --- |
 | `just build` 或 `just` | 构建 daemon |
-| `just fmt` | 格式化 Go 源码和测试 |
+| `just fmt` | 使用 `go.mod` 的 Go 版本格式化源码和测试, 与 CI 保持一致 |
 | `just test` | 运行单元测试, 不启动或重启服务 |
 | `just check` | 单元测试, race 检查, vet; 不启动 Telegram polling |
 | `just install` | 构建并仅安装二进制; 配置和数据由用户管理 |
 | `just deploy` | 安装后, 安排五秒后分离执行已有 supervisor 服务重启 |
+
+`just test` 和 `just check` 在各自 recipe shell 内设置 `umask 0077`. Go 的 `testing.T.TempDir` 以 `0777` 经进程 umask 过滤后创建编号子目录, 调用方使用 `0002` 等掩码时会令 store fixture 可被组写入, 在业务断言之前就初始化失败. Recipe 内的掩码不影响调用方 shell, 也不对已有目录执行 chmod. 保持 store 对组/其他用户可写数据目录的拒绝校验不变.
 
 本地配置检查先构建, 再运行 `./omp-telegram --check`; 需要时显式指定 `--config`. 该命令会创建目录, 测试配置行为时使用一次性路径.
 
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
 
 Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 request 和 epoch, 再注入 deadline 错误; 根任务, session 和队列断言仍然适用. RPC 测试单独覆盖真实 context deadline, 合并发现请求和迟到响应. 不为测试提速缩短生产查询 deadline.
+
+恢复测试等待新交付的状态回执确认已保存的会话身份, 不依赖瞬时的 `OMP: released` 标签. 临时状态 runtime 排空缓冲元数据期间仍可能显示已连接. 独立的 runtime 释放测试覆盖最终进程释放及新到任务不被中断.
 
 会进入原生启动路径的单元测试必须使用 RPC 子进程 fixture 的绝对可执行路径和隔离 workspace. 启动取消及菜单注册拒绝场景在 `PATH` 中没有 `omp` 的环境下验证; 只有显式真实 OMP smoke 可以依赖本机安装的 OMP.
 
@@ -755,6 +777,8 @@ OMP_TELEGRAM_TEST_OMP=/absolute/path/to/omp \
 应用版本来自 [`main.go`](../cmd/omp-telegram/main.go) 的 `Version`, 可用 `-ldflags "-X main.Version=..."` 覆盖. `--version`, `-v`, `/help`, `/start` 使用同一 display version, 构建信息可用时附带 Git revision/dirty 标记. 应用版本与 SQLite schema 版本独立.
 
 [发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 格式和依赖一致性检查只在 amd64 执行一次, 在 Linux amd64/arm64 原生 runner 上运行 `govulncheck`, vet 和普通测试. 完整 amd64 race 测试独立为一个 job, 与两个架构构建并行. 测试命令使用 `-vet=off` 避免重复执行自动 vet 子集; 两个原生构建仍分别执行独立的完整 vet 检查. 各架构以 CGO disabled 构建, 实跑 version/help, 将二进制和 LICENSE 打包为 `.txz`; 发布包附带 `SHA256SUMS`. 迁移 Extension 内嵌于二进制, 只在配置开关启用时加载. CI 门禁和发布都要求两个原生构建及 race job 成功.
+
+工作流固定 `govulncheck` 版本. 升级 Go 时还需选择 `x/tools` SSA 实现支持新 Go 语法的扫描器. 扫描器崩溃仍须使 CI 失败, 不通过忽略错误或降低扫描深度绕过兼容问题.
 
 缓存 action 固定到 commit SHA, 使用 Node.js 24. Go module 和编译缓存按 runner OS/架构, build/race job 及依赖文件 hash 隔离. 每个源码 revision 使用新缓存键, 恢复前一个兼容缓存, 无需等待 `go.sum` 变化才能更新编译产物. 新缓存前缀的首次运行是冷缓存; 普通测试不会因缓存而跳过执行.
 
