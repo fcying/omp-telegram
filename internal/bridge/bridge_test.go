@@ -671,6 +671,9 @@ func TestMain(m *testing.M) {
 				}
 			case "set_host_tools":
 				recordFixtureRPCTrace(typ, "")
+				if fixtureHoldsRPC(typ) {
+					continue
+				}
 			case "get_entries":
 				recordFixtureRPCTrace("get_entries", "")
 				if nativeMode == "autoresearch-entries-error" || autoresearchEntriesMode == "error" {

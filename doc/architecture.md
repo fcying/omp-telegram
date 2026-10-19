@@ -760,6 +760,8 @@ Worker lifecycle tests may cancel a real command-discovery waiter and inject a d
 
 Recovery tests wait for a newly delivered status reply identifying the saved session, not a transient `OMP: released` label. A temporary status runtime may still be connected while buffered metadata drains. Dedicated released-runtime tests cover eventual process release and preservation of incoming work.
 
+Linux-only [`TestCrashRecovery`](../internal/bridge/crash_recovery_linux_test.go) kills an independent daemon subprocess with `SIGKILL` at three synchronized boundaries: a submitted prompt without an acknowledgment, a Telegram send accepted by the local server without a response, and a persisted startup intent before binding commit. A fresh daemon opens the same database after each crash. Assertions cover uncertain settlement without replay/resend, cancellation of queued work, saved session identity, and explicit cancellation/resume after interrupted startup. The parent observes SQLite through a read-only connection so observation cannot trigger startup reconciliation. A process-local subreaper kills and reaps test-owned RPC fixtures before temporary-directory cleanup. These tests use an RPC subprocess fixture and a local fake Telegram HTTP server, not real OMP, a provider, or the live Bot API.
+
 Unit tests that reach native startup must use the RPC subprocess fixture by absolute executable path and an isolated workspace. Startup cancellation and registration-rejection coverage runs with no `omp` on `PATH`; only explicit real-OMP smoke checks may depend on an installed OMP.
 
 To exercise an installed OMP version explicitly, run:
