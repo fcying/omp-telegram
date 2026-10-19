@@ -440,6 +440,14 @@ just deploy
 
 `just test` 和 `just check` 在各自 recipe 内使用 `umask 0077`, 即使调用终端使用 `0002` 等允许组写入的掩码, 也以私有权限创建测试数据目录. 不修改终端的 umask, 也不放宽生产数据目录的权限校验.
 
+验证显式选择的 OMP 二进制, 不安装或部署:
+
+```sh
+just smoke-omp /absolute/path/to/omp
+```
+
+这个 opt-in 检查使用真实 OMP, 隔离 session 和确定性本地 provider, 覆盖流式任务中的 fast 控制, 排队回复归属, 附件 host-tool 入队, Stop/resume, 并复用已有迁移兼容检查. 不连接生产 provider 或 Telegram. 独立的 [OMP 兼容性工作流](.github/workflows/omp-compatibility.yaml) 支持手动和每周运行, 固定基线为 18.12.2, 候选版本独立报告结果, 默认为 `latest`. 不会升级已部署的 OMP.
+
 ## 架构
 
 实现及维护细节统一放在[中文架构说明](doc/architecture.zh.md)及[英文版](doc/architecture.md): 命令路由, RPC 完成语义, 持久化, 失败语义, 重启恢复, retention 和日志契约.

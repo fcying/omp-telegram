@@ -1,0 +1,89 @@
+name: OMP compatibility probes
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_version:
+        description: 'Candidate OMP version, e.g. 18.12.2 or v18.12.2; latest tracks the newest stable release'
+        required: true
+        default: latest
+        type: string
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compatibility:
+    name: ${{ matrix.track }} (OMP ${{ matrix.version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - track: baseline
+            version: '18.12.2'
+          - track: candidate
+            version: ${{ inputs.candidate_version || 'latest' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install pinned just in temporary storage
+        run: |
+          set -euo pipefail
+          # Verified against the official 1.59.0 release assets and SHA-256 digest.
+          # https://github.com/casey/just/releases/tag/1.59.0
+          tool_dir="$RUNNER_TEMP/omp-compatibility-tools"
+          mkdir -p "$tool_dir"
+          curl --fail --silent --show-error --location \
+            https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-x86_64-unknown-linux-musl.tar.gz \
+            --output "$tool_dir/just.tar.gz"
+          printf '%s  %s\n' \
+            409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e \
+            "$tool_dir/just.tar.gz" | sha256sum --check --strict
+          tar -xzf "$tool_dir/just.tar.gz" -C "$tool_dir" just
+          echo "$tool_dir" >> "$GITHUB_PATH"
+
+      - name: Download official OMP standalone into temporary storage
+        env:
+          OMP_VERSION: ${{ matrix.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Discover the asset URL from official release metadata, not a guessed URL.
+          # https://api.github.com/repos/can1357/oh-my-pi/releases/tags/v18.12.2
+          if [[ "$OMP_VERSION" == latest ]]; then
+            endpoint=latest
+          else
+            tag="v${OMP_VERSION#v}"
+            endpoint="tags/$(jq -rn --arg tag "$tag" '$tag | @uri')"
+          fi
+          tool_dir="$RUNNER_TEMP/omp-compatibility-tools"
+          curl --fail --silent --show-error --location \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/can1357/oh-my-pi/releases/$endpoint" \
+            --output "$tool_dir/omp-release.json"
+          resolved_tag=$(jq -er '.tag_name' "$tool_dir/omp-release.json")
+          asset_url=$(jq -er '.assets[] | select(.name == "omp-linux-x64") | .browser_download_url' "$tool_dir/omp-release.json")
+          digest=$(jq -er '.assets[] | select(.name == "omp-linux-x64") | .digest' "$tool_dir/omp-release.json")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          curl --fail --silent --show-error --location "$asset_url" --output "$tool_dir/omp"
+          printf '%s  %s\n' "${digest#sha256:}" "$tool_dir/omp" | sha256sum --check --strict
+          chmod 755 "$tool_dir/omp"
+          printf 'OMP release: %s\nAsset: %s\nDigest: %s\n' "$resolved_tag" "$asset_url" "$digest"
+          printf '### %s\n\nOMP: `%s`\n\nAsset: %s\n\nDigest: `%s`\n' \
+            '${{ matrix.track }}' "$resolved_tag" "$asset_url" "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run real OMP compatibility smoke
+        run: just smoke-omp "$RUNNER_TEMP/omp-compatibility-tools/omp"

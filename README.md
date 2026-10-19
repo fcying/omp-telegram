@@ -440,6 +440,14 @@ just deploy
 
 `just test` and `just check` use a recipe-local `umask 0077` so test data directories are private even when the invoking shell uses a group-writable mask such as `0002`. This does not change your terminal's umask or relax production data-directory permission checks.
 
+To check an explicitly selected OMP binary without installing or deploying it:
+
+```sh
+just smoke-omp /absolute/path/to/omp
+```
+
+This opt-in check runs real OMP against isolated sessions and a deterministic local provider: streaming fast controls, queued reply ownership, attachment host-tool enqueueing, Stop/resume, and the existing migration compatibility check. It does not contact a production provider or Telegram. The separate [OMP compatibility workflow](.github/workflows/omp-compatibility.yaml) runs manually and weekly, with a fixed 18.12.2 baseline and an independently reported candidate version (`latest` by default). It never upgrades the deployed OMP.
+
 ## Architecture
 
 Implementation and maintenance details belong in [Architecture](doc/architecture.md), also available in [Chinese](doc/architecture.zh.md): command routing, RPC completion, persistence, failure semantics, restart recovery, retention, and logging contracts.

@@ -26,9 +26,20 @@ deploy: install
     echo "Restart scheduled in 5s."
 
 # Run unit tests without touching the supervised daemon.
-test:
+[positional-arguments]
+test *args:
     umask 0077
-    go test ./...
+    go test ./... "$@"
+
+# Run real OMP compatibility tests with an explicitly supplied binary, without installing it.
+smoke-omp binary:
+    binary={{quote(binary)}}
+    if [[ -z "$binary" || ! -f "$binary" || ! -x "$binary" ]]; then
+        echo "Expected an explicit path to an executable OMP binary" >&2
+        exit 1
+    fi
+    binary=$(realpath -- "$binary")
+    OMP_TELEGRAM_TEST_OMP="$binary" {{quote(just_executable())}} test -run '^TestRealOMP(Bridge|Migration)Compatibility$' -count=1 -v
 
 # Run automated tests, race checks, and vet without starting Telegram polling.
 check:

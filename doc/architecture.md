@@ -747,6 +747,7 @@ The minimum Go toolchain is Go 1.27.2, declared in [go.mod](../go.mod). CI and `
 | `just fmt` | Format Go source and tests using the `go.mod` Go version, matching CI |
 | `just test` | Run unit tests without starting/restarting a service |
 | `just check` | Unit tests, race checks, and vet; no Telegram polling |
+| `just smoke-omp /absolute/path/to/omp` | Run opt-in real OMP Bridge and migration compatibility checks; no install/deploy |
 | `just install` | Build and install only the binary; leave configuration/data user-managed |
 | `just deploy` | Install, then schedule a detached restart of the existing supervisor service after five seconds |
 
@@ -767,11 +768,14 @@ Unit tests that reach native startup must use the RPC subprocess fixture by abso
 To exercise an installed OMP version explicitly, run:
 
 ```sh
-OMP_TELEGRAM_TEST_OMP=/absolute/path/to/omp \
-  GOFLAGS='-run=^TestRealOMPMigrationCompatibility$ -count=1 -v' just test
+just smoke-omp /absolute/path/to/omp
 ```
 
-Without `OMP_TELEGRAM_TEST_OMP`, the native compatibility test skips and the ordinary suite does not depend on OMP being installed. The selected executable's actual version and journal entry types are reported. Profiles, workspaces, sessions, data and child environment are isolated; no provider request or Telegram delivery is needed. This is an optional developer/maintainer check: before deploying a new OMP version, point it at the candidate executable. It is not a required upgrade step for ordinary users.
+The recipe requires an explicit executable path, sets `OMP_TELEGRAM_TEST_OMP`, and runs the two real compatibility tests without caching. Without that variable, both tests skip and the ordinary suite does not depend on OMP being installed. The selected executable's actual version is reported. Profiles, workspaces, sessions, data and child environment are isolated; every native process has an explicit absolute temporary `--session-dir`. No production-provider credentials or live Telegram delivery are needed. This is an optional developer/maintainer check before selecting a new OMP version, not a required upgrade step for ordinary users.
+
+[`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) uses the real worker and RPC client with a deterministic local OpenAI-compatible HTTP/SSE provider. It checks startup/catalog and host-tool registration, prompt acceptance versus completion, fast controls during a held root, queued final-reply ownership and the next request's actual `service_tier=priority`. A native `telegram_send` tool call/result must enqueue an immutable workspace snapshot for the original topic without claiming delivery. Stop must retire the old runtime and cancel queued work; lazy resume must retain session identity and prior native context without replay. The existing migration compatibility test remains a separate native Extension/journal check. Neither test certifies a production provider or live Bot API.
+
+The separate [OMP compatibility workflow](../.github/workflows/omp-compatibility.yaml) runs manually and weekly on Linux amd64. It downloads official standalone assets into runner-temporary storage, verifies their release-provided SHA-256 digests, and records resolved release tags. The baseline is fixed at 18.12.2; the candidate defaults to the latest stable release or an explicitly supplied tag. Both matrix results remain visible, and a candidate failure does not cancel the baseline. This workflow neither changes release CI nor installs/restarts the production daemon.
 
 A real OMP smoke must use isolated profiles, workspaces, databases, and explicit environment policy. A deterministic local provider verifies native RPC/model-tool interaction without proving production-provider compatibility. Injected Telegram updates or simulated callbacks verify bridge handling, not phone-originated input, button behavior, or live Bot API delivery. Real Telegram credentials and actual user-client interaction are required for those claims. Parent-death/process-group tests do not prove containment of arbitrary descendants. Do not retain per-fix smoke transcripts here or treat historical runs as current deployment certification.
 
