@@ -112,7 +112,7 @@ func (w *worker) persistedExportBindingMatches(result exportResult) bool {
 }
 
 func (w *worker) resumeBusy() bool {
-	return w.taskOrSessionBusy() || w.compacting || len(w.queue) != 0 || w.exportCancel != nil || w.deleteCancel != nil
+	return w.migrationLocked() || w.taskOrSessionBusy() || w.compacting || len(w.queue) != 0 || w.exportCancel != nil || w.deleteCancel != nil
 }
 
 func (w *worker) requestResumeList(user int64) {
@@ -124,6 +124,10 @@ func (w *worker) requestExportList(user int64, format string) {
 }
 
 func (w *worker) requestDirectExport(user int64, format, sessionID string) {
+	if w.migrationLocked() {
+		w.say("会话迁移尚未解决，不能导出。请先使用 /migrate recover 恢复。")
+		return
+	}
 	if !validSessionID(sessionID) {
 		w.say("Usage: /export [html] [session-id].")
 		return
@@ -191,6 +195,10 @@ func exportWorkspace(workspace string) (string, error) {
 	return cwd, nil
 }
 func (w *worker) requestSessionList(user int64, action, format string) {
+	if w.migrationLocked() {
+		w.say("会话迁移尚未解决，不能选择或导出会话。请先使用 /migrate recover 恢复。")
+		return
+	}
 	if w.deleteCancel != nil || action != "export" && action != "delete_refresh" && w.resumeBusy() {
 		w.say("Wait for the current task and queue to finish before selecting a session.")
 		return
@@ -243,6 +251,10 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 }
 
 func (w *worker) acceptSessionList(result resumeListResult) bool {
+	if w.migrationLocked() {
+		w.cancelResumeList()
+		return false
+	}
 	if result.request != w.resumeRequest || w.resumeCancel == nil {
 		return false
 	}
@@ -352,6 +364,10 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 }
 
 func (w *worker) beginExportWithArgs(session omp.SessionSummary, format, workspace string, generation int64, args []string) {
+	if w.migrationLocked() {
+		w.say("会话迁移尚未解决，不能导出。请先使用 /migrate recover 恢复。")
+		return
+	}
 	if format != "session" && format != "html" {
 		w.say("Usage: /export [html] [session-id].")
 		return

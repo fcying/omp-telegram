@@ -5,8 +5,9 @@ import (
 )
 
 type sessionClaim struct {
-	owner *worker
-	id    string
+	owner     *worker
+	id        string
+	migration bool
 }
 
 func validSessionID(id string) bool {
@@ -44,7 +45,8 @@ func (b *Bridge) sessionMatchesLocked(except *worker, id string) bool {
 			return true
 		}
 	}
-	return false
+	busy, _ := b.migrationSessionStatusLocked(except, id)
+	return busy
 }
 
 func (b *Bridge) exportMatchesLocked(except *worker, id string) bool {
@@ -64,7 +66,7 @@ func (b *Bridge) deleteMatchesLocked(id string) bool {
 	return false
 }
 
-// A released logical claim does not block deletion; live runtimes and in-flight operations do.
+// Released logical claims permit deletion, but durable migration claims never do.
 func (b *Bridge) sessionDeleteStatus(owner *worker, id string) (busy, elsewhere bool) {
 	b.sessionMu.Lock()
 	defer b.sessionMu.Unlock()
@@ -72,6 +74,7 @@ func (b *Bridge) sessionDeleteStatus(owner *worker, id string) (busy, elsewhere 
 }
 
 func (b *Bridge) sessionDeleteStatusLocked(owner *worker, id string) (busy, elsewhere bool) {
+	busy, elsewhere = b.migrationSessionStatusLocked(owner, id)
 	for _, claim := range b.sessionClaims {
 		if claim.owner == nil || !sessionIDsMatch(claim.id, id) {
 			continue
@@ -204,14 +207,14 @@ func (w *worker) claimSession(file, id string) bool {
 	if w.b.sessionClaims == nil {
 		w.b.sessionClaims = make(map[string]sessionClaim)
 	}
-	if w.b.exportMatchesLocked(w, id) || w.b.deleteMatchesLocked(id) {
+	if w.b.sessionMatchesLocked(w, id) || w.b.exportMatchesLocked(w, id) || w.b.deleteMatchesLocked(id) {
 		return false
 	}
 	if claim, exists := w.b.sessionClaims[file]; exists && claim.owner != w {
 		return false
 	}
 	for _, claim := range w.b.sessionClaims {
-		if claim.owner != w && strings.EqualFold(claim.id, id) {
+		if claim.owner == w && claim.migration {
 			return false
 		}
 	}
@@ -230,7 +233,7 @@ func (w *worker) releaseSession() {
 	w.b.sessionMu.Lock()
 	defer w.b.sessionMu.Unlock()
 	for path, claim := range w.b.sessionClaims {
-		if claim.owner == w {
+		if claim.owner == w && !claim.migration {
 			delete(w.b.sessionClaims, path)
 		}
 	}

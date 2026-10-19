@@ -151,7 +151,7 @@ func TestOMPArgsSelectionPersistenceAndReset(t *testing.T) {
 func TestVersionSixteenMigratesOMPArgsSelection(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
-	_, err := s.DB.Exec("DROP TABLE omp_args_selection; PRAGMA user_version=16")
+	_, err := s.DB.Exec("DROP TABLE migrations; DROP TABLE omp_args_selection; PRAGMA user_version=16")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -175,6 +175,7 @@ func TestVersionSeventeenDropsWorkspaceTrackingTables(t *testing.T) {
 CREATE TABLE workspace_leases(root TEXT,bot INTEGER,chat INTEGER,thread INTEGER,session TEXT);
 INSERT INTO workspace_users VALUES('/root',1,2,3,'session');
 INSERT INTO workspace_leases VALUES('/root',1,2,3,'session');
+DROP TABLE migrations;
 PRAGMA user_version=17;`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -216,7 +217,7 @@ func TestVersionElevenMigratesToCurrent(t *testing.T) {
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
-	_, err := s.DB.Exec("DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=11")
+	_, err := s.DB.Exec("DROP TABLE migrations; DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=11")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -242,7 +243,7 @@ func TestVersionTwelveMigrationRollsBackOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
-	_, err := s.DB.Exec(`DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
+	_, err := s.DB.Exec(`DROP TABLE migrations; DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	if reopened, err := Open(dir); err == nil {
@@ -273,6 +274,7 @@ func TestVersionTwelveMigratesToCurrentWithoutOtherDataLoss(t *testing.T) {
 CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id));
 INSERT INTO activity_messages(inbox_id,chat,message_id) VALUES (10,2,91);
 ALTER TABLE startup_intents DROP COLUMN created_at;
+DROP TABLE migrations;
 PRAGMA user_version=12;`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -308,7 +310,7 @@ func TestVersionThirteenStartsRetentionAtMigration(t *testing.T) {
 	previous := Binding{Bot: 1, Chat: 2, Thread: 3}
 	intent := StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/new", Generation: 1}
 	requireStoreOK(t, s.PrepareStart(previous, intent))
-	_, err := s.DB.Exec("DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=13")
+	_, err := s.DB.Exec("DROP TABLE migrations; DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=13")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -334,7 +336,7 @@ func TestVersionTwelveMissingTableLeavesDataUntouched(t *testing.T) {
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
-	_, err := s.DB.Exec("DROP TABLE omp_args_selection; PRAGMA user_version=12")
+	_, err := s.DB.Exec("DROP TABLE migrations; DROP TABLE omp_args_selection; PRAGMA user_version=12")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	if reopened, err := Open(dir); err == nil {

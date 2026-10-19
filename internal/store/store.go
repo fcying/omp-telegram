@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 18
+const schemaVersion = 19
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -380,6 +380,12 @@ CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));
 		}
 		version = 18
 	}
+	if version == 18 {
+		if _, e = tx.Exec(migrationSchema); e != nil {
+			return e
+		}
+		version = 19
+	}
 
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
@@ -725,6 +731,13 @@ func (s *Store) DeleteSessionReferences(bot int64, sessionID string) (int64, err
 		return 0, err
 	}
 	defer tx.Rollback()
+	var locked bool
+	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM migrations WHERE bot=? AND (session_id=? COLLATE NOCASE OR candidate_id=? COLLATE NOCASE))", bot, sessionID, sessionID).Scan(&locked); err != nil {
+		return 0, err
+	}
+	if locked {
+		return 0, ErrMigrationLocked
+	}
 	if _, err = tx.Exec("DELETE FROM history WHERE bot=? AND session<>'' AND session IN (SELECT session FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND session<>'')", bot, bot, sessionID); err != nil {
 		return 0, err
 	}
@@ -783,6 +796,12 @@ func (s *Store) Save(b Binding) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := migrationGuard(tx, b.Bot, b.Chat, b.Thread); err != nil {
+		return err
+	}
+	if err := migrationSessionGuard(tx, b.Bot, b.Session, b.SessionID); err != nil {
+		return err
+	}
 	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread); err != nil {
 		return err
 	}
@@ -853,7 +872,7 @@ func (s *Store) BindingsForChat(bot, chat int64) ([]BindingListEntry, error) {
 }
 
 func (s *Store) TouchBinding(bot, chat, thread, generation, usedAt int64) (bool, error) {
-	result, err := s.DB.Exec("UPDATE bindings SET last_used_at=? WHERE bot=? AND chat=? AND thread=? AND generation=?", usedAt, bot, chat, thread, generation)
+	result, err := s.DB.Exec("UPDATE bindings SET last_used_at=? WHERE bot=? AND chat=? AND thread=? AND generation=? AND NOT EXISTS (SELECT 1 FROM migrations WHERE bot=? AND chat=? AND thread=?)", usedAt, bot, chat, thread, generation, bot, chat, thread)
 	if err != nil {
 		return false, err
 	}
@@ -867,7 +886,7 @@ func (s *Store) DeleteClosedBinding(bot, chat, thread, generation int64) (bool, 
 		return false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec("DELETE FROM bindings WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=0 AND NOT EXISTS (SELECT 1 FROM startup_intents WHERE bot=? AND chat=? AND thread=?)", bot, chat, thread, generation, bot, chat, thread)
+	result, err := tx.Exec("DELETE FROM bindings WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=0 AND NOT EXISTS (SELECT 1 FROM startup_intents WHERE bot=? AND chat=? AND thread=?) AND NOT EXISTS (SELECT 1 FROM migrations WHERE bot=? AND chat=? AND thread=?)", bot, chat, thread, generation, bot, chat, thread, bot, chat, thread)
 	if err != nil {
 		return false, err
 	}
@@ -964,7 +983,7 @@ func validSessionID(id string) string {
 }
 
 func (s *Store) SetRunning(b Binding, running bool) error {
-	result, err := s.DB.Exec("UPDATE bindings SET running=? WHERE bot=? AND chat=? AND thread=? AND generation=?", running, b.Bot, b.Chat, b.Thread, b.Generation)
+	result, err := s.DB.Exec("UPDATE bindings SET running=? WHERE bot=? AND chat=? AND thread=? AND generation=? AND NOT EXISTS (SELECT 1 FROM migrations WHERE bot=? AND chat=? AND thread=?)", running, b.Bot, b.Chat, b.Thread, b.Generation, b.Bot, b.Chat, b.Thread)
 	if err != nil {
 		return err
 	}
@@ -1052,6 +1071,7 @@ SET progress_message_id=0
 WHERE candidate.state IN ('done','cancelled','ignored','failed','uncertain')
   AND candidate.progress_message_id>0
   AND candidate.updated_at<?
+  AND NOT EXISTS (SELECT 1 FROM migrations WHERE inbox_id=candidate.id)
   AND NOT EXISTS (
 		SELECT 1
 		FROM outbox AS active
@@ -1060,7 +1080,7 @@ WHERE candidate.state IN ('done','cancelled','ignored','failed','uncertain')
 	)`, cutoff); err != nil {
 		return 0, err
 	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM inbox WHERE id IN (SELECT id FROM inbox WHERE state IN ('done','cancelled','ignored','failed','uncertain') AND progress_message_id=0 AND updated_at<? ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
+	result, err := tx.ExecContext(ctx, "DELETE FROM inbox WHERE id IN (SELECT id FROM inbox WHERE state IN ('done','cancelled','ignored','failed','uncertain') AND progress_message_id=0 AND updated_at<? AND NOT EXISTS (SELECT 1 FROM migrations WHERE inbox_id=inbox.id) ORDER BY id LIMIT ?)", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -1116,6 +1136,12 @@ func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := migrationGuard(tx, previous.Bot, previous.Chat, previous.Thread); err != nil {
+		return err
+	}
+	if err := migrationSessionGuard(tx, intent.Bot, intent.Session, sessionIDFromPath(intent.Session)); err != nil {
+		return err
+	}
 	if previous.Running {
 		result, err := tx.Exec("UPDATE bindings SET running=0 WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=1", previous.Bot, previous.Chat, previous.Thread, previous.Generation)
 		if err != nil {

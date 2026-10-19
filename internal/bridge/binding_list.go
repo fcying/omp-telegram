@@ -37,7 +37,7 @@ func (w *worker) conversationGeneration() int64 {
 }
 
 func (w *worker) touchBinding() {
-	if w.b == nil || w.b.db == nil || w.binding.Generation == 0 {
+	if w.migrationLocked() || w.b == nil || w.b.db == nil || w.binding.Generation == 0 {
 		return
 	}
 	usedAt := time.Now().Unix()
@@ -513,7 +513,7 @@ func (request bindingForgetRequest) reply(result bindingForgetResult) {
 }
 
 func (w *worker) canForgetBinding() bool {
-	return (w.runtime == runtimeReleased && w.client == nil || w.canReleaseRuntime()) &&
+	return !w.migrationLocked() && (w.runtime == runtimeReleased && w.client == nil || w.canReleaseRuntime()) &&
 		!w.taskActive() && !w.sessionControlBusy() && !w.restoring && !w.runtimeResuming &&
 		!w.awaitingContinuation && !w.previewBusy && w.exportingSession == "" &&
 		len(w.input) == 0 && len(w.queue) == 0 && len(w.albums) == 0 &&
@@ -524,6 +524,10 @@ func (w *worker) canForgetBinding() bool {
 }
 
 func (w *worker) forgetBinding(request bindingForgetRequest) {
+	if w.migrationLocked() {
+		request.reply(bindingForgetResult{status: "会话迁移尚未解决，不能删除绑定。请先使用 /migrate recover 恢复。"})
+		return
+	}
 	if w.ctx.Err() != nil {
 		request.reply(bindingForgetResult{status: "Binding changed. Use /bindings to refresh."})
 		return
@@ -621,6 +625,11 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, "Canceled")
 			return callbackDone
 		}
+		if w.b.migrationBindingLocked(c.deleteBot, c.deleteChat, c.deleteThread) {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, "迁移尚未解决")
+			w.say("会话迁移尚未解决，不能删除绑定。请先在对应会话使用 /migrate recover 恢复。")
+			return callbackDone
+		}
 		if c.deleteRunning {
 			if w.forgetPending || w.b.forgetRequests == nil {
 				_ = w.b.tg.AnswerCallback(ctx, q.ID, "Delete unavailable")
@@ -695,6 +704,11 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 		if !bindingCanDelete(entry, current) {
 			w.clearKeyboard(c.messageID)
 			w.say("Only a binding in another conversation without a pending start can be deleted.")
+			return callbackDone
+		}
+		if w.b.migrationBindingLocked(entry.Binding.Bot, entry.Binding.Chat, entry.Binding.Thread) {
+			w.clearKeyboard(c.messageID)
+			w.say("会话迁移尚未解决，不能删除绑定。请先在对应会话使用 /migrate recover 恢复。")
 			return callbackDone
 		}
 		w.clearKeyboard(c.messageID)

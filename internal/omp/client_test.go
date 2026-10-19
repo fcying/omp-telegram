@@ -79,6 +79,9 @@ func TestMain(m *testing.M) {
 				os.Exit(1)
 			}
 			fixtureDiscoveryRecord(command)
+			if fixtureMigrationCommand(command) {
+				continue
+			}
 			if fixtureSessionCommand(command) {
 				continue
 			}

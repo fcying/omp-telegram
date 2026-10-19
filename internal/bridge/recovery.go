@@ -84,6 +84,10 @@ func savedSessionAvailable(session, workspace string) bool {
 }
 
 func (w *worker) restoreBinding() {
+	if w.migrationLocked() {
+		w.restoring = false
+		return
+	}
 	w.restoring = false
 	if !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
 		sessionID := w.sessionID
@@ -119,6 +123,11 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			b.storeLog.Info("expired startup intents removed", "event", "cleanup_completed", "startup_intent_count", count)
 		}
 	}
+	migrations, err := b.db.PendingMigrations(b.bot.ID)
+	if err != nil {
+		b.storeLog.Error("migration read failed", "event", "binding_read_failed", "reason", "pending_migrations", "error_kind", "persistence")
+		return err
+	}
 	intents, err := b.db.PendingStarts(b.bot.ID)
 	if err != nil {
 		b.storeLog.Error("startup intent read failed", "event", "binding_read_failed", "reason", "pending_starts", "error_kind", "persistence")
@@ -133,7 +142,25 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 	if err := b.cancelPendingPrompts("restore"); err != nil {
 		return err
 	}
-	restored := make([]*worker, 0, len(bindings))
+	restored := make([]*worker, 0, len(bindings)+len(migrations))
+	// Reserve every migration before claiming any ordinary running binding.
+	// Closed sources still need a locked actor, but must not launch native OMP.
+	for i := range migrations {
+		migration := &migrations[i]
+		binding := migration.Source
+		if (binding.Thread == 0 && binding.Chat <= 0) || !slices.Contains(b.cfg.AllowedChats, binding.Chat) {
+			continue
+		}
+		key := target{binding.Chat, binding.Thread}
+		w := b.newWorker(ctx, key, binding, false, nil)
+		w.migration = migration
+		if !w.restoreMigrationClaims() {
+			w.cancel()
+			return errors.New("migration session identity is unavailable or claimed by another conversation")
+		}
+		workers[key] = w
+		restored = append(restored, w)
+	}
 	for _, binding := range bindings {
 		if ctx.Err() != nil {
 			break
@@ -142,6 +169,9 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			continue
 		}
 		key := target{binding.Chat, binding.Thread}
+		if workers[key] != nil {
+			continue
+		}
 		w := b.newWorker(ctx, key, binding, true, nil)
 		if !w.claimPersistedSession() {
 			w.log.Error("saved session claim failed", "event", "restore_claim", "generation", binding.Generation, "result", "failed", "reason", "identity_conflict")
@@ -233,6 +263,9 @@ func sameSessionFile(left, right string) bool {
 	return err == nil && os.SameFile(a, b)
 }
 func (w *worker) persistClosed() bool {
+	if w.migration != nil {
+		return true
+	}
 	if !w.binding.Running {
 		return true
 	}

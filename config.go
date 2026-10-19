@@ -6,3 +6,8 @@ import _ "embed"
 //
 //go:embed config.toml
 var DefaultConfig string
+
+// MigrationExtension is the bundled bridge-owned native migration command.
+//
+//go:embed extensions/omp-telegram-migrate.ts
+var MigrationExtension []byte

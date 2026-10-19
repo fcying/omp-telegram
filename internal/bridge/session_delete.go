@@ -9,6 +9,16 @@ import (
 )
 
 func (w *worker) sessionDeleteAvailable(sessionID, workspace string) (bool, error) {
+	migrations, err := w.b.db.PendingMigrations(w.b.bot.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, migration := range migrations {
+		if sessionIDsMatch(migration.Source.SessionID, sessionID) ||
+			migration.CandidateID != "" && sessionIDsMatch(migration.CandidateID, sessionID) {
+			return false, nil
+		}
+	}
 	bindings, err := w.b.db.RunningBindings(w.b.bot.ID)
 	if err != nil {
 		return false, err
@@ -149,7 +159,7 @@ func (w *worker) sessionDeleteFinished(result sessionDeleteResult) {
 			if !sessionIDsMatch(claim.id, result.sessionID) {
 				continue
 			}
-			if claim.owner != nil && (claim.owner.sessionRuntimeStarting.Load() || claim.owner.sessionRuntimeActive.Load()) {
+			if claim.migration || claim.owner != nil && (claim.owner.sessionRuntimeStarting.Load() || claim.owner.sessionRuntimeActive.Load()) {
 				continue
 			}
 			delete(w.b.sessionClaims, path)

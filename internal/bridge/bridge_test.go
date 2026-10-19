@@ -219,6 +219,166 @@ func waitForFixtureFile(path string) {
 	}
 }
 
+// Migration behavior is opt-in so ordinary RPC fixtures retain their wire format.
+type bridgeMigrationFixture struct {
+	mode        string
+	file        string
+	id          string
+	workspace   string
+	holdEntries bool
+}
+
+func newBridgeMigrationFixture(mode, file, id string) *bridgeMigrationFixture {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		os.Exit(2)
+	}
+	var header struct {
+		CWD string `json:"cwd"`
+	}
+	if json.Unmarshal(bytes.SplitN(data, []byte{'\n'}, 2)[0], &header) != nil {
+		os.Exit(2)
+	}
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			os.Exit(2)
+		}
+		if _, err := f.WriteString("\n"); err != nil {
+			os.Exit(2)
+		}
+		if f.Close() != nil {
+			os.Exit(2)
+		}
+	}
+	return &bridgeMigrationFixture{mode: mode, file: file, id: id, workspace: header.CWD}
+}
+
+func (f *bridgeMigrationFixture) append(entry any) {
+	file, err := os.OpenFile(f.file, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		os.Exit(2)
+	}
+	if json.NewEncoder(file).Encode(entry) != nil || file.Sync() != nil || file.Close() != nil {
+		os.Exit(2)
+	}
+}
+
+func (f *bridgeMigrationFixture) entries() ([]json.RawMessage, []json.RawMessage, any) {
+	data, err := os.ReadFile(f.file)
+	if err != nil {
+		os.Exit(2)
+	}
+	entries, messages := []json.RawMessage{}, []json.RawMessage{}
+	var leaf any
+	for _, line := range bytes.Split(bytes.TrimSuffix(data, []byte{'\n'}), []byte{'\n'})[1:] {
+		var entry struct {
+			ID      string          `json:"id"`
+			Message json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(line, &entry) != nil {
+			os.Exit(2)
+		}
+		entries = append(entries, json.RawMessage(line))
+		leaf = entry.ID
+		if len(entry.Message) != 0 {
+			messages = append(messages, entry.Message)
+		}
+	}
+	return entries, messages, leaf
+}
+
+func (f *bridgeMigrationFixture) command(cmd, resp map[string]any, emit func(any), file, id, model *string) bool {
+	typ, _ := cmd["type"].(string)
+	switch typ {
+	case "handoff":
+		recordFixtureRPCTrace("handoff", f.id)
+		if f.mode == "handoff-hold" {
+			return true
+		}
+		f.append(map[string]any{"type": "compaction", "id": "handoff-summary", "parentId": nil, "method": "handoff", "summary": "Synthetic handoff summary.\nPreserve the next task and its constraints."})
+		resp["data"] = map[string]any{}
+	case "get_entries":
+		recordFixtureRPCTrace(typ, f.id)
+		if f.mode == "setup-fail" {
+			resp["success"], resp["error"] = false, "fixture reload unavailable"
+			emit(resp)
+			return true
+		}
+		if f.holdEntries {
+			recordFixtureRPCTrace("migration_waiting", f.id)
+			return true
+		}
+		entries, _, leaf := f.entries()
+		resp["data"] = map[string]any{"entries": entries, "leafId": leaf}
+	case "get_messages":
+		recordFixtureRPCTrace(typ, f.id)
+		_, messages, _ := f.entries()
+		resp["data"] = map[string]any{"messages": messages}
+	case "prompt":
+		text, _ := cmd["message"].(string)
+		budgetPrefix := "/" + omp.MigrationHandoffCommand + " "
+		if strings.HasPrefix(text, budgetPrefix) {
+			var request struct {
+				Action, MigrationID, SourceSessionID, Workspace string
+			}
+			if json.Unmarshal([]byte(strings.TrimPrefix(text, budgetPrefix)), &request) != nil || request.SourceSessionID != f.id || request.Workspace != f.workspace {
+				os.Exit(2)
+			}
+			recordFixtureRPCTrace("budget_"+request.Action, f.id)
+			if f.mode == "budget-restore-fail" && request.Action == "restore" {
+				resp["success"], resp["error"] = false, "fixture budget restore unavailable"
+			}
+			emit(resp)
+			return true
+		}
+		prefix := "/" + omp.MigrationCommand + " "
+		if !strings.HasPrefix(text, prefix) {
+			return false
+		}
+		recordFixtureRPCTrace("migration_command", f.id)
+		var request omp.MigrationRequest
+		if json.Unmarshal([]byte(strings.TrimPrefix(text, prefix)), &request) != nil || request.SourceSessionID != f.id || request.Workspace != f.workspace {
+			os.Exit(2)
+		}
+		f.id = fmt.Sprintf("11111111-2222-4333-8444-%012x", os.Getpid())
+		f.file = filepath.Join(filepath.Dir(f.file), f.id+".jsonl")
+		newFile, err := os.OpenFile(f.file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			os.Exit(2)
+		}
+		if newFile.Close() != nil {
+			os.Exit(2)
+		}
+		f.append(map[string]any{"type": "session", "id": f.id, "cwd": f.workspace})
+		f.append(map[string]any{"type": "model_change", "id": "model", "parentId": nil, "model": "fixture/" + *model})
+		f.append(map[string]any{"type": "message", "id": "seed", "parentId": "model", "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": request.Summary}}}})
+		*file, *id = f.file, f.id
+		recordFixtureRPCTrace("new_session", f.id)
+		if f.mode != "setup-fail" && f.mode != "no-marker" {
+			hash := request.SummarySHA256
+			if f.mode == "hash-mismatch" {
+				hash = strings.Repeat("0", 64)
+			}
+			f.append(map[string]any{"type": "custom", "id": "marker", "parentId": "seed", "customType": omp.MigrationMarkerType, "data": map[string]any{"version": 1, "migrationId": request.MigrationID, "sourceSessionId": request.SourceSessionID, "sourceGeneration": request.SourceGeneration, "targetSessionId": f.id, "workspace": f.workspace, "summaryEntryId": "seed", "summarySha256": hash, "reloadCompleted": true}})
+		}
+		f.holdEntries = f.mode == "held"
+		if f.mode == "model-mismatch" {
+			*model = "wrong-model"
+		}
+		if f.mode == "setup-fail" {
+			resp["success"], resp["error"] = false, "fixture migration setup failed"
+		}
+		emit(resp)
+		emit(map[string]any{"type": "prompt_result", "id": cmd["id"], "status": "completed", "agentInvoked": false, "sessionSettled": true})
+		return true
+	default:
+		return false
+	}
+	emit(resp)
+	return true
+}
+
 func recordBridgeFixtureTrace(name string, value any) {
 	path := os.Getenv(name)
 	if path == "" {
@@ -316,10 +476,14 @@ func TestMain(m *testing.M) {
 			if err != nil {
 				os.Exit(2)
 			}
+			header := data
+			if os.Getenv("OMP_TELEGRAM_FIXTURE_MIGRATION") != "" {
+				header = bytes.SplitN(data, []byte{'\n'}, 2)[0]
+			}
 			var saved struct {
 				CWD string `json:"cwd"`
 			}
-			if json.Unmarshal(data, &saved) != nil || os.Chdir(saved.CWD) != nil {
+			if json.Unmarshal(header, &saved) != nil || os.Chdir(saved.CWD) != nil {
 				os.Exit(2)
 			}
 		} else if !noSession {
@@ -333,6 +497,15 @@ func TestMain(m *testing.M) {
 			}
 		}
 		sessionID = strings.TrimSuffix(filepath.Base(session), ".jsonl")
+		var migrationFixture *bridgeMigrationFixture
+		if mode := os.Getenv("OMP_TELEGRAM_FIXTURE_MIGRATION"); mode != "" {
+			migrationFixture = newBridgeMigrationFixture(mode, session, sessionID)
+			recordFixtureRPCTrace("migration_runtime_start", sessionID)
+			if release := os.Getenv("OMP_TELEGRAM_FIXTURE_MIGRATION_START_HOLD"); release != "" {
+				recordFixtureRPCTrace("migration_start_waiting", sessionID)
+				waitForFixtureFile(release)
+			}
+		}
 		emit(map[string]any{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": []int{1, 2}, "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
 		var streaming atomic.Bool
 		modelProvider, modelID := "fixture", "safe"
@@ -358,6 +531,12 @@ func TestMain(m *testing.M) {
 			nativeCommands = append(nativeCommands, map[string]any{"name": "plugin:command", "source": "file"}, map[string]any{"name": "foo", "source": "file"}, map[string]any{"name": "foo:bar", "source": "file"}, map[string]any{"name": "extension_switch", "aliases": []string{"extension_alias", "extension:session"}, "source": "extension"})
 		} else {
 			nativeCommands = []map[string]any{}
+		}
+		if migrationFixture != nil {
+			nativeCommands = append(nativeCommands,
+				map[string]any{"name": omp.MigrationCommand, "source": "extension"},
+				map[string]any{"name": omp.MigrationHandoffCommand, "source": "extension"},
+			)
 		}
 		if nativeMode == "bootstrap" {
 			nativeCommands = []map[string]any{
@@ -466,6 +645,9 @@ func TestMain(m *testing.M) {
 			}
 			typ, _ := cmd["type"].(string)
 			resp := map[string]any{"type": "response", "id": cmd["id"], "command": typ, "success": true}
+			if migrationFixture != nil && migrationFixture.command(cmd, resp, emit, &session, &sessionID, &modelID) {
+				continue
+			}
 			switch typ {
 			case "set_host_tools":
 				recordFixtureRPCTrace(typ, "")
@@ -3892,6 +4074,9 @@ func TestRPCOperationTimeouts(t *testing.T) {
 	}{
 		{name: "compact exceeds ordinary deadline", kind: "compact", work: 31 * time.Second, wantElapsed: 31 * time.Second},
 		{name: "compact remains bounded", kind: "compact", work: 181 * time.Second, wantErr: context.DeadlineExceeded, wantElapsed: 180 * time.Second},
+		{name: "handoff exceeds ordinary deadline", kind: "handoff", work: 31 * time.Second, wantElapsed: 31 * time.Second},
+		{name: "handoff remains bounded", kind: "handoff", work: 181 * time.Second, wantErr: context.DeadlineExceeded, wantElapsed: 180 * time.Second},
+		{name: "handoff respects worker cancellation", kind: "handoff", work: 31 * time.Second, cancelAfter: time.Second, wantErr: context.Canceled, wantElapsed: time.Second},
 		{name: "other operations retain deadline", kind: "status", work: 31 * time.Second, wantErr: context.DeadlineExceeded, wantElapsed: 30 * time.Second},
 		{name: "compact respects worker cancellation", kind: "compact", work: 31 * time.Second, cancelAfter: time.Second, wantErr: context.Canceled, wantElapsed: time.Second},
 	} {

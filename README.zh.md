@@ -23,7 +23,7 @@
 - 能访问 Telegram 和模型服务.
 - 一个 Telegram bot. 支持普通私聊, 私聊 topic 和群组 topic; 不支持没有 topic 的群组消息.
 
-已在 OMP 18.10.3 测试通过. 验证场景与未验证项见[架构文档](doc/architecture.zh.md).
+已在 OMP 18.12.2 测试通过. 验证场景与未验证项见[架构文档](doc/architecture.zh.md).
 
 同一个 bot token 同时只能由一个 polling 服务使用. 不能与 webhook 或其他 `getUpdates` 消费者同时运行.
 
@@ -38,7 +38,7 @@ mkdir -p "$HOME/tool/omp-telegram"
 tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 ```
 
-arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE, omp 需要单独安装. 每个发布版都附带 `SHA256SUMS`.
+arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE, omp 需要单独安装. 可选迁移 Extension 内嵌于二进制. 每个发布版都附带 `SHA256SUMS`.
 
 开发构建发布在 [Development build](https://github.com/fcying/omp-telegram/releases/tag/dev-latest). 这是 prerelease, 可能不稳定.
 
@@ -73,6 +73,7 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 binary = "omp"
 args = ["${OMP_TELEGRAM_ARGS}"]
 args_labels = ["Default"]
+migration_extension = false
 
 [omp.environment]
 mode = "denylist"
@@ -128,8 +129,9 @@ format = "text"
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram picker 标签, 每个预设一个. 未设置、为空或数量不匹配时回退显示 `Preset N`, 并在启动时记录 warning. 过长标签会截短以适配按钮. 标签会展示给能查看对话的人, 不要填凭据. |
+| `omp.migration_extension` | 为所有参数预设在每次 OMP 启动时加载内嵌迁移 Extension, 包括 resume. 默认 `false`, 无需单独安装 Extension. |
 | `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"` 会传递当前及未来新增的服务环境变量, 只排除显式列入 `deny` 的名称. 随附的 `config.toml` 设置了 `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` 只传递列出且已存在的变量. |
-| `storage.data_dir` | 数据库, lock 和输入/输出附件存储目录. 默认是二进制所在目录. |
+| `storage.data_dir` | 数据库, lock, 输入/输出附件及 bridge 生成的 Extension 缓存目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
 | `storage.database_retention_days` | Bridge 终态消息和符合清理条件的附件缓存的保留期. 默认 `90` 天; `0` 关闭按保留期执行的自动清理. 不删除 workspace, OMP session 数据或已保存的对话 binding. 见[数据与保留](#数据与保留). |
 | `worker.max_workers` | 同时连接的 OMP 进程上限. 默认 `8`; 配置最大值 `64`. |
@@ -226,7 +228,8 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/thinking` | 空闲时选择 thinking level. |
 | `/fast [on\|off\|status]` | 选择 fast mode, 显式开启或关闭, 或查看状态. |
 | `/compact` | 空闲时直接压缩当前 context, 无需确认. 状态消息原位更新结果和 context 使用量. |
-| `/handoff [补充要求]` | 空闲且队列为空时运行 OMP 原生 handoff. |
+| `/handoff [补充要求]` | 空闲且队列为空时运行 OMP 原生 handoff, deadline 为 180 秒. |
+| `/migrate` | 在同一 workspace 中将 handoff 上下文迁入新 session. 先启用 `omp.migration_extension`. |
 | `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. |
 | `/autoresearch [goal\|off\|clear]` | 当前 OMP 公布支持时控制原生 autoresearch. 安全边界和停止行为见下文. |
 | `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
@@ -372,6 +375,27 @@ Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变�
 `/stop` 结束活动任务但保留 session. `/close` 关闭 session, 保留 workspace 文件和 OMP history. 如果 `/new` 或 `/resume` 中断, 重试前先使用 `/close`.
 
 每个对话有独立 session, 但使用同一 workspace 的 session 会共享文件. 不同对话不是文件系统或凭据沙箱.
+
+### 迁移大型 session
+
+`/migrate` 先生成 handoff, 不增加模型回合地初始化一个小型新 session, 验证上下文和设置后再切换当前对话. 旧 session 和 workspace 保留. Handoff 本身使用模型, 最多等待 180 秒. 切换前必须确认 model, configured thinking (包括 `auto`) 和 fast-mode 设置一致. 所选模型写入原生 session 历史, 进程重启后恢复也保留该选择.
+
+短会话也支持迁移, 无需修改 OMP 的保留配置.
+
+在现有 `[omp]` 表中启用内嵌迁移 Extension, 然后重启 bridge:
+
+```toml
+[omp]
+migration_extension = true
+```
+
+默认值为 `false`. 开启后所有 OMP 参数预设都会加载内嵌 Extension, 不需要另装 `.ts` 文件. 现有 `omp.args` 保持不变; 如果之前已手动为该迁移 Extension 添加 `-e`, 请移除该项, 避免加载两份. 迁移要求 session 空闲且队列为空. 其他 Extension 命令和别名仍然拒绝执行.
+
+迁移失败, 超时或中断后, 普通输入保持锁定, 不排队也不重放. `/status` 显示操作及已知候选. `/stop` 和 `/close` 停止 runtime, 但不清除迁移锁. 显式使用 `/migrate recover old` 恢复源会话, 或 `/migrate recover <完整-session-id>` / `/migrate recover <绝对-session-文件路径>` 验证候选. 恢复不会再次执行 handoff 或创建 session, 也不会猜测最新文件作为未知候选.
+
+`/status` 没有候选信息表示身份未知, 不表示没有创建 session. 普通日志无法补全未记录的候选. 如果无法独立取得完整 ID 或绝对文件路径, 使用 `/migrate recover old`.
+
+迁移的是摘要文本, 不是活动工具, eval 状态或全部 session 专属 artifact. Bridge 只读取有界的本次新增 handoff 记录; OMP 恢复源 session 时仍可能需要加载旧历史.
 
 ## 数据与保留
 
