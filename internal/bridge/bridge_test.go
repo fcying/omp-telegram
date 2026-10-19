@@ -527,6 +527,8 @@ func TestMain(m *testing.M) {
 		var nativeCommands []map[string]any
 		var heldNativeDiscovery map[string]any
 		var heldNativeLocalID string
+		fastMode := os.Getenv("OMP_TELEGRAM_FIXTURE_FAST_MODE")
+		var heldFastAck map[string]any
 		if nativeMode != "" {
 			nativeCommands = []map[string]any{{"name": "native_local", "source": "builtin"}, {"name": "native_agent", "source": "file"}, {"name": "status", "source": "builtin"}, {"name": "move", "source": "builtin"}, {"name": "wt", "aliases": []string{"worktree"}, "source": "builtin"}, {"name": "session", "source": "builtin"}}
 			nativeCommands = append(nativeCommands, map[string]any{"name": "plugin:command", "source": "file"}, map[string]any{"name": "foo", "source": "file"}, map[string]any{"name": "foo:bar", "source": "file"}, map[string]any{"name": "extension_switch", "aliases": []string{"extension_alias", "extension:session"}, "source": "extension"})
@@ -547,6 +549,13 @@ func TestMain(m *testing.M) {
 				{"name": "status", "source": "builtin", "description": "Native status"},
 				{"name": "move", "source": "builtin", "description": "Move workspace"},
 			}
+		}
+		if nativeMode != "fast-missing" {
+			source := "builtin"
+			if nativeMode == "fast-file" || nativeMode == "fast-extension" {
+				source = strings.TrimPrefix(nativeMode, "fast-")
+			}
+			nativeCommands = append(nativeCommands, map[string]any{"name": "fast", "source": source})
 		}
 		autoresearchFixture := strings.HasPrefix(nativeMode, "autoresearch")
 		autoresearchEnabled := os.Getenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE") == "on"
@@ -650,6 +659,16 @@ func TestMain(m *testing.M) {
 				continue
 			}
 			switch typ {
+			case "fixture_fast_mode":
+				fastMode, _ = cmd["mode"].(string)
+			case "fixture_fast_release":
+				if heldFastAck != nil {
+					if data, present := cmd["data"]; present {
+						heldFastAck["data"] = data
+					}
+					emit(heldFastAck)
+					heldFastAck = nil
+				}
 			case "set_host_tools":
 				recordFixtureRPCTrace(typ, "")
 			case "get_entries":
@@ -980,6 +999,52 @@ func TestMain(m *testing.M) {
 					continue
 				}
 				recordFixtureRPCTrace(typ, text)
+				if text == "/fast" || strings.HasPrefix(text, "/fast ") {
+					if _, steered := cmd["streamingBehavior"]; steered {
+						os.Exit(2)
+					}
+					if fastMode == "reject" {
+						resp["success"], resp["error"] = false, "PRIVATE_FAST_REJECTION"
+						emit(resp)
+						continue
+					}
+					args := strings.TrimSpace(strings.TrimPrefix(text, "/fast"))
+					output := ""
+					switch args {
+					case "":
+						fastEnabled = !fastEnabled
+					case "on", "ultra":
+						fastEnabled = true
+					case "off":
+						fastEnabled = false
+					case "status":
+					default:
+						output = "Usage: /fast [on|off|status|ultra]"
+					}
+					fastActive = fastEnabled && modelID != "fast-fallback"
+					if output == "" {
+						output = fmt.Sprintf("Fast mode: %s", map[bool]string{true: "on", false: "off"}[fastEnabled])
+						if args == "ultra" {
+							output += " (ultra)"
+						}
+					}
+					emit(map[string]any{"type": "command_output", "text": output})
+					resp["data"] = map[string]any{"agentInvoked": false}
+					switch fastMode {
+					case "hold":
+						heldFastAck = resp
+						recordFixtureRPCTrace("fast_waiting", text)
+						continue
+					case "missing-agent-invoked":
+						delete(resp, "data")
+					case "agent-invoked":
+						resp["data"] = map[string]any{"agentInvoked": true}
+					case "malformed-agent-invoked":
+						resp["data"] = map[string]any{"agentInvoked": "false"}
+					}
+					emit(resp)
+					continue
+				}
 				if autoresearchFixture && (text == "/autoresearch" || strings.HasPrefix(text, "/autoresearch ")) {
 					args := strings.TrimSpace(strings.TrimPrefix(text, "/autoresearch"))
 					if nativeMode == "autoresearch-off-error" && args == "off" {

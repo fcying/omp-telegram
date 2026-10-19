@@ -230,9 +230,8 @@ func TestSettingsMenusReportUnconfirmedResults(t *testing.T) {
 	}{
 		{name: "model identity", command: "/model", kind: "model_set_role", data: json.RawMessage(`{"provider":"fixture"}`)},
 		{name: "thinking level", command: "/thinking", kind: "model_verify_thinking", data: json.RawMessage(`{}`)},
-		{name: "fast active", command: "/fast", kind: "model_set_fast", data: json.RawMessage(`{"enabled":true}`)},
 		{name: "initial state", command: "/thinking", kind: "model_state", data: json.RawMessage(`{`)},
-		{name: "cancelled request", command: "/fast", kind: "model_set_fast", cancelled: true},
+		{name: "cancelled request", command: "/thinking", kind: "model_set_thinking", cancelled: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, f, command := setupWorkspaceWorker(t)
@@ -278,13 +277,13 @@ func TestStaleSettingsResultCannotEditNewMenu(t *testing.T) {
 	}
 }
 
-func TestConsumedModelAndFastMenusFinishOnRuntimeInterruption(t *testing.T) {
+func TestConsumedModelMenusFinishOnRuntimeInterruption(t *testing.T) {
 	for _, scenario := range []struct {
 		name, menu, kind string
 		replace          bool
 	}{
 		{name: "model close after native selection", menu: "/model", kind: "model_set_role"},
-		{name: "fast replacement after native mutation", menu: "/fast", kind: "model_set_fast", replace: true},
+		{name: "model replacement after native mutation", menu: "/model", kind: "model_set_role", replace: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, f, command := setupWorkspaceWorker(t)
@@ -309,11 +308,7 @@ func TestConsumedModelAndFastMenusFinishOnRuntimeInterruption(t *testing.T) {
 			if stale.kind != scenario.kind || stale.err != nil || stale.cancelled {
 				t.Fatalf("native settings operation did not succeed: %+v", stale)
 			}
-			if scenario.replace {
-				assertFastState(t, w, true, true)
-			} else {
-				assertPickerModel(t, w, "fixture", "quick")
-			}
+			assertPickerModel(t, w, "fixture", "quick")
 			pending, rows := pickerView(t, f)
 			if !strings.Contains(pending, "Applying") || len(rows) != 0 || !w.controlInProgress() {
 				t.Fatalf("consumed menu was not awaiting the native result: %q", pending)
@@ -323,7 +318,6 @@ func TestConsumedModelAndFastMenusFinishOnRuntimeInterruption(t *testing.T) {
 				if w.client == nil || w.client == client || w.binding.Generation <= before.Generation || !w.binding.Running || len(w.b.slots) != 1 {
 					t.Fatal("confirmed replacement did not install a new running native session")
 				}
-				assertFastState(t, w, false, false)
 			} else {
 				command("/close")
 				if w.client != nil || w.binding.Running || len(w.b.slots) != 0 {
@@ -358,7 +352,6 @@ func TestConsumedModelAndFastMenusFinishOnRuntimeInterruption(t *testing.T) {
 			if after != text || len(afterKeyboard) != len(keyboard) || resumeButtons(t, f)[0]["callback_data"].(string) != button || len(w.confirms) != 1 || w.client != currentClient || !sameBindingIdentity(w.binding, current) {
 				t.Fatal("old settings result changed the replacement runtime or current menu")
 			}
-			assertFastState(t, w, false, false)
 			assertPickerModel(t, w, "fixture", "safe")
 			if got := settingsMenuResult(t, f, messageID); got != interrupted {
 				t.Fatal("replayed result rewrote the old menu after a new menu opened")
@@ -386,28 +379,6 @@ func TestChineseModelPickerPreservesNativeRolesAndIdentity(t *testing.T) {
 		t.Fatalf("translated selection lost the actual model or role: %q", completed)
 	}
 	assertPickerModel(t, w, "fixture", "deep")
-}
-
-func TestChineseFastPickerKeepsProtocolOptions(t *testing.T) {
-	w, f, command := setupWorkspaceWorker(t)
-	command("/new " + t.TempDir())
-	w.b.setLanguage(i18n.Chinese)
-	command("/fast")
-	buttons := resumeButtons(t, f)
-	if len(buttons) != 3 || buttons[0]["text"] != i18n.Text(i18n.Chinese, i18n.Msg.On) || buttons[1]["text"] != "* "+i18n.Text(i18n.Chinese, i18n.Msg.Off) {
-		t.Fatalf("fast picker did not translate its labels: %v", buttons)
-	}
-	for _, c := range w.confirms {
-		if c.action == "fast" && (len(c.options) != 2 || c.options[0] != "on" || c.options[1] != "off") {
-			t.Fatalf("translated fast picker changed protocol options: %v", c.options)
-		}
-	}
-	messageID := f.messageCount()
-	clickKeyboard(w, 7, buttons[0]["callback_data"].(string))
-	assertFastState(t, w, true, true)
-	if got := settingsMenuResult(t, f, messageID); got != i18n.Text(i18n.Chinese, i18n.Msg.FastSettingFastActive, i18n.Text(i18n.Chinese, i18n.Msg.On), i18n.Text(i18n.Chinese, i18n.Msg.On)) {
-		t.Fatalf("fast selection did not display translated confirmed state: %q", got)
-	}
 }
 
 func TestChineseThinkingPickerKeepsProtocolOptions(t *testing.T) {

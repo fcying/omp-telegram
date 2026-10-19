@@ -63,7 +63,7 @@ func TestStartupThinkingFailureOutcomes(t *testing.T) {
 				case "resume":
 					command("/resume " + resumeID)
 				case "lazy-resume":
-					command("/fast")
+					command("/thinking")
 				}
 
 				stopped := mode == "hold" || mode == "unknown-ack"

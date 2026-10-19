@@ -533,15 +533,18 @@ A connected runtime keeps its launch argv unchanged. New starts and lazy restore
 
 ### Model, thinking and fast controls
 
-[`model_picker.go`](../internal/bridge/model_picker.go) serializes settings operations through the asynchronous RPC lane, fencing callbacks by generation/client/task context. Mutations require an idle native runtime and an empty bridge queue; `get_state` also rejects native streaming or compaction. State-requiring controls can lazily restore an open released session. `/fast status` is read-only and may run during a task, but does not bypass an already-active control operation.
+[`model_picker.go`](../internal/bridge/model_picker.go) serializes model/thinking operations through the asynchronous RPC lane, fencing callbacks by generation/client/task context. Mutations require an idle native runtime and an empty bridge queue; `get_state` also rejects native streaming or compaction. State-requiring controls can lazily restore an open released session.
 
 | Control | Native boundary |
 | --- | --- |
 | `/model` | Read `cycleOrder` and `modelRoles` through native read-only configuration queries; select a native `/model @role`. |
 | `/model provider/model` | Call `set_model` and use the returned native identity. |
 | `/thinking` | Call `set_thinking_level`, then verify `get_state.thinkingLevel`; report OMP's actual adjustment. |
-| `/fast [on\|off]` | Call `set_fast_mode` and report returned enabled and active values separately. |
-| `/fast status` | Read setting/activity without modifying them. |
+| `/fast [on\|ultra\|off\|status]` | Submit the native `/fast` command through RPC `prompt`; require explicit `agentInvoked=false`. Bare `/fast` toggles without a picker. |
+
+[`native_control.go`](../internal/bridge/native_control.go) owns the dedicated fast submission independently of the running root. It accepts controls while a task or queued work exists, without adding a prompt/steer or changing root identity, turn, owner, or final reply. Other active controls and bridge-owned compaction/handoff still exclude it. The shared asynchronous RPC lane serializes acknowledgments, not task completion; the next queued root waits for control settlement. Discovery waiting and the prompt RPC each have a 15-second deadline. Submission requires current builtin advertisement; catalog epoch/session, client and binding generation fence submission and acknowledgment. A reader-published catalog update can satisfy discovery without waiting for an older query response; unavailable or non-builtin commands are cancelled, never forwarded as model text.
+
+Native `command_output` lacks request IDs and remains standalone output, not a captured fast receipt or part of the running answer. OMP owns argument validation, service tiers and user-facing text. Explicit RPC rejection preserves the running root. Missing, malformed, or agent-invoking acknowledgments and uncertain submissions mark the control uncertain and retire the current runtime without replay; an interrupted root remains uncertain. `/stop`, the task Stop button, `/close`, and runtime replacement cancel pending control ownership; stop does not wait behind its acknowledgment and preserves the existing research mode-off and steered-owner shutdown boundaries. Already-submitted controls remain uncertain, and late results cannot affect the replacement client or generation.
 
 [`CycleRoles`](../internal/omp/model.go) retains native role ordering and default-role fallback. It applies the runtime's ordered `--config` overlays through native `PI_CONFIG_FILES` handling, honoring the child environment policy; explicit overlays still apply when inherited overlays are filtered out. It does not enumerate roles by switching models, duplicate selector resolution or modify configuration. A selected role is confirmed only after local-only acknowledgment, matching native success output and a matching `get_state` model. An unconfirmed role mutation retires the runtime. Explicit direct-setting RPC rejection is distinguished from an uncertain submission; uncertain mutations retire the process without changing the logical binding or replaying the mutation.
 

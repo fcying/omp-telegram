@@ -533,15 +533,18 @@ ID 精确匹配已提交会话时直接读取已提交路径, 空闲释放或 `/
 
 ### Model, thinking 与 fast 控制
 
-[`model_picker.go`](../internal/bridge/model_picker.go)通过异步 RPC 通道串行执行设置操作, 结果受代际/客户端/任务上下文栅栏保护. 修改要求原生运行时空闲且桥接队列为空; `get_state` 还会拒绝原生 streaming 或 compacting 状态. 需要状态的控制可以惰性恢复开启但已释放的会话. `/fast status` 只读, 可在任务中使用, 但不能绕过已经进行的控制操作.
+[`model_picker.go`](../internal/bridge/model_picker.go)通过异步 RPC 通道串行执行 model/thinking 操作, 结果受代际/客户端/任务上下文栅栏保护. 修改要求原生运行时空闲且桥接队列为空; `get_state` 还会拒绝原生 streaming 或 compacting 状态. 需要状态的控制可以惰性恢复开启但已释放的会话.
 
 | 控制 | 原生边界 |
 | --- | --- |
 | `/model` | 原生只读配置查询取得 `cycleOrder` 和 `modelRoles`; 选择时执行原生 `/model @role`. |
 | `/model provider/model` | 调用 `set_model`, 使用原生返回身份. |
 | `/thinking` | 调用 `set_thinking_level`, 然后验证 `get_state.thinkingLevel`, 报告 OMP 的实际调整. |
-| `/fast [on\|off]` | 调用 `set_fast_mode`, 分别报告返回的 enabled 与 active. |
-| `/fast status` | 只读取设置/活动状态, 不修改. |
+| `/fast [on\|ultra\|off\|status]` | 通过 RPC `prompt` 提交原生 `/fast` 命令; 要求明确 `agentInvoked=false`. 裸 `/fast` 直接切换, 不弹选择器. |
+
+[`native_control.go`](../internal/bridge/native_control.go)独立于运行中的 root 管理 fast 提交. 有活动任务或排队工作时仍可接受控制, 不新增 prompt/steer 任务, 不改变 root 身份, turn, owner 或最终回复. 其他活动控制及 Bridge 管理的 compact/handoff 仍与它互斥. 共享异步 RPC 通道串行等待 acknowledgment, 不等待任务完成; 下一个排队 root 等待控制结算后才启动. 目录发现等待和 prompt RPC 各有 15 秒 deadline. 提交要求当前目录公布 builtin; 提交和 acknowledgment 受 catalog epoch/session, client 和 binding generation 栅栏保护. Reader 发布的新目录可满足发现条件, 无需等待旧查询响应; 命令不可用或并非 builtin 时取消, 不作为模型文本转发.
+
+原生 `command_output` 没有请求 ID, 仍独立输出, 不捕获为某次 fast 专属回执, 也不并入当前答案. 参数校验, service tier 和用户可见文本归 OMP 所有. RPC 明确拒绝时保留当前 root. acknowledgment 缺失, 畸形或表示启动了 agent, 以及提交结果不确定时, 将控制标为 uncertain 并退役当前 runtime, 不自动重放; 被中断的 root 保留 uncertain. `/stop`, 任务 Stop 按钮, `/close` 和 runtime 替换会取消待处理控制的所有权; stop 不等待其 acknowledgment, 并保留既有研究模式关闭和 steered owner 停止边界. 已提交控制保留 uncertain, 晚到结果不能影响替换后的 client 或 generation.
 
 [`CycleRoles`](../internal/omp/model.go)保留原生 role 顺序和 default-role 回退. 它通过原生 `PI_CONFIG_FILES` 处理应用运行时有序的 `--config` overlay, 遵守子进程环境策略; 即使继承 overlay 被过滤, 显式 overlay 仍生效. 它不通过切换模型枚举 role, 不复制 selector 解析, 不修改配置. 选择 role 必须经本地执行确认, 匹配的原生成功输出及匹配的 `get_state` 模型共同确认. role 修改未确认时退役运行时. 直接设置 RPC 的明确拒绝与不确定提交不同; 不确定修改退役进程, 不改变逻辑绑定, 不重放修改.
 

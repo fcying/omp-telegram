@@ -204,6 +204,7 @@ const (
 	controlStatus
 	controlName
 	controlModel
+	controlNative
 )
 
 type sessionOperation uint8
@@ -267,6 +268,7 @@ type worker struct {
 	rootRequestID       string
 	nativeCatalog       nativeCommandCatalog
 	research            autoresearchState
+	nativeControl       *nativeControlRequest
 	resumeFailed        bool
 	progressTransport
 	compacting             bool
@@ -513,7 +515,7 @@ var botCommands = []struct {
 	{Command: "name", Description: i18n.Msg.NameOmpSessionNameTitle},
 	{Command: "model", Description: i18n.Msg.ChooseCycleRoleModelProviderModel},
 	{Command: "thinking", Description: i18n.Msg.ChooseThinkingLevelSession},
-	{Command: "fast", Description: i18n.Msg.ChooseFastModeFastOnOffStatus},
+	{Command: "fast", Description: i18n.Msg.ToggleNativeFastMode},
 	{Command: "compact", Description: i18n.Msg.CompactContextWhileIdle},
 	{Command: "handoff", Description: i18n.Msg.RunNativeHandoffHandoffInstructions},
 	{Command: "migrate", Description: i18n.Msg.MigrateContextMigrateRecoverOldSessionIdSessionFile},
@@ -1305,7 +1307,7 @@ func (w *worker) canEvict() bool {
 func (w *worker) hasRuntimeConfirmation() bool {
 	for _, c := range w.confirms {
 		switch c.action {
-		case "model", "thinking", "fast", "ui", "new", "autoresearch_clear":
+		case "model", "thinking", "ui", "new", "autoresearch_clear":
 			return true
 		}
 	}
@@ -1366,6 +1368,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.cancelNativeControl()
 	w.flushReplyStatus()
 	w.cancelProgressNative()
 	w.configuredThinking = ""
@@ -1725,6 +1728,10 @@ func (w *worker) run() {
 }
 
 func (w *worker) operationFinished(result operationResult) {
+	if result.kind == "native_control" {
+		w.nativeControlFinished(result)
+		return
+	}
 	if result.kind == "research_control" {
 		w.researchControlFinished(result)
 		if w.research.control == nil && w.client != nil {
@@ -2129,6 +2136,11 @@ func (w *worker) stop() {
 		w.cancelMigration("cancelled", true)
 		return
 	}
+	if w.nativeControl != nil {
+		w.clearQueue()
+		w.stopNativeControl(w.tr(i18n.Msg.AbortRequestedQueuedPromptsCleared))
+		return
+	}
 	if w.research.control != nil {
 		w.handleResearchStop()
 		w.clearQueue()
@@ -2154,6 +2166,10 @@ func (w *worker) stop() {
 }
 
 func (w *worker) stopActiveTask() {
+	if w.nativeControl != nil {
+		w.stopNativeControl(w.tr(i18n.Msg.AbortRequestedCurrentTaskQueuedPromptsWillContinue))
+		return
+	}
 	if w.handleResearchStop() {
 		return
 	}
@@ -2747,6 +2763,14 @@ func (w *worker) handle(in incoming) {
 		return
 	}
 	arg := slashCommandArguments(tail)
+	if cmd == "/fast" {
+		text := "/fast"
+		if arg != "" {
+			text += " " + arg
+		}
+		w.beginNativeControl(in, text)
+		return
+	}
 	if cmd == "/review" {
 		prompt := "/review"
 		if arg != "" {
@@ -2860,17 +2884,6 @@ func (w *worker) handle(in incoming) {
 			return
 		}
 		w.showThinkingPicker(in.msg.From.ID)
-	case "/fast":
-		switch arg {
-		case "":
-			w.showFastPicker(in.msg.From.ID)
-		case "on", "off":
-			w.switchFast(arg == "on")
-		case "status":
-			w.showFastStatus()
-		default:
-			w.say(w.tr(i18n.Msg.UsageFastOnOffStatus))
-		}
 	case "/handoff":
 		w.handoff(arg)
 	case "/compact":
@@ -4554,10 +4567,6 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		w.selectThinking(c, n)
 		return callbackDone
 	}
-	if c.action == "fast" {
-		w.selectFast(c, n)
-		return callbackDone
-	}
 	if n != 0 {
 		return callbackDone
 	}
@@ -4590,7 +4599,7 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 	} else {
 		if c.method == "select" {
 			text = w.tr(i18n.Msg.Selected, c.options[index])
-			if c.action == "model" || c.action == "thinking" || c.action == "fast" {
+			if c.action == "model" || c.action == "thinking" {
 				text += w.tr(i18n.Msg.Applying)
 			}
 		} else {

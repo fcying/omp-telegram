@@ -625,10 +625,6 @@ func TestIdleReleaseBlockedByThinkingConfirmation(t *testing.T) {
 	assertIdleReleaseBlockedByConfirmation(t, "thinking")
 }
 
-func TestIdleReleaseBlockedByFastConfirmation(t *testing.T) {
-	assertIdleReleaseBlockedByConfirmation(t, "fast")
-}
-
 func TestIdleReleaseBlockedByNativeUIConfirmation(t *testing.T) {
 	assertIdleReleaseBlockedByConfirmation(t, "ui")
 }
