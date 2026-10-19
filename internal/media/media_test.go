@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"image"
 	"image/color"
@@ -17,7 +18,34 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"omp-telegram/internal/telegram"
 )
+
+func TestPrepareReturnsStableErrorIdentities(t *testing.T) {
+	for _, scenario := range []struct {
+		name     string
+		messages []telegram.Message
+		want     error
+		text     string
+	}{
+		{"empty album", nil, ErrAlbumNoAttachments, "album has no attachments"},
+		{"invalid member", []telegram.Message{{Text: "not an attachment"}}, ErrAlbumMemberNotPhotoDocument, "album member is not a photo or document"},
+		{"missing file ID", []telegram.Message{{Document: &telegram.Document{}}}, ErrAttachmentMissingFileIDExceedsMBDownloadLimit, "attachment is missing a file ID or exceeds the 20 MB download limit"},
+		{"oversized attachment", []telegram.Message{{Document: &telegram.Document{FileID: "file", FileSize: MaxDownloadBytes + 1}}}, ErrAttachmentMissingFileIDExceedsMBDownloadLimit, "attachment is missing a file ID or exceeds the 20 MB download limit"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			_, err := PrepareAlbum(context.Background(), nil, t.TempDir(), scenario.messages)
+			if !errors.Is(err, scenario.want) || err.Error() != scenario.text {
+				t.Fatalf("preparation error = %v, want identity %v and text %q", err, scenario.want, scenario.text)
+			}
+		})
+	}
+	_, err := Prepare(context.Background(), nil, filepath.Join(t.TempDir(), "missing"), telegram.Message{Document: &telegram.Document{FileID: "file"}})
+	if !errors.Is(err, ErrCannotOpenIncomingAttachmentDirectory) || err.Error() != "cannot open incoming attachment directory" {
+		t.Fatalf("incoming directory error = %v", err)
+	}
+}
 
 func TestSnapshotConfinesSource(t *testing.T) {
 	workspace, outside, spool := t.TempDir(), t.TempDir(), t.TempDir()

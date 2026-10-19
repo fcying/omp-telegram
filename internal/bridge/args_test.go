@@ -794,3 +794,16 @@ func TestArgsCancelKeepsOperationContextAndSelection(t *testing.T) {
 		t.Fatalf("cancel changed or retained selection: memory=%d stored=%d error=%v", index, stored, err)
 	}
 }
+
+func TestChineseArgsButtonsPreserveConfiguredLabels(t *testing.T) {
+	labels := []string{"Cancel", "Preset 2 中文"}
+	if got := argsMenuButtonLabel("zh", 1, 1, labels); got != "1: * Cancel" {
+		t.Fatalf("configured preset label was translated: %q", got)
+	}
+	if got := argsMenuButtonLabel("zh", 2, 1, labels); got != "2: Preset 2 中文" {
+		t.Fatalf("configured mixed-language preset label was changed: %q", got)
+	}
+	if got := argsMenuButtonLabel("zh", 2, 1, nil); !strings.Contains(got, "预设 2") {
+		t.Fatalf("generated preset label was not localized: %q", got)
+	}
+}

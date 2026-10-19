@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/telegram"
 )
 
@@ -363,5 +364,106 @@ func TestConsumedModelAndFastMenusFinishOnRuntimeInterruption(t *testing.T) {
 				t.Fatal("replayed result rewrote the old menu after a new menu opened")
 			}
 		})
+	}
+}
+
+func TestChineseModelPickerPreservesNativeRolesAndIdentity(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.b.setLanguage(i18n.Chinese)
+	command("/model")
+	buttons := resumeButtons(t, f)
+	if len(buttons) != 5 || buttons[1]["text"] != "* default - fixture/safe:medium" {
+		t.Fatalf("translated picker changed native role data: %v", buttons)
+	}
+	if buttons[4]["text"] != i18n.Text(i18n.Chinese, i18n.Msg.Cancel) || !f.has(11, i18n.Text(i18n.Chinese, i18n.Msg.ChooseOMPCycleRoleCurrentModel, "fixture/safe")) {
+		t.Fatal("model picker did not translate its title and cancel control")
+	}
+	messageID := f.messageCount()
+	clickKeyboard(w, 7, buttons[2]["callback_data"].(string))
+	completed := settingsMenuResult(t, f, messageID)
+	if !strings.Contains(completed, i18n.Text(i18n.Chinese, i18n.Msg.ModelSwitched, "fixture/deep")) || !strings.Contains(completed, i18n.Text(i18n.Chinese, i18n.Msg.Role, "slow")) {
+		t.Fatalf("translated selection lost the actual model or role: %q", completed)
+	}
+	assertPickerModel(t, w, "fixture", "deep")
+}
+
+func TestChineseFastPickerKeepsProtocolOptions(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.b.setLanguage(i18n.Chinese)
+	command("/fast")
+	buttons := resumeButtons(t, f)
+	if len(buttons) != 3 || buttons[0]["text"] != i18n.Text(i18n.Chinese, i18n.Msg.On) || buttons[1]["text"] != "* "+i18n.Text(i18n.Chinese, i18n.Msg.Off) {
+		t.Fatalf("fast picker did not translate its labels: %v", buttons)
+	}
+	for _, c := range w.confirms {
+		if c.action == "fast" && (len(c.options) != 2 || c.options[0] != "on" || c.options[1] != "off") {
+			t.Fatalf("translated fast picker changed protocol options: %v", c.options)
+		}
+	}
+	messageID := f.messageCount()
+	clickKeyboard(w, 7, buttons[0]["callback_data"].(string))
+	assertFastState(t, w, true, true)
+	if got := settingsMenuResult(t, f, messageID); got != i18n.Text(i18n.Chinese, i18n.Msg.FastSettingFastActive, i18n.Text(i18n.Chinese, i18n.Msg.On), i18n.Text(i18n.Chinese, i18n.Msg.On)) {
+		t.Fatalf("fast selection did not display translated confirmed state: %q", got)
+	}
+}
+
+func TestChineseThinkingPickerKeepsProtocolOptions(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.b.setLanguage(i18n.Chinese)
+	command("/thinking")
+	buttons := resumeButtons(t, f)
+	if len(buttons) != len(thinkingLevels)+1 || buttons[4]["text"] != i18n.Text(i18n.Chinese, i18n.Msg.High) {
+		t.Fatalf("thinking picker did not translate its labels: %v", buttons)
+	}
+	for _, c := range w.confirms {
+		if c.action == "thinking" && strings.Join(c.options, ",") != strings.Join(thinkingLevels[:], ",") {
+			t.Fatalf("translated thinking picker changed protocol options: %v", c.options)
+		}
+	}
+	messageID := f.messageCount()
+	clickKeyboard(w, 7, buttons[4]["callback_data"].(string))
+	var state modelSettings
+	raw, err := w.call("get_state", nil)
+	if err != nil || json.Unmarshal(raw, &state) != nil || state.ThinkingLevel != "high" {
+		t.Fatalf("translated thinking choice did not send the native level: %s, %v", raw, err)
+	}
+	if got := settingsMenuResult(t, f, messageID); got != i18n.Text(i18n.Chinese, i18n.Msg.ThinkingLevel, "high") {
+		t.Fatalf("thinking selection changed native state text: %q", got)
+	}
+}
+
+func TestThinkingLevelLabelsPreserveProtocolValues(t *testing.T) {
+	w, _, _ := setupWorkspaceWorker(t)
+	labels := []struct {
+		level   string
+		message i18n.Message
+	}{
+		{"off", i18n.Msg.Off},
+		{"minimal", i18n.Msg.Minimal},
+		{"low", i18n.Msg.Low},
+		{"medium", i18n.Msg.Medium},
+		{"high", i18n.Msg.High},
+		{"xhigh", i18n.Msg.Xhigh},
+		{"max", i18n.Msg.Max},
+	}
+	for _, language := range []i18n.Language{i18n.English, i18n.Chinese} {
+		w.b.setLanguage(language)
+		for i, label := range labels {
+			if thinkingLevels[i] != label.level {
+				t.Fatalf("thinking protocol level %d changed: %q", i, thinkingLevels[i])
+			}
+			if got, want := w.thinkingLevelLabel(label.level), i18n.Text(language, label.message); got != want {
+				t.Fatalf("thinking label %q: got %q, want %q", label.level, got, want)
+			}
+		}
+		for _, native := range []string{"Cancel", "custom", "high "} {
+			if got := w.thinkingLevelLabel(native); got != native {
+				t.Fatalf("native thinking value changed: got %q, want %q", got, native)
+			}
+		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 )
@@ -51,14 +52,14 @@ func (w *worker) steer(in incoming, text string) {
 		return
 	}
 	if w.pendingInputFull() {
-		w.say("The queue is full. This message was not submitted.")
+		w.say(w.tr(i18n.Msg.Queue.Full))
 		w.mark(in.id, "cancelled")
 		return
 	}
 	prompt := preparePromptText(in.msg, text)
 	// Leave room for streamingBehavior on the already conservative prompt frame budget.
 	if _, fits := promptInlineCount(prompt, nil, client.FrameLimit()-len(`,"streamingBehavior":"steer"`)); !fits {
-		w.say("Prompt exceeds the omp RPC frame limit. No task was submitted.")
+		w.say(w.tr(i18n.Msg.PromptExceedsOmpRPCFrameLimitNoTaskSubmitted))
 		w.mark(in.id, "failed")
 		return
 	}
@@ -118,9 +119,9 @@ func (w *worker) steerOperationFinished(result operationResult) {
 			return
 		}
 		if state == store.InboxUncertain {
-			w.retireTaskRuntime("Steering outcome is uncertain and will not be replayed automatically.")
+			w.retireTaskRuntime(w.tr(i18n.Msg.SteeringOutcomeUncertainWillNotReplayedAutomatically))
 		} else {
-			w.say("Steering failed. The current task may not include that instruction.")
+			w.say(w.tr(i18n.Msg.SteeringFailedCurrentTaskMayNotIncludeInstruction))
 			w.maybeFinishSteeredRoot()
 		}
 		return
@@ -161,9 +162,9 @@ func (w *worker) steerResult(e rpcEvent) bool {
 		w.steerFence.settled = e.SessionSettled != nil && *e.SessionSettled
 	}
 	if state == store.InboxFailed {
-		w.say("Steering failed. The current task may not include that instruction.")
+		w.say(w.tr(i18n.Msg.SteeringFailedCurrentTaskMayNotIncludeInstruction))
 	} else if state == store.InboxUncertain {
-		w.retireTaskRuntime("Steering outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.SteeringOutcomeUncertainWillNotReplayedAutomatically))
 		return true
 	}
 	w.maybeFinishSteeredRoot()
@@ -206,12 +207,12 @@ func (w *worker) maybeFinishSteeredRoot() {
 	switch fence.terminal {
 	case terminalDone:
 		if w.preview == "" {
-			w.finishUncertain("omp ended without a confirmed text result. The task outcome is uncertain and will not be replayed automatically.")
+			w.finishUncertain(w.tr(i18n.Msg.OmpEndedWithoutConfirmedTextResultTaskOutcomeUncertain))
 		} else {
 			w.finishReplyWithStatus(false)
 		}
 	case terminalCancelled:
-		w.finishCancelled("Task was cancelled before completion.")
+		w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion))
 	case terminalUncertain:
 		w.finishUncertain(fence.notice)
 	}
@@ -291,7 +292,7 @@ func (w *worker) steeredQuiescenceFinished(result steerProbeResult) {
 	}
 	w.cancelSteerProbe()
 	if result.err != nil {
-		w.retireTaskRuntime("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.SteeringStateCouldNotConfirmedTaskOutcomeUncertainWill))
 		return
 	}
 	if result.settled {
@@ -316,7 +317,7 @@ func (w *worker) settleOutstandingSteers() bool {
 }
 
 func (w *worker) stopSteeredRoot() {
-	w.retireTaskRuntime("Steering was interrupted. The task outcome is uncertain and will not be replayed automatically.")
+	w.retireTaskRuntime(w.tr(i18n.Msg.SteeringInterruptedTaskOutcomeUncertainWillNotReplayedAutomatically))
 }
 
 func (w *worker) retireTaskRuntime(notice string) {

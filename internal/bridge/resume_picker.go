@@ -15,6 +15,7 @@ import (
 	"unicode"
 	"unicode/utf16"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/telegram"
@@ -125,31 +126,31 @@ func (w *worker) requestExportList(user int64, format string) {
 
 func (w *worker) requestDirectExport(user int64, format, sessionID string) {
 	if w.migrationLocked() {
-		w.say("会话迁移尚未解决，不能导出。请先使用 /migrate recover 恢复。")
+		w.say(w.tr(i18n.Msg.SessionMigrationUnresolvedExportUnavailableUseMigrateRecoverFirst))
 		return
 	}
 	if !validSessionID(sessionID) {
-		w.say("Usage: /export [html] [session-id].")
+		w.say(w.tr(i18n.Msg.UsageExportHtmlSessionId))
 		return
 	}
 	w.initResumePicker()
 	if w.resumeCancel != nil || w.exportCancel != nil {
-		w.say("The omp session operation is still loading.")
+		w.say(w.tr(i18n.Msg.OmpSessionOperationStillLoading))
 		return
 	}
 	binding, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && binding.Workspace == "" {
-		w.say("No working directory is selected. Use /new <name or path>, or /resume first.")
+		w.say(w.tr(i18n.Msg.NoWorkingDirectorySelectedUseNewNamePathResume))
 		return
 	}
 	if err != nil {
-		w.say("Failed to read the session.")
+		w.say(w.tr(i18n.Msg.FailedReadSession))
 		return
 	}
 	w.binding = binding
 	cwd, err := exportWorkspace(binding.Workspace)
 	if err != nil {
-		w.say(err.Error())
+		w.say(w.tr(i18n.Msg.WorkingDirectoryUnavailableNoSessionsLoaded))
 		return
 	}
 	args := w.b.selectedArgsSnapshot()
@@ -182,45 +183,45 @@ func parseExportArgs(arg string) (format, sessionID string, ok bool) {
 
 func exportWorkspace(workspace string) (string, error) {
 	if !filepath.IsAbs(workspace) {
-		return "", errors.New("The working directory is unavailable. No sessions were loaded.")
+		return "", newMessageError(i18n.Msg.WorkingDirectoryUnavailableNoSessionsLoaded)
 	}
 	cwd, err := filepath.EvalSymlinks(workspace)
 	if err != nil {
-		return "", errors.New("The working directory is unavailable. No sessions were loaded.")
+		return "", newMessageError(i18n.Msg.WorkingDirectoryUnavailableNoSessionsLoaded)
 	}
 	info, err := os.Stat(cwd)
 	if err != nil || !info.IsDir() {
-		return "", errors.New("The working directory is unavailable. No sessions were loaded.")
+		return "", newMessageError(i18n.Msg.WorkingDirectoryUnavailableNoSessionsLoaded)
 	}
 	return cwd, nil
 }
 func (w *worker) requestSessionList(user int64, action, format string) {
 	if w.migrationLocked() {
-		w.say("会话迁移尚未解决，不能选择或导出会话。请先使用 /migrate recover 恢复。")
+		w.say(w.tr(i18n.Msg.SessionMigrationUnresolvedSessionSelectionExportUnavailableUseMigrate))
 		return
 	}
 	if w.deleteCancel != nil || action != "export" && action != "delete_refresh" && w.resumeBusy() {
-		w.say("Wait for the current task and queue to finish before selecting a session.")
+		w.say(w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeSelectingSession))
 		return
 	}
 	w.initResumePicker()
 	if w.resumeCancel != nil || w.exportCancel != nil {
-		w.say("The omp session operation is still loading.")
+		w.say(w.tr(i18n.Msg.OmpSessionOperationStillLoading))
 		return
 	}
 	binding, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && binding.Workspace == "" {
-		w.say("No working directory is selected. Use /new <name or path>, or /resume first.")
+		w.say(w.tr(i18n.Msg.NoWorkingDirectorySelectedUseNewNamePathResume))
 		return
 	}
 	if err != nil {
-		w.say("Failed to read the session.")
+		w.say(w.tr(i18n.Msg.FailedReadSession))
 		return
 	}
 	w.binding = binding
 	cwd, err := exportWorkspace(binding.Workspace)
 	if err != nil {
-		w.say(err.Error())
+		w.say(w.tr(i18n.Msg.WorkingDirectoryUnavailableNoSessionsLoaded))
 		return
 	}
 	w.cancelResumeList()
@@ -261,24 +262,24 @@ func (w *worker) acceptSessionList(result resumeListResult) bool {
 	w.resumeCancel()
 	w.resumeCancel = nil
 	if result.epoch != w.b.bindingsEpoch.Load() {
-		w.say("The saved binding changed. Use /resume again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseResumeAgain))
 		return false
 	}
 	if result.generation != w.binding.Generation {
 		return false
 	}
 	if !w.persistedBindingGenerationMatches(result.generation) {
-		w.say("The saved binding changed. Use /resume again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseResumeAgain))
 		return false
 	}
 	if result.err != nil {
 		if !errors.Is(result.err, context.Canceled) {
-			w.say("Native omp session listing failed: " + result.err.Error())
+			w.say(w.tr(i18n.Msg.NativeOmpSessionListingFailed, result.err.Error()))
 		}
 		return false
 	}
 	if result.action != "export" && result.action != "delete_refresh" && w.resumeBusy() {
-		w.say("The conversation became busy. Use /resume again when it is idle.")
+		w.say(w.tr(i18n.Msg.ConversationBecameBusyUseResumeAgainWhenIdle))
 		return false
 	}
 	return true
@@ -309,12 +310,12 @@ func (w *worker) resumeListed(result resumeListResult) {
 		return
 	}
 	if len(result.sessions) == 0 {
-		w.say("omp has no saved sessions in this working directory.")
+		w.say(w.tr(i18n.Msg.OmpNoSavedSessionsWorkingDirectory))
 		return
 	}
 	pinned, err := w.b.db.PinnedSessions(w.b.bot.ID, w.key.chat, w.key.thread, result.cwd)
 	if err != nil {
-		w.say("Failed to read pinned sessions.")
+		w.say(w.tr(i18n.Msg.FailedReadPinnedSessions))
 		return
 	}
 	nativeSessions := append([]omp.SessionSummary(nil), result.sessions...)
@@ -325,7 +326,7 @@ func (w *worker) resumeListed(result resumeListResult) {
 
 func (w *worker) exportListed(result resumeListResult) {
 	if len(result.sessions) == 0 {
-		w.say("omp has no saved sessions in this working directory.")
+		w.say(w.tr(i18n.Msg.OmpNoSavedSessionsWorkingDirectory))
 		return
 	}
 	w.showResumePage(confirmation{action: "export", method: "select", workspace: result.cwd, exportFormat: result.exportFormat, user: result.user, generation: result.generation, epoch: result.epoch, sessions: result.sessions, ompArgs: result.args}, 0, 0)
@@ -365,39 +366,39 @@ func (w *worker) beginExport(session omp.SessionSummary, format, workspace strin
 
 func (w *worker) beginExportWithArgs(session omp.SessionSummary, format, workspace string, generation int64, args []string) {
 	if w.migrationLocked() {
-		w.say("会话迁移尚未解决，不能导出。请先使用 /migrate recover 恢复。")
+		w.say(w.tr(i18n.Msg.SessionMigrationUnresolvedExportUnavailableUseMigrateRecoverFirst))
 		return
 	}
 	if format != "session" && format != "html" {
-		w.say("Usage: /export [html] [session-id].")
+		w.say(w.tr(i18n.Msg.UsageExportHtmlSessionId))
 		return
 	}
 	w.initResumePicker()
 	if w.exportCancel != nil || w.exportingSession != "" || w.deleteCancel != nil {
-		w.say("The omp session operation is still loading.")
+		w.say(w.tr(i18n.Msg.OmpSessionOperationStillLoading))
 		return
 	}
 	committed, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
 	if err != nil || committed.Generation != generation {
-		w.say("The saved binding changed. Use /export again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseExportAgain))
 		return
 	}
 	currentCandidate := sessionIDMatches(committed.SessionID, session.ID)
 	currentExact := strings.EqualFold(committed.SessionID, session.ID)
 	if currentCandidate && w.exportCurrentBusy(session.ID) {
-		w.say("Wait for the current task and queue to finish before exporting.")
+		w.say(w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeExporting))
 		return
 	}
 	if !currentExact && omp.HasCustomSessionDir(args, w.b.cfg.OMPEnvironment) {
-		w.say("Cannot export an inactive session when omp uses a custom session directory.")
+		w.say(w.tr(i18n.Msg.CannotExportInactiveSessionWhenOmpUsesCustomSession))
 		return
 	}
 	if w.b.sessionInUseByOther(w, session.ID) {
-		w.say("This session is currently active in another conversation. Close that instance before exporting it.")
+		w.say(w.tr(i18n.Msg.SessionCurrentlyActiveAnotherConversationCloseInstanceBeforeExporting))
 		return
 	}
 	if !w.b.reserveExport(w, session.ID) {
-		w.say("This session is currently being exported. Try again after that export finishes.")
+		w.say(w.tr(i18n.Msg.SessionCurrentlyExportedTryAgainAfterExportFinishes))
 		return
 	}
 	if currentCandidate {
@@ -511,7 +512,7 @@ func (w *worker) exportFinished(result exportResult) {
 		w.cleanupExportResult(result)
 		w.log.Warn("session export failed", "event", "session_export", "format", result.format, "session_id", result.sessionID, "result", "failed", "reason", sessionExportReason(result.err))
 		if !errors.Is(result.err, context.Canceled) {
-			w.say(sessionExportMessage(result))
+			w.say(sessionExportMessage(w.b.language(), result))
 		}
 		return
 	}
@@ -536,7 +537,7 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	}
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
-		w.say("Cannot create the session selection menu.")
+		w.say(w.tr(i18n.Msg.CannotCreateSessionSelectionMenu))
 		return
 	}
 	token := hex.EncodeToString(random[:])
@@ -549,13 +550,13 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	c.pickerOptions = nil
 	start, end := page*resumePageSize, min((page+1)*resumePageSize, len(c.sessions))
 	var text strings.Builder
-	heading := "Saved omp sessions"
+	heading := w.tr(i18n.Msg.SavedOmpSessions)
 	if c.action == "export" {
-		heading = "Export omp session"
+		heading = w.tr(i18n.Msg.ExportOmpSession)
 	}
-	fmt.Fprintf(&text, "%s | Page %d/%d\nWorkspace: %s\n\n", heading, page+1, pages, menuText(c.workspace, 512))
+	text.WriteString(w.tr(i18n.Msg.PageWorkspace, heading, page+1, pages, menuText(c.workspace, 512)))
 	if c.action == "export" {
-		fmt.Fprintf(&text, "Format: %s\n", strings.ToUpper(c.exportFormat))
+		text.WriteString(w.tr(i18n.Msg.FormatLine, strings.ToUpper(c.exportFormat)))
 	}
 	keyboard := &telegram.Keyboard{}
 	add := func(label string, option resumePickerOption) telegram.Button {
@@ -567,7 +568,7 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	for i, session := range c.sessions[start:end] {
 		title := menuText(session.Title, 40)
 		if title == "" {
-			title = "Untitled"
+			title = w.tr(i18n.Msg.Untitled)
 		}
 		currentMarker := ""
 		if w.bindingSessionSelected(session.ID) {
@@ -575,13 +576,13 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		}
 		pinnedMarker := ""
 		if c.action == "resume" && sessionIsPinned(session, c.pinnedSessions) {
-			pinnedMarker = " [pinned]"
+			pinnedMarker = w.tr(i18n.Msg.Pinned)
 		}
 		inUseElsewhereMarker := ""
 		if c.action == "resume" {
 			_, inUseElsewhere := w.b.sessionDeleteStatus(w, session.ID)
 			if inUseElsewhere {
-				inUseElsewhereMarker = " [in use elsewhere]"
+				inUseElsewhereMarker = w.tr(i18n.Msg.UseElsewhere)
 			}
 		}
 		sessionIndex := start + i
@@ -589,19 +590,19 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		if updated, err := time.Parse(time.RFC3339Nano, session.UpdatedAt); err == nil {
 			fmt.Fprintf(&text, " | %s", updated.UTC().Format("2006-01-02 15:04 UTC"))
 		}
-		fmt.Fprintf(&text, "\nID: %s\n", session.ID)
+		text.WriteString(w.tr(i18n.Msg.ID, session.ID))
 		selectLabel := menuText(title, 20)
 		if c.action == "export" {
-			selectLabel = "Export"
+			selectLabel = w.tr(i18n.Msg.Export)
 		}
 		row := []telegram.Button{add(fmt.Sprintf("%d. %s", sessionIndex+1, selectLabel), resumePickerOption{session: sessionIndex, action: "select"})}
 		if c.action == "resume" {
-			pinLabel := "Pin"
+			pinLabel := w.tr(i18n.Msg.Pin)
 			if sessionIsPinned(session, c.pinnedSessions) {
-				pinLabel = "Unpin"
+				pinLabel = w.tr(i18n.Msg.Unpin)
 			}
 			row = append(row, add(pinLabel, resumePickerOption{session: sessionIndex, action: "toggle_pin"}))
-			deleteButton := add("Delete", resumePickerOption{session: sessionIndex, action: "delete"})
+			deleteButton := add(w.tr(i18n.Msg.Delete), resumePickerOption{session: sessionIndex, action: "delete"})
 			deleteButton.Style = "danger"
 			row = append(row, deleteButton)
 		}
@@ -609,12 +610,12 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	}
 	var navigation []telegram.Button
 	if page > 0 {
-		navigation = append(navigation, add("Previous", resumePickerOption{action: "previous"}))
+		navigation = append(navigation, add(w.tr(i18n.Msg.Previous), resumePickerOption{action: "previous"}))
 	}
 	if page+1 < pages {
-		navigation = append(navigation, add("Next", resumePickerOption{action: "next"}))
+		navigation = append(navigation, add(w.tr(i18n.Msg.Next), resumePickerOption{action: "next"}))
 	}
-	navigation = append(navigation, add("Cancel", resumePickerOption{action: "cancel"}))
+	navigation = append(navigation, add(w.tr(i18n.Msg.Cancel), resumePickerOption{action: "cancel"}))
 	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, navigation)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	defer cancel()
@@ -631,7 +632,7 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		if c.action == "export" {
 			command = "/export"
 		}
-		w.say("Failed to display the session selection menu. Use " + command + " to try again.")
+		w.say(w.tr(i18n.Msg.FailedDisplaySessionSelectionMenuUseTryAgain, command))
 		return
 	}
 	c.messageID = messageID
@@ -654,7 +655,7 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 	option := c.pickerOptions[index]
 	if c.epoch != w.b.bindingsEpoch.Load() {
 		w.clearKeyboard(messageID)
-		w.say("The saved binding changed. Use " + command + " again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseAgain, command))
 		return
 	}
 	switch option.action {
@@ -665,7 +666,7 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		w.showResumePage(c, c.page+1, messageID)
 		return
 	case "cancel":
-		text := "Cancel\n" + command
+		text := w.tr(i18n.Msg.CancelledWithDetail, command)
 		if c.action == "export" {
 			text += " " + strings.ToUpper(c.exportFormat)
 		}
@@ -684,7 +685,7 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 	}
 	if c.action != "export" && w.resumeBusy() {
 		w.clearKeyboard(messageID)
-		w.say("The conversation is busy. Use " + command + " again after the task and queue finish.")
+		w.say(w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, command))
 		return
 	}
 	if !w.persistedBindingGenerationMatches(c.generation) {
@@ -694,28 +695,28 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 	selected := c.sessions[option.session]
 	if !sameWorkspace(selected.CWD, c.workspace) {
 		w.clearKeyboard(messageID)
-		w.say("The selected session is not in this working directory.")
+		w.say(w.tr(i18n.Msg.SelectedSessionNotWorkingDirectory))
 		return
 	}
 	if !validSessionID(selected.ID) {
 		w.clearKeyboard(messageID)
-		w.say("omp returned an unsupported session ID.")
+		w.say(w.tr(i18n.Msg.OmpReturnedUnsupportedSessionID))
 		return
 	}
 	title := menuText(selected.Title, 40)
 	if title == "" {
-		title = "Untitled"
+		title = w.tr(i18n.Msg.Untitled)
 	}
-	receipt := fmt.Sprintf("Selected: %s\nID: %s", title, selected.ID)
+	receipt := w.tr(i18n.Msg.SelectedID, title, selected.ID)
 	if c.action == "export" {
-		receipt += "\nFormat: " + strings.ToUpper(c.exportFormat)
+		receipt += w.tr(i18n.Msg.AppendFormat, strings.ToUpper(c.exportFormat))
 	}
 	var launchArgs []string
 	if c.action == "resume" {
 		var current bool
 		launchArgs, current = w.b.argsPresetSnapshotIfCurrent(c.argsPresetIndex, c.argsFingerprint)
 		if !current {
-			w.finishMenu(messageID, "OMP argument preset changed. Use /resume again.")
+			w.finishMenu(messageID, w.tr(i18n.Msg.OMPArgumentPresetChangedUseResumeAgain))
 			return
 		}
 	}
@@ -725,11 +726,11 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		return
 	}
 	if w.client != nil && strings.EqualFold(selected.ID, w.sessionID) {
-		w.say("This omp session is already active in this conversation.")
+		w.say(w.tr(i18n.Msg.OmpSessionAlreadyActiveConversation))
 		return
 	}
 	if w.b.sessionInUse(selected.ID) {
-		w.say("This session is active in another conversation. Close that instance first.")
+		w.say(w.tr(i18n.Msg.SessionActiveAnotherConversationCloseInstanceFirst))
 		return
 	}
 	w.startFencedWithArgs(true, selected.ID, c.workspace, true, c.generation, c.epoch, launchArgs)
@@ -743,19 +744,19 @@ func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID
 	selected := c.sessions[sessionIndex]
 	if !sameWorkspace(selected.CWD, c.workspace) {
 		w.clearKeyboard(messageID)
-		w.say("The selected session is not in this working directory.")
+		w.say(w.tr(i18n.Msg.SelectedSessionNotWorkingDirectory))
 		return
 	}
 	if !validSessionID(selected.ID) {
 		w.clearKeyboard(messageID)
-		w.say("omp returned an unsupported session ID.")
+		w.say(w.tr(i18n.Msg.OmpReturnedUnsupportedSessionID))
 		return
 	}
 	w.b.sessionMu.Lock()
 	if c.epoch != w.b.bindingsEpoch.Load() || !w.persistedBindingGenerationMatches(c.generation) {
 		w.b.sessionMu.Unlock()
 		w.clearKeyboard(messageID)
-		w.say("The saved binding changed. Use /resume again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseResumeAgain))
 		return
 	}
 	pinned := sessionIsPinned(selected, c.pinnedSessions)
@@ -763,12 +764,12 @@ func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID
 	w.b.sessionMu.Unlock()
 	if err != nil {
 		w.clearKeyboard(messageID)
-		w.say("Failed to update pinned sessions.")
+		w.say(w.tr(i18n.Msg.FailedUpdatePinnedSessions))
 		return
 	}
 	if !changed {
 		w.clearKeyboard(messageID)
-		w.say("The saved binding changed. Use /resume again.")
+		w.say(w.tr(i18n.Msg.SavedBindingChangedUseResumeAgain))
 		return
 	}
 	if c.pinnedSessions == nil {

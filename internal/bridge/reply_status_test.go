@@ -230,3 +230,32 @@ func TestFinalReplyLateSnapshotCannotChangeNewInputOrRPCOwnership(t *testing.T) 
 		})
 	}
 }
+
+func TestLanguageChangeDuringTaskPreservesOldOutputAndUsesLatestReplyLanguage(t *testing.T) {
+	w, _, command, _ := replyStatusWorker(t)
+	taskID := w.active
+	command("/lang")
+	var noticeID int64
+	var original string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT id,text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&noticeID, &original))
+	if !strings.Contains(original, "Global language: English") {
+		t.Fatalf("task did not start with the English interface: %q", original)
+	}
+	command("/lang zh")
+	if w.active != taskID {
+		t.Fatal("language change replaced the active task")
+	}
+	replyStatusMessage(t, w, 100, 1000, 1000)
+	endReplyStatus(w)
+	w.operationReturned(receiveReplyStatus(t, w))
+	var final string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=? ORDER BY id DESC LIMIT 1", taskID).Scan(&final))
+	if !strings.Contains(final, "平均 ") || strings.Contains(final, "avg ") || replyBody(final) != "answer" {
+		t.Fatalf("final Bridge header did not use Chinese or model body changed: %q", final)
+	}
+	var preserved string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE id=?", noticeID).Scan(&preserved))
+	if preserved != original {
+		t.Fatalf("language change rewrote old outbox text: %q", preserved)
+	}
+}

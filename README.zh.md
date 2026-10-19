@@ -44,7 +44,7 @@ arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE
 
 ### 从源码构建
 
-需要 [go.mod](go.mod) 指定的 Go 版本及 [just](https://github.com/casey/just):
+需要 Go 1.27.2 或更新版本 (见 [go.mod](go.mod)) 及 [just](https://github.com/casey/just):
 
 ```sh
 git clone https://github.com/fcying/omp-telegram.git
@@ -232,6 +232,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/migrate` | 在同一 workspace 中将 handoff 上下文迁入新 session. 先启用 `omp.migration_extension`. |
 | `/review [arguments]` | 作为排队任务运行 OMP 原生 `/review` 命令. |
 | `/autoresearch [goal\|off\|clear]` | 当前 OMP 公布支持时控制原生 autoresearch. 安全边界和停止行为见下文. |
+| `/lang [en\|zh]` | 查看全局 Bridge 界面语言, 或将所有私聊和 topic 统一切换为英文或中文. |
 | `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
 
 Model 或 thinking 修改成功后, 仍可能因无法读取配置等级而显示 `Thinking: n/a`. 这不会撤销修改; 如果必须关闭进程, 回执会说明 session 已保留.
@@ -265,7 +266,11 @@ Telegram 菜单列出 bridge 命令及当前可用的原生命令. Telegram 每�
 
 命令识别和来源限制见[架构文档](doc/architecture.zh.md#原生命令识别与提交).
 
-以上命令都可用于普通私聊和 topic. bot 菜单, 按钮和服务提示使用英语; 可以用任意语言提问, bridge 不翻译模型回复.
+以上命令都可用于普通私聊和 topic. Bridge 生成的菜单, 按钮和服务提示默认使用英文. `/lang` 查看全局设置, `/lang zh` 切换中文, `/lang en` 切换英文. 任意已授权用户都能统一修改所有私聊和 topic 的语言, 设置在守护进程重启后保留. 更改作用于新生成的 Bridge 文本及刷新的命令菜单, 不重写此前已渲染的消息. 不翻译 OMP 回复, 原生交互内容和命令简介, 模型/工具内容, 用户 caption, session 标题或路径. 可以用任意语言提问.
+
+任务可以在英文界面下开始, 执行期间使用 `/lang zh` 后, 完成时的 Bridge 回执或回复状态头使用中文. 这不会翻译 OMP 回复, 也不会重写此前的消息.
+
+Telegram 命令菜单异步更新. API 临时故障和限流会触发退避重试, 使用最新全局语言, 不重复发送已经确认的 scope. 语言切换回执确认的是设置已保存, 不代表所有菜单都已更新. 永久性 API 拒绝不会触发持续后台重试.
 
 在群组 topic 中, 所有获准使用 bot 的用户共享该 topic 的 OMP session 和 workspace, 包括上下文及命令效果. bot 的用户白名单不限制 Telegram 群成员查看消息: 能查看该 topic 的其他成员也能看到 bot 回复和导出文件. 敏感任务只应在可信的群组 topic 中运行.
 
@@ -425,11 +430,13 @@ just deploy
 ```
 
 - `just build` 构建二进制.
-- `just fmt` 格式化全部 Go 源码和测试文件.
+- `just fmt` 使用 `go.mod` 声明的 Go 版本格式化全部 Go 源码和测试文件, 即使本地默认 Go 更新也与 CI 保持一致.
 - `just test` 运行单元测试, 不启动或重启服务.
 - `just check` 运行测试, race 检查和 `go vet`, 不启动 Telegram polling.
 - `just install` 只安装二进制, 配置和数据由用户管理.
 - `just deploy` 安装二进制, 然后安排五秒后在后台重启已有的 `supervisord` 服务. Recipe 返回不代表服务已经成功重启.
+
+`just test` 和 `just check` 在各自 recipe 内使用 `umask 0077`, 即使调用终端使用 `0002` 等允许组写入的掩码, 也以私有权限创建测试数据目录. 不修改终端的 umask, 也不放宽生产数据目录的权限校验.
 
 ## 架构
 

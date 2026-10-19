@@ -263,14 +263,14 @@ func TestReplyContextTruncatesUTF16WithoutTruncatingCurrentMessage(t *testing.T)
 
 func TestQueuePreviewUsesCurrentMessageText(t *testing.T) {
 	q := queued{text: "[Telegram reply context - quoted content]\\n...\\n[Current user message]\\ncurrent", displayText: "current"}
-	if got := queueTaskText(q); got != "current" {
+	if got := queueTaskText("en", q); got != "current" {
 		t.Fatalf("queue preview = %q, want current message", got)
 	}
 }
 
 func TestQueuePreviewFallsBackToAttachmentPrompt(t *testing.T) {
 	q := queued{text: "Telegram attachment:\nPlease inspect the attached file.", displayText: ""}
-	if got := queueTaskText(q); got != "Telegram attachment: Please inspect the attached file." {
+	if got := queueTaskText("en", q); got != "Telegram attachment: Please inspect the attached file." {
 		t.Fatalf("attachment queue preview = %q", got)
 	}
 }

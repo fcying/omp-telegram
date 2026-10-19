@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
@@ -38,7 +39,7 @@ func (b *Bridge) runWorker(w *worker) {
 		w.markExitRequested()
 		select {
 		case request := <-w.forgetRequests:
-			request.reply(bindingForgetResult{status: "Binding changed. Use /bindings to refresh."})
+			request.reply(bindingForgetResult{status: i18n.Msg.BindingChangedUseBindingsRefresh})
 		default:
 		}
 		if b.workerExits == nil || b.ctx == nil {
@@ -94,7 +95,7 @@ func (w *worker) restoreBinding() {
 		if w.persistClosed() {
 			w.releaseSession()
 			w.logRuntimeEvent(slog.LevelInfo, "restore_runtime_skipped", "session_file_unavailable", "startup restore skipped", sessionID)
-			w.say("The saved omp session file or working directory is unavailable, so startup restore was skipped. Use /new to start a new session.")
+			w.say(w.tr(i18n.Msg.SavedOmpSessionFileWorkingDirectoryUnavailableSoStartup))
 		}
 		return
 	}
@@ -108,7 +109,7 @@ func (w *worker) restoreBinding() {
 		return
 	}
 	w.binding.Interrupted = false
-	w.say("⚠️ Gateway restarted while the previous task was active. It was interrupted and was not resubmitted.")
+	w.say(w.tr(i18n.Msg.GatewayRestartedWhilePreviousTaskActiveInterruptedNotResubmitted))
 }
 
 func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker) error {

@@ -1,9 +1,12 @@
 package bridge
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"omp-telegram/internal/i18n"
 )
 
 func TestResolveWorkspace(t *testing.T) {
@@ -190,5 +193,32 @@ func TestResolveWorkspaceRejectsPermissionErrors(t *testing.T) {
 	}
 	if got, err := resolveWorkspace(root, filepath.Join(locked, "child")); err == nil || got != "" {
 		t.Fatalf("inaccessible path returned workspace %q, error %v", got, err)
+	}
+}
+
+func TestWorkspaceErrorsAreTypedAndOpaqueErrorsStayUnchanged(t *testing.T) {
+	w := &worker{b: &Bridge{}}
+	w.b.setLanguage(i18n.Chinese)
+	root := t.TempDir()
+	for _, tc := range []struct {
+		root    string
+		input   string
+		english string
+		chinese string
+	}{
+		{"relative", "project", "The workspace root must be an absolute path.", "工作区根目录必须是绝对路径."},
+		{root, "bad\nname", "Workspace paths cannot contain control characters.", "工作区路径不能包含控制字符."},
+		{root, "../project", "Use a single workspace name, an absolute project path, or ~/path.", "请使用单个工作区名称, 项目绝对路径或 ~/path."},
+	} {
+		_, err := resolveWorkspace(tc.root, tc.input)
+		if err == nil || err.Error() != tc.english {
+			t.Fatalf("workspace error = %v, want stable English %q", err, tc.english)
+		}
+		if got := w.errorText(err); got != tc.chinese {
+			t.Fatalf("localized workspace error = %q, want %q", got, tc.chinese)
+		}
+		if got := w.errorText(errors.New(tc.english)); got != tc.english {
+			t.Fatalf("opaque error was translated: %q", got)
+		}
 	}
 }

@@ -368,7 +368,7 @@ func TestAlbumUsesOneQueueSlotAndCompletesMembers(t *testing.T) {
 	first.Message.MediaGroupID = "album-queue"
 	first.Message.Photo = []telegram.PhotoSize{{FileID: "photo-a", Width: 8, Height: 8, FileSize: int64(len(data))}}
 	accept(2, first.Message)
-	if len(w.queue) != 1 || len(w.albums) != 1 || queueTaskText(w.queue[0]) != "Queued album" {
+	if len(w.queue) != 1 || len(w.albums) != 1 || queueTaskText("en", w.queue[0]) != "Queued album" {
 		t.Fatalf("album placeholder = queue:%+v albums:%d", w.queue, len(w.albums))
 	}
 	second := update(3, 11, "")
@@ -377,7 +377,7 @@ func TestAlbumUsesOneQueueSlotAndCompletesMembers(t *testing.T) {
 	second.Message.Photo = []telegram.PhotoSize{{FileID: "photo-b", Width: 8, Height: 8, FileSize: int64(len(data))}}
 	accept(3, second.Message)
 	album, ok := w.albums[albumKey{group: "album-queue", user: 7}]
-	if len(w.queue) != 1 || !ok || len(album.messages) != 2 || queueTaskText(w.queue[0]) != "later caption" {
+	if len(w.queue) != 1 || !ok || len(album.messages) != 2 || queueTaskText("en", w.queue[0]) != "later caption" {
 		t.Fatalf("album member consumed an extra queue slot or preview lost caption: queue=%+v albums=%+v", w.queue, w.albums)
 	}
 	var state string
@@ -414,7 +414,7 @@ func TestCancelledAlbumSuppressesLateMembers(t *testing.T) {
 	first.Message.Caption = "cancel this album"
 	first.Message.Photo = []telegram.PhotoSize{{FileID: "photo-a", FileSize: 1}}
 	accept(2, first.Message)
-	if len(w.queue) != 1 || queueTaskText(w.queue[0]) != "cancel this album" {
+	if len(w.queue) != 1 || queueTaskText("en", w.queue[0]) != "cancel this album" {
 		t.Fatalf("album caption was not used for queue preview: %+v", w.queue)
 	}
 	if !w.cancelQueuedTask(2) {
@@ -1962,5 +1962,71 @@ func TestReleasedRuntimeRejectsObsoleteAttachmentResults(t *testing.T) {
 			}
 			w.previewFinished(preview)
 		})
+	}
+}
+
+func TestMediaPreparationErrorKeepsExternalDetailsUnchanged(t *testing.T) {
+	for _, external := range []string{
+		"Telegram: cannot read downloaded attachment at /Workspace/on (中文)",
+		"cannot read downloaded attachment",
+		"cannot save incoming attachment session owner",
+	} {
+		if got := mediaPreparationError("zh", errors.New(external)); got != external {
+			t.Fatalf("native attachment failure was translated: %q", got)
+		}
+	}
+	for _, scenario := range []struct {
+		err              error
+		english, chinese string
+	}{
+		{media.ErrAlbumNoAttachments, "album has no attachments", "相册没有附件"},
+		{media.ErrAlbumMemberNotPhotoDocument, "album member is not a photo or document", "相册项目不是照片或文档"},
+		{media.ErrCannotOpenIncomingAttachmentDirectory, "cannot open incoming attachment directory", "无法打开传入附件目录"},
+		{media.ErrCannotCreateAttachmentDirectory, "cannot create attachment directory", "无法创建附件目录"},
+		{media.ErrCannotOpenAttachmentDirectory, "cannot open attachment directory", "无法打开附件目录"},
+		{media.ErrCannotMarkAttachmentDirectory, "cannot mark attachment directory", "无法标记附件目录"},
+		{media.ErrCannotPersistAttachmentPreparationMarker, "cannot persist attachment preparation marker", "无法持久化附件准备标记"},
+		{media.ErrAttachmentMissingFileIDExceedsMBDownloadLimit, "attachment is missing a file ID or exceeds the 20 MB download limit", "附件缺少文件 ID 或超过 20 MB 下载限制"},
+		{media.ErrCannotReadDownloadedAttachment, "cannot read downloaded attachment", "无法读取已下载的附件"},
+		{media.ErrCannotSaveIncomingAttachmentSessionOwner, "cannot save incoming attachment session owner", "无法保存传入附件的会话归属."},
+	} {
+		if scenario.err.Error() != scenario.english {
+			t.Fatalf("media sentinel changed English text: %v", scenario.err)
+		}
+		if got := mediaPreparationError("en", scenario.err); got != scenario.english {
+			t.Fatalf("English attachment failure = %q, want %q", got, scenario.english)
+		}
+		for _, err := range []error{scenario.err, errors.Join(errors.New("preparation failed"), scenario.err)} {
+			if got := mediaPreparationError("zh", err); got != scenario.chinese {
+				t.Fatalf("Chinese attachment failure = %q, want %q", got, scenario.chinese)
+			}
+		}
+	}
+}
+
+func TestQueuedAlbumFallbackTracksGlobalLanguage(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 1
+	command("/new " + t.TempDir())
+	message := update(500, 11, "").Message
+	message.MediaGroupID = "language-album"
+	message.Photo = []telegram.PhotoSize{{FileID: "queued-photo", Width: 1, Height: 1}}
+	if err := w.b.db.Accept(500, []byte(`{"update_id":500}`)); err != nil {
+		t.Fatal(err)
+	}
+	w.collectAlbum(incoming{id: 500, msg: message})
+	if len(w.queue) != 1 || queueTaskText(w.b.language(), w.queue[0]) != "Queued album" {
+		t.Fatal("album was not queued with the English fallback")
+	}
+	command("/lang zh")
+	if got := queueTaskText(w.b.language(), w.queue[0]); got != "排队中的相册" {
+		t.Fatalf("queued album retained its old language: %q", got)
+	}
+	command("/lang en")
+	if got := queueTaskText(w.b.language(), w.queue[0]); got != "Queued album" {
+		t.Fatalf("queued album did not switch back to English: %q", got)
+	}
+	if !w.cancelQueuedTask(500) {
+		t.Fatal("queued album could not be canceled")
 	}
 }

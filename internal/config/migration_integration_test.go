@@ -84,7 +84,7 @@ func TestRealOMPMigrationCompatibility(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
-	version := exec.CommandContext(ctx, cfg.OMP, "--version")
+	version := exec.CommandContext(ctx, cfg.OMP, "--session-dir", sessions, "--version")
 	version.Dir = workspace
 	version.Env = omp.ChildEnv(cfg.OMPEnvironment)
 	output, err := version.CombinedOutput()

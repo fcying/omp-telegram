@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/telegram"
 )
 
@@ -71,7 +72,7 @@ func knownBridgeCommand(command string) bool {
 	return false
 }
 
-func commandHelp(version string) string {
+func commandHelp(version string, language i18n.Language) string {
 	var help strings.Builder
 	help.WriteString("omp-telegram ")
 	help.WriteString(version)
@@ -83,9 +84,30 @@ func commandHelp(version string) string {
 		help.WriteByte('/')
 		help.WriteString(command.Command)
 		help.WriteString(" - ")
-		help.WriteString(command.Description)
+		help.WriteString(i18n.Text(language, command.Description))
 	}
 	return help.String()
+}
+
+// Command menus begin with typed Bridge descriptions, followed by opaque native descriptions.
+func localizedCommands(native []telegram.BotCommand, language i18n.Language) []telegram.BotCommand {
+	commands := make([]telegram.BotCommand, 0, min(100, len(botCommands)+len(native)))
+	for _, command := range botCommands {
+		if len(commands) == 100 {
+			break
+		}
+		commands = append(commands, telegram.BotCommand{Command: command.Command, Description: i18n.Text(language, command.Description)})
+	}
+	for _, command := range native {
+		if len(commands) == 100 {
+			break
+		}
+		if command.Description == "" {
+			command.Description = i18n.Text(language, i18n.Msg.OMPNativeCommand)
+		}
+		commands = append(commands, command)
+	}
+	return commands
 }
 
 func logTelegramFailure(logger *slog.Logger, level slog.Level, event, message string, err error, extra ...slog.Attr) {

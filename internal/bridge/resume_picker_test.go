@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"omp-telegram/internal/omp"
+	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
 
@@ -783,5 +785,36 @@ func TestExportPickerRejectsGenerationChange(t *testing.T) {
 	requireNoSessionSelectionReceipt(t, f)
 	if len(w.confirms) != 0 || w.exportCancel != nil {
 		t.Fatal("generation-stale export picker remained actionable")
+	}
+}
+
+func TestResumePickerLocalizesLabelsWithoutTranslatingSessionData(t *testing.T) {
+	for _, test := range []struct {
+		title string
+		want  string
+	}{
+		{title: "Untitled", want: "Untitled"},
+		{title: "Main chat", want: "Main chat"},
+		{title: "Untitled Main chat 中文", want: "Untitled Main chat 中文"},
+		{title: "", want: "无标题"},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			requireStoreOK(t, err)
+			defer db.Close()
+			w, fake := newBindingTestWorker(t, db)
+			w.b.setLanguage("zh")
+			session := omp.SessionSummary{ID: "abcd1234-0000-4000-8000-000000000000", CWD: "/Workspace/on", Title: test.title}
+			w.showResumePage(confirmation{action: "resume", workspace: session.CWD, sessions: []omp.SessionSummary{session}}, 0, 0)
+			text, rows := pickerView(t, fake)
+			for _, data := range []string{session.ID, session.CWD, "1. " + test.want + "\nID: "} {
+				if !strings.Contains(text, data) {
+					t.Fatalf("session data was changed during localization: missing %q in %q", data, text)
+				}
+			}
+			if !strings.Contains(text, "已保存的 omp 会话") || len(rows) != 2 || rows[0][1]["text"] != "置顶" || rows[0][2]["text"] != "删除" || rows[1][0]["text"] != "取消" {
+				t.Fatalf("session picker labels were not localized: %q; %v", text, rows)
+			}
+		})
 	}
 }

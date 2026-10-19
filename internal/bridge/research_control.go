@@ -3,10 +3,10 @@ package bridge
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 )
@@ -145,14 +145,14 @@ func (w *worker) disableResearch(inbox int64) {
 		replacedReadOnly = readOnly && !researchActive
 		w.cancelResearchControl()
 		if !replacedReadOnly {
-			w.retireResearch("Autoresearch control was interrupted. It will not be replayed automatically.")
+			w.retireResearch(w.tr(i18n.Msg.AutoresearchControlInterruptedWillNotReplayedAutomatically))
 		}
 	}
 	w.invalidateResearchAdmission()
 	client, connected := w.runtimeClient()
 	if connected && w.taskActive() && !researchActive && w.researchOffProof(client) {
 		w.mark(inbox, store.InboxDone)
-		w.say("Autoresearch mode is already disabled. The current ordinary task was left running.")
+		w.say(w.tr(i18n.Msg.AutoresearchModeAlreadyDisabledCurrentOrdinaryTaskLeftRunning))
 		return
 	}
 	if connected && (w.taskActive() || replacedReadOnly) && !researchActive {
@@ -165,13 +165,13 @@ func (w *worker) disableResearch(inbox int64) {
 
 func (w *worker) beginResearchDisable(inbox int64) {
 	if w.taskActive() || w.research.root || w.steerFence.active || w.rpcOperationActive {
-		w.retireResearch("Autoresearch was forcibly interrupted. Its task outcome is uncertain and will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchForciblyInterruptedTaskOutcomeUncertainWillNotReplayed))
 	}
 	w.research.disablePending, w.resumeFailed = true, true
 	client, err := w.prepareResearchControlRuntime()
 	if err != nil {
 		w.mark(inbox, store.InboxUncertain)
-		w.say("Autoresearch could not be confirmed disabled. Queued work is paused: " + err.Error())
+		w.say(w.tr(i18n.Msg.AutoresearchCouldNotConfirmedDisabledQueuedWorkPaused, w.errorText(err)))
 		return
 	}
 	c := w.newResearchControl(client, "off", inbox)
@@ -193,28 +193,28 @@ func (w *worker) prepareResearchControlRuntime() (*omp.Client, error) {
 		sessionID = w.binding.SessionID
 	}
 	if sessionID == "" || !strings.EqualFold(sessionID, w.binding.SessionID) {
-		return nil, errors.New("saved autoresearch session is unavailable; restore its session file and working directory before disabling")
+		return nil, newMessageError(i18n.Msg.SavedAutoresearchSessionUnavailableRestoreSessionFileWorkingDirectory)
 	}
 	if w.b.sessionInUseByOther(w, sessionID) {
-		return nil, errors.New("autoresearch session is active in another conversation")
+		return nil, newMessageError(i18n.Msg.AutoresearchSessionActiveAnotherConversation)
 	}
 	if client, connected := w.runtimeClient(); connected {
 		return client, nil
 	}
 	if !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
-		return nil, errors.New("saved autoresearch owner is unavailable; restore its session file and working directory before disabling")
+		return nil, newMessageError(i18n.Msg.SavedAutoresearchOwnerUnavailableRestoreSessionFileWorkingDirectory)
 	}
 	if w.runtime == runtimeStarting {
-		return nil, errors.New("OMP is starting")
+		return nil, newMessageError(i18n.Msg.OMPStarting)
 	}
 	select {
 	case w.b.slots <- struct{}{}:
 	default:
-		return nil, errors.New("the active instance limit has been reached")
+		return nil, newMessageError(i18n.Msg.ResearchInstanceLimitReached)
 	}
 	if !w.beginSessionRestore(sessionID) {
 		<-w.b.slots
-		return nil, errors.New("autoresearch session is being deleted or used elsewhere")
+		return nil, newMessageError(i18n.Msg.AutoresearchSessionDeletedUsedElsewhere)
 	}
 	w.beginRuntimeStart()
 	launchArgs := w.b.selectedArgsSnapshot()
@@ -241,7 +241,7 @@ func (w *worker) confirmResearchClear(confirmation confirmation) {
 	client, ok := w.runtimeClient()
 	if !ok || !w.researchAvailable(client) || client.CommandCatalog().Epoch != confirmation.epoch ||
 		w.sessionControlBusy() || w.taskActive() || len(w.queue) != 0 || len(w.steers) != 0 {
-		w.say("Autoresearch clear was canceled because the instance is no longer idle or its command catalog changed.")
+		w.say(w.tr(i18n.Msg.AutoresearchClearCanceledBecauseInstanceNoLongerIdleCommand))
 		return
 	}
 	c := w.newResearchControl(client, "clear", 0)
@@ -262,7 +262,7 @@ func (w *worker) researchControlFailed(c *researchControl) {
 			w.mark(c.inbox, store.InboxCancelled)
 		}
 		if w.research.root {
-			w.retireResearch("Autoresearch mode could not be confirmed. The old task was interrupted and will not be replayed automatically.")
+			w.retireResearch(w.tr(i18n.Msg.AutoresearchModeCouldNotConfirmedOldTaskInterruptedWill))
 		}
 		w.researchModeFailure()
 		return
@@ -271,11 +271,11 @@ func (w *worker) researchControlFailed(c *researchControl) {
 		// A failed read-only probe does not establish a research hook to retire.
 		w.research.disablePending, w.resumeFailed = true, true
 		w.mark(c.inbox, store.InboxUncertain)
-		w.say("Autoresearch mode could not be confirmed. The current ordinary task was left running; queued work is paused. Use /autoresearch off to retry or /close.")
+		w.say(w.tr(i18n.Msg.AutoresearchModeCouldNotConfirmedCurrentOrdinaryTaskLeft))
 		return
 	}
 	if c.intent == "local" || w.taskActive() {
-		w.retireResearch("Autoresearch control completion could not be confirmed. Its task outcome is uncertain and will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchControlCompletionCouldNotConfirmedTaskOutcomeUncertain))
 	} else {
 		w.research.disablePending, w.resumeFailed = true, true
 		w.releaseRuntimeWithReason(true, "failure")
@@ -284,9 +284,9 @@ func (w *worker) researchControlFailed(c *researchControl) {
 		w.mark(c.inbox, store.InboxUncertain)
 	}
 	if c.intent == "clear" {
-		w.say("Autoresearch clear could not be confirmed. The runtime is closed and queued work is paused; no clear will be replayed automatically.")
+		w.say(w.tr(i18n.Msg.AutoresearchClearCouldNotConfirmedRuntimeClosedQueuedWork))
 	} else {
-		w.say("Autoresearch could not be confirmed disabled. The runtime is closed and queued work is paused. Use /autoresearch off to retry or /close; nothing will be replayed automatically.")
+		w.say(w.tr(i18n.Msg.AutoresearchCouldNotConfirmedDisabledRuntimeClosedQueuedWork))
 	}
 }
 
@@ -350,7 +350,7 @@ func (w *worker) researchControlFinished(result operationResult) {
 			if enabled {
 				w.disableResearch(0)
 			} else {
-				w.requestAbort("Abort requested and queued prompts cleared.")
+				w.requestAbort(w.tr(i18n.Msg.AbortRequestedQueuedPromptsCleared))
 			}
 		case "off":
 			if !enabled {
@@ -412,12 +412,12 @@ func (w *worker) finishResearchRoute(c *researchControl, enabled bool) {
 		}
 		if w.sessionControlBusy() || w.taskActive() || len(w.queue) != 0 || len(w.steers) != 0 {
 			w.mark(c.inbox, store.InboxCancelled)
-			w.say("Autoresearch clear requires an idle instance and an empty queue. Stop research first.")
+			w.say(w.tr(i18n.Msg.AutoresearchClearRequiresIdleInstanceEmptyQueueStopResearch))
 			return
 		}
 		w.mark(c.inbox, store.InboxDone)
 		w.confirm(confirmation{action: "autoresearch_clear", user: c.input.msg.From.ID,
-			autoresearchText: c.text, epoch: c.epoch}, "Clear autoresearch? Native clear can hard-reset tracked files and delete untracked files, unless --keep-tree is supplied. This cannot be undone by the bridge.", []string{"Clear autoresearch", "Cancel"})
+			autoresearchText: c.text, epoch: c.epoch}, w.tr(i18n.Msg.ClearAutoresearchNativeClearCanHardResetTrackedFiles), []string{w.tr(i18n.Msg.ClearAutoresearch), w.tr(i18n.Msg.Cancel)})
 		return
 	}
 	if c.queued {
@@ -445,9 +445,9 @@ func (w *worker) finishResearchControl(c *researchControl, enabled bool) {
 	w.touchBinding()
 	if c.intent == "off" {
 		w.mark(c.inbox, store.InboxDone)
-		w.say("Autoresearch mode disabled. The old research task was not replayed.")
+		w.say(w.tr(i18n.Msg.AutoresearchModeDisabledOldResearchTaskNotReplayed))
 	} else {
-		w.say("Autoresearch clear completed.")
+		w.say(w.tr(i18n.Msg.AutoresearchClearCompleted))
 	}
 }
 

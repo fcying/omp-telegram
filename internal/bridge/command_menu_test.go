@@ -12,11 +12,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/logging"
 	"omp-telegram/internal/omp"
+	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
 )
 
@@ -29,12 +32,20 @@ type commandMenuRequest struct {
 	Language string `json:"language_code"`
 }
 
+type commandMenuScope struct {
+	chatID   int64
+	language string
+}
+
 type commandMenuTransport struct {
 	mu            sync.Mutex
 	calls         []commandMenuRequest
 	menus         map[int64]map[string][]telegram.BotCommand
 	failures      map[string]int
 	lostResponses map[string]int
+	scopeFailures map[commandMenuScope]int
+	failureStatus int
+	retryAfter    int
 	gate          <-chan struct{}
 	started       chan commandMenuRequest
 	completed     chan commandMenuRequest
@@ -59,6 +70,12 @@ func (f *commandMenuTransport) RoundTrip(r *http.Request) (*http.Response, error
 	if fail {
 		f.failures[request.Language]--
 	}
+	scope := commandMenuScope{request.Scope.ChatID, request.Language}
+	if !lostResponse && f.scopeFailures[scope] > 0 {
+		f.scopeFailures[scope]--
+		fail = true
+	}
+	failureStatus, retryAfter := f.failureStatus, f.retryAfter
 	f.mu.Unlock()
 	f.started <- request
 	if first && f.gate != nil {
@@ -71,8 +88,11 @@ func (f *commandMenuTransport) RoundTrip(r *http.Request) (*http.Response, error
 	status := http.StatusOK
 	body := `{"ok":true,"result":true}`
 	if fail {
-		status = http.StatusBadRequest
-		body = `{"ok":false,"error_code":400,"description":"SECRET_NATIVE_NAME SECRET_TOKEN https://private.invalid/workspace"}`
+		status = failureStatus
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+		body = fmt.Sprintf(`{"ok":false,"error_code":%d,"description":"SECRET_NATIVE_NAME SECRET_TOKEN https://private.invalid/workspace","parameters":{"retry_after":%d}}`, status, retryAfter)
 	} else {
 		f.mu.Lock()
 		if f.menus[request.Scope.ChatID] == nil {
@@ -94,6 +114,7 @@ func newCommandMenuFixture(t *testing.T, chats ...int64) (*Bridge, *commandMenuT
 		menus:         make(map[int64]map[string][]telegram.BotCommand),
 		failures:      make(map[string]int),
 		lostResponses: make(map[string]int),
+		scopeFailures: make(map[commandMenuScope]int),
 		started:       make(chan commandMenuRequest, 256),
 		completed:     make(chan commandMenuRequest, 256),
 	}
@@ -150,18 +171,22 @@ func commandMenuCommands(names ...string) []telegram.BotCommand {
 
 func requireCommandMenu(t *testing.T, commands []telegram.BotCommand, native ...string) {
 	t.Helper()
-	commandsWithDescriptions := commandMenuCommands(native...)
-	for i := range commandsWithDescriptions {
-		commandsWithDescriptions[i].Description = nativeCommandDescription
-	}
-	requireDescribedCommandMenu(t, commands, commandsWithDescriptions...)
+	requireDescribedCommandMenu(t, commands, commandMenuCommands(native...)...)
 }
 
 func requireDescribedCommandMenu(t *testing.T, commands []telegram.BotCommand, native ...telegram.BotCommand) {
 	t.Helper()
-	want := append(slices.Clone(botCommands), native...)
-	if !slices.Equal(commands, want) {
-		t.Fatalf("commands = %#v, want %#v", commands, want)
+	want := localizedCommands(native, i18n.English)
+	if len(commands) != len(want) {
+		t.Fatalf("commands = %#v, want identities %#v", commands, want)
+	}
+	for index, expected := range want {
+		if commands[index].Command != expected.Command {
+			t.Fatalf("command %d = %q, want %q", index, commands[index].Command, expected.Command)
+		}
+		if commands[index].Description != expected.Description {
+			t.Fatalf("command %q description = %q, want %q", expected.Command, commands[index].Description, expected.Description)
+		}
 	}
 }
 
@@ -474,22 +499,25 @@ func TestCommandMenuRestoresPreviousMenuAfterPublicationFailure(t *testing.T) {
 				if tc.uncertain {
 					restoreRequests = 2
 				}
-				for range restoreRequests {
+				restored, barriers := 0, 0
+				for range restoreRequests + 2 {
 					request := receiveCommandMenu(t, f.completed)
-					if request.Scope.ChatID != -10 {
-						t.Fatalf("restoration chat = %d, want -10", request.Scope.ChatID)
+					switch request.Scope.ChatID {
+					case -10:
+						restored++
+						if !tc.uncertain && request.Language == language {
+							t.Fatalf("definite rejection discarded the successful cache for language %q", language)
+						}
+						requireCommandMenu(t, request.Commands, "menu_a")
+					case -20:
+						barriers++
+						requireCommandMenu(t, request.Commands, "restored_barrier")
+					default:
+						t.Fatalf("unexpected restoration chat: %d", request.Scope.ChatID)
 					}
-					if !tc.uncertain && request.Language == language {
-						t.Fatalf("definite rejection discarded the successful cache for language %q", language)
-					}
-					requireCommandMenu(t, request.Commands, "menu_a")
 				}
-				for range 2 {
-					request := receiveCommandMenu(t, f.completed)
-					if request.Scope.ChatID != -20 {
-						t.Fatalf("restoration barrier chat = %d, want -20", request.Scope.ChatID)
-					}
-					requireCommandMenu(t, request.Commands, "restored_barrier")
+				if restored != restoreRequests || barriers != 2 {
+					t.Fatalf("restoration requests: restored=%d, barriers=%d", restored, barriers)
 				}
 				requirePublishedMenus(t, f, -10, "menu_a")
 			})
@@ -795,5 +823,321 @@ func TestCommandMenuCatalogInvalidationRestoresBootstrap(t *testing.T) {
 	w.syncCommandMenu()
 	for range 2 {
 		requireDescribedCommandMenu(t, receiveCommandMenu(t, f.completed).Commands, b.commandMenus.bootstrap...)
+	}
+}
+
+func TestLocalizedCommandMenusPreserveOpaqueNativeDescriptions(t *testing.T) {
+	native := []telegram.BotCommand{
+		{Command: "empty"},
+		{Command: "native_fallback_phrase", Description: "OMP native command"},
+		{Command: "bridge_phrase", Description: "Cancel"},
+		{Command: "bridge_help_phrase", Description: "New session: /new <name or project path>"},
+		{Command: "native_text", Description: "原生 command description"},
+	}
+	for _, language := range []i18n.Language{i18n.English, i18n.Chinese} {
+		b, transport := newCommandMenuFixture(t, -10)
+		b.setLanguage(language)
+		w := &worker{key: target{chat: -10, thread: 1}}
+		b.registerCommandMenuWorker(w)
+		b.updateCommandMenu(w, native)
+		startCommandMenuPublisher(t, b)
+		for range 2 {
+			commands := receiveCommandMenu(t, transport.completed).Commands
+			if len(commands) != len(botCommands)+len(native) {
+				t.Fatalf("menu length = %d", len(commands))
+			}
+			for index, command := range botCommands {
+				want := telegram.BotCommand{Command: command.Command, Description: i18n.Text(language, command.Description)}
+				if commands[index] != want {
+					t.Fatalf("Bridge command = %#v, want %#v", commands[index], want)
+				}
+			}
+			byName := make(map[string]string, len(native))
+			for _, command := range commands[len(botCommands):] {
+				byName[command.Command] = command.Description
+			}
+			for _, command := range native {
+				want := command.Description
+				if want == "" {
+					want = "OMP native command"
+					if language == i18n.Chinese {
+						want = "OMP 原生命令"
+					}
+				}
+				if got := byName[command.Command]; got != want {
+					t.Fatalf("native command %q = %q, want %q", command.Command, got, want)
+				}
+			}
+		}
+		for index, command := range native {
+			if index == 0 && command.Description != "" {
+				t.Fatal("publication mutated the native catalog")
+			}
+		}
+	}
+}
+
+func requireCommandMenuLanguage(t *testing.T, f *commandMenuTransport, chatID int64, language i18n.Language) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, code := range []string{"", "zh"} {
+		found := false
+		for _, command := range f.menus[chatID][code] {
+			if command.Command == "help" {
+				found = true
+				if command.Description != i18n.Text(language, i18n.Msg.CommandHelp) {
+					t.Fatalf("menu chat=%d language=%q did not converge to %s: %q", chatID, code, language, command.Description)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("menu chat=%d language=%q is missing bridge commands", chatID, code)
+		}
+	}
+}
+
+func TestCommandMenuRetriesPersistedLanguageWithoutUpdates(t *testing.T) {
+	for _, chatID := range []int64{0, -10} {
+		for _, code := range []string{"", "zh"} {
+			t.Run(fmt.Sprintf("chat=%d/language=%q", chatID, code), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					b, f := newCommandMenuFixture(t, -10)
+					db, err := store.Open(t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { db.Close() })
+					b.db = db
+					b.refreshLanguageMenus()
+					startCommandMenuPublisher(t, b)
+					synctest.Wait()
+					requireCommandMenuLanguage(t, f, 0, i18n.English)
+					requireCommandMenuLanguage(t, f, -10, i18n.English)
+					failed := commandMenuScope{chatID, code}
+					f.mu.Lock()
+					f.scopeFailures[failed] = 1
+					f.failureStatus = http.StatusTooManyRequests
+					f.retryAfter = 90
+					f.mu.Unlock()
+					if err := b.changeLanguage(i18n.Chinese); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if language, err := db.Language(); err != nil || language != i18n.Chinese {
+						t.Fatalf("language was not persisted: %s, %v", language, err)
+					}
+					f.mu.Lock()
+					before := len(f.calls)
+					f.mu.Unlock()
+					time.Sleep(90*time.Second - time.Nanosecond)
+					synctest.Wait()
+					f.mu.Lock()
+					calls := len(f.calls)
+					f.mu.Unlock()
+					if calls != before {
+						t.Fatal("menu retry ignored Telegram retry_after")
+					}
+					time.Sleep(time.Nanosecond)
+					synctest.Wait()
+					requireCommandMenuLanguage(t, f, 0, i18n.Chinese)
+					requireCommandMenuLanguage(t, f, -10, i18n.Chinese)
+					f.mu.Lock()
+					defer f.mu.Unlock()
+					counts := make(map[commandMenuScope]int)
+					for _, request := range f.calls {
+						counts[commandMenuScope{request.Scope.ChatID, request.Language}]++
+					}
+					for _, id := range []int64{0, -10} {
+						for _, language := range []string{"", "zh"} {
+							scope := commandMenuScope{id, language}
+							want := 2
+							if scope == failed {
+								want++
+							}
+							if counts[scope] != want {
+								t.Fatalf("scope %+v sent %d requests, want %d", scope, counts[scope], want)
+							}
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
+func commandMenuCallCount(f *commandMenuTransport, scope commandMenuScope) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, request := range f.calls {
+		if request.Scope.ChatID == scope.chatID && request.Language == scope.language {
+			count++
+		}
+	}
+	return count
+}
+
+func TestCommandMenuRetryBackoffBoundsTrafficAndLogs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, f := newCommandMenuFixture(t, -10)
+		capture := &logCapture{}
+		logs, err := logging.New(capture, logging.Options{Level: "info", Format: "json"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.telegramLog = logs.Logger(logging.Telegram)
+		failed := commandMenuScope{-10, ""}
+		f.scopeFailures[failed] = 100
+		f.failureStatus = http.StatusTooManyRequests
+		cancel, done := startCommandMenuPublisher(t, b)
+		synctest.Wait()
+		// A failed chat must not delay unrelated menus.
+		b.registerCommandMenuWorker(&worker{key: target{chat: -20, thread: 1}})
+		synctest.Wait()
+		requireCommandMenuLanguage(t, f, -20, i18n.English)
+		for attempt, delay := range []time.Duration{
+			time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+			16 * time.Second, 32 * time.Second, time.Minute, time.Minute,
+		} {
+			for range 20 {
+				b.refreshLanguageMenus()
+			}
+			synctest.Wait()
+			time.Sleep(delay - time.Nanosecond)
+			synctest.Wait()
+			if calls := commandMenuCallCount(f, failed); calls != attempt+1 {
+				t.Fatalf("attempt %d bypassed backoff: %d requests", attempt, calls)
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			if calls := commandMenuCallCount(f, failed); calls != attempt+2 {
+				t.Fatalf("attempt %d did not retry after %s: %d requests", attempt, delay, calls)
+			}
+		}
+		if warnings := strings.Count(capture.String(), "telegram_chat_commands_failed"); warnings != 1 {
+			t.Fatalf("one continuous failure produced %d warnings", warnings)
+		}
+		cancel()
+		<-done
+		calls := commandMenuCallCount(f, failed)
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if commandMenuCallCount(f, failed) != calls {
+			t.Fatal("cancellation left a menu retry running")
+		}
+	})
+}
+
+func TestCommandMenuRetryUsesLatestCatalogAndLanguage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b, f := newCommandMenuFixture(t, -10)
+		w := &worker{key: target{chat: -10, thread: 1}}
+		b.registerCommandMenuWorker(w)
+		b.updateCommandMenu(w, commandMenuCommands("initial"))
+		startCommandMenuPublisher(t, b)
+		synctest.Wait()
+		f.mu.Lock()
+		f.scopeFailures[commandMenuScope{-10, "zh"}] = 1
+		f.failureStatus = http.StatusTooManyRequests
+		f.retryAfter = 5
+		f.mu.Unlock()
+		b.setLanguage(i18n.Chinese)
+		b.refreshLanguageMenus()
+		synctest.Wait()
+		b.updateCommandMenu(w, commandMenuCommands("latest"))
+		b.setLanguage(i18n.English)
+		b.refreshLanguageMenus()
+		synctest.Wait()
+		f.mu.Lock()
+		before := len(f.calls)
+		f.mu.Unlock()
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		requireCommandMenuLanguage(t, f, -10, i18n.English)
+		requirePublishedMenus(t, f, -10, "latest")
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if len(f.calls)-before != 2 {
+			t.Fatalf("retry sent %d requests, want both scopes of only the deferred chat", len(f.calls)-before)
+		}
+		for _, request := range f.calls[before:] {
+			if request.Scope.ChatID != -10 {
+				t.Fatalf("retry rewrote an unrelated chat: %d", request.Scope.ChatID)
+			}
+			requireCommandMenu(t, request.Commands, "latest")
+		}
+	})
+}
+
+func TestCommandMenuPermanentRejectionWaitsForChanges(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				b, f := newCommandMenuFixture(t, -10)
+				w := &worker{key: target{chat: -10, thread: 1}}
+				b.registerCommandMenuWorker(w)
+				failed := commandMenuScope{-10, ""}
+				f.scopeFailures[failed] = 100
+				f.failureStatus = status
+				startCommandMenuPublisher(t, b)
+				synctest.Wait()
+				time.Sleep(10 * time.Minute)
+				synctest.Wait()
+				if calls := commandMenuCallCount(f, failed); calls != 1 {
+					t.Fatalf("permanent HTTP %d rejection retried without an update: %d requests", status, calls)
+				}
+				b.updateCommandMenu(w, commandMenuCommands("changed"))
+				synctest.Wait()
+				if calls := commandMenuCallCount(f, failed); calls != 2 {
+					t.Fatalf("new catalog did not retry HTTP %d rejection: %d requests", status, calls)
+				}
+			})
+		})
+	}
+}
+
+func TestCommandMenuRetriesUnconfirmedPublication(t *testing.T) {
+	for _, scenario := range []struct {
+		name          string
+		lostResponses int
+		rejections    int
+	}{
+		{"lost responses", 3, 0},
+		{"temporary rejection", 0, 3},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				b, f := newCommandMenuFixture(t, -10)
+				w := &worker{key: target{chat: -10, thread: 1}}
+				b.registerCommandMenuWorker(w)
+				b.updateCommandMenu(w, commandMenuCommands("initial"))
+				startCommandMenuPublisher(t, b)
+				synctest.Wait()
+				f.mu.Lock()
+				f.lostResponses["zh"] = scenario.lostResponses
+				f.scopeFailures[commandMenuScope{-10, "zh"}] = scenario.rejections
+				f.failureStatus = http.StatusServiceUnavailable
+				f.mu.Unlock()
+				b.updateCommandMenu(w, commandMenuCommands("latest"))
+				time.Sleep(600 * time.Millisecond)
+				synctest.Wait()
+				failed := commandMenuScope{-10, "zh"}
+				if calls := commandMenuCallCount(f, failed); calls != 4 {
+					t.Fatalf("expected initial publication and three failed client attempts, got %d", calls)
+				}
+				time.Sleep(time.Second)
+				synctest.Wait()
+				requirePublishedMenus(t, f, -10, "latest")
+				if calls := commandMenuCallCount(f, failed); calls != 5 {
+					t.Fatalf("publisher did not retry after client retries were exhausted: %d requests", calls)
+				}
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				if calls := commandMenuCallCount(f, failed); calls != 5 {
+					t.Fatal("acknowledged menu publication kept retrying")
+				}
+			})
+		})
 	}
 }

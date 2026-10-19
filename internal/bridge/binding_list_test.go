@@ -703,27 +703,6 @@ func TestBindingCallbackRejectsWrongMessage(t *testing.T) {
 	}
 }
 
-func TestFormatLastUsedHandlesUnknownAndFuture(t *testing.T) {
-	if got := formatLastUsed(0); got != "unknown" {
-		t.Fatalf("zero timestamp = %q", got)
-	}
-	if got := formatLastUsed(time.Now().Add(time.Minute).Unix()); got != "unknown" {
-		t.Fatalf("future timestamp = %q", got)
-	}
-	for _, tc := range []struct {
-		age  time.Duration
-		want string
-	}{
-		{age: 24*time.Hour + 10*time.Minute, want: "1d ago"},
-		{age: 4*24*time.Hour + 10*time.Minute, want: "4d ago"},
-		{age: 4*24*time.Hour + 2*time.Hour + 10*time.Minute, want: "4d 2h ago"},
-	} {
-		if got := formatLastUsed(time.Now().Add(-tc.age).Unix()); got != tc.want {
-			t.Fatalf("age %s = %q, want %q", tc.age, got, tc.want)
-		}
-	}
-}
-
 func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	requireStoreOK(t, err)
@@ -745,5 +724,24 @@ func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
 	requireStoreOK(t, err)
 	if !sameBindingIdentity(saved, closed) || len(w.confirms) != 0 {
 		t.Fatal("cancelled binding deletion changed the binding or remained actionable")
+	}
+}
+
+func TestQueuePreviewLocalizesOnlyBridgeFallbacks(t *testing.T) {
+	if got := queueTaskText("zh", queued{preparing: true, album: true}); got != "排队中的相册" {
+		t.Fatalf("album fallback was not localized: %q", got)
+	}
+	for _, q := range []queued{
+		{displayText: "Queued task", preparing: true, album: true},
+		{displayText: "Preparing attachment..."},
+		{text: "Queued task"},
+	} {
+		want := q.displayText
+		if want == "" {
+			want = q.text
+		}
+		if got := queueTaskText("zh", q); got != want {
+			t.Fatalf("user queue text was translated: got %q, want %q", got, want)
+		}
 	}
 }

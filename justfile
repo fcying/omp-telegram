@@ -7,9 +7,10 @@ build:
     echo "Building omp-telegram..."
     go build -o omp-telegram ./cmd/omp-telegram
 
-# Format Go source and test files.
+# Format with the module's Go version, matching CI.
 fmt:
-    go fmt ./...
+    version=$(go list -m -f '{{ "{{.GoVersion}}" }}')
+    GOTOOLCHAIN="go${version}" go fmt ./...
 
 # Install only the binary; configuration and data remain user-managed.
 install bin_dir=(env_var("HOME") / "tool/omp-telegram"): build
@@ -26,10 +27,12 @@ deploy: install
 
 # Run unit tests without touching the supervised daemon.
 test:
+    umask 0077
     go test ./...
 
 # Run automated tests, race checks, and vet without starting Telegram polling.
 check:
+    umask 0077
     go test ./...
     go test -race ./...
     go vet ./...

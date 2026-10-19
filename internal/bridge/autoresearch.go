@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -51,7 +52,7 @@ func (w *worker) researchAvailable(client *omp.Client) bool {
 
 func (w *worker) researchModeFailure() {
 	w.resumeFailed = true
-	w.say("Autoresearch mode could not be confirmed. No waiting input was submitted. Use /autoresearch off to safely disable it, or /close.")
+	w.say(w.tr(i18n.Msg.AutoresearchModeCouldNotConfirmedNoWaitingInputSubmitted))
 }
 
 // pendingIndex is -1 for new input; the result reports an in-place queue conversion.
@@ -75,7 +76,7 @@ func (w *worker) routeResearchInput(in incoming, text string, client *omp.Client
 			w.queue = append(w.queue[:pendingIndex], w.queue[pendingIndex+1:]...)
 		}
 		w.mark(in.id, store.InboxCancelled)
-		w.say("Autoresearch clear requires an idle instance and an empty queue. Stop research first.")
+		w.say(w.tr(i18n.Msg.AutoresearchClearRequiresIdleInstanceEmptyQueueStopResearch))
 		return false
 	}
 	if w.research.control != nil {
@@ -83,7 +84,7 @@ func (w *worker) routeResearchInput(in incoming, text string, client *omp.Client
 			w.queue = append(w.queue[:pendingIndex], w.queue[pendingIndex+1:]...)
 		}
 		w.mark(in.id, store.InboxCancelled)
-		w.say("The autoresearch control is still loading. No command was submitted.")
+		w.say(w.tr(i18n.Msg.AutoresearchControlStillLoadingNoCommandSubmitted))
 		return false
 	}
 	// Convert pending discovery in place; the control fences dispatch until lookup finishes.
@@ -94,7 +95,7 @@ func (w *worker) routeResearchInput(in incoming, text string, client *omp.Client
 	} else {
 		if w.pendingInputFull() {
 			w.mark(in.id, store.InboxCancelled)
-			w.say("The queue is full. This message was not submitted.")
+			w.say(w.tr(i18n.Msg.Queue.Full))
 			return false
 		}
 		w.enqueueNativeCommand(in, text, "autoresearch", client.CommandCatalog().SessionID)
@@ -135,7 +136,7 @@ func (w *worker) routeDeferredResearchToggle() {
 		}
 		if q.nativeSession != catalog.SessionID || !w.researchAvailable(client) {
 			w.cancelQueuedTask(q.id)
-			w.say("The queued native command is no longer available. It was canceled and was not sent as a model prompt.")
+			w.say(w.tr(i18n.Msg.QueuedNativeCommandNoLongerAvailableCanceledNotSent))
 			return
 		}
 		w.routeResearchInput(incoming{id: q.id, msg: q.reply}, q.text, client, i)
@@ -209,7 +210,7 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 
 func (w *worker) commitResearchRound() {
 	if w.preview != "" {
-		if err := w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, replyTaskReplies(w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
+		if err := w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, replyTaskReplies(w.b.language(), w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
 			w.b.fail(err)
 			w.cancel()
 			return
@@ -232,7 +233,7 @@ func (w *worker) researchLocalResult(e rpcEvent) bool {
 		return false
 	}
 	if e.Status != "completed" || e.SessionSettled == nil || !*e.SessionSettled {
-		w.retireResearch("Autoresearch command completion could not be confirmed. It will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchCommandCompletionCouldNotConfirmedWillNotReplayed))
 		return true
 	}
 	if w.research.control == nil {
@@ -260,12 +261,12 @@ func (w *worker) researchNotify(e rpcEvent) bool {
 	}
 	// Notifications are display only: never derive completion or mode from them.
 	if trimmed := strings.TrimSpace(text); strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		text = "Native diagnostic notification omitted."
+		text = w.tr(i18n.Msg.NativeDiagnosticNotificationOmitted)
 	}
 	text = terminalFailureDetail(text)
 	if text != "" {
 		w.research.notices++
-		w.say("Autoresearch: " + text)
+		w.say(w.tr(i18n.Msg.Autoresearch, text))
 	}
 	return true
 }
@@ -308,7 +309,7 @@ func researchCallbackMessage(q *telegram.CallbackQuery, c confirmation, key targ
 func (w *worker) handleResearchStop() bool {
 	if w.research.control != nil {
 		w.cancelResearchControl()
-		w.retireResearch("Autoresearch control was canceled. Its outcome is uncertain; no control will be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchControlCanceledOutcomeUncertainNoControlWillReplayed))
 		return true
 	}
 	if w.research.root || w.research.enabled || w.research.disablePending {
@@ -327,13 +328,13 @@ func (w *worker) handleResearchStop() bool {
 func (w *worker) researchStatus() string {
 	switch {
 	case w.research.disablePending:
-		return "\nAutoresearch: disable not confirmed; queued work paused."
+		return w.tr(i18n.Msg.AutoresearchDisableNotConfirmedQueuedWorkPaused)
 	case w.research.root:
-		return "\nAutoresearch: active research root (managed until off or Stop; a round ending is not research completion)."
+		return w.tr(i18n.Msg.AutoresearchActiveResearchRootManagedUntilOffStopRound)
 	case w.research.known && w.research.enabled:
-		return "\nAutoresearch: mode enabled; no active research root."
+		return w.tr(i18n.Msg.AutoresearchModeEnabledNoActiveResearchRoot)
 	case w.research.known:
-		return "\nAutoresearch: mode disabled."
+		return w.tr(i18n.Msg.AutoresearchModeDisabled)
 	default:
 		return ""
 	}

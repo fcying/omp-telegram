@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 )
 
@@ -127,7 +128,7 @@ drained:
 	}
 	var state researchSettlementState
 	if result.err != nil || json.Unmarshal(result.data, &state) != nil {
-		w.retireResearch("Autoresearch settlement could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireResearch(w.tr(i18n.Msg.AutoresearchSettlementCouldNotConfirmedTaskOutcomeUncertainWill))
 		return
 	}
 	w.research.known, w.research.enabled = true, state.Enabled

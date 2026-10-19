@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 )
 
@@ -176,7 +177,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		return
 	}
 	if w.steerFence.active && result.err != nil {
-		w.retireTaskRuntime("Steering state could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.SteeringStateCouldNotConfirmedTaskOutcomeUncertainWill))
 		return
 	}
 	if !w.stuckTaskEligible() || result.err != nil || !result.idle {
@@ -195,7 +196,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		if w.idleProbe.pendingSince.IsZero() {
 			w.idleProbe.pendingSince = now
 		} else if now.Sub(w.idleProbe.pendingSince) >= nativeSteerIdleLimit {
-			w.retireTaskRuntime("omp's native steering queue remained idle too long. The task outcome is uncertain and will not be replayed automatically.")
+			w.retireTaskRuntime(w.tr(i18n.Msg.OmpSNativeSteeringQueueRemainedIdleTooLong))
 		}
 		return
 	}
@@ -221,7 +222,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 		return
 	}
 	if w.steerFence.active {
-		w.retireTaskRuntime("omp is idle but steering completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.")
+		w.retireTaskRuntime(w.tr(i18n.Msg.OmpIdleButSteeringCompletionCouldNotConfirmedTask))
 		return
 	}
 	inboxID, generation, turn := w.active, w.binding.Generation, w.turn
@@ -229,7 +230,7 @@ func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
 	if w.client != nil {
 		clientID = w.client.ID()
 	}
-	if w.finishUncertain("omp is idle but no confirmed terminal result was received. The task outcome is uncertain and will not be replayed automatically.") {
+	if w.finishUncertain(w.tr(i18n.Msg.OmpIdleButNoConfirmedTerminalResultReceivedTask)) {
 		attrs := []slog.Attr{
 			slog.String("event", "watchdog_recover"),
 			slog.String("reason", "idle_completion_missing"),

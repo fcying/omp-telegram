@@ -12,8 +12,11 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-const commandMenuTimeout = 20 * time.Second
-const nativeCommandDescription = "OMP native command"
+const (
+	commandMenuTimeout      = 20 * time.Second
+	commandMenuRetryInitial = time.Second
+	commandMenuRetryMax     = time.Minute
+)
 
 type commandMenuOwner struct {
 	worker   *worker
@@ -23,8 +26,10 @@ type commandMenuOwner struct {
 }
 
 type commandMenuChat struct {
-	dirty     bool
-	published [2][]telegram.BotCommand
+	dirty      bool
+	published  [2][]telegram.BotCommand
+	retryAt    time.Time
+	retryDelay time.Duration
 }
 
 // commandMenuState is initialized under mu, since catalog updates can arrive
@@ -168,21 +173,55 @@ func (b *Bridge) removeCommandMenu(w *worker) {
 	s.dirtyLocked(w.key.chat)
 }
 
-func (s *commandMenuState) nextLocked() (int64, []telegram.BotCommand, bool) {
-	if s.head == len(s.pending) {
-		return 0, nil, false
+func (b *Bridge) refreshLanguageMenus() {
+	s := &b.commandMenus
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked()
+	// Chat ID zero is reserved for the global default command menu.
+	s.dirtyLocked(0)
+	for chatID := range s.chats {
+		s.dirtyLocked(chatID)
 	}
-	chatID := s.pending[s.head]
-	s.head++
-	if s.head == len(s.pending) {
-		s.pending = s.pending[:0]
-		s.head = 0
-	} else if s.head >= 64 && s.head >= len(s.pending)/2 {
-		// Reclaim consumed slots even if continuous updates keep the queue busy.
-		s.pending = s.pending[:copy(s.pending, s.pending[s.head:])]
-		s.head = 0
+	for _, chatID := range b.cfg.AllowedChats {
+		s.dirtyLocked(chatID)
 	}
-	s.chats[chatID].dirty = false
+}
+
+func (s *commandMenuState) nextLocked(now time.Time) (int64, []telegram.BotCommand, bool, time.Time) {
+	var chatID int64
+	var retryAt time.Time
+	ready := false
+	// Scan each queued chat once; deferred failures must not block healthy chats.
+	for range len(s.pending) - s.head {
+		chatID = s.pending[s.head]
+		s.head++
+		if s.head == len(s.pending) {
+			s.pending = s.pending[:0]
+			s.head = 0
+		} else if s.head >= 64 && s.head >= len(s.pending)/2 {
+			// Reclaim consumed slots even if continuous updates keep the queue busy.
+			s.pending = s.pending[:copy(s.pending, s.pending[s.head:])]
+			s.head = 0
+		}
+		chat := s.chats[chatID]
+		if now.Before(chat.retryAt) {
+			s.pending = append(s.pending, chatID)
+			if retryAt.IsZero() || chat.retryAt.Before(retryAt) {
+				retryAt = chat.retryAt
+			}
+			continue
+		}
+		chat.dirty = false
+		ready = true
+		break
+	}
+	if !ready {
+		return 0, nil, false, retryAt
+	}
+	if chatID == 0 {
+		return 0, nil, true, time.Time{}
+	}
 
 	union := make(map[string]string)
 	known := false
@@ -207,19 +246,14 @@ func (s *commandMenuState) nextLocked() (int64, []telegram.BotCommand, bool) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	commands := make([]telegram.BotCommand, 0, min(100, len(botCommands)+len(names)))
-	commands = append(commands, botCommands[:min(100, len(botCommands))]...)
+	commands := make([]telegram.BotCommand, 0, min(max(0, 100-len(botCommands)), len(names)))
 	for _, name := range names {
-		if len(commands) == 100 {
+		if len(commands)+len(botCommands) >= 100 {
 			break
 		}
-		description := union[name]
-		if description == "" {
-			description = nativeCommandDescription
-		}
-		commands = append(commands, telegram.BotCommand{Command: name, Description: description})
+		commands = append(commands, telegram.BotCommand{Command: name, Description: union[name]})
 	}
-	return chatID, commands, true
+	return chatID, commands, true, time.Time{}
 }
 
 func (b *Bridge) runCommandMenus(ctx context.Context) {
@@ -233,50 +267,107 @@ func (b *Bridge) runCommandMenus(ctx context.Context) {
 	}
 	wake := s.wake
 	s.mu.Unlock()
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		s.mu.Lock()
-		chatID, commands, ok := s.nextLocked()
+		chatID, commands, ok, retryAt := s.nextLocked(time.Now())
+		reportFailure := ok && s.chats[chatID].retryDelay == 0
 		s.mu.Unlock()
 		if !ok {
+			var retry <-chan time.Time
+			if !retryAt.IsZero() {
+				if timer == nil {
+					timer = time.NewTimer(time.Until(retryAt))
+				} else {
+					timer.Reset(time.Until(retryAt))
+				}
+				retry = timer.C
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-wake:
+			case <-retry:
+			}
+			if timer != nil {
+				timer.Stop()
 			}
 			continue
 		}
+		localized := localizedCommands(commands, b.language())
+		failed, retry := false, false
+		var retryAfter time.Duration
 		for i, language := range [...]string{"", "zh"} {
 			if ctx.Err() != nil {
 				return
 			}
 			s.mu.Lock()
-			unchanged := slices.Equal(s.chats[chatID].published[i], commands)
+			unchanged := slices.Equal(s.chats[chatID].published[i], localized)
 			s.mu.Unlock()
 			if unchanged {
 				continue
 			}
 			requestCtx, cancel := context.WithTimeout(ctx, commandMenuTimeout)
-			err := b.tg.SetChatCommands(requestCtx, chatID, commands, language)
+			var err error
+			if chatID == 0 {
+				err = b.tg.SetCommands(requestCtx, localized, language)
+			} else {
+				err = b.tg.SetChatCommands(requestCtx, chatID, localized, language)
+			}
 			cancel()
 			if err != nil {
+				failed = true
+				info := telegram.ClassifyError(err)
+				if info.Uncertain || info.Reason == "timeout" {
+					retry = true
+				}
+				if info.Code == 429 || info.Code >= 500 && info.Code <= 599 {
+					retry = true
+				}
+				if info.RetryAfter > 0 {
+					seconds := min(int64(info.RetryAfter), int64((1<<63-1)/time.Second))
+					retryAfter = max(retryAfter, time.Duration(seconds)*time.Second)
+				}
 				if telegram.DeliveryUncertain(err) {
 					// The remote menu may have changed despite the failed response.
 					s.mu.Lock()
 					s.chats[chatID].published[i] = nil
 					s.mu.Unlock()
 				}
-				if ctx.Err() == nil && b.telegramLog != nil {
+				if reportFailure && ctx.Err() == nil && b.telegramLog != nil {
 					logTelegramFailure(b.telegramLog, slog.LevelWarn, "telegram_chat_commands_failed", "telegram chat command registration failed", err, slog.Int64("chat_id", chatID), slog.String("language_code", language))
 				}
 				continue
 			}
 			s.mu.Lock()
-			s.chats[chatID].published[i] = commands
+			s.chats[chatID].published[i] = localized
 			s.mu.Unlock()
 		}
+		s.mu.Lock()
+		chat := s.chats[chatID]
+		if failed {
+			if chat.retryDelay == 0 {
+				chat.retryDelay = commandMenuRetryInitial
+			} else {
+				chat.retryDelay = min(chat.retryDelay*2, commandMenuRetryMax)
+			}
+			chat.retryAt = time.Now().Add(max(chat.retryDelay, retryAfter))
+			if retry {
+				s.dirtyLocked(chatID)
+			}
+		} else {
+			chat.retryDelay = 0
+			chat.retryAt = time.Time{}
+		}
+		s.mu.Unlock()
 	}
 }

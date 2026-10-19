@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"omp-telegram/internal/i18n"
 )
 
 func cloneArgv(args []string) []string {
@@ -136,18 +138,18 @@ func (b *Bridge) selectArgsPreset(index int) error {
 	return nil
 }
 
-func (b *Bridge) argsPresetSelectionMessage(index int) string {
+func (b *Bridge) argsPresetSelectionMessage(language i18n.Language, index int) string {
 	_, count, labels := b.argsMenuSnapshot()
 	if index > 0 && index <= count && len(labels) > 0 {
-		return fmt.Sprintf("Selected OMP argument preset %d: %s.", index, menuText(labels[index-1], 120))
+		return i18n.Text(language, i18n.Msg.NamedArgumentPresetSelected, index, menuText(labels[index-1], 120))
 	}
-	return fmt.Sprintf("Selected OMP argument preset %d.", index)
+	return i18n.Text(language, i18n.Msg.ArgumentPresetSelected, index)
 }
 
 const argsMenuPageSize = 90
 
-func argsMenuButtonLabel(preset, current int, labels []string) string {
-	labelName := fmt.Sprintf("Preset %d", preset)
+func argsMenuButtonLabel(language i18n.Language, preset, current int, labels []string) string {
+	labelName := i18n.Text(language, i18n.Msg.Preset, preset)
 	if len(labels) > 0 {
 		labelName = labels[preset-1]
 	}
@@ -176,14 +178,14 @@ func (w *worker) handleArgsCommand(arg string, user int64) {
 	index, err := strconv.Atoi(arg)
 	_, count := w.b.argsPresetSelection()
 	if !validNumber || err != nil || index < 1 || index > count {
-		w.say("Usage: /args [preset-number]. Invalid preset number.")
+		w.say(w.tr(i18n.Msg.UsageArgsPresetNumberInvalidPresetNumber))
 		return
 	}
 	if err := w.b.selectArgsPreset(index); err != nil {
-		w.say("Failed to save the OMP argument preset selection.")
+		w.say(w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
 		return
 	}
-	w.say(w.b.argsPresetSelectionMessage(index))
+	w.say(w.b.argsPresetSelectionMessage(w.b.language(), index))
 }
 
 func (w *worker) showArgsMenuPage(c confirmation, page int) {
@@ -201,22 +203,22 @@ func (w *worker) showArgsMenuPage(c confirmation, page int) {
 	options := make([]string, 0, choices+3)
 	for offset := range choices {
 		preset := start + offset + 1
-		label := argsMenuButtonLabel(preset, current, labels)
+		label := argsMenuButtonLabel(w.b.language(), preset, current, labels)
 		c.options = append(c.options, label)
 		options = append(options, label)
 	}
 	if page > 0 {
 		c.options = append(c.options, "Previous")
-		options = append(options, "Previous")
+		options = append(options, w.tr(i18n.Msg.Previous))
 	}
 	if page+1 < pages {
 		c.options = append(c.options, "Next")
-		options = append(options, "Next")
+		options = append(options, w.tr(i18n.Msg.Next))
 	}
-	options = append(options, "Cancel")
-	title := fmt.Sprintf("Current OMP argument preset: %d\nAsterisk marks the current preset.\nChoose a preset:", current)
+	options = append(options, w.tr(i18n.Msg.Cancel))
+	title := w.tr(i18n.Msg.CurrentOMPArgumentPresetAsteriskMarksCurrentPresetChoose, current)
 	if pages > 1 {
-		title += fmt.Sprintf("\nPage %d/%d", page+1, pages)
+		title += w.tr(i18n.Msg.Page, page+1, pages)
 	}
 	w.confirm(c, title, options)
 }
@@ -239,17 +241,17 @@ func (w *worker) selectArgsFromMenu(c confirmation, index int) {
 		default:
 			return
 		}
-		w.finishMenu(c.messageID, "Page changed.")
+		w.finishMenu(c.messageID, w.tr(i18n.Msg.PageChanged))
 		w.showArgsMenuPage(c, nextPage)
 		return
 	}
 	preset := c.argsPage*argsMenuPageSize + index + 1
 	if err := w.b.selectArgsPreset(preset); err != nil {
-		w.finishMenu(c.messageID, "Selection was not changed.")
-		w.say("Failed to save the OMP argument preset selection.")
+		w.finishMenu(c.messageID, w.tr(i18n.Msg.SelectionNotChanged))
+		w.say(w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
 		return
 	}
-	message := w.b.argsPresetSelectionMessage(preset)
+	message := w.b.argsPresetSelectionMessage(w.b.language(), preset)
 	if c.messageID == 0 {
 		w.say(message)
 		return

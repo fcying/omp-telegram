@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -118,7 +119,7 @@ func (w *worker) commandCatalogFinished(result commandCatalogResult) {
 		w.nativeCatalog.pausedEpoch = catalog.Epoch
 		if w.ctx.Err() == nil {
 			w.logRuntimeEvent(slog.LevelWarn, "command_catalog_unavailable", omp.ClassifyError(result.err), "native command discovery unavailable", w.sessionID)
-			w.say("Native command discovery is unavailable. Waiting slash commands were not submitted; the running task and runtime were preserved. Use /queue and Cancel on the waiting slash item to let later tasks continue.")
+			w.say(w.tr(i18n.Msg.NativeCommandDiscoveryUnavailableWaitingSlashCommandsNotSubmitted))
 		}
 		return
 	}
@@ -235,18 +236,18 @@ func unsupportedNativeCommand(text, botUsername string) string {
 
 func (w *worker) unsupportedNativeCommandNotice(command string) {
 	if command == "/session delete" {
-		w.say("/session delete is not supported by the bridge because it deletes the active session. Use /close, then the /resume picker Delete control instead.")
+		w.say(w.tr(i18n.Msg.SessionDeleteNotSupportedBridgeBecauseDeletesActiveSession))
 		return
 	}
-	w.say(command + " is not supported by the bridge because it can move the session or workspace. Use /new or /resume instead.")
+	w.say(w.tr(i18n.Msg.NotSupportedBridgeBecauseCanMoveSessionWorkspaceUse, command))
 }
 
 func (w *worker) unsupportedCommandSourceNotice(catalog omp.CommandCatalog, name string) {
 	if catalog.HasExtensionCommand(name) {
-		w.say("Extension commands are not supported by the bridge because they can change the native session without updating its binding. No command was submitted.")
+		w.say(w.tr(i18n.Msg.ExtensionCommandsNotSupportedBridgeBecauseTheyCanChange))
 		return
 	}
-	w.say("Commands with an unknown or unsupported source are not supported by the bridge. No command was submitted.")
+	w.say(w.tr(i18n.Msg.CommandsUnknownUnsupportedSourceNotSupportedBridgeNoCommand))
 }
 
 // Unsupported discovery cannot prove that slash text is safe model input.
@@ -257,7 +258,7 @@ func (w *worker) rejectUnsupportedSlash(catalog omp.CommandCatalog, text string,
 	if !w.cancelQueuedTask(inbox) && !w.mark(inbox, store.InboxCancelled) {
 		return true
 	}
-	w.say("OMP does not support native command discovery. Slash input was cancelled because its command source cannot be verified. Use an OMP version with command discovery, or send ordinary text without a leading slash.")
+	w.say(w.tr(i18n.Msg.OMPDoesNotSupportNativeCommandDiscoverySlashInput))
 	return true
 }
 
@@ -276,7 +277,7 @@ func (w *worker) routeSlashInput(in incoming, text string) {
 		if w.ctx.Err() != nil {
 			return
 		}
-		w.say(err.Error())
+		w.say(w.errorText(err))
 		w.mark(in.id, store.InboxDone)
 		return
 	}
@@ -288,7 +289,7 @@ func (w *worker) routeSlashInput(in incoming, text string) {
 		if _, research := autoresearchArguments(text, w.b.bot.Username); research {
 			if !w.researchAvailable(client) {
 				w.mark(in.id, store.InboxCancelled)
-				w.say("/autoresearch is not available from the current native extension catalog. No command was submitted.")
+				w.say(w.tr(i18n.Msg.AutoresearchNotAvailableCurrentNativeExtensionCatalogNoCommand))
 				return
 			}
 			_, normalized, _ := advertisedCommand(catalog, text, w.b.bot.Username)
@@ -313,7 +314,7 @@ func (w *worker) routeSlashInput(in incoming, text string) {
 
 func (w *worker) enqueueSlashInput(in incoming, text string, client *omp.Client) {
 	if w.pendingInputFull() {
-		w.say("The queue is full. This message was not submitted.")
+		w.say(w.tr(i18n.Msg.Queue.Full))
 		w.mark(in.id, store.InboxCancelled)
 		return
 	}
@@ -323,7 +324,7 @@ func (w *worker) enqueueSlashInput(in incoming, text string, client *omp.Client)
 
 func (w *worker) enqueueNativeCommand(in incoming, text, name, sessionID string) {
 	if w.pendingInputFull() {
-		w.say("The queue is full. This message was not submitted.")
+		w.say(w.tr(i18n.Msg.Queue.Full))
 		w.mark(in.id, store.InboxCancelled)
 		return
 	}
@@ -357,7 +358,7 @@ func (w *worker) resolveSlashInputs() {
 			in := incoming{id: q.id, msg: q.reply}
 			if !w.researchAvailable(client) {
 				w.cancelQueuedTask(q.id)
-				w.say("/autoresearch is not available from the current native extension catalog. No command was submitted.")
+				w.say(w.tr(i18n.Msg.AutoresearchNotAvailableCurrentNativeExtensionCatalogNoCommand))
 			} else {
 				_, normalized, _ := advertisedCommand(catalog, q.text, w.b.bot.Username)
 				if w.routeResearchInput(in, normalized, client, i) {
@@ -420,14 +421,14 @@ func (w *worker) queuedCommandDispatchReady(client *omp.Client) bool {
 		}
 		if q.kind != queuedNativeCommand || q.nativeName != "autoresearch" || !w.researchAvailable(client) {
 			if w.cancelQueuedTask(q.id) {
-				w.say("Send /autoresearch directly using the current native extension command, not through a followup or attachment. No command was submitted.")
+				w.say(w.tr(i18n.Msg.SendAutoresearchDirectlyUsingCurrentNativeExtensionCommandNot))
 			}
 			return false
 		}
 		args, _ := autoresearchArguments(q.text, w.b.bot.Username)
 		if autoresearchClear(args) || args == "off" {
 			w.cancelQueuedTask(q.id)
-			w.say("Autoresearch controls must be sent directly; clear also requires confirmation. No command was submitted.")
+			w.say(w.tr(i18n.Msg.AutoresearchControlsMustSentDirectlyClearAlsoRequiresConfirmation))
 			return false
 		}
 	}
@@ -461,7 +462,7 @@ func (w *worker) queuedCommandDispatchReady(client *omp.Client) bool {
 	}
 	if q.kind == queuedNativeCommand && (q.nativeSession != catalog.SessionID || !native || name != q.nativeName) {
 		w.cancelQueuedTask(q.id)
-		w.say("The queued native command is no longer available. It was canceled and was not sent as a model prompt.")
+		w.say(w.tr(i18n.Msg.QueuedNativeCommandNoLongerAvailableCanceledNotSent))
 		return false
 	}
 	return q.kind == queuedNativeCommand
@@ -479,7 +480,7 @@ func (w *worker) nativeCommandOutput(text string) {
 	if _, connected := w.runtimeClient(); !connected || strings.TrimSpace(text) == "" {
 		return
 	}
-	for _, part := range taskReplies(text, "", false) {
+	for _, part := range taskReplies(w.b.language(), text, "", false) {
 		w.say(part)
 	}
 }

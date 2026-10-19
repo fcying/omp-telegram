@@ -44,7 +44,7 @@ func (w *worker) finishReplyWithStatus(round bool) {
 	if w.replyStatus.pending != nil {
 		return
 	}
-	w.replyStatus.header = replyHeader(statusState{}, w.replyStatus.metrics)
+	w.replyStatus.header = replyHeader(w.b.language(), statusState{}, w.replyStatus.metrics)
 	client, connected := w.runtimeClient()
 	if !connected || !w.taskActive() || w.preview == "" || w.ctx.Err() != nil {
 		w.commitReplyStatus(round)
@@ -93,7 +93,7 @@ func (w *worker) replyStatusFinished(result operationResult) {
 	catalog := request.client.CommandCatalog()
 	if sample.valid && request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID && sample.state.SessionID == request.sessionID {
 		sample.state.ConfiguredThinking = w.configuredThinking
-		w.replyStatus.header = replyHeader(sample.state, w.replyStatus.metrics)
+		w.replyStatus.header = replyHeader(w.b.language(), sample.state, w.replyStatus.metrics)
 	}
 	w.commitReplyStatus(request.round)
 }

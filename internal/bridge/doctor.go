@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -27,9 +28,11 @@ const (
 )
 
 type doctorCheck struct {
-	Name    string
-	Level   doctorLevel
-	Message string
+	Name        i18n.Message
+	Level       doctorLevel
+	Message     i18n.Message
+	MessageArgs []any
+	Opaque      string
 }
 
 type doctorBindingSnapshot struct {
@@ -71,14 +74,14 @@ var (
 
 func (w *worker) runDoctor() {
 	if w.doctorCancel != nil {
-		w.say("Diagnostics are already running.")
+		w.say(w.tr(i18n.Msg.DiagnosticsAlreadyRunning))
 		return
 	}
 	b := w.b
 	key := w.key
 	binding, err := readDoctorBinding(b.db, b.bot.ID, key)
 	if err != nil {
-		w.say("Diagnostics unavailable. Run /doctor again.")
+		w.say(w.tr(i18n.Msg.DiagnosticsUnavailableRunDoctorAgain))
 		return
 	}
 	fence := doctorFence{binding: binding, runtime: w.runtime}
@@ -173,13 +176,13 @@ func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client
 
 func checkDoctorConfig(cfg config.Config) doctorCheck {
 	if cfg.OMP == "" || cfg.DataDir == "" || cfg.MaxWorkers < 1 || cfg.MaxWorkers > config.MaxWorkersLimit || cfg.QueueCapacity < 1 || cfg.QueueCapacity > config.MaxQueueCapacityLimit {
-		return doctorCheck{Name: "Config", Level: doctorFail, Message: "invalid runtime configuration"}
+		return doctorCheck{Name: i18n.Msg.Config, Level: doctorFail, Message: i18n.Msg.InvalidRuntimeConfiguration}
 	}
 	switch cfg.ProgressMode {
 	case "off", "summary", "verbose":
-		return doctorCheck{Name: "Config", Level: doctorOK}
+		return doctorCheck{Name: i18n.Msg.Config, Level: doctorOK}
 	default:
-		return doctorCheck{Name: "Config", Level: doctorFail, Message: "invalid runtime configuration"}
+		return doctorCheck{Name: i18n.Msg.Config, Level: doctorFail, Message: i18n.Msg.InvalidRuntimeConfiguration}
 	}
 }
 
@@ -195,27 +198,27 @@ func checkDoctorTelegram(parent context.Context, tg *telegram.Client) doctorChec
 	ctx, cancel := context.WithTimeout(parent, doctorTelegramTimeout)
 	defer cancel()
 	if err := doctorGetMe(ctx, tg); err != nil {
-		return doctorCheck{Name: "Telegram", Level: doctorFail, Message: "Bot API unavailable"}
+		return doctorCheck{Name: i18n.Msg.Telegram, Level: doctorFail, Message: i18n.Msg.BotAPIUnavailable}
 	}
-	return doctorCheck{Name: "Telegram", Level: doctorOK}
+	return doctorCheck{Name: i18n.Msg.Telegram, Level: doctorOK}
 }
 
 func checkDoctorDatabase(ctx context.Context, db *store.Store) doctorCheck {
 	if db == nil {
-		return doctorCheck{Name: "Database", Level: doctorFail, Message: "SQLite check unavailable"}
+		return doctorCheck{Name: i18n.Msg.Database, Level: doctorFail, Message: i18n.Msg.SQLiteCheckUnavailable}
 	}
 	if err := db.QuickCheck(ctx); err != nil {
-		if err.Error() == "sqlite quick check failed" {
-			return doctorCheck{Name: "Database", Level: doctorFail, Message: "SQLite quick check failed"}
+		if errors.Is(err, store.ErrQuickCheckFailed) {
+			return doctorCheck{Name: i18n.Msg.Database, Level: doctorFail, Message: i18n.Msg.SQLiteQuickCheckFailed}
 		}
-		return doctorCheck{Name: "Database", Level: doctorFail, Message: "SQLite check unavailable"}
+		return doctorCheck{Name: i18n.Msg.Database, Level: doctorFail, Message: i18n.Msg.SQLiteCheckUnavailable}
 	}
-	return doctorCheck{Name: "Database", Level: doctorOK}
+	return doctorCheck{Name: i18n.Msg.Database, Level: doctorOK}
 }
 
 func checkDoctorStorage(dataDir string) doctorCheck {
 	fail := func() doctorCheck {
-		return doctorCheck{Name: "Storage", Level: doctorFail, Message: "data directory is not writable"}
+		return doctorCheck{Name: i18n.Msg.Storage, Level: doctorFail, Message: i18n.Msg.DataDirectoryNotWritable}
 	}
 	if !filepath.IsAbs(dataDir) {
 		return fail()
@@ -244,16 +247,16 @@ func checkDoctorStorage(dataDir string) doctorCheck {
 	if err = os.Remove(path); err != nil {
 		return fail()
 	}
-	return doctorCheck{Name: "Storage", Level: doctorOK}
+	return doctorCheck{Name: i18n.Msg.Storage, Level: doctorOK}
 }
 
 func checkDoctorOMPWithTimeout(parent context.Context, binary string, environment omp.Environment) doctorCheck {
 	ctx, cancel := context.WithTimeout(parent, doctorOMPTimeout)
 	defer cancel()
 	if err := doctorRunOMP(ctx, binary, environment); err != nil {
-		return doctorCheck{Name: "OMP binary", Level: doctorFail, Message: "executable check failed"}
+		return doctorCheck{Name: i18n.Msg.OMPBinary, Level: doctorFail, Message: i18n.Msg.ExecutableCheckFailed}
 	}
-	return doctorCheck{Name: "OMP binary", Level: doctorOK}
+	return doctorCheck{Name: i18n.Msg.OMPBinary, Level: doctorOK}
 }
 
 func checkDoctorOMP(ctx context.Context, binary string, environment omp.Environment) error {
@@ -270,13 +273,13 @@ func checkDoctorOMP(ctx context.Context, binary string, environment omp.Environm
 
 func checkDoctorWorkspaceSession(binding doctorBindingSnapshot, runtime runtimeState) (doctorCheck, doctorCheck) {
 	if !binding.exists {
-		return doctorCheck{Name: "Workspace", Level: doctorWarn, Message: "not selected"}, doctorCheck{Name: "Session", Level: doctorWarn, Message: "not selected"}
+		return doctorCheck{Name: i18n.Msg.Workspace, Level: doctorWarn, Message: i18n.Msg.NotSelected}, doctorCheck{Name: i18n.Msg.Session.Label, Level: doctorWarn, Message: i18n.Msg.NotSelected}
 	}
-	workspace := doctorCheck{Name: "Workspace", Level: doctorFail, Message: "directory unavailable"}
+	workspace := doctorCheck{Name: i18n.Msg.Workspace, Level: doctorFail, Message: i18n.Msg.DirectoryUnavailable}
 	if filepath.IsAbs(binding.workspace) {
 		if info, err := os.Stat(binding.workspace); err == nil && info.IsDir() {
 			workspace.Level = doctorOK
-			workspace.Message = ""
+			workspace.Message = i18n.Message{}
 		}
 	}
 	session := checkDoctorSession(binding, runtime)
@@ -285,7 +288,7 @@ func checkDoctorWorkspaceSession(binding doctorBindingSnapshot, runtime runtimeS
 
 func checkDoctorSession(binding doctorBindingSnapshot, runtime runtimeState) doctorCheck {
 	if binding.session == "" {
-		return doctorCheck{Name: "Session", Level: doctorWarn, Message: "not selected"}
+		return doctorCheck{Name: i18n.Msg.Session.Label, Level: doctorWarn, Message: i18n.Msg.NotSelected}
 	}
 	available := filepath.IsAbs(binding.session)
 	if available {
@@ -294,54 +297,56 @@ func checkDoctorSession(binding doctorBindingSnapshot, runtime runtimeState) doc
 	}
 	if !available {
 		if binding.running && runtime != runtimeReleased {
-			return doctorCheck{Name: "Session", Level: doctorWarn, Message: "session history not persisted yet"}
+			return doctorCheck{Name: i18n.Msg.Session.Label, Level: doctorWarn, Message: i18n.Msg.SessionHistoryNotPersistedYet}
 		}
 		if binding.running {
-			return doctorCheck{Name: "Session", Level: doctorFail, Message: "released session file unavailable"}
+			return doctorCheck{Name: i18n.Msg.Session.Label, Level: doctorFail, Message: i18n.Msg.ReleasedSessionFileUnavailable}
 		}
-		return doctorCheck{Name: "Session", Level: doctorWarn, Message: "saved session file is unavailable"}
+		return doctorCheck{Name: i18n.Msg.Session.Label, Level: doctorWarn, Message: i18n.Msg.SavedSessionFileUnavailable}
 	}
 	message := ""
 	if validSessionID(binding.sessionID) {
 		message = "[" + shortSessionID(binding.sessionID) + "]"
 	}
-	return doctorCheck{Name: "Session", Level: doctorOK, Message: message}
+	return doctorCheck{Name: i18n.Msg.Session.Label, Level: doctorOK, Opaque: message}
 }
 
 func checkDoctorRuntime(runtime runtimeState, binding doctorBindingSnapshot) doctorCheck {
-	status := "Closed"
+	status := i18n.Msg.Closed
 	switch runtime {
 	case runtimeConnected:
-		status = "Connected"
+		status = i18n.Msg.Connected
 	case runtimeStarting:
-		status = "Starting"
+		status = i18n.Msg.Starting
 	case runtimeReleased:
 		if binding.exists && binding.running {
-			status = "Released"
+			status = i18n.Msg.Released
 		}
 	default:
-		return doctorCheck{Name: "Runtime", Level: doctorFail, Message: "inconsistent internal runtime state"}
+		return doctorCheck{Name: i18n.Msg.Runtime, Level: doctorFail, Message: i18n.Msg.InconsistentInternalRuntimeState}
 	}
-	return doctorCheck{Name: "Runtime", Level: doctorOK, Message: status}
+	return doctorCheck{Name: i18n.Msg.Runtime, Level: doctorOK, Message: status}
 }
 
 func checkDoctorUncertain(ctx context.Context, db *store.Store) (doctorCheck, doctorCheck) {
 	if db == nil {
-		return doctorCheck{Name: "Inbox", Level: doctorWarn, Message: "count unavailable"}, doctorCheck{Name: "Outbox", Level: doctorWarn, Message: "count unavailable"}
+		return doctorCheck{Name: i18n.Msg.Inbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}, doctorCheck{Name: i18n.Msg.Outbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}
 	}
 	counts, err := db.UncertainCounts(ctx)
 	if err != nil {
-		return doctorCheck{Name: "Inbox", Level: doctorWarn, Message: "count unavailable"}, doctorCheck{Name: "Outbox", Level: doctorWarn, Message: "count unavailable"}
+		return doctorCheck{Name: i18n.Msg.Inbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}, doctorCheck{Name: i18n.Msg.Outbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}
 	}
-	inbox := doctorCheck{Name: "Inbox", Level: doctorOK}
+	inbox := doctorCheck{Name: i18n.Msg.Inbox, Level: doctorOK}
 	if counts.Inbox > 0 {
 		inbox.Level = doctorWarn
-		inbox.Message = fmt.Sprintf("%d uncertain", counts.Inbox)
+		inbox.Message = i18n.Msg.UncertainCount
+		inbox.MessageArgs = []any{counts.Inbox}
 	}
-	outbox := doctorCheck{Name: "Outbox", Level: doctorOK}
+	outbox := doctorCheck{Name: i18n.Msg.Outbox, Level: doctorOK}
 	if counts.Outbox > 0 {
 		outbox.Level = doctorWarn
-		outbox.Message = fmt.Sprintf("%d uncertain", counts.Outbox)
+		outbox.Message = i18n.Msg.UncertainCount
+		outbox.MessageArgs = []any{counts.Outbox}
 	}
 	return inbox, outbox
 }
@@ -349,7 +354,7 @@ func checkDoctorUncertain(ctx context.Context, db *store.Store) (doctorCheck, do
 func checkDoctorDisk(dataDir string) doctorCheck {
 	free, err := doctorStatfs(dataDir)
 	if err != nil {
-		return doctorCheck{Name: "Disk", Level: doctorWarn, Message: "free space unavailable"}
+		return doctorCheck{Name: i18n.Msg.Disk, Level: doctorWarn, Message: i18n.Msg.FreeSpaceUnavailable}
 	}
 	level := doctorOK
 	if free < doctorDiskFail {
@@ -357,14 +362,10 @@ func checkDoctorDisk(dataDir string) doctorCheck {
 	} else if free < doctorDiskWarn {
 		level = doctorWarn
 	}
-	return doctorCheck{Name: "Disk", Level: level, Message: formatDoctorFreeSpace(free)}
-}
-
-func formatDoctorFreeSpace(free uint64) string {
 	if free >= 1<<30 {
-		return fmt.Sprintf("%.1f GiB free", float64(free)/(1<<30))
+		return doctorCheck{Name: i18n.Msg.Disk, Level: level, Message: i18n.Msg.DiskFreeGiB, MessageArgs: []any{float64(free) / (1 << 30)}}
 	}
-	return fmt.Sprintf("%d MiB free", free/(1<<20))
+	return doctorCheck{Name: i18n.Msg.Disk, Level: level, Message: i18n.Msg.DiskFreeMiB, MessageArgs: []any{free / (1 << 20)}}
 }
 
 func doctorOverall(checks []doctorCheck) doctorLevel {
@@ -380,41 +381,50 @@ func doctorOverall(checks []doctorCheck) doctorLevel {
 	return overall
 }
 
-func doctorLevelName(level doctorLevel) string {
+func doctorLevelName(level doctorLevel) i18n.Message {
 	switch level {
 	case doctorWarn:
-		return "WARN"
+		return i18n.Msg.WARN
 	case doctorFail:
-		return "FAIL"
+		return i18n.Msg.FAIL
 	default:
-		return "OK"
+		return i18n.Msg.OK
 	}
 }
 
 func doctorResultName(level doctorLevel) string {
-	return strings.ToLower(doctorLevelName(level))
+	switch level {
+	case doctorWarn:
+		return "warn"
+	case doctorFail:
+		return "fail"
+	default:
+		return "ok"
+	}
 }
 
-func formatDoctorReport(checks []doctorCheck) string {
+func formatDoctorReport(language i18n.Language, checks []doctorCheck) string {
 	var report strings.Builder
-	report.WriteString("omp-telegram diagnostics")
+	report.WriteString(i18n.Text(language, i18n.Msg.OmpTelegramDiagnostics))
 	for _, check := range checks {
 		report.WriteByte('\n')
-		report.WriteString(fmt.Sprintf("%-12s", check.Name))
-		if check.Name == "Runtime" && check.Level == doctorOK {
+		report.WriteString(fmt.Sprintf("%-12s", i18n.Text(language, check.Name)))
+		if check.Name == i18n.Msg.Runtime && check.Level == doctorOK {
 			report.WriteByte(' ')
-			report.WriteString(check.Message)
+			report.WriteString(i18n.Text(language, check.Message))
 			continue
 		}
 		report.WriteByte(' ')
-		report.WriteString(doctorLevelName(check.Level))
-		if check.Message != "" {
+		report.WriteString(i18n.Text(language, doctorLevelName(check.Level)))
+		if check.Opaque != "" {
 			report.WriteString(" - ")
-			report.WriteString(check.Message)
+			report.WriteString(check.Opaque)
+		} else if check.Message != (i18n.Message{}) {
+			report.WriteString(" - ")
+			report.WriteString(i18n.Text(language, check.Message, check.MessageArgs...))
 		}
 	}
-	report.WriteString("\n\nResult: ")
-	report.WriteString(doctorLevelName(doctorOverall(checks)))
+	report.WriteString(i18n.Text(language, i18n.Msg.ResultSummary, i18n.Text(language, doctorLevelName(doctorOverall(checks)))))
 	return report.String()
 }
 
@@ -430,19 +440,19 @@ func (w *worker) doctorFinished(result doctorResult) {
 		if w.ctx.Err() != nil {
 			return
 		}
-		message := "Diagnostics unavailable. Run /doctor again."
+		message := i18n.Msg.DiagnosticsUnavailableRunDoctorAgain
 		if errors.Is(result.err, context.DeadlineExceeded) {
-			message = "Diagnostics timed out. Run /doctor again."
+			message = i18n.Msg.DiagnosticsTimedOutRunDoctorAgain
 		}
 		w.log.Warn("doctor diagnostics failed", "event", "doctor", "result", "fail")
-		w.say(message)
+		w.say(w.tr(message))
 		return
 	}
 	current, err := readDoctorBinding(w.b.db, w.b.bot.ID, w.key)
 	if err != nil {
 		if w.ctx.Err() == nil {
 			w.log.Warn("doctor binding snapshot failed", "event", "doctor", "result", "fail")
-			w.say("Diagnostics unavailable. Run /doctor again.")
+			w.say(w.tr(i18n.Msg.DiagnosticsUnavailableRunDoctorAgain))
 		}
 		return
 	}
@@ -452,10 +462,10 @@ func (w *worker) doctorFinished(result doctorResult) {
 	}
 	if result.fence.runtime != w.runtime || result.fence.clientID != clientID || !sameDoctorBinding(result.fence.binding, current) {
 		w.log.Info("doctor diagnostics discarded", "event", "doctor", "result", "stale")
-		w.say("State changed during diagnostics. Run /doctor again.")
+		w.say(w.tr(i18n.Msg.StateChangedDuringDiagnosticsRunDoctorAgain))
 		return
 	}
 	level := doctorOverall(result.checks)
 	w.log.Info("doctor diagnostics completed", "event", "doctor", "result", doctorResultName(level))
-	w.say(formatDoctorReport(result.checks))
+	w.say(formatDoctorReport(w.b.language(), result.checks))
 }
