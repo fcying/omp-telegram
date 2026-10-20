@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,12 @@ type doctorCheck struct {
 	Message     i18n.Message
 	MessageArgs []any
 	Opaque      string
+	Delivery    *doctorDelivery
+}
+
+type doctorDelivery struct {
+	stats store.DeliveryDiagnostics
+	now   int64
 }
 
 type doctorBindingSnapshot struct {
@@ -101,10 +108,7 @@ func (w *worker) runDoctor() {
 	go func() {
 		defer w.background.Done()
 		result := doctorResult{request: request, fence: fence}
-		result.checks = runDoctorChecks(ctx, b.cfg, b.tg, b.db, fence.binding, fence.runtime)
-		if ctx.Err() != nil {
-			result.err = ctx.Err()
-		}
+		result.checks, result.err = runDoctorChecks(ctx, b.cfg, b.tg, b.db, fence.binding, fence.runtime, key)
 		select {
 		case results <- result:
 		case <-workerCtx.Done():
@@ -135,7 +139,7 @@ func sameDoctorBinding(left, right doctorBindingSnapshot) bool {
 	return left == right
 }
 
-func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client, db *store.Store, binding doctorBindingSnapshot, runtime runtimeState) []doctorCheck {
+func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client, db *store.Store, binding doctorBindingSnapshot, runtime runtimeState, key target) ([]doctorCheck, error) {
 	checks := make([]doctorCheck, 0, 11)
 	appendChecks := func(items ...doctorCheck) bool {
 		if ctx.Err() != nil {
@@ -145,33 +149,36 @@ func runDoctorChecks(ctx context.Context, cfg config.Config, tg *telegram.Client
 		return ctx.Err() == nil
 	}
 	if !appendChecks(checkDoctorConfig(cfg)) {
-		return checks
+		return checks, ctx.Err()
 	}
 	if !appendChecks(checkDoctorTelegram(ctx, tg)) {
-		return checks
+		return checks, ctx.Err()
 	}
 	if !appendChecks(checkDoctorDatabase(ctx, db)) {
-		return checks
+		return checks, ctx.Err()
 	}
 	if !appendChecks(checkDoctorStorage(cfg.DataDir)) {
-		return checks
+		return checks, ctx.Err()
 	}
 	if !appendChecks(checkDoctorOMPWithTimeout(ctx, cfg.OMP, cfg.OMPEnvironment)) {
-		return checks
+		return checks, ctx.Err()
 	}
 	workspace, session := checkDoctorWorkspaceSession(binding, runtime)
 	if !appendChecks(workspace, session) {
-		return checks
+		return checks, ctx.Err()
 	}
 	if !appendChecks(checkDoctorRuntime(runtime, binding)) {
-		return checks
+		return checks, ctx.Err()
 	}
-	inbox, outbox := checkDoctorUncertain(ctx, db)
-	if !appendChecks(inbox, outbox) {
-		return checks
+	if !appendChecks(checkDoctorInbox(ctx, db)) {
+		return checks, ctx.Err()
 	}
-	appendChecks(checkDoctorDisk(cfg.DataDir))
-	return checks
+	if !appendChecks(checkDoctorDisk(cfg.DataDir)) {
+		return checks, ctx.Err()
+	}
+	// A delivery query failure, including its deadline, degrades only this check.
+	outbox := checkDoctorDelivery(ctx, db, key, time.Now().Unix())
+	return append(checks, outbox), nil
 }
 
 func checkDoctorConfig(cfg config.Config) doctorCheck {
@@ -328,27 +335,96 @@ func checkDoctorRuntime(runtime runtimeState, binding doctorBindingSnapshot) doc
 	return doctorCheck{Name: i18n.Msg.Runtime, Level: doctorOK, Message: status}
 }
 
-func checkDoctorUncertain(ctx context.Context, db *store.Store) (doctorCheck, doctorCheck) {
+func checkDoctorInbox(ctx context.Context, db *store.Store) doctorCheck {
+	inbox := doctorCheck{Name: i18n.Msg.Inbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}
 	if db == nil {
-		return doctorCheck{Name: i18n.Msg.Inbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}, doctorCheck{Name: i18n.Msg.Outbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}
+		return inbox
 	}
-	counts, err := db.UncertainCounts(ctx)
+	count, err := db.InboxUncertainCount(ctx)
 	if err != nil {
-		return doctorCheck{Name: i18n.Msg.Inbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}, doctorCheck{Name: i18n.Msg.Outbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}
+		return inbox
 	}
-	inbox := doctorCheck{Name: i18n.Msg.Inbox, Level: doctorOK}
-	if counts.Inbox > 0 {
+	inbox.Level, inbox.Message = doctorOK, i18n.Message{}
+	if count > 0 {
 		inbox.Level = doctorWarn
 		inbox.Message = i18n.Msg.UncertainCount
-		inbox.MessageArgs = []any{counts.Inbox}
+		inbox.MessageArgs = []any{count}
 	}
-	outbox := doctorCheck{Name: i18n.Msg.Outbox, Level: doctorOK}
-	if counts.Outbox > 0 {
+	return inbox
+}
+
+func checkDoctorDelivery(ctx context.Context, db *store.Store, key target, now int64) doctorCheck {
+	outbox := doctorCheck{Name: i18n.Msg.Outbox, Level: doctorWarn, Message: i18n.Msg.CountUnavailable}
+	if db == nil {
+		return outbox
+	}
+	stats, err := db.DeliveryDiagnostics(ctx, key.chat, key.thread)
+	if err != nil {
+		return outbox
+	}
+	outbox.Level, outbox.Message = doctorOK, i18n.Message{}
+	outbox.Delivery = &doctorDelivery{stats: stats, now: now}
+	if stats.Topic.Uncertain > 0 || stats.Global.Uncertain > 0 {
 		outbox.Level = doctorWarn
-		outbox.Message = i18n.Msg.UncertainCount
-		outbox.MessageArgs = []any{counts.Outbox}
 	}
-	return inbox, outbox
+	return outbox
+}
+
+func (d *doctorDelivery) head() (state string, wait, retry int64) {
+	switch d.stats.HeadState {
+	case store.OutboxPending:
+		return "pending", doctorElapsed(d.now, d.stats.HeadCreatedAt), max(int64(0), d.stats.HeadNextAttemptAt-d.now)
+	case store.OutboxSending:
+		return "sending", doctorElapsed(d.now, d.stats.HeadUpdatedAt), 0
+	default:
+		return "idle", 0, 0
+	}
+}
+
+func doctorElapsed(now, at int64) int64 {
+	if at <= 0 {
+		return 0
+	}
+	return max(int64(0), now-at)
+}
+
+// Integer formatting also handles retry deadlines beyond time.Duration's range.
+func doctorSeconds(seconds int64) string {
+	if seconds >= 3600 {
+		return fmt.Sprintf("%dh%dm%ds", seconds/3600, seconds/60%60, seconds%60)
+	}
+	if seconds >= 60 {
+		return fmt.Sprintf("%dm%ds", seconds/60, seconds%60)
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+func formatDoctorDelivery(language i18n.Language, d *doctorDelivery) string {
+	stats := d.stats
+	state, wait, retry := d.head()
+	head := i18n.Text(language, i18n.Msg.Delivery.Idle)
+	switch state {
+	case "pending":
+		head = i18n.Text(language, i18n.Msg.Delivery.Ready)
+		if retry > 0 {
+			head = i18n.Text(language, i18n.Msg.Delivery.RetryIn, doctorSeconds(retry))
+		}
+	case "sending":
+		head = i18n.Text(language, i18n.Msg.Delivery.Sending, doctorSeconds(wait))
+	}
+	var report strings.Builder
+	report.WriteString(i18n.Text(language, i18n.Msg.Delivery.Counts, stats.Topic.Pending, stats.Topic.Sending))
+	if stats.Topic.Pending > 0 {
+		age := i18n.Text(language, i18n.Msg.Unavailable)
+		if stats.OldestPendingAt > 0 {
+			age = doctorSeconds(doctorElapsed(d.now, stats.OldestPendingAt))
+		}
+		report.WriteString("\n  " + i18n.Text(language, i18n.Msg.Delivery.OldestPending, age))
+	}
+	report.WriteString("\n  " + i18n.Text(language, i18n.Msg.Delivery.Head, head))
+	report.WriteString("\n  " + i18n.Text(language, i18n.Msg.Delivery.Uncertain, stats.Topic.Uncertain))
+	report.WriteString("\n  " + i18n.Text(language, i18n.Msg.Delivery.Global, stats.Global.Pending, stats.Global.Sending, stats.Global.Uncertain))
+	return report.String()
 }
 
 func checkDoctorDisk(dataDir string) doctorCheck {
@@ -416,6 +492,11 @@ func formatDoctorReport(language i18n.Language, checks []doctorCheck) string {
 		}
 		report.WriteByte(' ')
 		report.WriteString(i18n.Text(language, doctorLevelName(check.Level)))
+		if check.Delivery != nil {
+			report.WriteString(" - ")
+			report.WriteString(formatDoctorDelivery(language, check.Delivery))
+			continue
+		}
 		if check.Opaque != "" {
 			report.WriteString(" - ")
 			report.WriteString(check.Opaque)
@@ -466,6 +547,26 @@ func (w *worker) doctorFinished(result doctorResult) {
 		return
 	}
 	level := doctorOverall(result.checks)
-	w.log.Info("doctor diagnostics completed", "event", "doctor", "result", doctorResultName(level))
+	attrs := []slog.Attr{slog.String("event", "doctor"), slog.String("result", doctorResultName(level))}
+	for _, check := range result.checks {
+		if check.Name != i18n.Msg.Outbox {
+			continue
+		}
+		if check.Delivery == nil {
+			attrs = append(attrs, slog.String("head_state", "unavailable"))
+			break
+		}
+		d := check.Delivery
+		state, wait, retry := d.head()
+		attrs = append(attrs,
+			slog.Int64("pending_count", d.stats.Topic.Pending),
+			slog.Int64("sending_count", d.stats.Topic.Sending),
+			slog.Int64("uncertain_count", d.stats.Topic.Uncertain),
+			slog.String("head_state", state),
+			slog.Int64("head_wait_seconds", wait),
+			slog.Int64("retry_in_seconds", retry))
+		break
+	}
+	w.log.LogAttrs(context.Background(), slog.LevelInfo, "doctor diagnostics completed", attrs...)
 	w.say(formatDoctorReport(w.b.language(), result.checks))
 }

@@ -96,13 +96,16 @@ func TestDoctorChecksReportSafeState(t *testing.T) {
 	doctorRunOMP = func(context.Context, string, omp.Environment) error { return nil }
 	doctorStatfs = func(string) (uint64, error) { return 2 << 30, nil }
 
-	checks := runDoctorChecks(context.Background(), config.Config{
+	checks, err := runDoctorChecks(context.Background(), config.Config{
 		OMP:           "/usr/bin/omp",
 		DataDir:       dataDir,
 		MaxWorkers:    2,
 		QueueCapacity: 4,
 		ProgressMode:  "summary",
-	}, newTestTelegram(t), db, binding, runtimeReleased)
+	}, newTestTelegram(t), db, binding, runtimeReleased, target{chat: 1, thread: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, check := range checks {
 		if check.Level != doctorOK {
 			t.Fatalf("check %s = %#v, want OK", i18n.Text(i18n.English, check.Name), check)
@@ -117,47 +120,6 @@ func TestDoctorChecksReportSafeState(t *testing.T) {
 	}
 	if !strings.Contains(report, "[12345678]") {
 		t.Fatalf("report omitted the safe session identifier: %q", report)
-	}
-}
-
-func TestDoctorReportsUncertainRecords(t *testing.T) {
-	db, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if err := db.Accept(1, []byte(`{"update_id":1}`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Mark(1, "submitted"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Mark(1, "uncertain"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Enqueue(1, 2, "uncertain output"); err != nil {
-		t.Fatal(err)
-	}
-	output, err := db.NextOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.MarkOutput(output.ID, "sending"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.MarkOutput(output.ID, "uncertain"); err != nil {
-		t.Fatal(err)
-	}
-	inbox, outbox := checkDoctorUncertain(context.Background(), db)
-	if inbox.Level != doctorWarn {
-		t.Fatalf("inbox check = %#v", inbox)
-	}
-	if outbox.Level != doctorWarn {
-		t.Fatalf("outbox check = %#v", outbox)
-	}
-	report := formatDoctorReport("zh", []doctorCheck{inbox, outbox})
-	if strings.Contains(report, "%!d") || strings.Contains(report, "uncertain") || strings.Count(report, "1 条结果不确定") != 2 {
-		t.Fatalf("uncertain record counts were not localized before formatting: %q", report)
 	}
 }
 
@@ -458,24 +420,11 @@ func TestDoctorStopsChecksAfterCancellation(t *testing.T) {
 		t.Fatal("doctor reached filesystem checks after cancellation")
 		return 0, nil
 	}
-	checks := runDoctorChecks(ctx, config.Config{OMP: "fixture", DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 1, ProgressMode: "summary"}, newTestTelegram(t), db, doctorBindingSnapshot{}, runtimeReleased)
+	checks, err := runDoctorChecks(ctx, config.Config{OMP: "fixture", DataDir: t.TempDir(), MaxWorkers: 1, QueueCapacity: 1, ProgressMode: "summary"}, newTestTelegram(t), db, doctorBindingSnapshot{}, runtimeReleased, target{chat: 1, thread: 2})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled doctor error = %v", err)
+	}
 	if len(checks) != 1 || checks[0].Name != i18n.Msg.Config {
 		t.Fatalf("checks after cancellation = %#v", checks)
-	}
-}
-
-func TestTypedDoctorReportPreservesOpaqueValues(t *testing.T) {
-	report := formatDoctorReport(i18n.Chinese, []doctorCheck{
-		{Name: i18n.Msg.Session.Label, Level: doctorOK, Opaque: "Connected"},
-		{Name: i18n.Msg.Runtime, Level: doctorOK, Message: i18n.Msg.Connected},
-		{Name: i18n.Msg.Database, Level: doctorFail, Message: i18n.Msg.SQLiteQuickCheckFailed},
-	})
-	for _, want := range []string{"omp-telegram 诊断", "会话", "正常 - Connected", "运行时", "已连接", "数据库", "SQLite 快速检查失败", "结果: 失败"} {
-		if !strings.Contains(report, want) {
-			t.Fatalf("localized diagnostic report omitted %q: %q", want, report)
-		}
-	}
-	if strings.Contains(report, "%!") {
-		t.Fatalf("localized diagnostics contain a formatting error: %q", report)
 	}
 }

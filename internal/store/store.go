@@ -96,9 +96,15 @@ type CleanupResult struct {
 	Inbox, Outbox   int64
 	AttachmentPaths []string
 }
-type UncertainCounts struct {
-	Inbox  int
-	Outbox int
+type DeliveryCounts struct {
+	Pending, Sending, Uncertain int64
+}
+
+type DeliveryDiagnostics struct {
+	Topic, Global                                   DeliveryCounts
+	OldestPendingAt                                 int64
+	HeadState                                       OutboxState
+	HeadCreatedAt, HeadUpdatedAt, HeadNextAttemptAt int64
 }
 
 func (s *Store) QuickCheck(ctx context.Context) error {
@@ -139,16 +145,46 @@ func quickCheckError(err error) error {
 	return errors.New("sqlite quick check unavailable")
 }
 
-func (s *Store) UncertainCounts(ctx context.Context) (UncertainCounts, error) {
-	var counts UncertainCounts
-	if err := ctx.Err(); err != nil {
-		return counts, err
-	}
+func (s *Store) InboxUncertainCount(ctx context.Context) (int64, error) {
+	var count int64
+	err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM inbox WHERE state='uncertain'").Scan(&count)
+	return count, err
+}
+
+// DeliveryDiagnostics reads queue metadata in one SQLite statement snapshot.
+func (s *Store) DeliveryDiagnostics(ctx context.Context, chat, thread int64) (DeliveryDiagnostics, error) {
+	var diagnostics DeliveryDiagnostics
 	err := s.DB.QueryRowContext(ctx, `
-SELECT
- (SELECT COUNT(*) FROM inbox WHERE state='uncertain'),
- (SELECT COUNT(*) FROM outbox WHERE state='uncertain')`).Scan(&counts.Inbox, &counts.Outbox)
-	return counts, err
+WITH topic_counts AS (
+ SELECT COUNT(CASE WHEN state='pending' THEN 1 END) AS pending,
+        COUNT(CASE WHEN state='sending' THEN 1 END) AS sending,
+        COUNT(CASE WHEN state='uncertain' THEN 1 END) AS uncertain,
+        COALESCE(MIN(CASE WHEN state='pending' THEN created_at END),0) AS oldest_pending_at
+ FROM outbox WHERE chat IS ? AND thread IS ? AND state IN ('pending','sending','uncertain')
+), global_counts AS (
+ SELECT COUNT(CASE WHEN state='pending' THEN 1 END) AS pending,
+        COUNT(CASE WHEN state='sending' THEN 1 END) AS sending,
+        COUNT(CASE WHEN state='uncertain' THEN 1 END) AS uncertain
+ FROM outbox WHERE state IN ('pending','sending','uncertain')
+), head AS (
+ SELECT state,created_at,updated_at,next_attempt_at
+ FROM outbox
+ WHERE chat IS ? AND thread IS ? AND state IN ('pending','sending')
+ ORDER BY id LIMIT 1
+)
+SELECT topic_counts.pending,topic_counts.sending,topic_counts.uncertain,
+       global_counts.pending,global_counts.sending,global_counts.uncertain,
+       topic_counts.oldest_pending_at,
+       COALESCE(head.state,''),COALESCE(head.created_at,0),
+       COALESCE(head.updated_at,0),COALESCE(head.next_attempt_at,0)
+FROM topic_counts CROSS JOIN global_counts LEFT JOIN head ON 1=1`, chat, thread, chat, thread).Scan(
+		&diagnostics.Topic.Pending, &diagnostics.Topic.Sending, &diagnostics.Topic.Uncertain,
+		&diagnostics.Global.Pending, &diagnostics.Global.Sending, &diagnostics.Global.Uncertain,
+		&diagnostics.OldestPendingAt,
+		&diagnostics.HeadState, &diagnostics.HeadCreatedAt,
+		&diagnostics.HeadUpdatedAt, &diagnostics.HeadNextAttemptAt,
+	)
+	return diagnostics, err
 }
 
 func Open(dir string) (*Store, error) {

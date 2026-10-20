@@ -221,7 +221,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
 | `/status` | 查看当前 workspace, session, model, thinking, fast mode, context, runtime 和队列状态. |
 | `/args [预设编号]` | 查看预设标签并切换所有对话后续新启动进程使用的 OMP 参数. 不影响已运行的 OMP 进程. |
-| `/doctor` | 异步运行安全的 bridge 诊断, 不启动或修改 OMP session. |
+| `/doctor` | 异步运行安全的 bridge 诊断, 包括当前 topic 的投递队首/等待情况和全局队列计数, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
 | `/model` | 用按钮选择 OMP 配置的 model role. |
 | `/model provider/model` | 空闲时切换到指定 model. |

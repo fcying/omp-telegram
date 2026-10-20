@@ -22,12 +22,25 @@ type languageMessages struct {
 	CommandDescription Message
 }
 
+type deliveryMessages struct {
+	Counts        Message
+	OldestPending Message
+	Head          Message
+	RetryIn       Message
+	Ready         Message
+	Sending       Message
+	Idle          Message
+	Uncertain     Message
+	Global        Message
+}
+
 // Msg is the complete typed catalog. Each entry keeps both languages together.
 var Msg = struct {
 	Task     taskMessages
 	Session  sessionMessages
 	Queue    queueMessages
 	Language languageMessages
+	Delivery deliveryMessages
 
 	Output                                                                    Message
 	ResultSummary                                                             Message
@@ -505,6 +518,17 @@ var Msg = struct {
 		Usage:              message("Usage: /lang [en|zh]", "用法: /lang [en|zh]"),
 		SaveFailed:         message("Failed to save the language preference. The language was not changed.", "无法保存语言设置. 语言未更改."),
 		CommandDescription: message("Set global language: /lang [en|zh]", "设置全局语言: /lang [en|zh]"),
+	},
+	Delivery: deliveryMessages{
+		Counts:        message("pending %d, sending %d", "等待 %d, 发送中 %d"),
+		OldestPending: message("Oldest pending: %s", "最早等待: %s"),
+		Head:          message("Head: %s", "队首: %s"),
+		RetryIn:       message("Waiting for retry (%s)", "等待重试 (%s)"),
+		Ready:         message("Ready to send", "等待发送"),
+		Sending:       message("Sending for %s", "发送中, 已持续 %s"),
+		Idle:          message("Idle", "空闲"),
+		Uncertain:     message("Uncertain: %d", "结果不确定: %d"),
+		Global:        message("Global outbox: pending %d, sending %d, uncertain %d", "全局发件箱: 等待 %d, 发送中 %d, 结果不确定 %d"),
 	},
 
 	Output:        message("\n\nOutput:\n", "\n\n输出:\n"),
