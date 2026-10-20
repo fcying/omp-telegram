@@ -2,6 +2,9 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -271,7 +274,7 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	}
 
 	clickKeyboard(w, 7, data)
-	assertKeyboardClears(t, f, int(result.id))
+	waitKeyboardClears(t, f, int(result.id))
 	var state string
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state); err != nil || state != "pending" {
 		t.Fatalf("queued root state = %q, error %v; want pending", state, err)
@@ -281,9 +284,6 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	}
 	if len(w.queue) != 1 || len(w.confirms) != 0 {
 		t.Fatal("valid progress stop cleared queued work or retained UI state")
-	}
-	if callbackCount(f, "Stopping") != 1 {
-		t.Fatal("progress Stop did not request one abort")
 	}
 
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "cancelled" {
@@ -368,7 +368,7 @@ func TestStaleProgressStopClearsOnlyOwnerKeyboard(t *testing.T) {
 	clickKeyboard(w, 8, data)
 	assertKeyboardClears(t, f)
 	clickKeyboard(w, 7, data)
-	assertKeyboardClears(t, f, 42)
+	waitKeyboardClears(t, f, 42)
 	if _, exists := w.confirms[token]; exists {
 		t.Fatal("stale stop token remained actionable")
 	}
@@ -380,7 +380,7 @@ func TestStaleProgressStopClearsOnlyOwnerKeyboard(t *testing.T) {
 	w.callback(&telegram.CallbackQuery{ID: "stale-stop-wrong-owner", From: telegram.User{ID: 8}, Message: &telegram.Message{MessageID: 43}, Data: settledData})
 	assertKeyboardClears(t, f, 42)
 	w.callback(&telegram.CallbackQuery{ID: "stale-stop-owner", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: 43}, Data: settledData})
-	assertKeyboardClears(t, f, 42, 43)
+	waitKeyboardClears(t, f, 42, 43)
 }
 
 func TestRootCompletionPersistsReplyToOrigin(t *testing.T) {
@@ -499,71 +499,154 @@ func stopConfirmation(t *testing.T, w *worker, data string) (string, confirmatio
 	return token, c
 }
 
-func callbackCount(f *fakeHTTP, text string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	count := 0
-	for _, got := range f.callbacks {
-		if got == text {
-			count++
-		}
-	}
-	return count
-}
-
 func TestProgressStopRejectsStaleGenerationAndTurn(t *testing.T) {
-	for _, scenario := range []string{"generation", "turn"} {
+	for _, scenario := range []string{"generation", "turn", "expiry"} {
 		t.Run(scenario, func(t *testing.T) {
 			w, f, data, messageID := activeProgressStop(t)
 			token, c := stopConfirmation(t, w, data)
 			if scenario == "generation" {
 				c.generation++
+			} else if scenario == "expiry" {
+				c.expires = time.Now().Add(-time.Second)
 			} else {
 				c.turn++
 			}
 			w.confirms[token] = c
 			active, turn := w.active, w.turn
 			clickKeyboard(w, 7, data)
-			assertKeyboardClears(t, f, messageID)
+			waitKeyboardClears(t, f, messageID)
 			if w.active != active || w.turn != turn || !w.busy {
 				t.Fatalf("stale %s Stop changed active task: active=%d turn=%d busy=%t", scenario, w.active, w.turn, w.busy)
-			}
-			if callbackCount(f, "Stopping") != 0 {
-				t.Fatalf("stale %s Stop issued abort", scenario)
 			}
 		})
 	}
 }
 
 func TestProgressStopReplayAndOldTaskCannotAbortNewerTask(t *testing.T) {
-	w, f, data, messageID := activeProgressStop(t)
-	clickKeyboard(w, 7, data)
-	assertKeyboardClears(t, f, messageID)
-	if callbackCount(f, "Stopping") != 1 {
-		t.Fatal("first Stop was not accepted")
-	}
-	clickKeyboard(w, 7, data)
-	if callbackCount(f, "Stopping") != 1 {
-		t.Fatal("replayed Stop issued another abort")
-	}
-
-	w, f, data, messageID = activeProgressStop(t)
-	_, c := stopConfirmation(t, w, data)
-	w.active = c.active + 1
-	clickKeyboard(w, 7, data)
-	assertKeyboardClears(t, f, messageID)
-	if w.active != c.active+1 || !w.busy || callbackCount(f, "Stopping") != 0 {
-		t.Fatal("old Stop affected the newer active task")
-	}
+	t.Run("replay", func(t *testing.T) {
+		w, f, data, messageID := activeProgressStop(t)
+		clickKeyboard(w, 7, data)
+		waitKeyboardClears(t, f, messageID)
+		if queueState(t, w, 2) != "cancelled" {
+			t.Fatal("first Stop did not cancel the root")
+		}
+		clickKeyboard(w, 7, data)
+		if queueState(t, w, 2) != "cancelled" {
+			t.Fatal("replayed Stop rewrote the cancelled root")
+		}
+	})
+	t.Run("old-task", func(t *testing.T) {
+		w, f, data, messageID := activeProgressStop(t)
+		_, c := stopConfirmation(t, w, data)
+		w.active = c.active + 1
+		clickKeyboard(w, 7, data)
+		waitKeyboardClears(t, f, messageID)
+		if w.active != c.active+1 || !w.busy {
+			t.Fatal("old Stop affected the newer active task")
+		}
+	})
 }
 
 func TestProgressStopCleanupFailureDoesNotBlockAbort(t *testing.T) {
 	w, f, data, messageID := activeProgressStop(t)
 	f.failKeyboardClear = true
 	clickKeyboard(w, 7, data)
-	assertKeyboardClears(t, f, messageID)
-	if callbackCount(f, "Stopping") != 1 || len(w.confirms) != 0 {
+	waitKeyboardClears(t, f, messageID)
+	if queueState(t, w, 2) != "cancelled" || len(w.confirms) != 0 {
 		t.Fatal("keyboard cleanup failure prevented Stop")
+	}
+}
+
+type stopCallbackHTTP struct {
+	base    *fakeHTTP
+	method  string
+	gate    <-chan struct{}
+	started chan context.Context
+}
+
+func (f *stopCallbackHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/"+f.method) {
+		f.started <- r.Context()
+		if f.gate == nil {
+			return nil, errors.New("Telegram unavailable")
+		}
+		select {
+		case <-f.gate:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}
+	return f.base.RoundTrip(r)
+}
+
+func TestProgressStopAdvancesWithoutTelegram(t *testing.T) {
+	for _, method := range []string{"answerCallbackQuery", "editMessageReplyMarkup"} {
+		for _, outcome := range []string{"blocked", "failure"} {
+			t.Run(method+"/"+outcome, func(t *testing.T) {
+				w, f, data, messageID := activeProgressStop(t)
+				nativeUntil(t, w, func() bool { return w.busy && !w.rpcOperationActive })
+				client := w.client
+				transport := &stopCallbackHTTP{base: f, method: method, started: make(chan context.Context, 8)}
+				if outcome == "blocked" {
+					gate := make(chan struct{})
+					transport.gate = gate
+					defer close(gate)
+				}
+				http.DefaultTransport = transport
+				w.input = make(chan incoming, 2)
+				followup := update(1000, 11, "/followup queued")
+				stop := telegram.Update{UpdateID: 1001, CallbackQuery: &telegram.CallbackQuery{
+					ID: "network-stop", From: telegram.User{ID: 7},
+					Message: &telegram.Message{MessageID: int64(messageID)}, Data: data,
+				}}
+				for _, u := range []telegram.Update{followup, stop} {
+					raw, err := json.Marshal(u)
+					requireStoreOK(t, err)
+					requireStoreOK(t, w.b.db.Accept(u.UpdateID, raw))
+					w.input <- incoming{id: u.UpdateID, msg: u.Message, callback: u.CallbackQuery}
+				}
+				done := make(chan struct{})
+				go func() {
+					w.run()
+					close(done)
+				}()
+				t.Cleanup(func() {
+					w.cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Error("worker did not cancel Stop UI requests")
+					}
+				})
+				defer func() {
+					if t.Failed() {
+						t.Logf("inbox states: root=%s callback=%s followup=%s", queueState(t, w, 2), queueState(t, w, 1001), queueState(t, w, 1000))
+					}
+				}()
+				var uiContext context.Context
+				select {
+				case uiContext = <-transport.started:
+				case <-time.After(3 * time.Second):
+					t.Fatal("Stop UI request did not start")
+				}
+				// The gate stays closed until the old process exits and the actor
+				// settles the callback and completes the preserved followup.
+				waitForTimeout(t, 3*time.Second, func() bool {
+					select {
+					case <-client.Done():
+						return queueState(t, w, 1001) == "done" && queueState(t, w, 1000) == "done"
+					default:
+						return false
+					}
+				})
+				if outcome == "blocked" && uiContext.Err() != nil {
+					t.Fatal("Stop waited for the Telegram request to expire")
+				}
+				if got := replyBody(strings.Join(researchReplies(t, w, 1000), "")); got != "answer: queued" {
+					t.Fatalf("preserved followup reply = %q", got)
+				}
+			})
+		}
 	}
 }
 
@@ -682,8 +765,9 @@ func TestProgressStopAcceptsCallbackBeforeInitialResult(t *testing.T) {
 		t.Fatalf("pending Stop recorded message ID %d before actor processed send result", c.messageID)
 	}
 	w.callback(&telegram.CallbackQuery{ID: "pending-stop", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: result.id}, Data: data})
-	assertKeyboardClears(t, f, int(result.id))
-	if callbackCount(f, "Stopping") != 1 {
+	drainControlOperations(t, w)
+	waitKeyboardClears(t, f, int(result.id))
+	if queueState(t, w, 2) != "cancelled" {
 		t.Fatal("pending Stop did not abort the active task")
 	}
 	if _, exists := w.confirms[token]; exists || w.previewStopToken != "" {

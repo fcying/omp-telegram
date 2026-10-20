@@ -270,6 +270,8 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 初始 Send 失败抑制该 turn 后续 progress, 避免重复消息; Edit 失败仍可重试. Preview 和最终回复尽可能回复 root 的原 Telegram 消息; 回复目标被拒绝时可退回普通消息, 不改变执行状态. Progress 清理由持久完成/输出投递驱动, 不证明 preview 曾可见. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
 
+Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 worker 取消控制, 单次请求的 deadline 为五秒. Owner, 过期时间, generation, active inbox 和 turn 检查仍由 actor 执行, 中断前的 token 消费也留在 actor 内. 通道只接收 UI 目标和回执文本; 迟到结果不能改变任务所有权, 结算或重放任务. 背压可以丢弃 UI 操作, 不丢弃停止请求. 其他 callback 类型保留原行为.
+
 ### 原生 status 投影
 
 [`status.go`](../internal/bridge/status.go) 只解码可安全展示字段, 不解码原始模型配置. 详细 `/status` 显示 workspace, session/name, provider/model, configured thinking, fast 设置/实际活动, 原生 context usage, streaming/compaction, 桥接队列长度, 原生速度, runtime 连接状态和空闲时长. 缺失/非法数据为 `n/a`, 不估算. `Running` 是原生 streaming, 不是桥接 active-root 判定. 检查已释放的 running binding 可临时恢复再释放已持久且空闲的 runtime; 新输入, pending work/UI 或缓冲输出会阻止过早释放.
