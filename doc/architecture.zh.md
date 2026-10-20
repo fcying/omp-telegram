@@ -576,6 +576,10 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 [`doctor.go`](../internal/bridge/doctor.go)是十秒异步控制面诊断, 不是提示词或惰性运行时启动. 它检查运行配置, Telegram `getMe`, SQLite `quick_check`, 数据目录创建/写入/sync/删除权限, `omp --version`, 已提交工作目录/历史可用性, 运行时状态, 不确定 inbox/outbox 数量及可用磁盘空间. Telegram 和 binary probe 各有五秒截止时间. 它不修改绑定, 不修复不确定工作; 临时存储探针会被移除. 报告只用固定安全摘要, 不展示原始错误, 凭据, 提示词, RPC 状态或完整路径.
 
+现有 Outbox 项显示当前 chat/thread 的 pending/sending 计数, 最老 pending 等待时间, 队首状态和 uncertain 数量. 队首为该会话中 `pending` 或 `sending` 的最小 outbox ID, 与投递排序一致. 仅 pending 队首自身的 `next_attempt_at` 用于区分等待重试和等待发送; sending 队首显示其 `updated_at` 距今时长, 不显示后续记录的重试时间. 空闲, 就绪, 发送中, 队列年龄和正常重试等待不新增告警. 不确定结果沿用已有告警. 全局 outbox 仅包含 pending/sending/uncertain 计数, 不显示其他 topic 的 ID, 内容, 文件名, 路径或时间戳.
+
+投递诊断在已有 store 上使用一条支持 context 的只读 SQLite 语句, 不领取任务, 不改重试字段, 不另开 store 触发对账, 不改 schema. 查询在 doctor deadline 内最后执行; 其超时或数据库错误仅令 Outbox 不可用/`WARN`, 保留之前包括 Inbox 在内的检查结果. 诊断完成时只向已有 `doctor` 日志事件增加最多六个当前 topic 元数据字段: `pending_count`, `sending_count`, `uncertain_count`, `head_state`, `head_wait_seconds`, `retry_in_seconds`. Pending 队首等待时长使用 `created_at`, sending 使用 `updated_at`, 重试秒数仅适用于 pending. 查询不可用时只记录 `head_state=unavailable`, 不伪造零计数. 这是按需摘要, 不新增监控服务; Telegram 无法接收诊断请求或交付排队报告时, 仍通过已有 polling/delivery 日志排查.
+
 每个 worker 同时只运行一个 doctor 请求. 请求身份和已提交绑定/运行时/客户端快照栅栏拒绝过时结果; 超时或状态改变要求重新诊断, 不报告陈旧成功. 开启且连接/启动中会话的历史文件缺失为 `WARN`, 因为可能尚未持久化; 开启且已释放会话缺历史为 `FAIL`, 已关闭绑定缺历史为 `WARN`. 可用磁盘低于 1 GiB 为 `WARN`, 低于 128 MiB 为 `FAIL`; 平台探针不可用为 `WARN`. Linux 在 [`doctor_disk_linux.go`](../internal/bridge/doctor_disk_linux.go)使用文件系统可用块数计算.
 
 ## 持久化与恢复
