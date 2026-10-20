@@ -1962,6 +1962,8 @@ func (w *worker) operationFinished(result operationResult) {
 	}
 }
 
+// teardownWorker releases runtime/session resources and settles unconfirmed work.
+// Callers reusing the worker must clear its task fields separately.
 func (w *worker) teardownWorker(releaseSlot bool) {
 	if w.migrationRun != nil {
 		w.cancelMigration("shutdown", false)
@@ -1993,13 +1995,10 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.endSessionOperation()
 	w.endControlOperation()
 	w.preview = ""
-	w.finalAssistantBytes = 0
 	w.finalizedStreamBytes = 0
-	w.finalOutputTruncated = false
 	w.activeReplyTo = 0
-	w.finalAssistantTexts, w.assistantRunStart = nil, 0
-	w.lastAssistant = nil
 	w.stream.Reset()
+	w.resetAssistantResult()
 	w.clearConfirmations()
 	w.releaseRuntime(releaseSlot)
 	w.releaseSession()
@@ -3308,6 +3307,13 @@ func (w *worker) assistantBudgetExceeded() {
 	w.retireTaskRuntime(w.tr(i18n.Msg.AssistantOutputBudgetExceededSessionKept))
 }
 
+func (w *worker) resetAssistantResult() {
+	w.lastAssistant = nil
+	w.finalAssistantTexts, w.assistantRunStart = nil, 0
+	w.finalAssistantBytes = 0
+	w.finalOutputTruncated = false
+}
+
 func (w *worker) finish() {
 	w.stopTyping()
 	w.resetIdleProbe()
@@ -3335,10 +3341,7 @@ func (w *worker) finish() {
 			w.say(part)
 		}
 	}
-	w.lastAssistant = nil
-	w.finalAssistantTexts, w.assistantRunStart = nil, 0
-	w.finalAssistantBytes = 0
-	w.finalOutputTruncated = false
+	w.resetAssistantResult()
 	w.finishProgressWhenReady()
 }
 
@@ -3381,10 +3384,7 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.logTaskComplete(taskID, state)
 	w.clearTask()
 	w.preview = ""
-	w.lastAssistant = nil
-	w.finalAssistantTexts, w.assistantRunStart = nil, 0
-	w.finalAssistantBytes = 0
-	w.finalOutputTruncated = false
+	w.resetAssistantResult()
 	w.stream.Reset()
 	w.finalizedStreamBytes = 0
 	w.clearTaskConfirmations()
