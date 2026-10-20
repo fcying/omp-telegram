@@ -357,7 +357,7 @@ Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变�
 
 ## 附件
 
-使用 Telegram 附件按钮发送照片或文档, 在 caption 中说明要让 OMP 做什么; 没有 caption 时默认请 OMP 查看附件. Photo 或 document 相册作为一个任务处理, 最多 10 个文件, 使用第一个非空 caption.
+使用 Telegram 附件按钮发送照片或文档, 在 caption 中说明要让 OMP 做什么; 没有 caption 时仍会将附件元数据作为一次任务提交给 OMP, 但 bridge 不补充具体任务指令. Photo 或 document 相册作为一个任务处理, 最多 10 个文件, 使用第一个非空 caption.
 
 需要回传文件时, 可以直接告诉 OMP, 例如: "把报告作为文件发给我". OMP 可以发送当前 workspace 中的普通文件. "附件已加入队列" 不代表已经送达, 请检查聊天中是否出现实际文件.
 

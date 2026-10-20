@@ -693,7 +693,7 @@ Albums are worker-local collections keyed by media group and sender. The first m
 | Upload | Stream multipart data instead of loading the whole file; reopen with no-follow/nonblocking semantics and verify regular-file identity and limits. |
 | Acknowledgment | Host-tool success means durably queued, not delivered. Failure to return the host result retires the affected runtime conservatively; the task is not replayed to manufacture an acknowledgment. |
 
-Confinement is a path-access boundary, not secret detection or a sandbox for OMP's other tools. A secret already inside the workspace is still a regular eligible file; the tool instruction not to send secrets does not inspect its contents.
+Confinement is a path-access boundary, not secret detection or a sandbox for OMP's other tools. Attachment metadata and tool definitions describe transport facts and enforced limits, without adding content policy or task instructions. Captionless uploads still submit OMP work; they are not save-only uploads.
 
 `/export` hands its completed private document snapshot to the same attachment outbox. Failed, canceled, or stale export results remove their temporary files; after enqueue, delivery owns cleanup. Export session resolution and native rendering remain session-management responsibilities.
 

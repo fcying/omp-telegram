@@ -789,6 +789,8 @@ func TestAlbumMembersUseMessageIDOrder(t *testing.T) {
 }
 
 func TestDocumentAlbumAggregatesWithoutCaption(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "rpc.trace")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
 	dataDir := t.TempDir()
 	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	f.mu.Lock()
@@ -806,9 +808,6 @@ func TestDocumentAlbumAggregatesWithoutCaption(t *testing.T) {
 	send(first)
 	send(second)
 
-	waitFor(t, func() bool {
-		return f.has(11, "answer: Telegram album:\nPlease inspect the attached files.\n\nAttachments:\n1.") && f.has(11, "2. ")
-	})
 	waitInputDone(t, db, 2)
 	waitInputDone(t, db, 3)
 	firstFiles, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "001-report.pdf"))
@@ -826,6 +825,19 @@ func TestDocumentAlbumAggregatesWithoutCaption(t *testing.T) {
 	secondData, err := os.ReadFile(secondFiles[0])
 	if err != nil || string(secondData) != "second document" {
 		t.Fatalf("second album file content = %q, error %v", secondData, err)
+	}
+	input, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(input)
+	firstAt := strings.Index(text, firstFiles[0])
+	secondAt := strings.Index(text, secondFiles[0])
+	if firstAt < 0 || secondAt <= firstAt {
+		t.Fatalf("OMP input lost or reordered album paths: %q", text)
+	}
+	if strings.Contains(text, "Please inspect the attached files.") {
+		t.Fatal("captionless album acquired a task instruction")
 	}
 }
 
@@ -876,6 +888,8 @@ func TestAlbumTimerVersionFencesStaleReady(t *testing.T) {
 }
 
 func TestDocumentWithoutCaptionIsDownloadedAndDispatched(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "rpc.trace")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
 	dataDir := t.TempDir()
 	f, db, send := setupBridgeWithDataDir(t, dataDir)
 	f.mu.Lock()
@@ -885,8 +899,9 @@ func TestDocumentWithoutCaptionIsDownloadedAndDispatched(t *testing.T) {
 	waitBinding(t, db, 11)
 	u := update(2, 11, "")
 	u.Message.Document = &telegram.Document{FileID: "doc", FileName: "../report.txt"}
+	u.Message.ReplyToMessage = &telegram.Message{Text: "earlier explanation"}
 	send(u)
-	waitFor(t, func() bool { return f.has(11, "Attachment saved at") })
+	waitInputDone(t, db, 2)
 	files, err := filepath.Glob(filepath.Join(dataDir, "attachments", "inbox", "incoming-*", "report.txt"))
 	if err != nil || len(files) != 1 {
 		t.Fatal("document not retained inside attachment directory")
@@ -894,6 +909,20 @@ func TestDocumentWithoutCaptionIsDownloadedAndDispatched(t *testing.T) {
 	data, err := os.ReadFile(files[0])
 	if err != nil || string(data) != "document contents" {
 		t.Fatal("downloaded document changed")
+	}
+	input, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(input)
+	pathAt := strings.Index(text, files[0])
+	quoteAt := strings.Index(text, "earlier explanation")
+	quoteEnd := strings.Index(text, replyContextEnd)
+	if quoteAt < 0 || quoteEnd <= quoteAt || pathAt <= quoteEnd {
+		t.Fatalf("OMP input lost the quoted context or attachment path: %q", text)
+	}
+	if strings.Contains(text, "Please inspect the attached file.") {
+		t.Fatal("captionless document acquired a task instruction")
 	}
 }
 

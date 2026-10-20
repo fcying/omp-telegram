@@ -357,7 +357,7 @@ Final text replies may include a compact model and context status header. Thinki
 
 ## Attachments
 
-Send photos or documents with Telegram's attachment button. Add a caption describing what OMP should do; without one, OMP is asked to inspect the attachment. A photo or document album is handled as one task, with up to 10 files and the first non-empty caption.
+Send photos or documents with Telegram's attachment button. Add a caption describing what OMP should do; without one, the attachment metadata is still submitted to OMP as a task, but the bridge does not add task instructions. A photo or document album is handled as one task, with up to 10 files and the first non-empty caption.
 
 To receive a file, ask OMP directly, for example, "Send me the report as a file." OMP can return regular files from the current working directory. A message saying that an attachment was queued does not mean it has arrived; check the chat for the actual file.
 

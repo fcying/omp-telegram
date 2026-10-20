@@ -19,7 +19,7 @@ import (
 
 var telegramSendTools = []map[string]any{{
 	"name": "telegram_send", "label": "Send Telegram attachment", "loadMode": "essential",
-	"description": "Queue an image or file from the current workspace for delivery to the current Telegram conversation when the user asks for it. Use kind photo for inline JPEG/PNG images, or document for original files. Only regular files inside this workspace are allowed. Never send secrets. Success means queued, not confirmed delivery.",
+	"description": "Queue an image or file from the current workspace for delivery to the current Telegram conversation when the user asks for it. Use kind photo for inline JPEG/PNG images, or document for original files. Only regular files inside this workspace are allowed. Success means queued, not confirmed delivery.",
 	"parameters": map[string]any{"type": "object", "properties": map[string]any{
 		"path":    map[string]any{"type": "string", "description": "Path to an existing file inside the current workspace."},
 		"kind":    map[string]any{"type": "string", "enum": []string{"photo", "document"}, "description": "Defaults to document; photo requires JPEG/PNG within Telegram photo limits."},

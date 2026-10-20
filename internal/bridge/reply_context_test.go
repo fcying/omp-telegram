@@ -268,13 +268,6 @@ func TestQueuePreviewUsesCurrentMessageText(t *testing.T) {
 	}
 }
 
-func TestQueuePreviewFallsBackToAttachmentPrompt(t *testing.T) {
-	q := queued{text: "Telegram attachment:\nPlease inspect the attached file.", displayText: ""}
-	if got := queueTaskText("en", q); got != "Telegram attachment: Please inspect the attached file." {
-		t.Fatalf("attachment queue preview = %q", got)
-	}
-}
-
 func TestControlCommandDoesNotUseReplyContext(t *testing.T) {
 	f, db, send := setupBridge(t)
 	u := update(1, 11, "/help")
@@ -364,24 +357,6 @@ func TestReplyContextAttachmentDoesNotDownloadRepliedMedia(t *testing.T) {
 	}
 }
 
-func TestReplyContextAttachmentWithoutCaptionKeepsPromptAndImage(t *testing.T) {
-	f, db, send := setupBridge(t)
-	data := testPNG(t)
-	f.mu.Lock()
-	f.files = map[string][]byte{"current-photo": data}
-	f.mu.Unlock()
-	send(update(1, 11, "/new "+t.TempDir()))
-	waitBinding(t, db, 11)
-
-	u := update(2, 11, "")
-	u.Message.Photo = []telegram.PhotoSize{{FileID: "current-photo", Width: 8, Height: 8, FileSize: int64(len(data))}}
-	u.Message.ReplyToMessage = &telegram.Message{Text: "old explanation"}
-	send(u)
-	waitFor(t, func() bool {
-		return f.has(11, "image=8x8; [Telegram reply context - quoted content]\nFrom: user\nMessage:\nold explanation\n[/Telegram reply context]\n\n[Current user message]\nTelegram attachment:\nPlease inspect the attached file.")
-	})
-	waitInputDone(t, db, 2)
-}
 func TestReplyContextDoesNotContainNestedReply(t *testing.T) {
 	message := &telegram.Message{ReplyToMessage: &telegram.Message{
 		Text:           "first level",
