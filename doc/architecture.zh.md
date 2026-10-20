@@ -747,6 +747,7 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 | `just fmt` | 使用 `go.mod` 的 Go 版本格式化源码和测试, 与 CI 保持一致 |
 | `just test` | 运行单元测试, 不启动或重启服务 |
 | `just check` | 单元测试, race 检查, vet; 不启动 Telegram polling |
+| `just smoke-omp /absolute/path/to/omp` | 运行 opt-in 真实 OMP Bridge 和迁移兼容检查; 不安装或部署 |
 | `just install` | 构建并仅安装二进制; 配置和数据由用户管理 |
 | `just deploy` | 安装后, 安排五秒后分离执行已有 supervisor 服务重启 |
 
@@ -767,11 +768,14 @@ Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 reques
 显式验证某个已安装的 OMP 版本:
 
 ```sh
-OMP_TELEGRAM_TEST_OMP=/absolute/path/to/omp \
-  GOFLAGS='-run=^TestRealOMPMigrationCompatibility$ -count=1 -v' just test
+just smoke-omp /absolute/path/to/omp
 ```
 
-未设置 `OMP_TELEGRAM_TEST_OMP` 时跳过原生兼容测试, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本及 journal 记录类型. Profile, workspace, session, data 和子进程环境均隔离, 不需要 provider 请求或 Telegram 交付. 这是开发和维护人员的可选检查: 部署新版 OMP 前, 使用候选版本的可执行文件运行测试. 不是普通用户升级 OMP 的必需步骤.
+Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行两个真实兼容测试. 未设置该变量时两者均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本. Profile, workspace, session, data 和子进程环境均隔离; 每个原生进程都显式传入临时目录内的绝对 `--session-dir`. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
+
+[`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) 使用真实 worker 和 RPC client, 对接确定性的本地 OpenAI-compatible HTTP/SSE provider. 检查启动/catalog 和 host-tool 注册, prompt 接受与任务完成的区别, root 暂停期间的 fast 控制, 排队最终回复归属及后续请求实际携带的 `service_tier=priority`. 原生 `telegram_send` 调用/结果必须为原 topic 入队不可变 workspace 快照, 不宣称已交付. Stop 必须退役旧 runtime 并取消排队任务; 惰性 resume 必须保留 session 身份和原生上下文, 不重放任务. 已有迁移兼容测试继续独立检查原生 Extension/journal. 两者都不证明生产 provider 或线上 Bot API 兼容.
+
+独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 支持手动和每周运行. 官方 standalone 资产下载到 runner 临时目录, 按 release 提供的 SHA-256 摘要校验, 并记录解析后的 release tag. 基线固定为 18.12.2; 候选默认为最新正式 release, 也可显式指定 tag. 两个矩阵结果独立可见, 候选失败不取消基线. 不改变发布 CI, 不安装或重启生产 daemon.
 
 真实 OMP smoke 必须使用隔离的 profile, workspace, 数据库和显式 environment 策略. 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 
