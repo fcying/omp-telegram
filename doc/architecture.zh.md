@@ -693,7 +693,7 @@ Progress 初次发送成功后将 Telegram message ID 记录到 root inbox; 后�
 | Upload | 使用 multipart 流, 不将整个文件载入内存; 重新打开时禁止跟随 symlink 并使用 nonblocking, 验证普通文件身份和大小限制. |
 | 确认 | Host tool 成功仅表示持久化入队, 不表示已交付. Host result 无法返回时保守地退役相关 runtime; 不重放任务来补造确认. |
 
-Confinement 是路径访问边界, 不是秘密识别, 也不是 OMP 其他工具的 sandbox. 已位于 workspace 内的秘密仍是可能合规的普通文件; 工具说明中禁止发送秘密不等于检查文件内容.
+Confinement 是路径访问边界, 不是秘密识别, 也不是 OMP 其他工具的 sandbox. 附件元数据和工具定义只描述中转事实及实际执行的限制, 不额外添加内容策略或任务指令. 没有 caption 的附件仍会提交 OMP 任务, 并非仅保存文件.
 
 `/export` 将生成完成的私有 document snapshot 交给同一附件 outbox. 失败, 取消或过期 export 结果会删除临时文件; 入队后由 delivery 拥有清理职责. Export session 解析和原生渲染仍属于 session 管理.
 
