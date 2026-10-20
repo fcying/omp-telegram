@@ -2987,6 +2987,58 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 	}
 }
 
+func TestReplyCommitFailurePreservesOutputCache(t *testing.T) {
+	for _, kind := range []string{"done", "cancelled", "uncertain", "research"} {
+		t.Run(kind, func(t *testing.T) {
+			db, err := store.Open(t.TempDir())
+			requireStoreOK(t, err)
+			defer db.Close()
+			requireStoreOK(t, db.Accept(10, []byte(`{}`)))
+			requireStoreOK(t, db.Mark(10, "submitted"))
+			_, err = db.DB.Exec("CREATE TRIGGER reject_reply BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'reply rejected'); END")
+			requireStoreOK(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			last := &terminalAssistant{}
+			w := testWorker(t, &worker{
+				b:   testBridge(t, &Bridge{db: db, fatal: make(chan error, 1)}),
+				ctx: ctx, cancel: cancel, taskState: taskState{active: 10, owner: 7, busy: true},
+				preview: "confirmed reply", lastAssistant: last,
+				finalAssistantTexts: []string{"previous message", "current message"}, assistantRunStart: 1,
+				finalAssistantBytes: 31, finalizedStreamBytes: 14, finalOutputTruncated: true,
+			})
+			w.stream.WriteString("streamed reply")
+			switch kind {
+			case "done":
+				w.finish()
+			case "cancelled":
+				w.finishCancelled("cancelled notice")
+			case "uncertain":
+				w.finishUncertain("uncertain notice")
+			case "research":
+				w.research.root, w.research.roundOpen = true, true
+				w.commitResearchRound()
+			}
+			if ctx.Err() == nil || w.active != 10 || !w.busy || w.owner != 7 || queueState(t, w, 10) != "submitted" {
+				t.Fatal("failed reply transaction lost the uncommitted task")
+			}
+			var outputs int
+			requireStoreOK(t, db.DB.QueryRow("SELECT count(*) FROM outbox").Scan(&outputs))
+			if outputs != 0 {
+				t.Fatal("failed reply transaction left partial output")
+			}
+			if w.preview != "confirmed reply" || w.stream.String() != "streamed reply" || w.lastAssistant != last ||
+				strings.Join(w.finalAssistantTexts, "\n") != "previous message\ncurrent message" || w.assistantRunStart != 1 ||
+				w.finalAssistantBytes != 31 || w.finalizedStreamBytes != 14 || !w.finalOutputTruncated {
+				t.Fatal("output cache was cleared before the reply transaction committed")
+			}
+			if kind == "research" && (!w.research.root || !w.research.roundOpen) {
+				t.Fatal("failed round commit ended the research owner")
+			}
+		})
+	}
+}
+
 func TestDeliveryCleansDoneProgressAfterAllReplies(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	if err != nil {

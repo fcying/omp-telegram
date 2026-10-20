@@ -219,10 +219,8 @@ func (w *worker) commitResearchRound() {
 	w.research.roundOpen = false
 	w.preview = ""
 	w.stream.Reset()
-	w.finalAssistantTexts, w.assistantRunStart = nil, 0
-	w.finalAssistantBytes, w.finalizedStreamBytes = 0, 0
-	w.finalOutputTruncated = false
-	w.lastAssistant = nil
+	w.finalizedStreamBytes = 0
+	w.resetAssistantResult()
 	w.replyStatus.header = ""
 	w.replyStatus.metrics = replyMetrics{}
 	w.awaitTaskContinuation()
