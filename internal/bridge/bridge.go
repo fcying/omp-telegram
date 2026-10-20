@@ -304,6 +304,7 @@ type worker struct {
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
 	keyboardCleanup     chan int64
+	stopCallbackReplies chan stopCallbackReply
 	mediaResults        chan mediaResult
 	sendResults         chan sendResult
 	hostRequests        map[string]context.CancelFunc
@@ -1301,6 +1302,7 @@ func (w *worker) canEvict() bool {
 		len(w.operations) == 0 && len(w.previewResult) == 0 && len(w.mediaResults) == 0 &&
 		len(w.sendResults) == 0 && len(w.resumeResults) == 0 && len(w.exportResults) == 0 && len(w.deleteResults) == 0 &&
 		len(w.bindingNameResults) == 0 && len(w.doctorResults) == 0 && len(w.idleProbe.results) == 0 &&
+		len(w.stopCallbackReplies) == 0 &&
 		len(w.albumEvents) == 0 && len(w.keyboardCleanup) == 0
 }
 
@@ -4401,13 +4403,22 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	token, index, ok := strings.Cut(q.Data, ":")
 	c, exists := w.confirms[token]
 	if !ok || !exists {
-		if owner, isStop := progressStopTokenOwner(token); isStop && owner == q.From.ID && q.Message != nil {
-			w.clearKeyboard(q.Message.MessageID)
+		if owner, isStop := progressStopTokenOwner(token); isStop {
+			var messageID int64
+			if owner == q.From.ID && q.Message != nil {
+				messageID = q.Message.MessageID
+			}
+			w.queueStopCallbackReply(q.ID, i18n.Msg.ActionExpired, messageID)
+			return callbackDone
 		}
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
 	if c.user != q.From.ID {
+		if c.action == "stop" {
+			w.queueStopCallbackReply(q.ID, i18n.Msg.ActionExpired, 0)
+			return callbackDone
+		}
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
@@ -4445,8 +4456,12 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		if w.previewStopToken == token {
 			w.previewStopToken = ""
 		}
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
-		w.clearKeyboard(messageID)
+		if c.action == "stop" {
+			w.queueStopCallbackReply(q.ID, i18n.Msg.ActionExpired, messageID)
+		} else {
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
+			w.clearKeyboard(messageID)
+		}
 		if c.generation == w.binding.Generation {
 			w.cancelUI(c)
 		}
@@ -4488,16 +4503,14 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			if w.previewStopToken == token {
 				w.previewStopToken = ""
 			}
-			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
-			w.clearKeyboard(messageID)
+			w.queueStopCallbackReply(q.ID, i18n.Msg.ActionExpired, messageID)
 			return callbackDone
 		}
 		delete(w.confirms, token)
 		if w.previewStopToken == token {
 			w.previewStopToken = ""
 		}
-		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Stopping))
-		w.clearKeyboard(messageID)
+		w.queueStopCallbackReply(q.ID, i18n.Msg.Stopping, messageID)
 		w.stopActiveTask()
 		return callbackDone
 	}
@@ -4624,6 +4637,42 @@ func (w *worker) finishMenu(messageID int64, text string) bool {
 		return false
 	}
 	return true
+}
+
+type stopCallbackReply struct {
+	id   string
+	text string
+}
+
+func (w *worker) queueStopCallbackReply(id string, message i18n.Message, messageID int64) {
+	w.queueKeyboardCleanup(messageID)
+	if w.ctx.Err() != nil {
+		return
+	}
+	if w.stopCallbackReplies == nil {
+		replies := make(chan stopCallbackReply, 32)
+		w.stopCallbackReplies = replies
+		parent, tg := w.ctx, w.b.tg
+		w.background.Add(1)
+		go func() {
+			defer w.background.Done()
+			for {
+				select {
+				case <-parent.Done():
+					return
+				case reply := <-replies:
+					ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+					_ = tg.AnswerCallback(ctx, reply.id, reply.text)
+					cancel()
+				}
+			}
+		}()
+	}
+	// Stop tokens are already checked; UI receipts are expendable under backpressure.
+	select {
+	case w.stopCallbackReplies <- stopCallbackReply{id: id, text: w.tr(message)}:
+	default:
+	}
 }
 
 func (w *worker) clearKeyboard(messageID int64) {

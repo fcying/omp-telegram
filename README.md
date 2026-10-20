@@ -349,6 +349,8 @@ Very large replies may be truncated with an explicit notice. OMP's native sessio
 
 Progress for a new task appears after about three seconds, so short tasks normally produce only their final reply. Active tasks include a **Stop** button; it stops the current task, while `/stop` also clears waiting tasks.
 
+Stop does not wait for Telegram callback acknowledgment or button removal. Both are best-effort asynchronous UI operations.
+
 Progress is best-effort and may not show every task transition. It does not affect task execution or final replies.
 
 Final text replies may include a compact model and context status header. Thinking symbols in live progress and reply headers, and the `Thinking` field in `/status`, reflect the configured level rather than its per-turn resolution. Configured `auto` remains `auto` in `/status` and uses `⟳` in compact headers.

@@ -349,6 +349,8 @@ omp --resume /path/to/session.jsonl
 
 新任务的 progress 会延迟约三秒, 因此短任务通常只发送最终回复. 活跃任务带有 **Stop** 按钮, 只中止当前任务; `/stop` 还会清除等待中的任务.
 
+Stop 不等待 Telegram callback 确认或按钮移除. 两者均为尽力而为的异步 UI 操作.
+
 Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变化, 也不影响任务执行或最终回复.
 
 最终文字回复可能附带简短的 model 和 context 状态信息. 实时进度和回复头中的 thinking 图标, 以及 `/status` 的 `Thinking` 字段, 都表示配置等级, 不随每轮生效等级变化. 配置为 `auto` 时, `/status` 显示 `auto`, 精简状态头显示 `⟳`.
