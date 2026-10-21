@@ -22,6 +22,9 @@ func ClassifyError(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
+	if errors.Is(err, ErrBoundSessionMissing) {
+		return "file_missing"
+	}
 	var classified *classifiedError
 	if errors.As(err, &classified) {
 		return classified.kind

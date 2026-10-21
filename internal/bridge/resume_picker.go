@@ -52,12 +52,14 @@ type exportResult struct {
 	err                              error
 }
 type sessionDeleteResult struct {
-	request    uint64
-	generation int64
-	epoch      uint64
-	user       int64
-	sessionID  string
-	err        error
+	request       uint64
+	generation    int64
+	epoch         uint64
+	user          int64
+	sessionID     string
+	sessionFile   string
+	bindingDelete *confirmation
+	err           error
 }
 
 func sameWorkspace(left, right string) bool {

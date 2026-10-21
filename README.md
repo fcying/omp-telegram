@@ -212,7 +212,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
 | `/followup <message>` | Queue a separate prompt instead of steering the active task. |
 | `/close` | Close the current session while preserving its files and OMP history. |
-| `/bindings` | List this chat's saved conversation/session bindings as name, topic, logical session icon (`📖` Open / `📕` Closed / `⏳` pending), age and home-abbreviated workspace. Ages use one untranslated unit (`m/h/d/w/mo/y`), `now` under one minute, or `-` when unknown. Icons do not indicate OMP process liveness. Tap an eligible entry, then confirm deletion; workspace files and OMP history are preserved. |
+| `/bindings` | List this chat's saved conversation/session bindings as name, topic, logical session icon (`📖` Open / `📕` Closed / `⏳` pending), age and home-abbreviated workspace. Ages use one untranslated unit (`m/h/d/w/mo/y`), `now` under one minute, or `-` when unknown. Icons do not indicate OMP process liveness. Tap an eligible entry, then choose `Binding` to keep local session history, `Binding+Session` to delete an existing, verified native session and its artifacts or clean Bridge references to a confirmed missing file, or `Cancel`. Workspace files are preserved. |
 | `/bindings old` | Cleanup order: Closed first, then Open, each least recently used first; Pending entries last. Open includes released runtimes. Unknown times follow known times within each group. |
 | `/resume` | Choose a saved native OMP session from the current workspace. Pin/Unpin entries or Delete a session after confirmation. |
 | `/resume <session ID>` | Resume the specified native OMP session; OMP may restore its recorded working directory. |
@@ -234,6 +234,16 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
 | `/lang [en\|zh]` | Show the global Bridge interface language, or switch it to English or Chinese for all chats and topics. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
+
+`Binding+Session` invokes OMP native deletion only when the session file exists and identity checks pass. After confirmed deletion, it clears all same-ID bindings under this bot, including other topics with Closed bindings or released runtimes. A confirmed missing file follows the reference-only path below, without starting OMP. Deletion depends on actual session use, not the number of bindings or their logical Open state. An Open binding with a released runtime does not block deletion; an in-use OMP runtime, active task, startup or migration does. `Binding` removes only the selected binding, preserving other topics' bindings and the native session.
+
+If the bound native Session file is already missing, `Binding+Session` rechecks its absence before clearing related bindings and pins. A restored file, a failed recheck, or a different/empty path in any same-ID binding under this bot preserves all references. A database cleanup failure is reported separately and does not claim native deletion. Unless cancelled, each outcome returns to the bindings list. This path does not start OMP or recreate the workspace.
+
+Closing or replacing the requesting conversation invalidates pending target-close replies and cancels missing-file reference cleanup. Cancellation and timeout handling includes database-connection waits and the cleanup transaction. The target may already be Closed; confirmed native deletion still requires reference settlement even after cancellation. On Linux, existing workspace ancestors need directory search permission, not permission to read directory entries.
+
+Graceful shutdown still settles references for confirmed native deletions before closing the database; cleanup failures are logged. It sends no shutdown deletion notices or picker refreshes. Native deletion and SQLite cleanup are not atomic across crashes or forced termination.
+
+Session-reference cleanup is limited to this bot's same-ID bindings, Bridge history rows matching the file paths currently recorded by those bindings, and this bot's same-ID pins. It does not sweep unrelated/orphan history across the database, remove other bots' references, or clear all project history. The missing-file path neither searches for nor removes remaining OMP artifacts. Workspace files are preserved.
 
 A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
 

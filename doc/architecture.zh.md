@@ -491,13 +491,27 @@ Bridge 独立比较原生身份/CWD, 有界新 journal, RPC entries 和 active l
 
 [`binding_list.go`](../internal/bridge/binding_list.go)实现 `/bindings [old]`, 读取当前 bot/chat 的已提交绑定与未完成启动意图, 按对话合并. 意图优先决定显示的工作目录和待启动状态. 原生标题只是尽力取得的临时 ACP 元数据; 缺失时使用工作目录 basename, 不在 SQLite 保存影子标题.
 
-默认每页十项, 当前对话优先, 待定启动其次, 其余按已知 `last_used_at` 从新到旧排列. `old` 的清理排序见下文. 零值/未来时间视为未知; 同序用 thread ID 排序. 异步名称更新不重排快照. 每个条目为一颗整行按钮, 合并名称, 话题, 逻辑会话图标, 时间和 home 缩写后的 workspace. `📖` 表示逻辑 Open, `📕` 表示 Closed, 依据持久化 binding 标记而非 OMP 进程连接状态; 未完成的启动或恢复使用 `⏳`. 按钮文本有长度上限, Telegram 客户端也可能截断显示. 当前项与待定项禁用. 点击符合条件的条目打开独立的破坏性确认, 展示完整的已解析名称, Open/Closed 状态文本和未缩写 workspace; 长确认先发送所有前序分段, 最后一段附带 Delete/Cancel 按钮. 不再单独显示 `Del` 按钮或只读详情行.
+默认每页十项, 当前对话优先, 待定启动其次, 其余按已知 `last_used_at` 从新到旧排列. `old` 的清理排序见下文. 零值/未来时间视为未知; 同序用 thread ID 排序. 异步名称更新不重排快照. 每个条目为一颗整行按钮, 合并名称, 话题, 逻辑会话图标, 时间和 home 缩写后的 workspace. `📖` 表示逻辑 Open, `📕` 表示 Closed, 依据持久化 binding 标记而非 OMP 进程连接状态; 未完成的启动或恢复使用 `⏳`. 按钮文本有长度上限, Telegram 客户端也可能截断显示. 当前项与待定项禁用. 点击符合条件的条目打开独立的破坏性确认, 展示完整的已解析名称, Open/Closed 状态文本, 未缩写 workspace 和 session ID; 长确认先发送所有前序分段, 最后一段附带 Binding/Binding+Session/Cancel 按钮. 不再单独显示 `Del` 按钮或只读详情行.
 
 删除确认中的名称只归一化空白和控制字符, 不额外截断; 列表按钮仍按 UTF-16 上限裁剪.
 
 时间向下取整, 仅显示一个不随语言变化的单位: `m`, `h`, `d`, `w`, `mo` (30 天) 或 `y` (365 天). 不足一分钟显示 `now`; 缺失, 非正数或未来时间戳显示 `-`. 每次渲染页面只取一次当前时间.
 
-遗忘 Closed 绑定只移除桥接绑定/history/favorite 元数据. Open 绑定请求会路由到所属 worker, 核对目标代际, 拒绝活跃任务, 等待或新到输入, 启动意图及会话操作. 空闲目标封住新输入, 持久化关闭, 释放运行时/认领, 再删除已关闭绑定. 关闭后的删除失败会保持关闭状态. 成功后保留原排序和页码刷新请求方列表; 不向目标对话发送通知, 不取消已提交 outbox 投递. 工作目录文件, 原生历史及 Telegram topic 均保留.
+`Binding` 只移除桥接绑定/history/favorite 元数据, 保留本地会话历史, 不创建目录. Open 绑定请求会路由到所属 worker, 核对目标代际, 拒绝活跃任务, 等待或新到输入, 启动意图及会话操作. 空闲目标封住新输入, 持久化关闭并释放运行时/认领. `Binding` 随后移除已关闭绑定. 原生会话文件存在且身份验证通过时, `Binding+Session` 保留绑定直到原生删除确认成功, 复用 `/resume` Delete 的会话预留和引用清理. 文件已确认不存在时改走下述仅清理引用路径, 不启动 OMP. 原生失败, 结果不确定或临时目录清理失败时保留绑定, 它可能已变为 Closed; 原生删除后数据库清理失败会明确报告部分成功. 两类情况均不自动重试. 成功后保留原排序和页码刷新请求方列表; 不向目标对话发送通知, 不取消已提交 outbox 投递. 工作目录文件和 Telegram topic 均保留. `Cancel` 不修改绑定或原生会话.
+
+`Binding+Session` 清理本 bot 下引用已删除会话的所有绑定, 包括其他 Topic 的 Closed 绑定或已释放运行时的绑定. 能否删除取决于 Session 的实际占用状态, 不取决于 Binding 数量或持久化的逻辑 `Running`/Open 状态. 特别是 Runtime 已 Released 的 Open Binding 允许删除. `sessionDeleteStatusLocked` 检查 runtime-active 和 runtime-starting 标记, 迁移认领及其他操作预留; `sessionDeleteAvailable` 还检查持久化迁移, 待启动意图及不确定身份. 无需先执行仅删除绑定. `Binding` 仍只处理选中绑定, 保留其他 Topic 的绑定和原生 Session.
+
+`DeleteBoundSession` 将初次检查时文件已不存在, 与其他访问错误及原生删除结果不确定区分处理. 只有这一缺失文件结果允许不执行原生删除而清理引用. `DeleteMissingSessionReferences` 在清理所用的同一数据库事务中, 核对本 bot 下全部同 ID 绑定是否记录完全相同的缺失文件路径; 不同或空路径会拒绝整个清理, 不修改绑定, history 或 Pin. 原生删除确认成功仍使用 `DeleteSessionReferences`, 不受此缺失文件限制影响. Bridge 明确提示两种结果, 并按原排序/页码刷新请求方绑定列表. 其他失败保留既有保守处理; 此路径不移除工作目录文件或残留的原生 artifacts.
+
+缺失文件引用清理前, worker 持有 Bridge session mutex 重新检查原路径. 文件已重新出现或无法确认仍不存在时, 保留引用并返回列表. 缺失文件的元数据清理失败使用独立提示, 不声称执行过原生删除. 复查可拒绝过期的缺失结果, 但无法令外部文件写入与 SQLite 事务成为原子操作.
+
+Worker teardown 使等待中的 binding-forget confirmation 失效, 但不提前释放 pending 回复槽位; 旧回复回收后新请求才能使用该槽位. 迟到的目标关闭回复仍须匹配发起者代际, 才能启动原生删除. 删除操作保留 context 直到结果结算: 已取消或超时的缺失文件结果保留引用并释放 reservation, 不重新打开旧菜单. 已确认的原生删除即使随后取消, 仍结算引用; 取消不能撤销原生变更. Linux 使用 `O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` 固定目录身份, 因而接受仅有搜索权限的祖先, 同时保持 inode 检查和仅清理自建空目录的规则. 其他平台保留原有目录打开行为.
+
+缺失文件清理通过 `BeginTx`, `QueryRowContext` 和 `ExecContext` 将操作 context 贯穿数据库连接获取及全部查询/删除. 事务取消时保留引用, 不作为持久化失败提示, 也不重新打开选择器.
+
+每个删除任务在 worker 取消后仍将唯一结果保留到有缓冲的 `deleteResults` 通道. 优雅停机时, `worker.run` 等待后台任务结束, 再通过 `sessionDeleteFinished` 排空结果, 然后才关闭数据库. 已确认原生删除成功时仍结算引用; 缺失, 失败和未确认结果保留引用, 释放删除状态及 reservation, 不重放操作. 退出中的 worker 不发送删除提示或刷新选择器; 元数据失败写入日志. 此机制不消除原生删除与 SQLite 之间的崩溃窗口.
+
+引用清理仅删除本 bot 下同 ID 的 Binding, 本 bot 下路径匹配这些目标 Binding 当前记录路径的 Bridge history 行, 以及本 bot 下同 ID 的 Pin. 这不是全库孤立 history 清扫, 不清理其他 bot 的引用或项目的全部历史. 文件缺失结果不查找或删除原生 artifacts.
 
 `last_used_at` 记录显式启动, 已接受任务提交和成功确认的原生会话修改控制. 恢复本身及只读 status/list/help 不刷新它. 更新时间失败只是元数据失败, 不撤销已接受操作.
 
@@ -549,9 +563,11 @@ ID 精确匹配已提交会话时直接读取已提交路径, 空闲释放或 `/
 
 ### 原生删除
 
-`/resume` 的 Delete 与遗忘绑定不同. [`session_delete.go`](../internal/bridge/session_delete.go)校验列表中完整 ID 和工作目录, 请求破坏性确认, 再次检查代际, epoch, 运行时认领, 待定恢复和 reservation, 然后启动有截止时间的隔离 RPC 子进程.
+`/resume` 的 Delete 和 `/bindings` 的 `Binding+Session` 都删除原生历史, 与单独的 `Binding` 不同. [`session_delete.go`](../internal/bridge/session_delete.go)校验精确身份, 检查运行时认领, 待定恢复和 reservation, 在破坏性确认后启动有截止时间的隔离 RPC 子进程. 绑定删除还会重查持久化代际, workspace, 完整 session ID 和文件; 启动参数在确认框创建时冻结.
 
 [`DeleteSession`](../internal/omp/delete.go)恢复精确 ID, 核对完整身份, 规范化工作目录和已有普通文件, 并在写入本地 `/session delete` 前启用破坏性关闭边界. 成功必须同时满足: 显式 `agentInvoked=false`, 原生输出确认删除确切文件, 立即终止进程组, 随后验证文件缺失. 此本地命令没有 `prompt_result`. 删除后优雅 EOF 可能重建历史, 因而越过破坏性边界后的所有路径都强制停止子进程, 包括拒绝, 输出缺失, 取消和协议失败. 桥接层绝不自行 unlink OMP 历史或推算原生 artifact 路径, 不重试不确定删除.
+
+[`DeleteBoundSession`](../internal/omp/delete.go)额外验证持久化的原生文件, 可临时重建缺失的原工作目录层级. 创建和清理使用不跟随符号链接的目录描述符及记录的目录身份. 子进程停止后, 只移除本次创建, 身份未变且仍为空的目录; 已有目录, 替换目录和新写入文件均保留. 无法完整清理时返回安全错误并保留绑定, 即使原生会话可能已被删除.
 
 原生删除确认后, `DeleteSessionReferences` 原子移除本 bot 下不区分大小写且精确 ID 匹配的绑定, 它们关联路径的历史快照, 以及跨对话/工作目录的匹配收藏. 只有该事务提交后才移除已释放认领, 保留活动/启动中认领. 即使引用清理失败也推进菜单 epoch, 将清理失败与原生成功分开报告, 仅刷新仍有效的选择器. SQLite 无法回滚原生删除. 工作目录文件和 Telegram topic 均不受影响.
 
@@ -764,6 +780,8 @@ Bridge 不提供日志文件, 轮转, 网络 exporter, 异步队列或运行时�
 事件使用稳定的 `snake_case` 名称和经过审查的 reason/error 分类. 成功生命周期节点通常为 info, 可恢复 transport/UI 失败为 warn, 协议/溢出/持久状态失败为 error; 用户正常取消本身不是 warning. 失败由拥有相应策略的边界记录, 不在每层复制原始 error. 只有持久化结算后才发出 `task_complete`, 包含 `result=done|cancelled|uncertain`, 可用时包含耗时.
 
 按适用范围使用 `chat_id`, `thread_id`, `generation`, `turn`, `inbox_id`, `client_id` 关联. `thread_id=0` 有意义. 可记录已验证的原生 session UUID, 不以路径作为 session 日志身份. Bot ID 保留在内部/数据库身份中, 但单 Bot 部署日志省略它. Outbox 失败记录 `outbox_id`, kind, API code, retry metadata 和 uncertainty, 不记录 Telegram description/body. 异步操作捕获原始身份, 不从后续复用的 worker 读取身份.
+
+原生删除失败使用 `event=session_delete`, `result=failed` 和有限枚举 `reason`: `invalid_request`, `file_unavailable`, `workspace_unavailable`, `startup_failed`, `identity_unconfirmed`, `identity_mismatch`, `native_unconfirmed`, `native_failed`, `cleanup_failed`, `timeout`, `cancelled`, 或兜底 `unknown`. 分类保留原错误及 `errors.Is` 行为; 取消/超时优先, 否则原始失败阶段优先于后续临时目录清理错误. 已确认缺失文件的引用清理使用 `reason=file_missing`; 数据库引用清理失败使用 `reason=reference_cleanup_failed`. reason 不包含原始错误, 原生输出, SQL 诊断或文件路径, 也不表示不确定删除可以安全重放.
 
 RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, 包括 `received`, `event_queued`, `response_queued`, `response_ignored`, `rejected` 及 bridge 侧 `handled`. 可选 terminal metadata 分为 `absent|true|false|invalid`. Request ID 只有安全解析为十进制数后才能记录. 同时将 `logging.component_levels.rpc` 和 `logging.component_levels.bridge` 设为 `debug`, 可跟踪 transport 接收到 actor 处理的路径; 这不会开启 frame 日志.
 

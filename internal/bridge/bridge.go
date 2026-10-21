@@ -80,12 +80,14 @@ type workerExit struct {
 type bindingForgetRequest struct {
 	key        target
 	generation int64
+	session    bool
 	source     *worker
 }
 
 type bindingForgetResult struct {
-	status i18n.Message
-	ok     bool
+	status  i18n.Message
+	binding *store.Binding
+	ok      bool
 }
 
 const deliveryWorkerCount = 4
@@ -317,6 +319,7 @@ type worker struct {
 	exportingSession    string
 	deleteResults       chan sessionDeleteResult
 	deleteCancel        context.CancelFunc
+	deleteContext       context.Context
 	deleteRequest       uint64
 	bindingNameResults  chan bindingNamesResult
 	bindingNameCancel   context.CancelFunc
@@ -327,9 +330,7 @@ type worker struct {
 	forgetRequests      chan bindingForgetRequest
 	forgetResults       chan bindingForgetResult
 	forgetPending       bool
-	forgetUser          int64
-	forgetOld           bool
-	forgetPage          int
+	forgetConfirmation  *confirmation
 
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -1975,6 +1976,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.cancelResumeList()
+	w.forgetConfirmation = nil
 	if w.deleteCancel != nil {
 		w.deleteCancel()
 	}
@@ -4328,7 +4330,7 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	for i, label := range options {
 		button := telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}
 		if c.action == "binding_delete" || c.action == "session_delete" {
-			if i == 0 {
+			if i == 0 || c.action == "binding_delete" && i == 1 {
 				button.Style = "danger"
 			}
 			deleteButtons = append(deleteButtons, button)
