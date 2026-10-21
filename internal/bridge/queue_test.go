@@ -214,14 +214,14 @@ func TestQueueViewerPaginatesPendingTasks(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 16
 	queueReady(t, w, command)
-	for i := range 7 {
+	for i := range 11 {
 		command("queued task " + string(rune('1'+i)))
 	}
 	w.queue[1].preparing = true
 	w.queue[1].text = ""
 	command("/queue")
 	menu := latestQueueMenu(t, f)
-	if !strings.Contains(menu.text, "Running: no") || !strings.Contains(menu.text, "Pending: 7") || !strings.Contains(menu.text, "Page 1/2") {
+	if !strings.Contains(menu.text, "Running: no") || !strings.Contains(menu.text, "Pending: 11") || !strings.Contains(menu.text, "Page 1/2") {
 		t.Fatalf("first queue page summary = %q", menu.text)
 	}
 	preparing := false
@@ -230,7 +230,7 @@ func TestQueueViewerPaginatesPendingTasks(t *testing.T) {
 			preparing = true
 		}
 	}
-	if !preparing || len(menu.rows) != 7 {
+	if !preparing || len(menu.rows) != 11 {
 		t.Fatalf("first queue page rows = %+v", menu.rows)
 	}
 	next := queueButtonData(t, menu, "Next")
@@ -386,22 +386,22 @@ func TestQueueCancelLastItemReturnsToPreviousPage(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 16
 	queueReady(t, w, command)
-	for i := range 7 {
+	for i := range 11 {
 		command(string(rune('A' + i)))
 	}
 	command("/queue")
 	menu := latestQueueMenu(t, f)
 	clickQueue(w, 7, menu.messageID, queueButtonData(t, menu, "Next"))
 	menu = latestQueueMenu(t, f)
-	clickQueue(w, 7, menu.messageID, queueCancelData(t, menu, "G"))
+	clickQueue(w, 7, menu.messageID, queueCancelData(t, menu, "K"))
 	if got := lastCallback(t, f); got != "Cancelled queued task." {
 		t.Fatalf("last page cancellation answer = %q", got)
 	}
 	menu = latestQueueMenu(t, f)
-	if !strings.Contains(menu.text, "Pending: 6") || !strings.Contains(menu.text, "Page 1/1") {
+	if !strings.Contains(menu.text, "Pending: 10") || !strings.Contains(menu.text, "Page 1/1") {
 		t.Fatalf("page after last item cancellation = %q", menu.text)
 	}
-	if len(w.queue) != 6 || w.queue[0].text != "A" || w.queue[5].text != "F" {
+	if len(w.queue) != 10 || w.queue[0].text != "A" || w.queue[9].text != "J" {
 		t.Fatalf("remaining queue after pagination cancellation = %+v", w.queue)
 	}
 }

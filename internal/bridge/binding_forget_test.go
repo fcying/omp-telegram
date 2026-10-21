@@ -85,6 +85,7 @@ func TestBindingDeleteOpenFromOtherTopic(t *testing.T) {
 	before := fake.messageCount()
 	send(update(2, 11, "/bindings old"))
 	listID, data := waitBindingAction(t, fake, before, "Saved bindings (oldest first)", "")
+	data = bindingEntryButton(t, fake, 22)
 	oldListID, oldData := listID, data
 	sendBindingCallback(t, db, send, 3, listID, data)
 	confirmID, data := waitBindingAction(t, fake, int(listID), "Close and forget idle binding for Topic 22?", "Delete")
@@ -171,7 +172,7 @@ func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 	listID, data := waitBindingAction(t, fake, before, "Saved bindings (oldest first)\nPage 1/2", "Next")
 	sendBindingCallback(t, db, send, 3, listID, data)
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), " · #22") {
+	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), " · #22 · ") {
 		t.Fatalf("open binding last page = %q, rows = %+v", text, rows)
 	}
 	sendBindingCallback(t, db, send, 4, listID, rows[0][0]["callback_data"].(string))
@@ -180,7 +181,7 @@ func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 	waitFor(t, func() bool { _, err := db.Binding(99, -10, 22); return errors.Is(err, sql.ErrNoRows) })
 	waitFor(t, func() bool { return fake.has(11, "Saved bindings (oldest first)\nPage 1/1") })
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 13 || rows[0][0]["text"] != "1. older · #35" {
+	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 11 || !strings.Contains(rows[0][0]["text"].(string), "older · #39 · ") {
 		t.Fatalf("open binding refreshed page = %q, rows = %+v", text, rows)
 	}
 }

@@ -146,7 +146,7 @@ func (b *Bridge) argsPresetSelectionMessage(language i18n.Language, index int) s
 	return i18n.Text(language, i18n.Msg.ArgumentPresetSelected, index)
 }
 
-const argsMenuPageSize = 90
+const argsMenuPageSize = 10
 
 func argsMenuButtonLabel(language i18n.Language, preset, current int, labels []string) string {
 	labelName := i18n.Text(language, i18n.Msg.Preset, preset)

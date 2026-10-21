@@ -26,8 +26,8 @@ type bindingNamesResult struct {
 }
 
 const (
-	bindingPageSize = 6
-	queuePageSize   = 6
+	bindingPageSize = 10
+	queuePageSize   = 10
 )
 
 func (w *worker) conversationGeneration() int64 {
@@ -84,7 +84,18 @@ func (w *worker) sortBindings(entries []store.BindingListEntry, oldestFirst bool
 	now := time.Now().Unix()
 	slices.SortFunc(entries, func(left, right store.BindingListEntry) int {
 		leftRank, rightRank := 2, 2
-		if !oldestFirst {
+		if oldestFirst {
+			if left.Intent != nil {
+				leftRank = 3
+			} else if left.Binding != nil && !left.Binding.Running {
+				leftRank = 1
+			}
+			if right.Intent != nil {
+				rightRank = 3
+			} else if right.Binding != nil && !right.Binding.Running {
+				rightRank = 1
+			}
+		} else {
 			if left.Intent != nil {
 				leftRank = 1
 			}
@@ -101,7 +112,7 @@ func (w *worker) sortBindings(entries []store.BindingListEntry, oldestFirst bool
 		if leftRank != rightRank {
 			return cmp.Compare(leftRank, rightRank)
 		}
-		if leftRank == 2 {
+		if leftRank == 2 || (oldestFirst && leftRank == 1) {
 			leftUsed, rightUsed := bindingLastUsedAt(left), bindingLastUsedAt(right)
 			if leftUsed <= 0 || leftUsed > now {
 				leftUsed = 0
@@ -229,14 +240,14 @@ func (w *worker) bindingNamesLoaded(result bindingNamesResult) {
 	}
 }
 
-func bindingSessionName(language i18n.Language, entry store.BindingListEntry) string {
-	if name := menuText(entry.SessionName, 32); name != "" {
+func bindingSessionName(language i18n.Language, entry store.BindingListEntry, limit int) string {
+	if name := menuText(entry.SessionName, limit); name != "" {
 		return name
 	}
 	if bindingWorkspace(entry) == "" {
 		return i18n.Text(language, i18n.Msg.Unknown)
 	}
-	return menuText(filepath.Base(bindingWorkspace(entry)), 32)
+	return menuText(filepath.Base(bindingWorkspace(entry)), limit)
 }
 
 func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
@@ -255,6 +266,7 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 	c.options = nil
 	start, end := page*bindingPageSize, min((page+1)*bindingPageSize, len(c.bindings))
 	var text strings.Builder
+	now := time.Now().Unix()
 	home, _ := os.UserHomeDir()
 	if c.bindingsOld {
 		text.WriteString(w.tr(i18n.Msg.SavedBindingsOldestFirstPage, page+1, pages))
@@ -281,29 +293,29 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 		if thread := bindingThread(entry); thread != 0 {
 			topic = fmt.Sprintf("#%d", thread)
 		}
-		title := menuText(fmt.Sprintf("%d. %s%s · %s", index+1, marker, bindingSessionName(w.b.language(), entry), topic), 128)
-		age := formatBindingAge(w.b.language(), bindingLastUsedAt(entry))
-		status := bindingEntryStatus(w.b.language(), entry)
-		if age != "" {
-			status += " " + age
+		age := formatBindingAge(bindingLastUsedAt(entry), now)
+		var status string
+		if entry.Intent != nil {
+			status = "⏳"
+		} else if entry.Binding != nil && entry.Binding.Running {
+			status = "📖"
+		} else {
+			status = "📕"
 		}
 		workspace := w.tr(i18n.Msg.Unknown)
 		if path := bindingWorkspace(entry); path != "" {
 			workspace = statusWorkspace(path, home)
 		}
-		detail := menuText(fmt.Sprintf("%s · %s", status, workspace), 128)
-		titleButton := telegram.Button{Text: title}
+		label := menuText(fmt.Sprintf("%d. %s%s · %s · %s · %s · %s", index+1, marker, bindingSessionName(w.b.language(), entry, 32), topic, status, age, workspace), 256)
+		entryButton := telegram.Button{Text: label}
 		if bindingCanDelete(entry, current) {
 			optionIndex := len(c.options)
 			c.options = append(c.options, "delete:"+strconv.Itoa(index))
-			titleButton.CallbackData = fmt.Sprintf("%s:%d", token, optionIndex)
+			entryButton.CallbackData = fmt.Sprintf("%s:%d", token, optionIndex)
 		} else {
-			titleButton.Disabled = &telegram.DisabledButton{}
+			entryButton.Disabled = &telegram.DisabledButton{}
 		}
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard,
-			[]telegram.Button{titleButton},
-			[]telegram.Button{{Text: detail, Disabled: &telegram.DisabledButton{}}},
-		)
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{entryButton})
 	}
 	navigation := make([]telegram.Button, 0, 3)
 	if page > 0 {
@@ -465,16 +477,6 @@ func bindingConversationTitle(language i18n.Language, entry store.BindingListEnt
 }
 
 func bindingEntryStatus(language i18n.Language, entry store.BindingListEntry) string {
-	if entry.Intent != nil {
-		switch entry.Intent.Kind {
-		case "new":
-			return i18n.Text(language, i18n.Msg.PendingNew)
-		case "resume":
-			return i18n.Text(language, i18n.Msg.PendingResume)
-		default:
-			return i18n.Text(language, i18n.Msg.Pending, entry.Intent.Kind)
-		}
-	}
 	if entry.Binding != nil && entry.Binding.Running {
 		return i18n.Text(language, i18n.Msg.Open)
 	}
@@ -498,27 +500,34 @@ func bindingWorkspace(entry store.BindingListEntry) string {
 	return ""
 }
 
-func formatBindingAge(language i18n.Language, timestamp int64) string {
-	if timestamp <= 0 {
-		return ""
+func formatBindingAge(timestamp, now int64) string {
+	if timestamp <= 0 || timestamp > now {
+		return "-"
 	}
-	age := time.Since(time.Unix(timestamp, 0))
-	if age < 0 {
-		return ""
-	}
+	const (
+		minute = int64(60)
+		hour   = 60 * minute
+		day    = 24 * hour
+		week   = 7 * day
+		month  = 30 * day
+		year   = 365 * day
+	)
+	age := now - timestamp
 	switch {
-	case age < time.Minute:
-		return i18n.Text(language, i18n.Msg.JustNow)
-	case age < time.Hour:
-		return i18n.Text(language, i18n.Msg.AgeMinutes, int(age/time.Minute))
-	case age < 24*time.Hour:
-		return i18n.Text(language, i18n.Msg.AgeHours, int(age/time.Hour))
+	case age < minute:
+		return "now"
+	case age < hour:
+		return strconv.FormatInt(age/minute, 10) + "m"
+	case age < day:
+		return strconv.FormatInt(age/hour, 10) + "h"
+	case age < week:
+		return strconv.FormatInt(age/day, 10) + "d"
+	case age < month:
+		return strconv.FormatInt(age/week, 10) + "w"
+	case age < year:
+		return strconv.FormatInt(age/month, 10) + "mo"
 	default:
-		days, hours := int(age/(24*time.Hour)), int(age/time.Hour)%24
-		if hours == 0 {
-			return i18n.Text(language, i18n.Msg.AgeDays, days)
-		}
-		return i18n.Text(language, i18n.Msg.AgeDaysHours, days, hours)
+		return strconv.FormatInt(age/year, 10) + "y"
 	}
 }
 
@@ -737,6 +746,7 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 		if entry.Binding.Running {
 			prompt = w.tr(i18n.Msg.CloseForgetIdleBindingActiveTasksPendingWorkCannot, bindingConversationTitle(w.b.language(), entry))
 		}
+		prompt += fmt.Sprintf("\n\n%s · %s\n%s: %s", bindingSessionName(w.b.language(), entry, 0), bindingEntryStatus(w.b.language(), entry), w.tr(i18n.Msg.Workspace), bindingWorkspace(entry))
 		w.confirm(confirmation{action: "binding_delete", method: "confirm", user: c.user, epoch: c.epoch, bindingsOld: c.bindingsOld, page: c.page, options: []string{"Delete", "Cancel"}, deleteBot: entry.Binding.Bot, deleteChat: entry.Binding.Chat, deleteThread: entry.Binding.Thread, deleteGeneration: entry.Binding.Generation, deleteRunning: entry.Binding.Running}, prompt, []string{w.tr(i18n.Msg.Delete), w.tr(i18n.Msg.Cancel)})
 	}
 	return callbackDone

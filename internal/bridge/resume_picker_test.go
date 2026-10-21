@@ -323,16 +323,16 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new test")
 	original := w.binding
-	sessions := setResumeFixtures(t, original.Workspace, 10)
+	sessions := setResumeFixtures(t, original.Workspace, 12)
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
 	text, rows := pickerView(t, f)
 	buttons := resumeButtons(t, f)
-	if len(buttons) != 10 || len(rows) != 9 {
-		t.Fatalf("first page: %d choices, %d rows; want eight sessions and navigation: %v", len(buttons), len(rows), rows)
+	if len(buttons) != 12 || len(rows) != 11 {
+		t.Fatalf("first page: %d choices, %d rows; want ten sessions and navigation: %v", len(buttons), len(rows), rows)
 	}
 	requirePickerFooter(t, rows, "Next", "Cancel")
-	for i := range 8 {
+	for i := range 10 {
 		listed := strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) && strings.Contains(text, "ID: "+sessions[i].ID)
 		paired := len(rows[i]) == 3 && strings.Contains(rows[i][0]["text"].(string), sessions[i].Title) && rows[i][1]["text"] == "Pin" && rows[i][2]["text"] == "Delete" && rows[i][2]["style"] == "danger"
 		if !listed || !paired {
@@ -342,17 +342,17 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	if !strings.Contains(text, "2026-09-20 12:00 UTC") {
 		t.Fatalf("native update time missing: %q", text)
 	}
-	clickResume(w, 7, buttons[8]["callback_data"].(string))
+	clickResume(w, 7, buttons[10]["callback_data"].(string))
 	text, rows = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
+	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "11. "+sessions[10].Title) || !strings.Contains(text, "12. "+sessions[11].Title) {
 		t.Fatalf("second page does not contain final native choices: %s; %v", text, rows)
 	}
 	requirePickerFooter(t, rows, "Previous", "Cancel")
 	clickResume(w, 7, buttons[2]["callback_data"].(string))
 	text, _ = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 10 || !strings.Contains(text, "1. "+sessions[0].Title) {
+	if len(buttons) != 12 || !strings.Contains(text, "1. "+sessions[0].Title) {
 		t.Fatal("previous did not return to first page")
 	}
 	if !sameBindingIdentity(w.binding, original) {

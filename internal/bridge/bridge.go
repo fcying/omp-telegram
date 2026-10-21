@@ -4302,6 +4302,8 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	parts := split(title, 3800)
 	if len(parts) == 0 {
 		title = w.tr(i18n.Msg.ConfirmationRequired)
+	} else if c.action == "binding_delete" {
+		title = parts[len(parts)-1]
 	} else {
 		title = parts[0]
 	}
@@ -4340,6 +4342,14 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	w.touchActivity()
 	defer cancel()
+	if c.action == "binding_delete" && len(parts) > 1 {
+		for _, part := range parts[:len(parts)-1] {
+			if _, err := w.b.tg.Send(ctx, w.key.chat, w.key.thread, part, telegram.SendOptions{}); err != nil {
+				w.say(w.tr(i18n.Msg.FailedSendConfirmationOperationCanceled))
+				return
+			}
+		}
+	}
 	message, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, telegram.SendOptions{Keyboard: k})
 	if e != nil {
 		w.cancelUI(c)
@@ -4743,7 +4753,7 @@ func (w *worker) cancelStart() bool {
 	return true
 }
 
-const uiSelectPageSize = 8
+const uiSelectPageSize = 10
 
 func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) bool {
 	pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize

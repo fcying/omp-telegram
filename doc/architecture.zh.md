@@ -252,7 +252,7 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ### 原生对话与 session operation
 
-[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页八个选项且可取消的 picker. 空 select 会取消. `input`/`editor` 请求被取消并提示发送普通文本; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 bridge 自有菜单, 原生对话没有 bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 没有取消时, 按钮一直有效到用户决定, 任务结算或 runtime/session teardown, 等待期间阻止正常空闲释放.
+[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. `input`/`editor` 请求被取消并提示发送普通文本; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 bridge 自有菜单, 原生对话没有 bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 没有取消时, 按钮一直有效到用户决定, 任务结算或 runtime/session teardown, 等待期间阻止正常空闲释放.
 
 原生 cancel 使匹配 token 失效. Teardown 先移除失效 token, 再进行有界键盘清理. 菜单 receipt 记录用户选择, 不是操作成功; confirm/select 写入失败按保守策略退役 runtime.
 
@@ -481,7 +481,7 @@ Bridge 独立比较原生身份/CWD, 有界新 journal, RPC entries 和 active l
 
 [`ListSessions`](../internal/omp/list.go)启动短期 `omp acp --cwd ...` 子进程, 通过 ACP `initialize` 协商并调用 `session/list`. 列表由 OMP 提供; 桥接 `history` 不是浏览器, 桥接层也不扫描目录拼装列表. 客户端校验协议响应, 有界分页, 拒绝重复 cursor 和超大/畸形结果, 对 ID 去重, 并只保留规范化后属于请求工作目录的记录. 列表帧上限 4 MiB, 条目安全上限 10,000. 取消会排空输出并回收子进程组.
 
-[`resume_picker.go`](../internal/bridge/resume_picker.go)带截止时间异步列目录, 列表与导出共享两个并发任务名额. `/resume` 要求已有可用的已提交工作目录, 且对话空闲. 每页八项显示原生标题, 完整 ID, 可选更新时间, 当前项和其他位置占用标记. `session_favorites` 只保存每个对话/工作目录下的收藏身份; 收藏优先, 每组保持原生顺序. 原生列表中不存在的收藏仅隐藏, 不生成合成结果.
+[`resume_picker.go`](../internal/bridge/resume_picker.go)带截止时间异步列目录, 列表与导出共享两个并发任务名额. `/resume` 要求已有可用的已提交工作目录, 且对话空闲. 每页十项显示原生标题, 完整 ID, 可选更新时间, 当前项和其他位置占用标记. `session_favorites` 只保存每个对话/工作目录下的收藏身份; 收藏优先, 每组保持原生顺序. 原生列表中不存在的收藏仅隐藏, 不生成合成结果.
 
 桥接选择 token 随机生成, 绑定用户并受代际栅栏保护, 通常两分钟过期, 重启后丢失. 会话选择器与删除确认还绑定来源消息和全桥接 mutation epoch. 选择时重新检查持久化代际与规范化工作目录; 消费后的 token 不能重放修改. 恢复选择器保留列目录时的 preset 索引/fingerprint, 全局选择变化后拒绝旧选择, 有效选择使用经核对的 argv 快照启动. 后续全局变化不能改写已经准入的启动.
 
@@ -489,13 +489,45 @@ Bridge 独立比较原生身份/CWD, 有界新 journal, RPC entries 和 active l
 
 ### 绑定列表与遗忘
 
-[`binding_list.go`](../internal/bridge/binding_list.go)实现 `/bindings [old]`, 读取当前 bot/chat 的已提交绑定与未完成启动意图, 按对话合并. 意图优先显示, 状态为 `Pending new`, `Pending resume`, `Open`, `Closed`. 原生标题只是尽力取得的临时 ACP 元数据; 缺失时使用工作目录 basename, 不在 SQLite 保存影子标题.
+[`binding_list.go`](../internal/bridge/binding_list.go)实现 `/bindings [old]`, 读取当前 bot/chat 的已提交绑定与未完成启动意图, 按对话合并. 意图优先决定显示的工作目录和待启动状态. 原生标题只是尽力取得的临时 ACP 元数据; 缺失时使用工作目录 basename, 不在 SQLite 保存影子标题.
 
-默认每页六项, 当前对话优先, 待定启动其次, 其余按已知 `last_used_at` 从新到旧排列. `old` 改为已知使用时间从旧到新. 零值/未来时间视为未知; 同序用 thread ID 排序. 异步名称更新不重排快照. 当前项与待定项不能从此 UI 遗忘. 其他对话中符合条件的条目会打开独立的破坏性确认.
+默认每页十项, 当前对话优先, 待定启动其次, 其余按已知 `last_used_at` 从新到旧排列. `old` 的清理排序见下文. 零值/未来时间视为未知; 同序用 thread ID 排序. 异步名称更新不重排快照. 每个条目为一颗整行按钮, 合并名称, 话题, 逻辑会话图标, 时间和 home 缩写后的 workspace. `📖` 表示逻辑 Open, `📕` 表示 Closed, 依据持久化 binding 标记而非 OMP 进程连接状态; 未完成的启动或恢复使用 `⏳`. 按钮文本有长度上限, Telegram 客户端也可能截断显示. 当前项与待定项禁用. 点击符合条件的条目打开独立的破坏性确认, 展示完整的已解析名称, Open/Closed 状态文本和未缩写 workspace; 长确认先发送所有前序分段, 最后一段附带 Delete/Cancel 按钮. 不再单独显示 `Del` 按钮或只读详情行.
+
+删除确认中的名称只归一化空白和控制字符, 不额外截断; 列表按钮仍按 UTF-16 上限裁剪.
+
+时间向下取整, 仅显示一个不随语言变化的单位: `m`, `h`, `d`, `w`, `mo` (30 天) 或 `y` (365 天). 不足一分钟显示 `now`; 缺失, 非正数或未来时间戳显示 `-`. 每次渲染页面只取一次当前时间.
 
 遗忘 Closed 绑定只移除桥接绑定/history/favorite 元数据. Open 绑定请求会路由到所属 worker, 核对目标代际, 拒绝活跃任务, 等待或新到输入, 启动意图及会话操作. 空闲目标封住新输入, 持久化关闭, 释放运行时/认领, 再删除已关闭绑定. 关闭后的删除失败会保持关闭状态. 成功后保留原排序和页码刷新请求方列表; 不向目标对话发送通知, 不取消已提交 outbox 投递. 工作目录文件, 原生历史及 Telegram topic 均保留.
 
 `last_used_at` 记录显式启动, 已接受任务提交和成功确认的原生会话修改控制. 恢复本身及只读 status/list/help 不刷新它. 更新时间失败只是元数据失败, 不撤销已接受操作.
+
+#### `/bindings old` 清理排序
+
+`old` 是用于找出长期不用的项目并遗忘绑定的清理视图, 不是会话健康诊断. 只使用已有 binding 元数据; 默认 `/bindings` 排序保持不变.
+
+| 优先级 | 分组 | 判断条件 |
+| --- | --- | --- |
+| 1 | Closed (`📕`) | 已提交 binding 的 `Running=false`, 且没有启动意图. |
+| 2 | Open (`📖`) | 已提交 binding 的 `Running=true`, 且没有启动意图, 包括运行时已空闲释放的情况. |
+| 3 | Pending (`⏳`) | 存在未完成的启动或恢复意图, 不受旧 binding 标记影响. |
+
+依次应用以下规则:
+
+1. 先检查启动意图, 存在意图就归入 Pending, 再考虑已提交 binding. 不根据运行时连接, 进程是否存在或任务是否活跃来分组; 释放 OMP 进程不等于关闭逻辑会话.
+2. 按 Closed, Open, Pending 排列分组. Open 或 Pending 不能仅因时间更久就排到 Closed 前面.
+3. Closed 和 Open 各组内按有效 `last_used_at` 升序排列, 即最久未使用优先. 缺失, 非正数或未来时间戳视为未知, 排在同组所有已知时间之后. 时间未知的 Closed 仍排在所有 Open 和 Pending 之前. Open 不另设长期未使用阈值.
+4. 时间相同或都未知时, 按 Topic/thread ID 升序排列. 比较原始时间戳, 不比较向下取整后的时间标签. Pending 固定最后, 按 Topic/thread ID 而非时间排序. 显示时间仍可沿用旧 binding 的 `last_used_at`, 没有则未知, 不改用意图创建时间.
+5. `old` 不将当前 Topic 置顶, 但保留 `*` 标记和不可删除限制. 默认 `/bindings` 的当前项优先, 待启动项其次规则保持不变.
+6. 翻页和异步名称更新沿用快照顺序. 重新列出或删除成功后刷新时应用新排序; 删除刷新仍保留所选模式, 并按需收敛页码. 既有授权, 二次确认和 generation/epoch 栅栏不变.
+
+显示时间仍表示距上次使用的时长, 不是关闭或释放了多久. 此排序不新增持久化字段或数据库迁移, 不检查 Worker 是否存活, 不查询运行时或启动 OMP 进程. 长期未使用只是清理线索; 既有活动工作检查和删除二次确认仍然生效.
+
+验收示例:
+
+- 3 天前使用的 Closed 排在一年前使用的 Open 前面, 即使后者没有连接中的进程.
+- 时间未知的 Closed 排在已知时间的 Closed 后面, 但仍排在 Open 前面.
+- 旧 Closed binding 上存在未完成恢复意图时, 归入 Pending, 排在所有 Open 后面.
+- Closed 和 Open 各组内旧时间在前, 新时间在后; 同时间和未知时间按 Topic ID 稳定排列. Pending 不受旧使用时间影响, 按 Topic ID 排列. 默认 `/bindings` 排序和删除/分页刷新行为不变.
 
 ### 重命名与导出
 
@@ -745,7 +777,7 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 
 ### 验证边界
 
-最低 Go 工具链为 Go 1.27.2, 由 [go.mod](../go.mod) 指定. CI 和 `just fmt` 从该模块文件选择版本. 使用仓库 [justfile](../justfile):
+最低 Go 工具链为 Go 1.27.3, 由 [go.mod](../go.mod) 指定. CI 和 `just fmt` 从该模块文件选择版本. 使用仓库 [justfile](../justfile):
 
 | 命令 | 效果 |
 | --- | --- |

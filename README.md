@@ -44,7 +44,7 @@ Development builds are published as the [Development build](https://github.com/f
 
 ### Build from source
 
-Requires Go 1.27.2 or later (see [go.mod](go.mod)) and [just](https://github.com/casey/just):
+Requires Go 1.27.3 or later (see [go.mod](go.mod)) and [just](https://github.com/casey/just):
 
 ```sh
 git clone https://github.com/fcying/omp-telegram.git
@@ -212,8 +212,8 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
 | `/followup <message>` | Queue a separate prompt instead of steering the active task. |
 | `/close` | Close the current session while preserving its files and OMP history. |
-| `/bindings` | List this chat's saved conversation/session bindings. Tap an eligible title to forget a closed or idle binding after confirmation; workspace files and OMP history are preserved. |
-| `/bindings old` | Show saved bindings from least recently used to most recently used. |
+| `/bindings` | List this chat's saved conversation/session bindings as name, topic, logical session icon (`📖` Open / `📕` Closed / `⏳` pending), age and home-abbreviated workspace. Ages use one untranslated unit (`m/h/d/w/mo/y`), `now` under one minute, or `-` when unknown. Icons do not indicate OMP process liveness. Tap an eligible entry, then confirm deletion; workspace files and OMP history are preserved. |
+| `/bindings old` | Cleanup order: Closed first, then Open, each least recently used first; Pending entries last. Open includes released runtimes. Unknown times follow known times within each group. |
 | `/resume` | Choose a saved native OMP session from the current workspace. Pin/Unpin entries or Delete a session after confirmation. |
 | `/resume <session ID>` | Resume the specified native OMP session; OMP may restore its recorded working directory. |
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |

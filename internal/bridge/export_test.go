@@ -937,24 +937,24 @@ func TestInactiveExportRejectsCustomSessionDirectory(t *testing.T) {
 func TestExportPickerListsMultipleSessions(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new test")
-	sessions := setResumeFixtures(t, w.binding.Workspace, 10)
+	sessions := setResumeFixtures(t, w.binding.Workspace, 12)
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
 	text, rows := pickerView(t, f)
 	buttons := resumeButtons(t, f)
-	if len(buttons) != 10 || len(rows) != 9 {
-		t.Fatalf("export first page has %d choices in %d rows; want eight sessions and navigation: %v", len(buttons), len(rows), rows)
+	if len(buttons) != 12 || len(rows) != 11 {
+		t.Fatalf("export first page has %d choices in %d rows; want ten sessions and navigation: %v", len(buttons), len(rows), rows)
 	}
 	requirePickerFooter(t, rows, "Next", "Cancel")
-	for i := range 8 {
+	for i := range 10 {
 		if !strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) || !strings.Contains(text, "ID: "+sessions[i].ID) || len(rows[i]) != 1 {
 			t.Fatalf("export choice %d lost native identity or single export action: %s; %v", i, text, rows[i])
 		}
 	}
-	clickResume(w, 7, buttons[8]["callback_data"].(string))
+	clickResume(w, 7, buttons[10]["callback_data"].(string))
 	text, rows = pickerView(t, f)
 	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "9. "+sessions[8].Title) || !strings.Contains(text, "10. "+sessions[9].Title) {
+	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "11. "+sessions[10].Title) || !strings.Contains(text, "12. "+sessions[11].Title) {
 		t.Fatalf("export second page does not contain final native choices: %s; %v", text, rows)
 	}
 	requirePickerFooter(t, rows, "Previous", "Cancel")

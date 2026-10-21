@@ -252,7 +252,7 @@ The message constructor rejects empty language text. Test-only reflection recurs
 
 ### Native dialogs and session operations
 
-[`worker.ui`](../internal/bridge/bridge.go) maps native `confirm` to Confirm/Cancel buttons and `select` to an eight-option paged picker with cancellation. Empty selects are cancelled. `input`/`editor` requests are cancelled with guidance to send ordinary text; widgets and generic native output are not a terminal UI emulation. Tokens are owner/generation/client scoped and single-use; selections are also tied to their menu message. Unlike bridge-owned menus, native dialogs have no bridge expiry, including after pagination: OMP owns any native deadline and cancel signal. Without cancellation, they remain actionable until a user decision, task settlement, or runtime/session teardown, and block normal idle release while pending.
+[`worker.ui`](../internal/bridge/bridge.go) maps native `confirm` to Confirm/Cancel buttons and `select` to a ten-option paged picker with cancellation. Empty selects are cancelled. `input`/`editor` requests are cancelled with guidance to send ordinary text; widgets and generic native output are not a terminal UI emulation. Tokens are owner/generation/client scoped and single-use; selections are also tied to their menu message. Unlike bridge-owned menus, native dialogs have no bridge expiry, including after pagination: OMP owns any native deadline and cancel signal. Without cancellation, they remain actionable until a user decision, task settlement, or runtime/session teardown, and block normal idle release while pending.
 
 Native cancellation invalidates matching tokens. Teardown removes obsolete tokens before bounded keyboard cleanup. A menu receipt records the user's choice, not operation success; failed confirmation/select writes retire the runtime conservatively.
 
@@ -481,7 +481,7 @@ Lazy restore holds `sessionMu` while rechecking the persisted binding generation
 
 [`ListSessions`](../internal/omp/list.go) launches a short-lived `omp acp --cwd ...` child and negotiates ACP `initialize` and `session/list`. OMP supplies the list; bridge `history` is not a browser, and the bridge does not scan directories to synthesize one. The client validates protocol responses, follows bounded pagination, rejects repeated cursors and oversized/malformed results, deduplicates IDs, and filters to the canonical requested workspace. Listing has a 4 MiB frame limit and a 10,000-entry safety bound. Cancellation drains and reaps the child process group.
 
-[`resume_picker.go`](../internal/bridge/resume_picker.go) runs directory listing asynchronously with a deadline and a shared two-job listing/export limit. `/resume` requires a committed usable workspace and an idle conversation. Its eight-entry pages show native titles, full IDs, optional update times, current selection and in-use-elsewhere markers. Per-conversation, per-workspace favorites store identities only in `session_favorites`; pinned entries come first while preserving native ordering within each group. A pin absent from native listing remains hidden, not a synthetic result.
+[`resume_picker.go`](../internal/bridge/resume_picker.go) runs directory listing asynchronously with a deadline and a shared two-job listing/export limit. `/resume` requires a committed usable workspace and an idle conversation. Its ten-entry pages show native titles, full IDs, optional update times, current selection and in-use-elsewhere markers. Per-conversation, per-workspace favorites store identities only in `session_favorites`; pinned entries come first while preserving native ordering within each group. A pin absent from native listing remains hidden, not a synthetic result.
 
 Bridge selection tokens are random, owner-bound and generation-fenced, normally expire after two minutes, and are lost on restart. Session pickers and delete confirmations also bind the source message and bridge-wide mutation epoch. Selection rechecks persisted generation and canonical workspace; consumed tokens cannot replay a mutation. A resume picker retains its listing preset index/fingerprint, rejects a changed global selection, and launches with the verified argv snapshot. Later global changes cannot alter that already-admitted launch.
 
@@ -489,13 +489,45 @@ A selection or `Confirmed` receipt records the user's decision, not restore/expo
 
 ### Binding list and forgetting
 
-[`binding_list.go`](../internal/bridge/binding_list.go) implements `/bindings [old]` over committed bindings and unfinished startup intents for the current bot/chat, merged by conversation. An intent takes display precedence, giving `Pending new`, `Pending resume`, `Open` or `Closed`. Native titles are best-effort transient ACP metadata; fallback titles use the workspace basename, with no shadow title in SQLite.
+[`binding_list.go`](../internal/bridge/binding_list.go) implements `/bindings [old]` over committed bindings and unfinished startup intents for the current bot/chat, merged by conversation. An intent takes precedence for the displayed workspace and pending state. Native titles are best-effort transient ACP metadata; fallback titles use the workspace basename, with no shadow title in SQLite.
 
-The normal six-entry view puts the current conversation first, pending starts next, then remaining entries by most recent known `last_used_at`. `old` sorts by oldest known usage instead. Zero/future times are unknown; thread ID breaks ties. Asynchronous name updates do not reorder the snapshot. Current and pending entries cannot be forgotten from this UI. Eligible entries from other conversations open a separate destructive confirmation.
+The normal ten-entry view puts the current conversation first, pending starts next, then remaining entries by most recent known `last_used_at`. The `old` cleanup ordering is specified below. Zero/future times are unknown; thread ID breaks ties. Asynchronous name updates do not reorder the snapshot. Each entry is one full-width button combining its name, topic, logical session icon, age and home-abbreviated workspace. `📖` means logically Open and `📕` means Closed, based on the persisted binding flag rather than OMP process connectivity; unfinished starts or resumes use `⏳`. Labels are bounded and may also be clipped by the Telegram client. Current and pending entries are disabled. Selecting an eligible entry opens a separate destructive confirmation with its full resolved name, textual Open/Closed status and unabbreviated workspace; long confirmations send all preceding chunks before the final chunk with Delete/Cancel buttons. There is no separate `Del` button or read-only detail row.
+
+Deletion-confirmation names normalize whitespace and control characters without additional truncation; list labels retain their UTF-16 limits.
+
+Ages use one language-independent unit, rounded down: `m`, `h`, `d`, `w`, `mo` (30 days), or `y` (365 days). Under one minute is `now`; missing, nonpositive or future timestamps display `-`. The current time is captured once for each page render.
 
 Forgetting a Closed binding removes bridge binding/history/favorite metadata only. An Open binding is routed to its owning worker, which checks the target generation and rejects active tasks, queued or incoming work, startup intents and session operations. An idle target fences new input, persists closure, releases the runtime/claim, then deletes the closed binding. A deletion failure after closure leaves it closed. Success refreshes the requesting viewer with its ordering and page retained; it creates no target-conversation notification and does not cancel already-committed outbox deliveries. Workspace files, native session history and Telegram topics remain intact.
 
 `last_used_at` records explicit starts, accepted task submissions and confirmed native session-changing controls. Restore itself and read-only status/list/help operations do not refresh it. A failed timestamp update is a metadata failure, not a reversal of an accepted operation.
+
+#### `/bindings old` cleanup ordering
+
+`old` is a cleanup view for finding long-unused projects and forgetting their bindings, not a session-health diagnostic. It uses existing binding metadata only; default `/bindings` ordering remains unchanged.
+
+| Priority | Group | Classification |
+| --- | --- | --- |
+| 1 | Closed (`📕`) | A committed binding with `Running=false` and no startup intent. |
+| 2 | Open (`📖`) | A committed binding with `Running=true` and no startup intent, including an idle-released runtime. |
+| 3 | Pending (`⏳`) | Any unfinished startup or resume intent, regardless of the previous binding's flag. |
+
+Apply these rules in order:
+
+1. Classify an entry with an intent as Pending before examining its committed binding. Runtime connectivity, process existence and task activity do not determine the group; releasing an OMP process does not close its logical session.
+2. Order groups Closed, Open, then Pending. An Open or Pending entry never precedes a Closed entry merely because it is older.
+3. Within Closed and Open, sort valid `last_used_at` timestamps ascending: least recently used first. Missing, nonpositive or future timestamps are unknown and follow all known times in that same group. Closed entries with unknown time still precede every Open or Pending entry. No separate inactivity threshold is used for Open.
+4. Break equal or unknown-time ties by ascending Topic/thread ID. Compare raw timestamps, not the rounded age labels. Pending is always last and sorted by Topic/thread ID, not age. Its displayed age can still use a previous binding's `last_used_at` when available, otherwise unknown; do not substitute the intent's creation time.
+5. Do not pin the current Topic to the front in `old`. Its `*` marker and deletion restriction remain. The current-first and pending-next behavior of default `/bindings` remains unchanged.
+6. Preserve snapshot ordering during navigation and asynchronous name updates. A fresh list or a successful deletion refresh applies the new ordering; deletion refresh still retains the selected mode and clamps the page as needed. Existing authorization, confirmation and generation/epoch checks remain unchanged.
+
+The age remains time since last use, not time since closure or release. This ordering needs no new persistent field, database migration, worker-liveness check, runtime query or OMP process launch. A long last-use age is only a cleanup hint; existing active-work checks and deletion confirmation still apply.
+
+Acceptance examples:
+
+- A Closed binding last used 3 days ago precedes an Open binding last used a year ago, even when the latter has no connected process.
+- A Closed binding with unknown time follows Closed bindings with known time but still precedes Open bindings.
+- An unfinished resume intent over an old Closed binding belongs to Pending and remains after all Open bindings.
+- Within Closed and Open, older timestamps precede newer ones; ties and unknown times use deterministic Topic ID ordering. Pending entries use Topic ID ordering regardless of saved age. Default `/bindings` ordering and deletion/page-refresh behavior are preserved.
 
 ### Rename and export
 
@@ -745,7 +777,7 @@ Log call sites project approved metadata; the handler is not a general secret sc
 
 ### Verification boundaries
 
-The minimum Go toolchain is Go 1.27.2, declared in [go.mod](../go.mod). CI and `just fmt` select that version from the module file. Use the repository's [justfile](../justfile):
+The minimum Go toolchain is Go 1.27.3, declared in [go.mod](../go.mod). CI and `just fmt` select that version from the module file. Use the repository's [justfile](../justfile):
 
 | Command | Effect |
 | --- | --- |
