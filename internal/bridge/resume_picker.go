@@ -731,8 +731,12 @@ func (w *worker) selectSession(c confirmation, index int, messageID int64) {
 		w.beginExportWithArgs(selected, c.exportFormat, c.workspace, c.generation, c.ompArgs)
 		return
 	}
-	if w.client != nil && strings.EqualFold(selected.ID, w.sessionID) {
-		w.say(w.tr(i18n.Msg.OmpSessionAlreadyActiveConversation))
+	if strings.EqualFold(selected.ID, w.sessionID) {
+		if w.client != nil {
+			w.say(w.tr(i18n.Msg.OmpSessionAlreadyActiveConversation))
+		} else {
+			w.say(w.tr(i18n.Msg.OmpSessionAlreadySelectedRuntimeReleased))
+		}
 		return
 	}
 	if w.b.sessionInUse(selected.ID) {
