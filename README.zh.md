@@ -214,12 +214,12 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出当前 chat 保存的对话/session binding, 显示名称, 话题, 逻辑会话图标 (`📖` 开启 / `📕` 关闭 / `⏳` 待启动或恢复), 时间和 home 缩写后的 workspace. 时间仅显示一个统一单位 (`m/h/d/w/mo/y`), 不足一分钟显示 `now`, 未知显示 `-`. 图标不表示 OMP 进程是否运行. 点击可删除条目后, 选择 `Binding` 只删除绑定并保留本地会话历史, `Binding+Session` 删除存在且验证通过的原生会话及 artifacts, 或清理已确认缺失文件的 Bridge 引用, `Cancel` 取消. 工作目录文件始终保留. |
 | `/bindings old` | 清理优先: Closed 在前, Open 其次, 各组内最久未使用优先; Pending 固定最后. Open 包含运行时已释放的会话. 未知时间排在同组已知时间之后. |
-| `/resume` | 从当前 workspace 选择已保存的原生 OMP session; 可 Pin/Unpin, 或经确认后 Delete. |
+| `/resume` | 从当前 workspace 选择已保存的原生 OMP session; 可 Pin/Unpin, 或经确认后 Delete. 重新选择当前开启的会话不改变绑定或运行时状态. |
 | `/resume <session ID>` | 恢复指定的原生 OMP session; OMP 可能恢复该 session 记录的工作目录. |
 | `/export` | 选择已保存的 session, 导出原始 main-session JSONL. 导出当前 session 前需等待其空闲. |
 | `/export html` | 选择已保存的 session, 导出 standalone HTML viewer. |
 | `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
-| `/status` | 查看当前 workspace, session, model, thinking, fast mode, context, runtime 和队列状态. |
+| `/status` | 查看当前 workspace, session 及完整原生 ID, model, thinking, fast mode, context, runtime 和队列状态. |
 | `/args [预设编号]` | 查看预设标签并切换所有对话后续新启动进程使用的 OMP 参数. 不影响已运行的 OMP 进程. |
 | `/doctor` | 异步运行安全的 bridge 诊断, 包括当前 topic 的投递队首/等待情况和全局队列计数, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |

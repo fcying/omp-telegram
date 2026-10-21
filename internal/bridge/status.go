@@ -49,11 +49,7 @@ func formatStatus(language i18n.Language, s statusState, workspace, sessionID, h
 		session = i18n.Text(language, i18n.Msg.Unavailable)
 	}
 	if name := menuText(s.SessionName, 160); name != "" {
-		shortID := i18n.Text(language, i18n.Msg.Unavailable)
-		if sessionID != "" {
-			shortID = menuText(sessionID, 8)
-		}
-		session = i18n.Text(language, i18n.Msg.NamedSessionIdentity, name, shortID)
+		session = i18n.Text(language, i18n.Msg.NamedSessionIdentity, name, session)
 	}
 	return i18n.Text(language, i18n.Msg.DetailedStatus,
 		clipUTF16(statusWorkspace(workspace, home), 1024), session, s.modelText(language), s.thinkingText(language), s.fastText(language), s.contextText(language),

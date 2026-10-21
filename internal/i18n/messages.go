@@ -390,6 +390,7 @@ var Msg = struct {
 	ActionExpired                                                             Message
 	BotSupportsPrivateChatsTelegramTopicsGroupsUseInside                      Message
 	OmpSessionAlreadyActiveConversation                                       Message
+	OmpSessionAlreadySelectedRuntimeReleased                                  Message
 	OmpSessionUnavailableAlreadyUseAnotherConversation                        Message
 	SavedSessionUseAnotherConversationRunStatusThereClose                     Message
 	SessionActiveAnotherConversationCloseInstanceFirst                        Message
@@ -880,6 +881,7 @@ var Msg = struct {
 	ActionExpired:                                                         message("This action has expired", "此操作已过期"),
 	BotSupportsPrivateChatsTelegramTopicsGroupsUseInside:                  message("This bot supports private chats and Telegram topics. In groups, use it inside a topic.", "此机器人支持私聊和 Telegram 话题. 在群组中请在话题内使用."),
 	OmpSessionAlreadyActiveConversation:                                   message("This omp session is already active in this conversation.", "此 omp 会话已在当前对话中运行."),
+	OmpSessionAlreadySelectedRuntimeReleased:                              message("This session is already selected in this conversation. OMP is released; sending a message will resume it.", "当前对话已绑定此会话. OMP 进程已释放, 发送消息即可恢复."),
 	OmpSessionUnavailableAlreadyUseAnotherConversation:                    message("This omp session is unavailable or already in use by another conversation.", "此 omp 会话不可用或已被其他对话使用."),
 	SavedSessionUseAnotherConversationRunStatusThereClose:                 message("This saved session is in use by another conversation. Run /status there, or /close that instance before using /resume here.", "此已保存的会话正被其他对话使用. 请在那里运行 /status, 或先 /close 该实例再在此使用 /resume."),
 	SessionActiveAnotherConversationCloseInstanceFirst:                    message("This session is active in another conversation. Close that instance first.", "此会话正在另一个对话中运行. 请先关闭该实例."),

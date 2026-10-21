@@ -214,12 +214,12 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List this chat's saved conversation/session bindings as name, topic, logical session icon (`📖` Open / `📕` Closed / `⏳` pending), age and home-abbreviated workspace. Ages use one untranslated unit (`m/h/d/w/mo/y`), `now` under one minute, or `-` when unknown. Icons do not indicate OMP process liveness. Tap an eligible entry, then choose `Binding` to keep local session history, `Binding+Session` to delete an existing, verified native session and its artifacts or clean Bridge references to a confirmed missing file, or `Cancel`. Workspace files are preserved. |
 | `/bindings old` | Cleanup order: Closed first, then Open, each least recently used first; Pending entries last. Open includes released runtimes. Unknown times follow known times within each group. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Pin/Unpin entries or Delete a session after confirmation. |
+| `/resume` | Choose a saved native OMP session from the current workspace. Pin/Unpin entries or Delete a session after confirmation. Re-selecting the current open session keeps its binding and runtime state. |
 | `/resume <session ID>` | Resume the specified native OMP session; OMP may restore its recorded working directory. |
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
-| `/status` | Show the current workspace, session, model, thinking, fast-mode, context, runtime, and queue status. |
+| `/status` | Show the current workspace, session with its full native ID, model, thinking, fast-mode, context, runtime, and queue status. |
 | `/args [preset-number]` | View configured preset labels and switch the OMP startup preset for future process starts across all conversations. Running OMP processes are unchanged. |
 | `/doctor` | Run safe, asynchronous bridge diagnostics, including the current topic's delivery head/wait and global queue counts, without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |

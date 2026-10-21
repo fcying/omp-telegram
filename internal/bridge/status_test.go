@@ -43,7 +43,7 @@ func TestStatusDisplaysWhitelistedNativeMetrics(t *testing.T) {
 			t.Errorf("%s=%q, want %q", key, fields[key], want)
 		}
 	}
-	if !strings.HasPrefix(fields["Session ID"], "abcdef12") || strings.Contains(text, "saved-id") {
+	if fields["Session ID"] != state.SessionID || strings.Contains(text, "saved-id") {
 		t.Fatal("named session did not retain the actual session identity")
 	}
 	if strings.Contains(text, "SECRET") || strings.Contains(text, "PRIVATE") || strings.Contains(text, "Authorization") {
@@ -189,7 +189,7 @@ func TestChineseStatusPreservesNativeIdentityAndPaths(t *testing.T) {
 	state.Model.ID = "on"
 	state.SessionName = "Session ID: on 中文"
 	text := formatStatus("zh", state, "/Workspace/on", "session-id", "", 3)
-	for _, native := range []string{"/Workspace/on", "Workspace/on", "Session ID: on 中文", "session-"} {
+	for _, native := range []string{"/Workspace/on", "Workspace/on", "Session ID: on 中文", "session-id"} {
 		if !strings.Contains(text, native) {
 			t.Fatalf("localized status changed native data %q: %q", native, text)
 		}
