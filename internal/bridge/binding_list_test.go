@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -50,6 +51,20 @@ func bindingButton(t *testing.T, f *fakeHTTP, label string) string {
 	return ""
 }
 
+func bindingEntryButton(t *testing.T, f *fakeHTTP, thread int64) string {
+	t.Helper()
+	marker := fmt.Sprintf(" · #%d · ", thread)
+	for _, button := range resumeButtons(t, f) {
+		label, _ := button["text"].(string)
+		data, _ := button["callback_data"].(string)
+		if strings.Contains(label, marker) && data != "" {
+			return data
+		}
+	}
+	t.Fatalf("no selectable binding for topic %d", thread)
+	return ""
+}
+
 func onlyBindingConfirmation(t *testing.T, w *worker) confirmation {
 	t.Helper()
 	if len(w.confirms) != 1 {
@@ -72,6 +87,7 @@ func TestBindingListRendersStatesAndDeletionButtons(t *testing.T) {
 		b:        testBridge(t, &Bridge{tg: newTestTelegram(t), bot: telegram.User{ID: 99}}),
 		key:      target{chat: -10, thread: 11},
 		ctx:      ctx,
+		runtime:  runtimeReleased,
 		cancel:   cancel,
 		confirms: make(map[string]confirmation),
 	})
@@ -92,10 +108,6 @@ func TestBindingListRendersStatesAndDeletionButtons(t *testing.T) {
 	}
 	message := fake.messages[0]
 	fake.mu.Unlock()
-	text, _ := message["text"].(string)
-	if text != "Saved bindings\nPage 1/1" {
-		t.Fatalf("binding list text = %q, want header only", text)
-	}
 	encoded, err := json.Marshal(message["reply_markup"])
 	if err != nil {
 		t.Fatal(err)
@@ -104,26 +116,25 @@ func TestBindingListRendersStatesAndDeletionButtons(t *testing.T) {
 	if err := json.Unmarshal(encoded, &keyboard); err != nil {
 		t.Fatal(err)
 	}
-	if len(keyboard.InlineKeyboard) != 11 {
-		t.Fatalf("binding list keyboard rows = %d, want 11", len(keyboard.InlineKeyboard))
+	if len(keyboard.InlineKeyboard) != len(entries)+1 {
+		t.Fatalf("binding list did not render one row per entry: %+v", keyboard.InlineKeyboard)
 	}
 	titles := []string{"1. * current · #11", "2. open · #55", "3. Closed task · #22", "4. resume · #33", "5. pending · #44"}
-	details := []string{"Open · /current", "Open · /open", "Closed 4d · /closed", "Pending resume 7m · /resume", "Pending new · /pending"}
+	details := []string{"📖 · - · /current", "📖 · - · /open", "📕 · 4d · /closed", "⏳ · 7m · /resume", "⏳ · - · /pending"}
 	for i := range titles {
-		title := keyboard.InlineKeyboard[2*i]
-		detail := keyboard.InlineKeyboard[2*i+1]
-		if len(title) != 1 || title[0].Text != titles[i] || len(detail) != 1 || detail[0].Text != details[i] || detail[0].Disabled == nil || detail[0].CallbackData != "" {
-			t.Fatalf("binding %d rows = %+v / %+v", i+1, title, detail)
+		row := keyboard.InlineKeyboard[i]
+		if len(row) != 1 || !strings.Contains(row[0].Text, titles[i]) || !strings.Contains(row[0].Text, details[i]) {
+			t.Fatalf("binding %d did not combine its identity, logical state, age and workspace: %+v", i+1, row)
 		}
 		if i == 1 || i == 2 {
-			if title[0].Style != "" || title[0].CallbackData == "" || title[0].Disabled != nil {
-				t.Fatalf("binding %d title is not clickable: %+v", i+1, title[0])
+			if row[0].CallbackData == "" || row[0].Disabled != nil {
+				t.Fatalf("binding %d is not selectable: %+v", i+1, row)
 			}
-		} else if title[0].Disabled == nil || title[0].CallbackData != "" {
-			t.Fatalf("binding %d title should be disabled: %+v", i+1, title[0])
+		} else if row[0].Disabled == nil || row[0].CallbackData != "" {
+			t.Fatalf("binding %d should not offer deletion: %+v", i+1, row)
 		}
 	}
-	if row := keyboard.InlineKeyboard[10]; len(row) != 1 || row[0].Text != "Close" || row[0].CallbackData == "" {
+	if row := keyboard.InlineKeyboard[len(entries)]; len(row) != 1 || row[0].Text != "Close" || row[0].CallbackData == "" {
 		t.Fatalf("close button = %+v", row)
 	}
 }
@@ -142,6 +153,10 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 		{Bot: 99, Chat: -10, Thread: 30, Workspace: "/old30", Generation: 1, LastUsedAt: now - 1000},
 		{Bot: 99, Chat: -10, Thread: 60, Workspace: "/future60", Generation: 1, LastUsedAt: now + 3600},
 		{Bot: 99, Chat: -10, Thread: 20, Workspace: "/recent20", Generation: 1, LastUsedAt: now - 100},
+		{Bot: 99, Chat: -10, Thread: 41, Workspace: "/unknown41", Generation: 1},
+		{Bot: 99, Chat: -10, Thread: 42, Workspace: "/unknown42", Generation: 1},
+		{Bot: 99, Chat: -10, Thread: 43, Workspace: "/unknown43", Generation: 1},
+		{Bot: 99, Chat: -10, Thread: 44, Workspace: "/unknown44", Generation: 1},
 	} {
 		if err := db.Save(entry); err != nil {
 			t.Fatal(err)
@@ -156,66 +171,95 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	titles := []string{
 		"1. * current · #11", "2. pending · #7", "3. recent20 · #20",
 		"4. recent50 · #50", "5. old30 · #30", "6. unknown40 · #40",
+		"7. unknown41 · #41", "8. unknown42 · #42", "9. unknown43 · #43", "10. unknown44 · #44",
 	}
-	if text != "Saved bindings\nPage 1/2" || len(rows) != 13 {
+	if text != "Saved bindings\nPage 1/2" || len(rows) != 11 {
 		t.Fatalf("first page = %q, rows = %+v", text, rows)
 	}
 	for i, title := range titles {
-		if len(rows[2*i]) != 1 || rows[2*i][0]["text"] != title {
-			t.Fatalf("binding %d title = %+v, want %q", i+1, rows[2*i], title)
+		if !strings.HasPrefix(rows[i][0]["text"].(string), title+" · ") {
+			t.Fatalf("binding %d title = %+v, want prefix %q", i+1, rows[i], title)
 		}
 	}
 	messageID := int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: bindingButton(t, fake, "Next")})
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings\nPage 2/2" || len(rows) != 3 || len(rows[0]) != 1 || rows[0][0]["text"] != "7. future60 · #60" || len(rows[1]) != 1 || rows[1][0]["text"] != "Closed · /future60" {
+	if text != "Saved bindings\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "future60 · #60 · 📕 · - · /future60") {
 		t.Fatalf("second page = %q, rows = %+v", text, rows)
 	}
 	w.showBindings(7, true, 0)
 	text, rows = pickerView(t, fake)
 	oldTitles := []string{
 		"1. old30 · #30", "2. * current · #11", "3. recent20 · #20",
-		"4. recent50 · #50", "5. pending · #7", "6. unknown40 · #40",
+		"4. recent50 · #50", "5. unknown40 · #40", "6. unknown41 · #41",
+		"7. unknown42 · #42", "8. unknown43 · #43", "9. unknown44 · #44", "10. future60 · #60",
 	}
-	if text != "Saved bindings (oldest first)\nPage 1/2" || len(rows) != 13 {
+	if text != "Saved bindings (oldest first)\nPage 1/2" || len(rows) != 11 {
 		t.Fatalf("oldest-first page = %q, rows = %+v", text, rows)
 	}
 	for i, title := range oldTitles {
-		if len(rows[2*i]) != 1 || rows[2*i][0]["text"] != title {
-			t.Fatalf("oldest-first binding %d title = %+v, want %q", i+1, rows[2*i], title)
+		if !strings.HasPrefix(rows[i][0]["text"].(string), title+" · ") {
+			t.Fatalf("oldest-first binding %d title = %+v, want prefix %q", i+1, rows[i], title)
 		}
 	}
 	messageID = int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "old-next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: bindingButton(t, fake, "Next")})
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 3 || rows[0][0]["text"] != "7. future60 · #60" {
+	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "pending · #7 · ") {
 		t.Fatalf("oldest-first second page = %q, rows = %+v", text, rows)
 	}
 }
 
-func TestBindingsOldSortsPendingBySavedLastUse(t *testing.T) {
+func TestBindingsOldPrioritizesClosedThenOldOpen(t *testing.T) {
 	db, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireStoreOK(t, err)
 	defer db.Close()
 	now := time.Now().Unix()
-	for _, entry := range []store.Binding{
-		{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", Generation: 1, LastUsedAt: now - 60},
-		{Bot: 99, Chat: -10, Thread: 22, Workspace: "/pending", Generation: 1, LastUsedAt: now - 7200},
+	for _, binding := range []store.Binding{
+		{Thread: 11, LastUsedAt: now - 60},
+		{Thread: 30, LastUsedAt: now - 100},
+		{Thread: 31, LastUsedAt: now - 100},
+		{Thread: 32},
+		{Thread: 33, LastUsedAt: now + 3600},
+		{Thread: 20, Running: true, LastUsedAt: now - 365*86400},
+		{Thread: 21, Running: true, LastUsedAt: now - 365*86400},
+		{Thread: 22, Running: true, LastUsedAt: now - 200},
+		{Thread: 23, Running: true},
+		{Thread: 24, Running: true, LastUsedAt: now + 3600},
+		{Thread: 6, Running: true, LastUsedAt: now - 1},
+		{Thread: 7, LastUsedAt: now - 2*365*86400},
 	} {
-		if err := db.Save(entry); err != nil {
-			t.Fatal(err)
-		}
+		binding.Bot, binding.Chat = 99, -10
+		binding.Workspace, binding.Generation = "/sort", 1
+		requireStoreOK(t, db.Save(binding))
 	}
-	if err := db.PrepareStart(store.Binding{Bot: 99, Chat: -10, Thread: 22, Generation: 1}, store.StartIntent{Bot: 99, Chat: -10, Thread: 22, Kind: "new", Workspace: "/next", Generation: 2}); err != nil {
-		t.Fatal(err)
+	for _, thread := range []int64{5, 6, 7} {
+		before, err := db.Binding(99, -10, thread)
+		if errors.Is(err, sql.ErrNoRows) {
+			before = store.Binding{Bot: 99, Chat: -10, Thread: thread}
+		} else {
+			requireStoreOK(t, err)
+		}
+		requireStoreOK(t, db.PrepareStart(before, store.StartIntent{Bot: 99, Chat: -10, Thread: thread, Kind: "new", Workspace: "/pending", Generation: before.Generation + 1}))
 	}
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindings(7, true, 0)
-	_, rows := pickerView(t, fake)
-	if rows[0][0]["text"] != "1. next · #22" || rows[2][0]["text"] != "2. * current · #11" {
-		t.Fatalf("oldest-first with pending start = %+v", rows)
+	want := []int64{30, 31, 11, 32, 33, 20, 21, 22, 23, 24, 5, 6, 7}
+	for start := 0; start < len(want); start += bindingPageSize {
+		_, rows := pickerView(t, fake)
+		end := min(start+bindingPageSize, len(want))
+		if len(rows) != end-start+1 {
+			t.Fatalf("page at %d has wrong entry count: %+v", start, rows)
+		}
+		for i, thread := range want[start:end] {
+			if !strings.Contains(rows[i][0]["text"].(string), fmt.Sprintf(" · #%d · ", thread)) {
+				t.Fatalf("entry %d = %q, want topic %d", start+i, rows[i][0]["text"], thread)
+			}
+		}
+		if end < len(want) {
+			c := onlyBindingConfirmation(t, w)
+			w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Next")})
+		}
 	}
 }
 
@@ -233,7 +277,7 @@ func TestBindingsOldCommandSortsWithoutChangingDefault(t *testing.T) {
 	send(update(1, 11, "/bindings old"))
 	waitInputDone(t, db, 1)
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 5 || rows[0][0]["text"] != "1. old · #22" || rows[2][0]["text"] != "2. recent · #33" {
+	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "old · #22 · ") || !strings.Contains(rows[1][0]["text"].(string), "recent · #33 · ") {
 		t.Fatalf("oldest-first command = %q, rows = %+v", text, rows)
 	}
 	send(update(2, 11, "/bindings old extra"))
@@ -242,7 +286,7 @@ func TestBindingsOldCommandSortsWithoutChangingDefault(t *testing.T) {
 	send(update(3, 11, "/bindings"))
 	waitInputDone(t, db, 3)
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings\nPage 1/1" || len(rows) != 5 || rows[0][0]["text"] != "1. recent · #33" || rows[2][0]["text"] != "2. old · #22" {
+	if text != "Saved bindings\nPage 1/1" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "recent · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), "old · #22 · ") {
 		t.Fatalf("default bindings command = %q, rows = %+v", text, rows)
 	}
 }
@@ -278,13 +322,13 @@ func TestBindingNavigationSharesFooterRow(t *testing.T) {
 			t.Fatalf("%s callback result = %v", label, got)
 		}
 	}
-	checkFooter("Page 1/3", 13, "Next", "Close")
+	checkFooter("Page 1/3", 11, "Next", "Close")
 	click("Next")
-	checkFooter("Page 2/3", 13, "Previous", "Next", "Close")
+	checkFooter("Page 2/3", 11, "Previous", "Next", "Close")
 	click("Next")
-	checkFooter("Page 3/3", 3, "Previous", "Close")
+	checkFooter("Page 3/3", 2, "Previous", "Close")
 	click("Previous")
-	checkFooter("Page 2/3", 13, "Previous", "Next", "Close")
+	checkFooter("Page 2/3", 11, "Previous", "Next", "Close")
 }
 
 func TestBindingListDisablesCurrentClosedDelete(t *testing.T) {
@@ -292,7 +336,7 @@ func TestBindingListDisablesCurrentClosedDelete(t *testing.T) {
 	entries := []store.BindingListEntry{{Binding: &store.Binding{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", SessionID: "current-session", Generation: 7}}}
 	w.showBindingsPage(confirmation{bindings: entries, user: 7}, 0, 0)
 	buttons := resumeButtons(t, fake)
-	if len(buttons) != 3 || buttons[0]["text"] != "1. * current · #11" {
+	if len(buttons) != 2 || !strings.Contains(buttons[0]["text"].(string), "* current · #11 · 📕 · - · /current") {
 		t.Fatalf("current closed buttons = %+v", buttons)
 	}
 	if _, ok := buttons[0]["callback_data"]; ok {
@@ -311,7 +355,7 @@ func TestBindingListKeepsTopicVisibleWithLongName(t *testing.T) {
 	}
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{entry}, user: 7}, 0, 0)
 	_, rows := pickerView(t, fake)
-	if len(rows) != 3 || len(rows[0]) != 1 || !strings.Contains(rows[0][0]["text"].(string), "... · #43062") || rows[0][0]["callback_data"] == nil {
+	if len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "... · #43062 · 📕 · - · /project/omp-telegram") || rows[0][0]["callback_data"] == nil {
 		t.Fatalf("long title obscured topic or delete action: %+v", rows)
 	}
 }
@@ -345,7 +389,7 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.b.cfg.OMP = binary
 	w.showBindings(7, false, 0)
 	_, rows := pickerView(t, fake)
-	if len(rows) != 5 || rows[0][0]["text"] != "1. "+filepath.Base(workspace)+" · #22" || rows[2][0]["text"] != "2. "+filepath.Base(workspace)+" · #33" {
+	if len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), filepath.Base(workspace)+" · #22 · ") || !strings.Contains(rows[1][0]["text"].(string), filepath.Base(workspace)+" · #33 · ") {
 		t.Fatalf("initial recent order = %+v", rows)
 	}
 	var result bindingNamesResult
@@ -357,12 +401,12 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.bindingNamesLoaded(result)
 	w.background.Wait()
 	_, rows = pickerView(t, fake)
-	if len(rows) != 5 || rows[0][0]["text"] != "1. Zzz session · #22" || rows[2][0]["text"] != "2. Aaa session · #33" || rows[0][0]["callback_data"] == nil || rows[2][0]["callback_data"] == nil {
+	if len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "Zzz session · #22 · ") || !strings.Contains(rows[1][0]["text"].(string), "Aaa session · #33 · ") || rows[0][0]["callback_data"] == nil || rows[1][0]["callback_data"] == nil {
 		t.Fatalf("native titles reordered bindings: %+v", rows)
 	}
 	w.showBindings(7, true, 0)
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || rows[0][0]["text"] != "1. "+filepath.Base(workspace)+" · #33" || rows[2][0]["text"] != "2. "+filepath.Base(workspace)+" · #22" {
+	if text != "Saved bindings (oldest first)\nPage 1/1" || !strings.Contains(rows[0][0]["text"].(string), filepath.Base(workspace)+" · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), filepath.Base(workspace)+" · #22 · ") {
 		t.Fatalf("initial oldest-first order = %q, rows = %+v", text, rows)
 	}
 	select {
@@ -374,7 +418,7 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.cancel()
 	w.background.Wait()
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || rows[0][0]["text"] != "1. Aaa session · #33" || rows[2][0]["text"] != "2. Zzz session · #22" {
+	if text != "Saved bindings (oldest first)\nPage 1/1" || !strings.Contains(rows[0][0]["text"].(string), "Aaa session · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), "Zzz session · #22 · ") {
 		t.Fatalf("native titles reordered oldest-first bindings: %q, rows = %+v", text, rows)
 	}
 }
@@ -397,11 +441,8 @@ func TestBindingCallbacksUseSentMessageID(t *testing.T) {
 			t.Fatalf("next confirmation = %+v, want page 1 and message %d", c, messageID)
 		}
 		text, rows := pickerView(t, fake)
-		if text != "Saved bindings\nPage 2/2" || len(rows) != 3 || len(rows[0]) != 1 || rows[0][0]["text"] != "7. unknown · #26" || rows[0][0]["callback_data"] == nil {
+		if text != "Saved bindings\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "unknown · #30 · 📖 · - · unknown") || rows[0][0]["callback_data"] == nil {
 			t.Fatalf("last page lost binding title action: text=%q rows=%+v", text, rows)
-		}
-		if len(rows[1]) != 1 || rows[1][0]["text"] != "Open · unknown" || rows[1][0]["disabled"] == nil {
-			t.Fatalf("last page detail is not read-only: %+v", rows[1])
 		}
 	})
 
@@ -462,10 +503,13 @@ func TestBindingDeleteCallbackDeletesClosedBinding(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &closed}}, user: 7}, 0, 0)
 	listMessageID := int64(fake.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingButton(t, fake, "1. closed · #22")})
+	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	confirmation := onlyBindingConfirmation(t, w)
 	if confirmation.action != "binding_delete" || confirmation.messageID == listMessageID {
 		t.Fatalf("delete confirmation = %+v", confirmation)
+	}
+	if _, err = db.Binding(closed.Bot, closed.Chat, closed.Thread); err != nil {
+		t.Fatalf("selecting the entry removed the binding before confirmation: %v", err)
 	}
 	_, confirmationRows := pickerView(t, fake)
 	if len(confirmationRows) != 1 || len(confirmationRows[0]) != 2 || confirmationRows[0][0]["text"] != "Delete" || confirmationRows[0][0]["style"] != "danger" || confirmationRows[0][1]["text"] != "Cancel" || confirmationRows[0][1]["style"] != nil {
@@ -501,14 +545,14 @@ func TestBindingsOldKeepsOrderAfterDeletingClosedEntry(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindings(7, true, 0)
 	listID := int64(fake.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "choose-old", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listID}, Data: bindingButton(t, fake, "1. old · #22")})
+	w.callback(&telegram.CallbackQuery{ID: "choose-old", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listID}, Data: bindingEntryButton(t, fake, 22)})
 	confirmID := onlyBindingConfirmation(t, w).messageID
 	w.callback(&telegram.CallbackQuery{ID: "delete-old", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirmID}, Data: bindingButton(t, fake, "Delete")})
 	if _, err := db.Binding(99, -10, 22); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("old binding still present: %v", err)
 	}
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 5 || rows[0][0]["text"] != "1. middle · #33" || rows[2][0]["text"] != "2. recent · #44" {
+	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "middle · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), "recent · #44 · ") {
 		t.Fatalf("oldest-first list after deletion = %q, rows = %+v", text, rows)
 	}
 }
@@ -518,13 +562,13 @@ func TestBindingDeletionRefreshesSourcePage(t *testing.T) {
 		name   string
 		old    bool
 		page   int
-		target string
-		first  string
+		target int64
+		first  int64
 	}{
-		{name: "recent middle", page: 1, target: "7. binding · #26", first: "7. binding · #27"},
-		{name: "old middle", old: true, page: 1, target: "7. binding · #26", first: "7. binding · #25"},
-		{name: "recent last", page: 2, target: "13. binding · #32", first: "7. binding · #26"},
-		{name: "old last", old: true, page: 2, target: "13. binding · #20", first: "7. binding · #26"},
+		{name: "recent middle", page: 1, target: 30, first: 31},
+		{name: "old middle", old: true, page: 1, target: 30, first: 29},
+		{name: "recent last", page: 2, target: 40, first: 30},
+		{name: "old last", old: true, page: 2, target: 20, first: 30},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, err := store.Open(t.TempDir())
@@ -551,14 +595,15 @@ func TestBindingDeletionRefreshesSourcePage(t *testing.T) {
 			for range tc.page {
 				click(listID, "Next")
 			}
-			click(listID, tc.target)
+			data := bindingEntryButton(t, fake, tc.target)
+			w.callback(&telegram.CallbackQuery{ID: "select-binding", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listID}, Data: data})
 			click(onlyBindingConfirmation(t, w).messageID, "Delete")
 			text, rows := pickerView(t, fake)
 			header := "Saved bindings"
 			if tc.old {
 				header += " (oldest first)"
 			}
-			if text != header+"\nPage 2/2" || len(rows) != 13 || rows[0][0]["text"] != tc.first {
+			if text != header+"\nPage 2/2" || len(rows) != 11 || !strings.Contains(rows[0][0]["text"].(string), fmt.Sprintf(" · #%d · ", tc.first)) {
 				t.Fatalf("refreshed page = %q, rows = %+v", text, rows)
 			}
 			w.cancel()
@@ -574,19 +619,33 @@ func TestBindingDeleteTitleTargetsMatchingEntry(t *testing.T) {
 	}
 	defer db.Close()
 	first := store.Binding{Bot: 99, Chat: -10, Thread: 22, Workspace: "/first", Generation: 1}
-	second := store.Binding{Bot: 99, Chat: -10, Thread: 33, Workspace: "/second", Generation: 1}
+	second := store.Binding{Bot: 99, Chat: -10, Thread: 33, Workspace: "/" + strings.Repeat("segment/", 480) + "target", Generation: 1}
+	name := strings.Repeat("长😀 ", 20) + "selected"
 	for _, binding := range []store.Binding{first, second} {
 		if err := db.Save(binding); err != nil {
 			t.Fatal(err)
 		}
 	}
 	w, fake := newBindingTestWorker(t, db)
-	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &first}, {Binding: &second}}, user: 7}, 0, 0)
+	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &first}, {Binding: &second, SessionName: "\t" + strings.ReplaceAll(name, " ", "\x00\n") + "\t"}}, user: 7}, 0, 0)
 	listMessageID := int64(fake.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "select-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingButton(t, fake, "2. second · #33")})
+	w.callback(&telegram.CallbackQuery{ID: "select-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingEntryButton(t, fake, second.Thread)})
 	confirm := onlyBindingConfirmation(t, w)
 	if confirm.deleteThread != second.Thread {
 		t.Fatalf("second title selected topic %d", confirm.deleteThread)
+	}
+	fake.mu.Lock()
+	var details strings.Builder
+	for _, message := range fake.messages[listMessageID:] {
+		text, _ := message["text"].(string)
+		details.WriteString(text)
+	}
+	fake.mu.Unlock()
+	if !strings.Contains(details.String(), name) || !strings.Contains(details.String(), second.Workspace) {
+		t.Fatal("confirmation lost the selected binding's full name or workspace across message chunks")
+	}
+	if _, err := db.Binding(second.Bot, second.Chat, second.Thread); err != nil {
+		t.Fatalf("selecting the long entry deleted it before confirmation: %v", err)
 	}
 	w.callback(&telegram.CallbackQuery{ID: "delete-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirm.messageID}, Data: bindingButton(t, fake, "Delete")})
 	if _, err := db.Binding(second.Bot, second.Chat, second.Thread); !errors.Is(err, sql.ErrNoRows) {
@@ -610,7 +669,7 @@ func TestBindingDeleteCallbackRejectsStaleGeneration(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &old}}, user: 7}, 0, 0)
 	listMessageID := int64(fake.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingButton(t, fake, "1. old · #22")})
+	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingEntryButton(t, fake, old.Thread)})
 	confirmation := onlyBindingConfirmation(t, w)
 	replacement := old
 	replacement.Generation = 5
@@ -654,17 +713,17 @@ func TestBindingDeleteRejectsStaleMutationEpoch(t *testing.T) {
 	entries := []store.BindingListEntry{{Binding: &closed}}
 	a.showBindingsPage(confirmation{bindings: entries, user: 7, epoch: b.bindingsEpoch.Load()}, 0, 0)
 	aListMessageID := int64(fake.messageCount())
-	a.callback(&telegram.CallbackQuery{ID: "a-list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: aListMessageID}, Data: bindingButton(t, fake, "1. old · #22")})
+	a.callback(&telegram.CallbackQuery{ID: "a-list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: aListMessageID}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	aDelete := onlyBindingConfirmation(t, a)
 	aDeleteData := bindingButton(t, fake, "Delete")
 	staleList := newWorker(target{chat: -10, thread: 44})
 	staleList.showBindingsPage(confirmation{bindings: entries, user: 7, epoch: b.bindingsEpoch.Load()}, 0, 0)
 	staleListMessageID := int64(fake.messageCount())
-	staleListData := bindingButton(t, fake, "1. old · #22")
+	staleListData := bindingEntryButton(t, fake, closed.Thread)
 
 	c.showBindingsPage(confirmation{bindings: entries, user: 7, epoch: b.bindingsEpoch.Load()}, 0, 0)
 	cListMessageID := int64(fake.messageCount())
-	c.callback(&telegram.CallbackQuery{ID: "c-list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: cListMessageID}, Data: bindingButton(t, fake, "1. old · #22")})
+	c.callback(&telegram.CallbackQuery{ID: "c-list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: cListMessageID}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	cDelete := onlyBindingConfirmation(t, c)
 	c.callback(&telegram.CallbackQuery{ID: "c-confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: cDelete.messageID}, Data: bindingButton(t, fake, "Delete")})
 	if got := b.bindingsEpoch.Load(); got != 1 {
@@ -711,7 +770,7 @@ func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
 	requireStoreOK(t, db.Save(closed))
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &closed}}, user: 7}, 0, 0)
-	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: int64(fake.messageCount())}, Data: bindingButton(t, fake, "1. closed · #22")})
+	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: int64(fake.messageCount())}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	c := onlyBindingConfirmation(t, w)
 	approve := bindingButton(t, fake, "Delete")
 	w.callback(&telegram.CallbackQuery{ID: "cancel-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Cancel")})
@@ -724,6 +783,43 @@ func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
 	requireStoreOK(t, err)
 	if !sameBindingIdentity(saved, closed) || len(w.confirms) != 0 {
 		t.Fatal("cancelled binding deletion changed the binding or remained actionable")
+	}
+}
+
+func TestBindingAgeUnitBoundaries(t *testing.T) {
+	const now = int64(2_000_000_000)
+	const day = int64(24 * 60 * 60)
+	for _, tc := range []struct {
+		name      string
+		timestamp int64
+		want      string
+	}{
+		{name: "missing", timestamp: 0, want: "-"},
+		{name: "negative", timestamp: -1, want: "-"},
+		{name: "future", timestamp: now + 1, want: "-"},
+		{name: "current", timestamp: now, want: "now"},
+		{name: "under minute", timestamp: now - 59, want: "now"},
+		{name: "minute", timestamp: now - 60, want: "1m"},
+		{name: "under hour", timestamp: now - 3599, want: "59m"},
+		{name: "hour", timestamp: now - 3600, want: "1h"},
+		{name: "under day", timestamp: now - day + 1, want: "23h"},
+		{name: "day", timestamp: now - day, want: "1d"},
+		{name: "discard smaller units", timestamp: now - 3*day - 12*3600, want: "3d"},
+		{name: "under week", timestamp: now - 7*day + 1, want: "6d"},
+		{name: "week", timestamp: now - 7*day, want: "1w"},
+		{name: "under month", timestamp: now - 30*day + 1, want: "4w"},
+		{name: "month", timestamp: now - 30*day, want: "1mo"},
+		{name: "under second month", timestamp: now - 60*day + 1, want: "1mo"},
+		{name: "second month", timestamp: now - 60*day, want: "2mo"},
+		{name: "under year", timestamp: now - 365*day + 1, want: "12mo"},
+		{name: "year", timestamp: now - 365*day, want: "1y"},
+		{name: "second year", timestamp: now - 730*day, want: "2y"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatBindingAge(tc.timestamp, now); got != tc.want {
+				t.Fatalf("age = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -21,7 +21,7 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-const resumePageSize = 8
+const resumePageSize = 10
 
 type resumeListResult struct {
 	request                   uint64
@@ -332,8 +332,12 @@ func (w *worker) exportListed(result resumeListResult) {
 	w.showResumePage(confirmation{action: "export", method: "select", workspace: result.cwd, exportFormat: result.exportFormat, user: result.user, generation: result.generation, epoch: result.epoch, sessions: result.sessions, ompArgs: result.args}, 0, 0)
 }
 
+// menuText normalizes whitespace and controls; a zero limit disables truncation.
 func menuText(text string, limit int) string {
 	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }), " ")
+	if limit == 0 {
+		return text
+	}
 	units := 0
 	for i, r := range text {
 		n := utf16.RuneLen(r)

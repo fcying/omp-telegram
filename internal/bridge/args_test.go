@@ -733,7 +733,7 @@ func TestIncomingCleanupUnionsAllPresetVisibilityAndRetainsOnAnyFailure(t *testi
 
 func TestArgsMenuPagesLargePresetSets(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
-	presets := make([][]string, 100)
+	presets := make([][]string, 11)
 	for i := range presets {
 		presets[i] = []string{"--profile", fmt.Sprintf("profile-%d", i+1)}
 	}
@@ -746,13 +746,13 @@ func TestArgsMenuPagesLargePresetSets(t *testing.T) {
 	messageID := int64(f.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "args-next-page", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[argsMenuPageSize][0]["callback_data"].(string)})
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/2") || len(rows) != 12 || rows[0][0]["text"] != "Preset 91" || rows[9][0]["text"] != "Preset 100" || rows[10][0]["text"] != "Previous" || rows[11][0]["text"] != "Cancel" {
+	if !strings.Contains(text, "Page 2/2") || len(rows) != 3 || rows[0][0]["text"] != "Preset 11" || rows[1][0]["text"] != "Previous" || rows[2][0]["text"] != "Cancel" {
 		t.Fatalf("second args page has invalid bounds: %q, rows=%v", text, rows)
 	}
 	messageID = int64(f.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "args-last-preset", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[9][0]["callback_data"].(string)})
-	if index, _ := w.b.argsPresetSelection(); index != 100 {
-		t.Fatalf("paged args selection = %d, want 100", index)
+	w.callback(&telegram.CallbackQuery{ID: "args-last-preset", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
+	if index, _ := w.b.argsPresetSelection(); index != 11 {
+		t.Fatalf("paged args selection = %d, want 11", index)
 	}
 }
 

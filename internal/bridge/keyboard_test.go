@@ -244,7 +244,7 @@ func TestNativeUIDialogSurvivesBridgeMenuExpiry(t *testing.T) {
 			command("/new " + t.TempDir())
 			w.owner = 7
 			before, client := w.binding, w.client
-			options := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+			options := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"}
 			w.ui(rpcEvent{ID: "waiting-native-dialog", Method: method, Title: "Permission required", Options: options})
 			_, rows := pickerView(t, f)
 			data := rows[0][0]["callback_data"].(string)
@@ -291,7 +291,7 @@ func TestNativeUIDialogSurvivesBridgeMenuExpiry(t *testing.T) {
 				if _, ok := w.confirms[token]; !ok {
 					t.Fatal("pagination added a bridge deadline to the native dialog")
 				}
-				expectedValue = options[8]
+				expectedValue = options[10]
 			}
 			w.callback(&telegram.CallbackQuery{ID: "delayed-native-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
 			if replies, value := readReplies(); replies != 1 || value != expectedValue {
@@ -383,7 +383,7 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 	click(7, rows[uiSelectPageSize][1]["callback_data"].(string))
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 3/3") || len(rows) != 7 || rows[4][0]["text"] != options[20] {
+	if !strings.Contains(text, "Page 3/3") || len(rows) != 3 || rows[0][0]["text"] != options[20] {
 		t.Fatalf("last commit page = %q; %v", text, rows)
 	}
 	requirePickerFooter(t, rows, "Previous", "Cancel")
@@ -395,12 +395,12 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 0 {
 		t.Fatalf("navigation submitted a native choice: %+v, error %v", state, err)
 	}
-	click(7, rows[4][0]["callback_data"].(string))
+	click(7, rows[0][0]["callback_data"].(string))
 	result, err = w.call("get_state", nil)
 	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 1 || state.Value != options[20] {
 		t.Fatalf("last-page choice = %+v, error %v", state, err)
 	}
-	raw, err = json.Marshal(map[string]any{"type": "extension_ui_request", "id": "review-cancel", "method": "select", "title": "Choose commit", "options": options[:9]})
+	raw, err = json.Marshal(map[string]any{"type": "extension_ui_request", "id": "review-cancel", "method": "select", "title": "Choose commit", "options": options[:11]})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,12 +537,12 @@ func TestResumeKeyboardNavigationAndSelection(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	command("/new test")
 	before := w.binding
-	sessions := setResumeFixtures(t, before.Workspace, 10)
+	sessions := setResumeFixtures(t, before.Workspace, 12)
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
 	first := resumeButtons(t, f)
 	messageID := f.messageCount()
-	clickResume(w, 7, first[8]["callback_data"].(string))
+	clickResume(w, 7, first[10]["callback_data"].(string))
 	second := resumeButtons(t, f)
 	assertKeyboardClears(t, f)
 	// A callback from the replaced page cannot clear the new page or select.

@@ -66,10 +66,6 @@ var Msg = struct {
 	DiskFreeGiB                                                               Message
 	DiskFreeMiB                                                               Message
 	UncertainCount                                                            Message
-	AgeDays                                                                   Message
-	AgeDaysHours                                                              Message
-	AgeHours                                                                  Message
-	AgeMinutes                                                                Message
 	NamedSessionIdentity                                                      Message
 	Setting                                                                   Message
 	NotSupportedBridgeBecauseCanMoveSessionWorkspaceUse                       Message
@@ -274,9 +270,6 @@ var Msg = struct {
 	Open                                                                      Message
 	Outbox                                                                    Message
 	PageChanged                                                               Message
-	Pending                                                                   Message
-	PendingNew                                                                Message
-	PendingResume                                                             Message
 	Pin                                                                       Message
 	PreparingAttachment                                                       Message
 	Preset                                                                    Message
@@ -457,7 +450,6 @@ var Msg = struct {
 	High                                                                      Message
 	InconsistentInternalRuntimeState                                          Message
 	InvalidRuntimeConfiguration                                               Message
-	JustNow                                                                   Message
 	Low                                                                       Message
 	Max                                                                       Message
 	Medium                                                                    Message
@@ -555,10 +547,6 @@ var Msg = struct {
 	DiskFreeGiB:                                   message("%.1f GiB free", "可用 %.1f GiB"),
 	DiskFreeMiB:                                   message("%d MiB free", "可用 %d MiB"),
 	UncertainCount:                                message("%d uncertain", "%d 条结果不确定"),
-	AgeDays:                                       message("%dd", "%d 天"),
-	AgeDaysHours:                                  message("%dd %dh", "%d 天 %d 小时"),
-	AgeHours:                                      message("%dh", "%d 小时"),
-	AgeMinutes:                                    message("%dm", "%d 分钟"),
 	NamedSessionIdentity:                          message("%s\nSession ID: %s", "%s\n会话 ID: %s"),
 	Setting:                                       message("%s (setting: %s)", "%s (设置: %s)"),
 	NotSupportedBridgeBecauseCanMoveSessionWorkspaceUse: message("%s is not supported by the bridge because it can move the session or workspace. Use /new or /resume instead.", "桥接器不支持 %s, 因为它可能移动会话或工作区. 请改用 /new 或 /resume."),
@@ -763,9 +751,6 @@ var Msg = struct {
 	Open:                message("Open", "已打开"),
 	Outbox:              message("Outbox", "发件箱"),
 	PageChanged:         message("Page changed.", "已切换页面."),
-	Pending:             message("Pending %s", "等待 %s"),
-	PendingNew:          message("Pending new", "等待新建"),
-	PendingResume:       message("Pending resume", "等待恢复"),
 	Pin:                 message("Pin", "置顶"),
 	PreparingAttachment: message("Preparing attachment...", "正在准备附件..."),
 	Preset:              message("Preset %d", "预设 %d"),
@@ -946,7 +931,6 @@ var Msg = struct {
 	High:                                          message("high", "高"),
 	InconsistentInternalRuntimeState:              message("inconsistent internal runtime state", "内部运行时状态不一致"),
 	InvalidRuntimeConfiguration:                   message("invalid runtime configuration", "运行时配置无效"),
-	JustNow:                                       message("just now", "刚刚"),
 	Low:                                           message("low", "低"),
 	Max:                                           message("max", "最大"),
 	Medium:                                        message("medium", "中"),

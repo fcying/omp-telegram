@@ -44,7 +44,7 @@ arm64 使用 `omp-telegram-linux-arm64.txz`. 压缩包包含二进制和 LICENSE
 
 ### 从源码构建
 
-需要 Go 1.27.2 或更新版本 (见 [go.mod](go.mod)) 及 [just](https://github.com/casey/just):
+需要 Go 1.27.3 或更新版本 (见 [go.mod](go.mod)) 及 [just](https://github.com/casey/just):
 
 ```sh
 git clone https://github.com/fcying/omp-telegram.git
@@ -212,8 +212,8 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/queue` | 查看运行及排队任务. Cancel 按钮只删除选中的等待任务, 不中止当前任务. |
 | `/followup <message>` | 明确排队一个独立任务, 不会作为 steer 发送给当前任务. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
-| `/bindings` | 列出当前 chat 保存的对话/session binding. 点击可删除条目的标题, 确认后忘记已关闭或空闲的 binding; 保留 workspace 文件和 OMP history. |
-| `/bindings old` | 按最久未使用优先的顺序显示已保存的 binding. |
+| `/bindings` | 列出当前 chat 保存的对话/session binding, 显示名称, 话题, 逻辑会话图标 (`📖` 开启 / `📕` 关闭 / `⏳` 待启动或恢复), 时间和 home 缩写后的 workspace. 时间仅显示一个统一单位 (`m/h/d/w/mo/y`), 不足一分钟显示 `now`, 未知显示 `-`. 图标不表示 OMP 进程是否运行. 点击可删除条目后再确认删除; 保留 workspace 文件和 OMP history. |
+| `/bindings old` | 清理优先: Closed 在前, Open 其次, 各组内最久未使用优先; Pending 固定最后. Open 包含运行时已释放的会话. 未知时间排在同组已知时间之后. |
 | `/resume` | 从当前 workspace 选择已保存的原生 OMP session; 可 Pin/Unpin, 或经确认后 Delete. |
 | `/resume <session ID>` | 恢复指定的原生 OMP session; OMP 可能恢复该 session 记录的工作目录. |
 | `/export` | 选择已保存的 session, 导出原始 main-session JSONL. 导出当前 session 前需等待其空闲. |
