@@ -272,10 +272,12 @@ func TestMigrationLockedWorkerRefusesForgetResumeDeleteAndExport(t *testing.T) {
 func TestMigrationBindingDeleteCallbackRefusesClosedSource(t *testing.T) {
 	w := migrationClaimWorker(t, false)
 	observer := testWorker(t, &worker{b: w.b, key: target{chat: -10, thread: 22}, ctx: w.ctx, confirms: map[string]confirmation{}})
-	c := confirmation{action: "binding_delete", options: []string{"Delete", "Cancel"}, messageID: 1, deleteBot: 99, deleteChat: -10, deleteThread: 11, deleteGeneration: w.binding.Generation}
+	c := confirmation{action: "binding_delete", options: []string{"Binding", "Binding+Session", "Cancel"}, messageID: 1, deleteBot: 99, deleteChat: -10, deleteThread: 11, deleteGeneration: w.binding.Generation}
 	q := &telegram.CallbackQuery{ID: "migration-delete", Message: &telegram.Message{MessageID: 1}}
-	if observer.bindingCallback(w.ctx, q, "token", "0", c) != callbackDone {
-		t.Fatal("locked binding callback was not consumed")
+	for _, choice := range []string{"0", "1"} {
+		if observer.bindingCallback(w.ctx, q, "token", choice, c) != callbackDone {
+			t.Fatal("locked binding callback was not consumed")
+		}
 	}
 	if observer.forgetPending || !w.b.migrationBindingLocked(99, -10, 11) {
 		t.Fatal("closed migrating binding was forgotten")

@@ -496,7 +496,10 @@ func TestBindingDeleteCallbackDeletesClosedBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	closed := store.Binding{Bot: 99, Chat: -10, Thread: 22, Workspace: "/closed", Session: "/sessions/closed.jsonl", Generation: 4}
+	closed := store.Binding{Bot: 99, Chat: -10, Thread: 22, Workspace: filepath.Join(t.TempDir(), "missing", "workspace"), Session: filepath.Join(t.TempDir(), "closed.jsonl"), Generation: 4}
+	if err := os.WriteFile(closed.Session, []byte("native history"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err = db.Save(closed); err != nil {
 		t.Fatal(err)
 	}
@@ -512,18 +515,24 @@ func TestBindingDeleteCallbackDeletesClosedBinding(t *testing.T) {
 		t.Fatalf("selecting the entry removed the binding before confirmation: %v", err)
 	}
 	_, confirmationRows := pickerView(t, fake)
-	if len(confirmationRows) != 1 || len(confirmationRows[0]) != 2 || confirmationRows[0][0]["text"] != "Delete" || confirmationRows[0][0]["style"] != "danger" || confirmationRows[0][1]["text"] != "Cancel" || confirmationRows[0][1]["style"] != nil {
+	if len(confirmationRows) != 1 || len(confirmationRows[0]) != 3 || confirmationRows[0][0]["text"] != "Binding" || confirmationRows[0][0]["style"] != "danger" || confirmationRows[0][1]["text"] != "Binding+Session" || confirmationRows[0][1]["style"] != "danger" || confirmationRows[0][2]["text"] != "Cancel" || confirmationRows[0][2]["style"] != nil {
 		t.Fatalf("delete confirmation buttons = %+v", confirmationRows)
 	}
 	deleteMessageID := confirmation.messageID
-	w.callback(&telegram.CallbackQuery{ID: "confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: deleteMessageID}, Data: bindingButton(t, fake, "Delete")})
+	w.callback(&telegram.CallbackQuery{ID: "confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: deleteMessageID}, Data: bindingButton(t, fake, "Binding")})
 	if _, err = db.Binding(closed.Bot, closed.Chat, closed.Thread); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("deleted binding lookup error = %v", err)
 	}
 	if len(w.confirms) != 0 {
 		t.Fatalf("delete left confirmations: %+v", w.confirms)
 	}
-	assertFinishedMenu(t, fake, int(deleteMessageID), "Confirmed")
+	assertFinishedMenu(t, fake, int(deleteMessageID), "Selected: Binding")
+	if data, err := os.ReadFile(closed.Session); err != nil || string(data) != "native history" {
+		t.Fatalf("Binding changed native history: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Dir(closed.Workspace)); !os.IsNotExist(err) {
+		t.Fatalf("Binding created a missing workspace component: %v", err)
+	}
 }
 
 func TestBindingsOldKeepsOrderAfterDeletingClosedEntry(t *testing.T) {
@@ -547,7 +556,7 @@ func TestBindingsOldKeepsOrderAfterDeletingClosedEntry(t *testing.T) {
 	listID := int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "choose-old", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listID}, Data: bindingEntryButton(t, fake, 22)})
 	confirmID := onlyBindingConfirmation(t, w).messageID
-	w.callback(&telegram.CallbackQuery{ID: "delete-old", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirmID}, Data: bindingButton(t, fake, "Delete")})
+	w.callback(&telegram.CallbackQuery{ID: "delete-old", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirmID}, Data: bindingButton(t, fake, "Binding")})
 	if _, err := db.Binding(99, -10, 22); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("old binding still present: %v", err)
 	}
@@ -597,7 +606,7 @@ func TestBindingDeletionRefreshesSourcePage(t *testing.T) {
 			}
 			data := bindingEntryButton(t, fake, tc.target)
 			w.callback(&telegram.CallbackQuery{ID: "select-binding", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listID}, Data: data})
-			click(onlyBindingConfirmation(t, w).messageID, "Delete")
+			click(onlyBindingConfirmation(t, w).messageID, "Binding")
 			text, rows := pickerView(t, fake)
 			header := "Saved bindings"
 			if tc.old {
@@ -647,7 +656,7 @@ func TestBindingDeleteTitleTargetsMatchingEntry(t *testing.T) {
 	if _, err := db.Binding(second.Bot, second.Chat, second.Thread); err != nil {
 		t.Fatalf("selecting the long entry deleted it before confirmation: %v", err)
 	}
-	w.callback(&telegram.CallbackQuery{ID: "delete-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirm.messageID}, Data: bindingButton(t, fake, "Delete")})
+	w.callback(&telegram.CallbackQuery{ID: "delete-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirm.messageID}, Data: bindingButton(t, fake, "Binding")})
 	if _, err := db.Binding(second.Bot, second.Chat, second.Thread); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("second binding still present: %v", err)
 	}
@@ -677,7 +686,7 @@ func TestBindingDeleteCallbackRejectsStaleGeneration(t *testing.T) {
 	if err = db.Save(replacement); err != nil {
 		t.Fatal(err)
 	}
-	w.callback(&telegram.CallbackQuery{ID: "confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirmation.messageID}, Data: bindingButton(t, fake, "Delete")})
+	w.callback(&telegram.CallbackQuery{ID: "confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: confirmation.messageID}, Data: bindingButton(t, fake, "Binding")})
 	got, err := db.Binding(old.Bot, old.Chat, old.Thread)
 	if err != nil || got.Generation != replacement.Generation || got.Workspace != replacement.Workspace {
 		t.Fatalf("stale delete changed binding: %+v, %v", got, err)
@@ -715,7 +724,7 @@ func TestBindingDeleteRejectsStaleMutationEpoch(t *testing.T) {
 	aListMessageID := int64(fake.messageCount())
 	a.callback(&telegram.CallbackQuery{ID: "a-list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: aListMessageID}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	aDelete := onlyBindingConfirmation(t, a)
-	aDeleteData := bindingButton(t, fake, "Delete")
+	aDeleteData := bindingButton(t, fake, "Binding")
 	staleList := newWorker(target{chat: -10, thread: 44})
 	staleList.showBindingsPage(confirmation{bindings: entries, user: 7, epoch: b.bindingsEpoch.Load()}, 0, 0)
 	staleListMessageID := int64(fake.messageCount())
@@ -725,7 +734,7 @@ func TestBindingDeleteRejectsStaleMutationEpoch(t *testing.T) {
 	cListMessageID := int64(fake.messageCount())
 	c.callback(&telegram.CallbackQuery{ID: "c-list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: cListMessageID}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	cDelete := onlyBindingConfirmation(t, c)
-	c.callback(&telegram.CallbackQuery{ID: "c-confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: cDelete.messageID}, Data: bindingButton(t, fake, "Delete")})
+	c.callback(&telegram.CallbackQuery{ID: "c-confirm-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: cDelete.messageID}, Data: bindingButton(t, fake, "Binding")})
 	if got := b.bindingsEpoch.Load(); got != 1 {
 		t.Fatalf("binding mutation epoch = %d, want 1", got)
 	}
@@ -772,7 +781,11 @@ func TestBindingDeleteCancelKeepsBinding(t *testing.T) {
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &closed}}, user: 7}, 0, 0)
 	w.callback(&telegram.CallbackQuery{ID: "list-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: int64(fake.messageCount())}, Data: bindingEntryButton(t, fake, closed.Thread)})
 	c := onlyBindingConfirmation(t, w)
-	approve := bindingButton(t, fake, "Delete")
+	approve := bindingButton(t, fake, "Binding")
+	w.callback(&telegram.CallbackQuery{ID: "unauthorized-delete", From: telegram.User{ID: 8}, Message: &telegram.Message{MessageID: c.messageID}, Data: approve})
+	if saved, err := db.Binding(closed.Bot, closed.Chat, closed.Thread); err != nil || !sameBindingIdentity(saved, closed) || len(w.confirms) != 1 {
+		t.Fatalf("unauthorized Binding callback changed binding or consumed owner menu: %+v, %v", saved, err)
+	}
 	w.callback(&telegram.CallbackQuery{ID: "cancel-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Cancel")})
 	text := assertFinishedMenu(t, fake, int(c.messageID), "Cancel")
 	if !strings.Contains(text, "Topic 22") {

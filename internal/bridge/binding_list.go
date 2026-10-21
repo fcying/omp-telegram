@@ -589,6 +589,12 @@ func (w *worker) forgetBinding(request bindingForgetRequest) {
 		request.reply(bindingForgetResult{status: i18n.Msg.FailedCloseSavedBinding})
 		return
 	}
+	if request.session {
+		binding := w.binding
+		request.reply(bindingForgetResult{ok: true, binding: &binding})
+		w.cancel()
+		return
+	}
 	ok, err := w.b.db.DeleteClosedBinding(w.b.bot.ID, w.key.chat, w.key.thread, request.generation)
 	if err != nil {
 		w.b.storeLog.Error("binding deletion failed", "event", "binding_delete_failed", "reason", "transaction", "error_kind", "persistence")
@@ -606,15 +612,18 @@ func (w *worker) forgetBinding(request bindingForgetRequest) {
 
 func (w *worker) forgetFinished(result bindingForgetResult) {
 	w.forgetPending = false
-	user := w.forgetUser
-	oldestFirst := w.forgetOld
-	page := w.forgetPage
-	w.forgetUser = 0
-	w.forgetOld = false
-	w.forgetPage = 0
+	c := w.forgetConfirmation
+	w.forgetConfirmation = nil
+	if c == nil || c.generation != w.conversationGeneration() || w.ctx.Err() != nil {
+		return
+	}
 	if result.ok {
+		if result.binding != nil {
+			w.beginBindingSessionDelete(*c, *result.binding)
+			return
+		}
 		w.say(w.tr(i18n.Msg.SavedBindingDeletedWorkspaceNativeOMPSessionHistoryPreserved))
-		w.showBindings(user, oldestFirst, page)
+		w.showBindings(c.user, c.bindingsOld, c.page)
 		return
 	}
 	w.say(w.tr(result.status))
@@ -650,37 +659,45 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 	}
 	if c.action == "binding_delete" {
 		delete(w.confirms, token)
-		w.finishConfirmation(c, n)
-		if n != 0 {
+		if n == len(c.options)-1 {
+			w.finishConfirmation(c, n)
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Canceled))
 			return callbackDone
 		}
+		w.finishMenu(c.messageID, w.tr(i18n.Msg.Selected, c.options[n])+"\n"+c.uiTitle)
 		if w.b.migrationBindingLocked(c.deleteBot, c.deleteChat, c.deleteThread) {
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.MigrationUnresolved))
 			w.say(w.tr(i18n.Msg.MigrationUnresolvedCannotDeleteOtherBinding))
 			return callbackDone
 		}
 		if c.deleteRunning {
-			if w.forgetPending || w.b.forgetRequests == nil {
+			if w.forgetPending || w.deleteCancel != nil || w.b.forgetRequests == nil {
 				_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.DeleteUnavailable))
 				w.say(w.tr(i18n.Msg.AnotherBindingDeletionPendingTryAgainLater))
 				return callbackDone
 			}
 			w.forgetPending = true
-			w.forgetUser = c.user
-			w.forgetOld = c.bindingsOld
-			w.forgetPage = c.page
+			w.forgetConfirmation = &c
 			select {
-			case w.b.forgetRequests <- bindingForgetRequest{key: target{chat: c.deleteChat, thread: c.deleteThread}, generation: c.deleteGeneration, source: w}:
+			case w.b.forgetRequests <- bindingForgetRequest{key: target{chat: c.deleteChat, thread: c.deleteThread}, generation: c.deleteGeneration, session: n == 1, source: w}:
 				_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Deleting))
 			default:
 				w.forgetPending = false
-				w.forgetUser = 0
-				w.forgetOld = false
-				w.forgetPage = 0
+				w.forgetConfirmation = nil
 				_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.DeleteUnavailable))
 				w.say(w.tr(i18n.Msg.BindingDeletionUnavailableTryAgainLater))
 			}
+			return callbackDone
+		}
+		if n == 1 {
+			binding, err := w.b.db.Binding(c.deleteBot, c.deleteChat, c.deleteThread)
+			if err != nil || binding.Generation != c.deleteGeneration || binding.Running {
+				_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.BindingChanged))
+				w.say(w.tr(i18n.Msg.SavedBindingChangedUseBindingsRefresh))
+				return callbackDone
+			}
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Deleting))
+			w.beginBindingSessionDelete(c, binding)
 			return callbackDone
 		}
 		ok, err := w.b.db.DeleteClosedBinding(c.deleteBot, c.deleteChat, c.deleteThread, c.deleteGeneration)
@@ -742,12 +759,15 @@ func (w *worker) bindingCallback(ctx context.Context, q *telegram.CallbackQuery,
 			return callbackDone
 		}
 		w.clearKeyboard(c.messageID)
-		prompt := w.tr(i18n.Msg.ForgetSavedBindingWorkspaceNativeOMPSessionHistoryWill, bindingConversationTitle(w.b.language(), entry))
+		prompt := w.tr(i18n.Msg.ChooseBindingDeletion, bindingConversationTitle(w.b.language(), entry))
 		if entry.Binding.Running {
-			prompt = w.tr(i18n.Msg.CloseForgetIdleBindingActiveTasksPendingWorkCannot, bindingConversationTitle(w.b.language(), entry))
+			prompt = w.tr(i18n.Msg.CloseChooseBindingDeletion, bindingConversationTitle(w.b.language(), entry))
 		}
 		prompt += fmt.Sprintf("\n\n%s · %s\n%s: %s", bindingSessionName(w.b.language(), entry, 0), bindingEntryStatus(w.b.language(), entry), w.tr(i18n.Msg.Workspace), bindingWorkspace(entry))
-		w.confirm(confirmation{action: "binding_delete", method: "confirm", user: c.user, epoch: c.epoch, bindingsOld: c.bindingsOld, page: c.page, options: []string{"Delete", "Cancel"}, deleteBot: entry.Binding.Bot, deleteChat: entry.Binding.Chat, deleteThread: entry.Binding.Thread, deleteGeneration: entry.Binding.Generation, deleteRunning: entry.Binding.Running}, prompt, []string{w.tr(i18n.Msg.Delete), w.tr(i18n.Msg.Cancel)})
+		if id := bindingSessionID(entry); id != "" {
+			prompt += "\n" + w.tr(i18n.Msg.ID, id)
+		}
+		w.confirm(confirmation{action: "binding_delete", method: "confirm", user: c.user, epoch: c.epoch, bindingsOld: c.bindingsOld, page: c.page, ompArgs: w.b.selectedArgsSnapshot(), options: []string{"Binding", "Binding+Session", "Cancel"}, deleteBot: entry.Binding.Bot, deleteChat: entry.Binding.Chat, deleteThread: entry.Binding.Thread, deleteGeneration: entry.Binding.Generation, deleteRunning: entry.Binding.Running}, prompt, []string{w.tr(i18n.Msg.BindingOnly), w.tr(i18n.Msg.BindingAndSession), w.tr(i18n.Msg.Cancel)})
 	}
 	return callbackDone
 }

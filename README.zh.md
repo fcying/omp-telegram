@@ -212,7 +212,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/queue` | 查看运行及排队任务. Cancel 按钮只删除选中的等待任务, 不中止当前任务. |
 | `/followup <message>` | 明确排队一个独立任务, 不会作为 steer 发送给当前任务. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
-| `/bindings` | 列出当前 chat 保存的对话/session binding, 显示名称, 话题, 逻辑会话图标 (`📖` 开启 / `📕` 关闭 / `⏳` 待启动或恢复), 时间和 home 缩写后的 workspace. 时间仅显示一个统一单位 (`m/h/d/w/mo/y`), 不足一分钟显示 `now`, 未知显示 `-`. 图标不表示 OMP 进程是否运行. 点击可删除条目后再确认删除; 保留 workspace 文件和 OMP history. |
+| `/bindings` | 列出当前 chat 保存的对话/session binding, 显示名称, 话题, 逻辑会话图标 (`📖` 开启 / `📕` 关闭 / `⏳` 待启动或恢复), 时间和 home 缩写后的 workspace. 时间仅显示一个统一单位 (`m/h/d/w/mo/y`), 不足一分钟显示 `now`, 未知显示 `-`. 图标不表示 OMP 进程是否运行. 点击可删除条目后, 选择 `Binding` 只删除绑定并保留本地会话历史, `Binding+Session` 删除存在且验证通过的原生会话及 artifacts, 或清理已确认缺失文件的 Bridge 引用, `Cancel` 取消. 工作目录文件始终保留. |
 | `/bindings old` | 清理优先: Closed 在前, Open 其次, 各组内最久未使用优先; Pending 固定最后. Open 包含运行时已释放的会话. 未知时间排在同组已知时间之后. |
 | `/resume` | 从当前 workspace 选择已保存的原生 OMP session; 可 Pin/Unpin, 或经确认后 Delete. |
 | `/resume <session ID>` | 恢复指定的原生 OMP session; OMP 可能恢复该 session 记录的工作目录. |
@@ -234,6 +234,16 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/autoresearch [goal\|off\|clear]` | 当前 OMP 公布支持时控制原生 autoresearch. 安全边界和停止行为见下文. |
 | `/lang [en\|zh]` | 查看全局 Bridge 界面语言, 或将所有私聊和 topic 统一切换为英文或中文. |
 | `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
+
+`Binding+Session` 仅在会话文件存在且身份验证通过时调用 OMP 原生删除. 删除确认成功后, 清理本 bot 下同 ID 的全部绑定, 包括其他 Topic 的 Closed 绑定或已释放运行时的绑定. 文件已确认不存在时走下述仅清理引用路径, 不启动 OMP. 能否删除取决于 Session 的实际占用状态, 不取决于 Binding 数量或逻辑 Open 状态. Runtime 已 Released 的 Open Binding 不阻止删除; OMP Runtime 正在使用, 有活跃任务, 正在启动或迁移时拒绝. `Binding` 只删除选中的绑定, 不影响其他 Topic 的绑定或原生 Session.
+
+绑定的原生 Session 文件已不存在时, `Binding+Session` 会在清理相关绑定和 Pin 前重新确认文件仍不存在. 文件已恢复, 复查失败, 或本 bot 下同 ID 的任一绑定记录不同/空路径时, 均保留全部引用. 数据库清理失败会单独提示, 不声称执行过原生删除. 操作未取消时, 各种结果均返回绑定列表. 此路径不启动 OMP, 也不重建工作目录.
+
+发起对话关闭或替换时, 等待中的目标关闭回复失效, 缺失文件引用清理取消. 取消和超时范围包含数据库连接等待及清理事务. 目标可能已经变为 Closed; 已确认的原生删除即使随后取消, 仍需结算引用. Linux 上已有工作目录的祖先只需目录搜索权限, 不额外要求读取目录内容的权限.
+
+优雅停机仍会在关闭数据库前结算已确认原生删除的引用; 清理失败写入日志. 停机期间不发送删除提示或刷新选择器. 原生删除与 SQLite 清理在崩溃或强制终止时并非原子操作.
+
+Session 引用清理仅包括本 bot 下同 ID 的 Binding, 这些 Binding 当前记录路径对应的 Bridge history 行, 以及本 bot 下同 ID 的 Pin. 不做全库无关/孤立 history 清扫, 不清理其他 bot 的引用, 也不清空项目的全部历史. 缺失文件路径不查找或删除残留的 OMP artifacts. 工作目录文件保留.
 
 Model 或 thinking 修改成功后, 仍可能因无法读取配置等级而显示 `Thinking: n/a`. 这不会撤销修改; 如果必须关闭进程, 回执会说明 session 已保留.
 

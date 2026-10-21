@@ -88,7 +88,7 @@ func TestBindingDeleteOpenFromOtherTopic(t *testing.T) {
 	data = bindingEntryButton(t, fake, 22)
 	oldListID, oldData := listID, data
 	sendBindingCallback(t, db, send, 3, listID, data)
-	confirmID, data := waitBindingAction(t, fake, int(listID), "Close and forget idle binding for Topic 22?", "Delete")
+	confirmID, data := waitBindingAction(t, fake, int(listID), "Topic 22?", "Binding")
 	sendBindingCallback(t, db, send, 4, confirmID, data)
 	waitFor(t, func() bool { _, err := db.Binding(99, -10, 22); return errors.Is(err, sql.ErrNoRows) })
 	waitFor(t, func() bool { return fake.has(11, "Saved binding deleted.") })
@@ -115,7 +115,7 @@ func TestBindingDeleteOpenFromOtherTopic(t *testing.T) {
 		t.Fatalf("stale menu changed the remaining binding: %v", err)
 	}
 	sendBindingCallback(t, db, send, 6, listID, data)
-	confirmID, data = waitBindingAction(t, fake, int(listID), "Forget saved binding for Topic 33?", "Delete")
+	confirmID, data = waitBindingAction(t, fake, int(listID), "Topic 33?", "Binding")
 	sendBindingCallback(t, db, send, 7, confirmID, data)
 	waitFor(t, func() bool { _, err := db.Binding(99, -10, 33); return errors.Is(err, sql.ErrNoRows) })
 	waitFor(t, func() bool { return fake.has(11, "No saved conversation bindings.") })
@@ -144,7 +144,7 @@ func TestBindingForgetDoesNotDependOnWorkspaceCoordination(t *testing.T) {
 			send(update(3, 11, "/bindings"))
 			listID, data := waitBindingAction(t, fake, before, "Saved bindings", "")
 			sendBindingCallback(t, db, send, 4, listID, data)
-			confirmID, data := waitBindingAction(t, fake, int(listID), "binding for Topic 22?", "Delete")
+			confirmID, data := waitBindingAction(t, fake, int(listID), "Topic 22?", "Binding")
 			sendBindingCallback(t, db, send, 5, confirmID, data)
 			waitFor(t, func() bool { _, err := db.Binding(99, -10, 22); return errors.Is(err, sql.ErrNoRows) })
 			waitFor(t, func() bool { return fake.has(11, "No saved conversation bindings.") })
@@ -176,7 +176,7 @@ func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 		t.Fatalf("open binding last page = %q, rows = %+v", text, rows)
 	}
 	sendBindingCallback(t, db, send, 4, listID, rows[0][0]["callback_data"].(string))
-	confirmID, data := waitBindingAction(t, fake, int(listID), "Close and forget idle binding for Topic 22?", "Delete")
+	confirmID, data := waitBindingAction(t, fake, int(listID), "Topic 22?", "Binding")
 	sendBindingCallback(t, db, send, 5, confirmID, data)
 	waitFor(t, func() bool { _, err := db.Binding(99, -10, 22); return errors.Is(err, sql.ErrNoRows) })
 	waitFor(t, func() bool { return fake.has(11, "Saved bindings (oldest first)\nPage 1/1") })
@@ -219,7 +219,7 @@ func TestBindingDeleteRestoredOpenWithoutRuntime(t *testing.T) {
 		sendBindingCallback(t, d.db, func(update telegram.Update) { d.fake.updates <- update }, d.nextID, messageID, data)
 	}
 	click(listID, data)
-	confirmID, data := waitBindingAction(t, d.fake, int(listID), "Close and forget idle binding for Topic 22?", "Delete")
+	confirmID, data := waitBindingAction(t, d.fake, int(listID), "Topic 22?", "Binding")
 	click(confirmID, data)
 	waitFor(t, func() bool { _, err := d.db.Binding(99, d.chat, 22); return errors.Is(err, sql.ErrNoRows) })
 	waitFor(t, func() bool { return d.fake.has(11, "Saved binding deleted.") })
@@ -255,7 +255,7 @@ func TestBindingDeleteOpenRejectsActiveTask(t *testing.T) {
 	send(update(3, 11, "/bindings"))
 	listID, data := waitBindingAction(t, fake, before, "Saved bindings", "")
 	sendBindingCallback(t, db, send, 4, listID, data)
-	confirmID, data := waitBindingAction(t, fake, int(listID), "Close and forget idle binding for Topic 22?", "Delete")
+	confirmID, data := waitBindingAction(t, fake, int(listID), "Topic 22?", "Binding")
 	sendBindingCallback(t, db, send, 5, confirmID, data)
 	waitFor(t, func() bool { return fake.has(11, "Binding is busy.") })
 	bound, err := db.Binding(99, -10, 22)
@@ -321,6 +321,8 @@ func TestBindingForgetResultUsesCurrentGlobalLanguage(t *testing.T) {
 			defer db.Close()
 			source, _ := newBindingTestWorker(t, db)
 			source.forgetResults = make(chan bindingForgetResult, 1)
+			source.forgetPending = true
+			source.forgetConfirmation = &confirmation{user: 7}
 			target := &worker{b: source.b, ctx: source.ctx, migration: &store.Migration{ID: "locked"}}
 			if language == "zh" {
 				source.b.setLanguage("en")

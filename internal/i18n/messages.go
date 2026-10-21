@@ -159,7 +159,7 @@ var Msg = struct {
 	ClearAutoresearch                                                         Message
 	ClearAutoresearchNativeClearCanHardResetTrackedFiles                      Message
 	Close                                                                     Message
-	CloseForgetIdleBindingActiveTasksPendingWorkCannot                        Message
+	CloseChooseBindingDeletion                                                Message
 	CloseOmpKeepWorkspaceSession                                              Message
 	Closed                                                                    Message
 	CommandsUnknownUnsupportedSourceNotSupportedBridgeNoCommand               Message
@@ -216,7 +216,7 @@ var Msg = struct {
 	FailedSendConfirmationOperationCanceled                                   Message
 	FailedStartOmpStartupOutcomeUncertainUseCloseBefore                       Message
 	FailedUpdatePinnedSessions                                                Message
-	ForgetSavedBindingWorkspaceNativeOMPSessionHistoryWill                    Message
+	ChooseBindingDeletion                                                     Message
 	FormatLine                                                                Message
 	HandoffCanceledWithoutResultInstanceClosedWillResumeOn                    Message
 	HandoffCompleted                                                          Message
@@ -298,6 +298,15 @@ var Msg = struct {
 	SQLiteCheckUnavailable                                                    Message
 	SQLiteQuickCheckFailed                                                    Message
 	SavedBindingDeletedWorkspaceNativeOMPSessionHistoryPreserved              Message
+	BindingOnly                                                               Message
+	BindingAndSession                                                         Message
+	SavedBindingAndSessionDeleted                                             Message
+	BindingSessionDeleteFailed                                                Message
+	BindingSessionMissingReferencesCleared                                    Message
+	BindingSessionMissingPathConflict                                         Message
+	BindingSessionMissingUnconfirmed                                          Message
+	BindingSessionMissingCleanupFailed                                        Message
+	BindingSessionIdentityUnavailable                                         Message
 	SavedBindingsPage                                                         Message
 	SavedBindingsOldestFirstPage                                              Message
 	SavedOmpSessions                                                          Message
@@ -639,10 +648,10 @@ var Msg = struct {
 	ChooseThinkingLevelSession:                                   message("Choose the thinking level for this session", "选择当前会话的思考级别"),
 	ClearAutoresearch:                                            message("Clear autoresearch", "清理自动研究"),
 	ClearAutoresearchNativeClearCanHardResetTrackedFiles:         message("Clear autoresearch? Native clear can hard-reset tracked files and delete untracked files, unless --keep-tree is supplied. This cannot be undone by the bridge.", "清理自动研究? 除非指定 --keep-tree, 原生清理可能硬重置已跟踪文件并删除未跟踪文件. 桥接器无法撤销此操作."),
-	Close: message("Close", "关闭"),
-	CloseForgetIdleBindingActiveTasksPendingWorkCannot: message("Close and forget idle binding for %s?\nActive tasks and pending work cannot be deleted. Workspace and native OMP session history will NOT be deleted.", "关闭并忘记 %s 的空闲绑定?\n无法删除活动任务及待处理工作. 工作目录和原生 OMP 会话历史不会被删除."),
-	CloseOmpKeepWorkspaceSession:                       message("Close omp, keep workspace and session", "关闭 omp, 保留工作目录和会话"),
-	Closed:                                             message("Closed", "已关闭"),
+	Close:                        message("Close", "关闭"),
+	CloseChooseBindingDeletion:   message("Close and delete idle binding for %s?\nActive tasks and pending work cannot be deleted.\nBinding: remove only the binding; keep local session history.\nBinding+Session: permanently delete the associated OMP session and artifacts.\nDeleting the Session also removes other topics' bindings to the same Session.\nClosed/Released references do not block deletion. An in-use OMP runtime, active task, startup or migration does.\nWorkspace files will NOT be deleted.", "关闭并删除 %s 的空闲绑定?\n无法删除活动任务及待处理工作.\nBinding: 只删除绑定, 保留本地会话历史.\nBinding+Session: 永久删除关联的 OMP 会话及 artifacts.\n删除 Session 会同时清理其他 Topic 对同一 Session 的绑定.\nClosed/Released 引用不阻止删除; OMP Runtime 正在使用, 有活跃任务, 正在启动或迁移时拒绝.\n不会删除工作目录文件."),
+	CloseOmpKeepWorkspaceSession: message("Close omp, keep workspace and session", "关闭 omp, 保留工作目录和会话"),
+	Closed:                       message("Closed", "已关闭"),
 	CommandsUnknownUnsupportedSourceNotSupportedBridgeNoCommand: message("Commands with an unknown or unsupported source are not supported by the bridge. No command was submitted.", "桥接器不支持来源未知或不受支持的命令. 未提交命令."),
 	CompactContextWhileIdle:    message("Compact context while idle", "空闲时压缩上下文"),
 	CompactingContext:          message("Compacting context...", "正在压缩上下文..."),
@@ -677,33 +686,33 @@ var Msg = struct {
 	FailedCheckSessionStateNoSessionDeleted: message("Failed to check the session state. No session was deleted.", "检查会话状态失败. 未删除任何会话."),
 	FailedCloseSavedBinding:                 message("Failed to close the saved binding.", "关闭已保存绑定失败."),
 	FailedCreateWorkingDirectory:            message("Failed to create the working directory.", "无法创建工作目录."),
-	FailedDeleteOmpSessionUseResumeCheckStatusBefore:       message("Failed to delete the omp session. Use /resume to check its status before trying again.", "删除 omp 会话失败. 请使用 /resume 检查状态后再重试."),
-	FailedDeleteSavedBinding:                               message("Failed to delete the saved binding.", "删除已保存绑定失败."),
-	FailedDisplaySavedBindingsUseBindingsTryAgain:          message("Failed to display saved bindings. Use /bindings to try again.", "显示已保存绑定失败. 请使用 /bindings 重试."),
-	FailedDisplayNativeSelectionMenuDialogCanceled:         message("Failed to display the native selection menu. The dialog was canceled.", "无法显示原生选择菜单. 对话框已取消."),
-	FailedDisplayQueueUseQueueTryAgain:                     message("Failed to display the queue. Use /queue to try again.", "显示队列失败. 请使用 /queue 重试."),
-	FailedDisplaySessionSelectionMenuUseTryAgain:           message("Failed to display the session selection menu. Use %s to try again.", "显示会话选择菜单失败. 请使用 %s 重试."),
-	FailedReadModelSettings:                                message("Failed to read model settings.", "读取模型设置失败."),
-	FailedReadPinnedSessions:                               message("Failed to read pinned sessions.", "读取置顶会话失败."),
-	FailedReadSavedBindings:                                message("Failed to read saved bindings.", "读取已保存绑定失败."),
-	FailedReadSessionBinding:                               message("Failed to read the session binding.", "无法读取会话绑定."),
-	FailedReadSessionState:                                 message("Failed to read the session state.", "无法读取会话状态."),
-	FailedReadSession:                                      message("Failed to read the session.", "无法读取会话."),
-	FailedResumeOmpStartupOutcomeUncertainUseCloseBefore:   message("Failed to resume omp. The startup outcome is uncertain; use /close before retrying.", "无法恢复 omp. 启动结果不确定; 请先使用 /close 再重试."),
-	FailedResumeReleasedOMPSessionNoPromptSubmitted:        message("Failed to resume the released OMP session. No prompt was submitted.", "无法恢复已释放的 OMP 会话. 未提交提示词."),
-	FailedSaveOMPArgumentPresetSelection:                   message("Failed to save the OMP argument preset selection.", "无法保存 OMP 参数预设选择."),
-	FailedSaveSessionBindingInstanceClosed:                 message("Failed to save the session binding. The instance has been closed.", "无法保存会话绑定. 实例已关闭."),
-	FailedSaveStartupIntent:                                message("Failed to save the startup intent: %s", "无法保存启动意图: %s"),
-	FailedSendConfirmationOperationCanceled:                message("Failed to send the confirmation. The operation was canceled.", "无法发送确认消息. 操作已取消."),
-	FailedStartOmpStartupOutcomeUncertainUseCloseBefore:    message("Failed to start omp. The startup outcome is uncertain; use /close before retrying.", "无法启动 omp. 启动结果不确定; 请先使用 /close 再重试."),
-	FailedUpdatePinnedSessions:                             message("Failed to update pinned sessions.", "更新置顶会话失败."),
-	ForgetSavedBindingWorkspaceNativeOMPSessionHistoryWill: message("Forget saved binding for %s?\nWorkspace and native OMP session history will NOT be deleted.", "忘记 %s 的已保存绑定?\n工作目录和原生 OMP 会话历史不会被删除."),
-	FormatLine: message("Format: %s\n", "格式: %s\n"),
-	HandoffCanceledWithoutResultInstanceClosedWillResumeOn: message("Handoff canceled without a result. The instance was closed and will resume on the next request.", "交接已取消且没有结果. 实例已关闭, 将在下次请求时恢复."),
-	HandoffCompleted: message("Handoff completed.", "交接已完成."),
+	FailedDeleteOmpSessionUseResumeCheckStatusBefore:        message("Failed to delete the omp session. Use /resume to check its status before trying again.", "删除 omp 会话失败. 请使用 /resume 检查状态后再重试."),
+	FailedDeleteSavedBinding:                                message("Failed to delete the saved binding.", "删除已保存绑定失败."),
+	FailedDisplaySavedBindingsUseBindingsTryAgain:           message("Failed to display saved bindings. Use /bindings to try again.", "显示已保存绑定失败. 请使用 /bindings 重试."),
+	FailedDisplayNativeSelectionMenuDialogCanceled:          message("Failed to display the native selection menu. The dialog was canceled.", "无法显示原生选择菜单. 对话框已取消."),
+	FailedDisplayQueueUseQueueTryAgain:                      message("Failed to display the queue. Use /queue to try again.", "显示队列失败. 请使用 /queue 重试."),
+	FailedDisplaySessionSelectionMenuUseTryAgain:            message("Failed to display the session selection menu. Use %s to try again.", "显示会话选择菜单失败. 请使用 %s 重试."),
+	FailedReadModelSettings:                                 message("Failed to read model settings.", "读取模型设置失败."),
+	FailedReadPinnedSessions:                                message("Failed to read pinned sessions.", "读取置顶会话失败."),
+	FailedReadSavedBindings:                                 message("Failed to read saved bindings.", "读取已保存绑定失败."),
+	FailedReadSessionBinding:                                message("Failed to read the session binding.", "无法读取会话绑定."),
+	FailedReadSessionState:                                  message("Failed to read the session state.", "无法读取会话状态."),
+	FailedReadSession:                                       message("Failed to read the session.", "无法读取会话."),
+	FailedResumeOmpStartupOutcomeUncertainUseCloseBefore:    message("Failed to resume omp. The startup outcome is uncertain; use /close before retrying.", "无法恢复 omp. 启动结果不确定; 请先使用 /close 再重试."),
+	FailedResumeReleasedOMPSessionNoPromptSubmitted:         message("Failed to resume the released OMP session. No prompt was submitted.", "无法恢复已释放的 OMP 会话. 未提交提示词."),
+	FailedSaveOMPArgumentPresetSelection:                    message("Failed to save the OMP argument preset selection.", "无法保存 OMP 参数预设选择."),
+	FailedSaveSessionBindingInstanceClosed:                  message("Failed to save the session binding. The instance has been closed.", "无法保存会话绑定. 实例已关闭."),
+	FailedSaveStartupIntent:                                 message("Failed to save the startup intent: %s", "无法保存启动意图: %s"),
+	FailedSendConfirmationOperationCanceled:                 message("Failed to send the confirmation. The operation was canceled.", "无法发送确认消息. 操作已取消."),
+	FailedStartOmpStartupOutcomeUncertainUseCloseBefore:     message("Failed to start omp. The startup outcome is uncertain; use /close before retrying.", "无法启动 omp. 启动结果不确定; 请先使用 /close 再重试."),
+	FailedUpdatePinnedSessions:                              message("Failed to update pinned sessions.", "更新置顶会话失败."),
+	ChooseBindingDeletion:                                   message("Delete saved binding for %s?\nBinding: remove only the binding; keep local session history.\nBinding+Session: permanently delete the associated OMP session and artifacts.\nDeleting the Session also removes other topics' bindings to the same Session.\nClosed/Released references do not block deletion. An in-use OMP runtime, active task, startup or migration does.\nWorkspace files will NOT be deleted.", "删除 %s 的已保存绑定?\nBinding: 只删除绑定, 保留本地会话历史.\nBinding+Session: 永久删除关联的 OMP 会话及 artifacts.\n删除 Session 会同时清理其他 Topic 对同一 Session 的绑定.\nClosed/Released 引用不阻止删除; OMP Runtime 正在使用, 有活跃任务, 正在启动或迁移时拒绝.\n不会删除工作目录文件."),
+	FormatLine:                                              message("Format: %s\n", "格式: %s\n"),
+	HandoffCanceledWithoutResultInstanceClosedWillResumeOn:  message("Handoff canceled without a result. The instance was closed and will resume on the next request.", "交接已取消且没有结果. 实例已关闭, 将在下次请求时恢复."),
+	HandoffCompleted:                                        message("Handoff completed.", "交接已完成."),
 	HandoffFailedOutcomeUncertainInstanceClosedWillResumeOn: message("Handoff failed or its outcome is uncertain. The instance was closed and will resume on the next request.", "交接失败或结果不确定. 实例已关闭, 将在下次请求时恢复."),
-	HandoffRequested: message("Handoff requested.", "已请求交接."),
-	HandoffResultCouldNotConfirmedInstanceClosedWillResume: message("Handoff result could not be confirmed. The instance was closed and will resume on the next request.", "无法确认交接结果. 实例已关闭, 将在下次请求时恢复."),
+	HandoffRequested:                                        message("Handoff requested.", "已请求交接."),
+	HandoffResultCouldNotConfirmedInstanceClosedWillResume:  message("Handoff result could not be confirmed. The instance was closed and will resume on the next request.", "无法确认交接结果. 实例已关闭, 将在下次请求时恢复."),
 	Inbox: message("Inbox", "收件箱"),
 	InputDialogsNotSupportedCanceledProvideInformationNormalMessage: message("Input dialogs are not supported and have been canceled. Provide the information in a normal message.", "不支持输入对话框, 已取消. 请通过普通消息提供信息."),
 	InvalidWorkingDirectory:                                          message("Invalid working directory.", "工作目录无效."),
@@ -779,15 +788,24 @@ var Msg = struct {
 	SQLiteCheckUnavailable:                       message("SQLite check unavailable", "SQLite 检查不可用"),
 	SQLiteQuickCheckFailed:                       message("SQLite quick check failed", "SQLite 快速检查失败"),
 	SavedBindingDeletedWorkspaceNativeOMPSessionHistoryPreserved: message("Saved binding deleted. Workspace and native OMP session history were preserved.", "已删除保存的绑定. 工作目录和原生 OMP 会话历史已保留."),
-	SavedBindingsPage:                 message("Saved bindings\nPage %d/%d", "已保存的绑定\n第 %d/%d 页"),
-	SavedBindingsOldestFirstPage:      message("Saved bindings (oldest first)\nPage %d/%d", "已保存的绑定 (最早使用优先)\n第 %d/%d 页"),
-	SavedOmpSessions:                  message("Saved omp sessions", "已保存的 omp 会话"),
-	SelectOMPArgumentPresetArgsNumber: message("Select OMP argument preset: /args [number]", "选择 OMP 参数预设: /args [编号]"),
-	ArgumentPresetSelected:            message("Selected OMP argument preset %d.", "已选择 OMP 参数预设 %d."),
-	NamedArgumentPresetSelected:       message("Selected OMP argument preset %d: %s.", "已选择 OMP 参数预设 %d: %s."),
-	Selected:                          message("Selected: %s", "已选择: %s"),
-	SelectedID:                        message("Selected: %s\nID: %s", "已选择: %s\nID: %s"),
-	SelectionNotChanged:               message("Selection was not changed.", "选择未更改."),
+	BindingOnly:                            message("Binding", "Binding"),
+	BindingAndSession:                      message("Binding+Session", "Binding+Session"),
+	SavedBindingAndSessionDeleted:          message("Saved binding and native OMP session deleted. Workspace files were preserved.", "已删除保存的绑定及原生 OMP 会话. 工作目录文件已保留."),
+	BindingSessionDeleteFailed:             message("Native session deletion or temporary directory cleanup failed or was not confirmed. The saved binding was retained and may now be Closed; the session may already have been deleted. No automatic retry was made.", "原生会话删除或临时目录清理失败, 或结果未确认. 已保留绑定, 它可能已变为 Closed; 会话可能已经被删除. 未自动重试."),
+	BindingSessionMissingReferencesCleared: message("The native Session file does not exist. Related bindings and pins were cleared. Workspace files were preserved.", "原生 Session 文件不存在. 已清理相关绑定和 Pin, 工作目录文件已保留."),
+	BindingSessionMissingPathConflict:      message("The selected Session file does not exist, but another binding for the same Session ID records a different or unknown file path. No bindings or pins were cleared. Workspace files were preserved.", "选中的 Session 文件不存在, 但同一 Session ID 的其他绑定记录了不同或未知的文件路径. 未清理任何绑定或 Pin, 工作目录文件已保留."),
+	BindingSessionMissingUnconfirmed:       message("The Session file is present again, or its absence could not be verified. No bindings or pins were cleared. No native deletion was attempted.", "Session 文件已重新出现, 或无法确认它仍不存在. 未清理任何绑定或 Pin, 未执行原生删除."),
+	BindingSessionMissingCleanupFailed:     message("The native Session file does not exist, but its related bindings and pins could not be cleared. No native deletion was attempted.", "原生 Session 文件不存在, 但相关绑定和 Pin 清理失败. 未执行原生删除."),
+	BindingSessionIdentityUnavailable:      message("The binding does not identify a deletable native session. Choose Binding to keep local history.", "绑定未提供可删除的原生会话身份. 可选择 Binding, 保留本地历史."),
+	SavedBindingsPage:                      message("Saved bindings\nPage %d/%d", "已保存的绑定\n第 %d/%d 页"),
+	SavedBindingsOldestFirstPage:           message("Saved bindings (oldest first)\nPage %d/%d", "已保存的绑定 (最早使用优先)\n第 %d/%d 页"),
+	SavedOmpSessions:                       message("Saved omp sessions", "已保存的 omp 会话"),
+	SelectOMPArgumentPresetArgsNumber:      message("Select OMP argument preset: /args [number]", "选择 OMP 参数预设: /args [编号]"),
+	ArgumentPresetSelected:                 message("Selected OMP argument preset %d.", "已选择 OMP 参数预设 %d."),
+	NamedArgumentPresetSelected:            message("Selected OMP argument preset %d: %s.", "已选择 OMP 参数预设 %d: %s."),
+	Selected:                               message("Selected: %s", "已选择: %s"),
+	SelectedID:                             message("Selected: %s\nID: %s", "已选择: %s\nID: %s"),
+	SelectionNotChanged:                    message("Selection was not changed.", "选择未更改."),
 	SendAutoresearchDirectlyUsingCurrentNativeExtensionCommandNot: message("Send /autoresearch directly using the current native extension command, not through a followup or attachment. No command was submitted.", "请直接使用当前原生扩展命令发送 /autoresearch, 不要通过后续消息或附件发送. 未提交命令."),
 	SessionHTMLExportFailed:                                               message("Session HTML export failed.", "会话 HTML 导出失败."),
 	SessionHTMLExportTimedOut:                                             message("Session HTML export timed out.", "会话 HTML 导出超时."),

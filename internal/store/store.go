@@ -51,6 +51,7 @@ var (
 	ErrOutboxStateTransition = errors.New("outbox state transition rejected")
 	ErrStaleBinding          = errors.New("stale binding")
 	ErrQuickCheckFailed      = errors.New("sqlite quick check failed")
+	ErrSessionPathConflict   = errors.New("session references use different file paths")
 )
 
 type Store struct {
@@ -766,25 +767,48 @@ func (s *Store) SetPinnedSession(bot, chat, thread int64, workspace, sessionID s
 
 // DeleteSessionReferences removes bridge metadata for a deleted native session.
 func (s *Store) DeleteSessionReferences(bot int64, sessionID string) (int64, error) {
+	// Confirmed native deletion must settle references despite caller cancellation.
+	return s.deleteSessionReferences(context.Background(), bot, sessionID, "")
+}
+
+// DeleteMissingSessionReferences requires every same-ID binding to use the missing file.
+// The caller must verify the file is absent and reserve the session against use.
+func (s *Store) DeleteMissingSessionReferences(ctx context.Context, bot int64, sessionID, sessionFile string) (int64, error) {
+	if !filepath.IsAbs(sessionFile) {
+		return 0, errors.New("invalid missing session file")
+	}
+	return s.deleteSessionReferences(ctx, bot, sessionID, sessionFile)
+}
+
+func (s *Store) deleteSessionReferences(ctx context.Context, bot int64, sessionID, missingFile string) (int64, error) {
 	if sessionID == "" {
 		return 0, errors.New("invalid session ID")
 	}
-	tx, err := s.DB.Begin()
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
 	var locked bool
-	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM migrations WHERE bot=? AND (session_id=? COLLATE NOCASE OR candidate_id=? COLLATE NOCASE))", bot, sessionID, sessionID).Scan(&locked); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM migrations WHERE bot=? AND (session_id=? COLLATE NOCASE OR candidate_id=? COLLATE NOCASE))", bot, sessionID, sessionID).Scan(&locked); err != nil {
 		return 0, err
 	}
 	if locked {
 		return 0, ErrMigrationLocked
 	}
-	if _, err = tx.Exec("DELETE FROM history WHERE bot=? AND session<>'' AND session IN (SELECT session FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND session<>'')", bot, bot, sessionID); err != nil {
+	if missingFile != "" {
+		var conflicting bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND session<>?)", bot, sessionID, missingFile).Scan(&conflicting); err != nil {
+			return 0, err
+		}
+		if conflicting {
+			return 0, ErrSessionPathConflict
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM history WHERE bot=? AND session<>'' AND session IN (SELECT session FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND session<>'')", bot, bot, sessionID); err != nil {
 		return 0, err
 	}
-	result, err := tx.Exec("DELETE FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID)
+	result, err := tx.ExecContext(ctx, "DELETE FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -792,7 +816,7 @@ func (s *Store) DeleteSessionReferences(bot int64, sessionID string) (int64, err
 	if err != nil {
 		return 0, err
 	}
-	if _, err = tx.Exec("DELETE FROM session_favorites WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID); err != nil {
+	if _, err = tx.ExecContext(ctx, "DELETE FROM session_favorites WHERE bot=? AND session_id=? COLLATE NOCASE", bot, sessionID); err != nil {
 		return 0, err
 	}
 	return count, tx.Commit()
