@@ -432,6 +432,14 @@ Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 
 
 日志输出到 stderr, 保存及轮转由进程管理器负责. 不记录 prompt, 模型回复, 凭据, 工具负载或 workspace/session 路径. Chat 和 thread ID 仍可能识别具体对话, 应限制日志访问权限.
 
+## Roadmap
+
+- [ ] **Undo/rewind 和 redo.** 等待上游 OMP 同时提供:
+  - 权威且可持久恢复的 `submissionId -> entryId` 回执, 将 Telegram 输入关联到已落盘的 OMP entry, 覆盖排队输入和重连. 跟踪 [#12991](https://github.com/can1357/oh-my-pi/issues/12991).
+  - 原生 rewind/redo 的 RPC, 或至少支持仅回退会话的原地 `navigateTree` RPC. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) 提供的是只读 tree 查询, 不能移动 session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) 增加原生 TUI 文件及会话 rewind/redo, 仍需通过 RPC 暴露给 bridge. Tree navigation 本身不恢复文件, bridge 不自行实现文件回退引擎.
+- [ ] **Stop 后复用 OMP 进程.** 等待上游提供取消完成屏障, 阻止旧回调继续派发工作及旧任务事件影响后续任务. 包含 `isSettled=true` 的空闲 `get_state` 快照不等于该屏障. 在此之前, 停止活动任务仍会退役进程并保留 session.
+- [ ] **原生排队 prompt 的精确取消.** 等待上游为每个被移除的 prompt 返回真实且关联原请求 ID 的取消终态. OMP 18.10.4 的 `remove_queued_message` 可能返回 `removed:true`, 被移除的 prompt 却随后收到 `prompt_result(status="completed")`. OMP 已有 `abort_and_restore_queue`, 缺的不是另一个原子清队列 RPC. 当前 `/queue` 只取消 bridge 尚未派发的任务; 中止未决原生 steer 时仍退役进程, 并将执行状态保留为 uncertain.
+
 ## 开发
 
 ```sh

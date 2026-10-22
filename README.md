@@ -432,6 +432,14 @@ Logs support `text` and `json`, selected by `logging.format`. `logging.level` se
 
 Logs are written to stderr; use your process manager for storage and rotation. Prompts, model replies, credentials, tool payloads, and workspace/session paths are not logged. Chat and thread IDs may still identify conversations, so restrict log access.
 
+## Roadmap
+
+- [ ] **Undo/rewind and redo.** Waiting for upstream OMP to provide both:
+  - Authoritative, durable `submissionId -> entryId` receipts linking Telegram inputs to persisted OMP entries, including queued input and reconnects. Track [#12991](https://github.com/can1357/oh-my-pi/issues/12991).
+  - An RPC operation for native rewind/redo, or at least in-place `navigateTree` for conversation-only undo. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) proposes read-only tree access and cannot move the session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) adds native TUI file-and-conversation rewind/redo but still needs RPC access for the bridge. Tree navigation alone does not restore files; the bridge will not implement its own file rollback engine.
+- [ ] **Reuse the OMP process after Stop.** Waiting for an upstream cancellation barrier that prevents stale callbacks from dispatching more work and old task events from affecting subsequent tasks. An idle `get_state` snapshot, including `isSettled=true`, is not that barrier. Until then, stopping an active task retires the process while preserving the session.
+- [ ] **Precise cancellation of native queued prompts.** Waiting for truthful, request-ID-correlated cancellation results for each removed prompt. In OMP 18.10.4, `remove_queued_message` can return `removed:true` while the removed prompt later receives `prompt_result(status="completed")`. `abort_and_restore_queue` already exists; another atomic queue-clearing RPC is not the missing capability. For now, `/queue` cancels only bridge-pending tasks; stopping unresolved native steering retires the process and leaves its execution status uncertain.
+
 ## Development
 
 ```sh
