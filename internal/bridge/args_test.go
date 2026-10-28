@@ -97,6 +97,286 @@ func persistTestSelection(t *testing.T, b *Bridge, index int) {
 	}
 }
 
+func requireArgsSelection(t *testing.T, b *Bridge, want int) {
+	t.Helper()
+	index, _ := b.argsPresetSelection()
+	var stored int
+	if err := b.db.DB.QueryRow("SELECT preset_index FROM omp_args_selection").Scan(&stored); err != nil || index != want || stored != want {
+		t.Fatalf("preset selection: memory=%d stored=%d error=%v, want %d", index, stored, err, want)
+	}
+}
+
+func requireArgsBinding(t *testing.T, w *worker, before store.Binding) {
+	t.Helper()
+	stored, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
+	if err != nil || !sameBindingIdentity(w.binding, before) || !sameBindingIdentity(stored, before) || w.sessionID != before.SessionID || !w.b.sessionInUse(before.SessionID) {
+		t.Fatalf("preset switch changed binding or claim: memory=%+v stored=%+v error=%v, before=%+v", w.binding, stored, err, before)
+	}
+}
+
+func TestIdleArgsSwitchResumesSameSessionAndLeavesPeersAlone(t *testing.T) {
+	for _, menu := range []bool{false, true} {
+		t.Run(fmt.Sprintf("menu=%t", menu), func(t *testing.T) {
+			tracePath := filepath.Join(t.TempDir(), "argv.jsonl")
+			t.Setenv("OMP_TELEGRAM_FIXTURE_ARGV_TRACE", tracePath)
+			w, f, command := setupWorkspaceWorker(t)
+			one, two := testConfigOverlay(t), testConfigOverlay(t)
+			configureTestArgPresets(w.b, [][]string{{"--config", one}, {"--config", two}}, strings.Repeat("2", 64), 1)
+			w.b.slots = make(chan struct{}, 3)
+			command("/new " + t.TempDir())
+			oldClient, before := w.client, w.binding
+			peer := newArgsTestPeer(t, w, 12)
+			if failure := peer.start(false, t.TempDir(), "", false); failure != "" {
+				t.Fatal(failure)
+			}
+			peerClient, peerBefore := peer.client, peer.binding
+			if menu {
+				command("/args")
+				_, rows := pickerView(t, f)
+				clickKeyboard(w, 7, rows[1][0]["callback_data"].(string))
+				drainControlOperations(t, w)
+			} else {
+				command("/args 2")
+			}
+			requireArgsSelection(t, w.b, 2)
+			requireArgsBinding(t, w, before)
+			requireArgsBinding(t, peer, peerBefore)
+			if w.client == nil || w.client == oldClient || w.runtime != runtimeConnected || strings.Join(w.launchArgs, "\x00") != strings.Join([]string{"--config", two}, "\x00") {
+				t.Fatalf("idle switch did not immediately reconnect with selected argv: %v", w.launchArgs)
+			}
+			select {
+			case <-oldClient.Done():
+			default:
+				t.Fatal("replaced process was not stopped")
+			}
+			if peer.client != peerClient || strings.Join(peer.launchArgs, "\x00") != strings.Join([]string{"--config", one}, "\x00") {
+				t.Fatal("switch mutated another conversation's connected process")
+			}
+			select {
+			case <-peerClient.Done():
+				t.Fatal("switch stopped another conversation's process")
+			default:
+			}
+			future := newArgsTestPeer(t, w, 13)
+			if failure := future.start(false, t.TempDir(), "", false); failure != "" {
+				t.Fatal(failure)
+			}
+			if strings.Join(future.launchArgs, "\x00") != strings.Join([]string{"--config", two}, "\x00") {
+				t.Fatalf("future conversation used stale argv: %v", future.launchArgs)
+			}
+			trace := readStringArgvTrace(t, tracePath)
+			if len(trace) != 4 || !strings.Contains(strings.Join(trace[2], "\x00"), before.Session) || !strings.Contains(strings.Join(trace[2], "\x00"), two) || !strings.Contains(strings.Join(trace[3], "\x00"), two) {
+				t.Fatalf("switch did not resume the same session followed by a new selected-preset launch: %v", trace)
+			}
+		})
+	}
+}
+
+func TestArgsMenuRejectsSelectionIfConversationBecameBusy(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_HOLD_RPC", "prompt")
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 4
+	configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("3", 64), 1)
+	persistTestSelection(t, w.b, 1)
+	command("/new " + t.TempDir())
+	command("/args")
+	_, rows := pickerView(t, f)
+	oldClient, before := w.client, w.binding
+	command("task after opening menu")
+	w.dispatch()
+	if !w.taskActive() {
+		t.Fatal("fixture did not become busy after opening the menu")
+	}
+	clickKeyboard(w, 7, rows[1][0]["callback_data"].(string))
+	drainControlOperations(t, w)
+	requireArgsSelection(t, w.b, 1)
+	requireArgsBinding(t, w, before)
+	if w.client != oldClient || !w.taskActive() {
+		t.Fatal("stale menu selection interrupted the running task")
+	}
+}
+
+func TestArgsSwitchRejectsNativePendingOrUnknownState(t *testing.T) {
+	for _, state := range []string{"pending", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			t.Setenv("OMP_TELEGRAM_FIXTURE_ABORT_STATE", state)
+			w, _, command := setupWorkspaceWorker(t)
+			configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("4", 64), 1)
+			persistTestSelection(t, w.b, 1)
+			command("/new " + t.TempDir())
+			oldClient, before := w.client, w.binding
+			command("/args 2")
+			requireArgsSelection(t, w.b, 1)
+			requireArgsBinding(t, w, before)
+			if w.client != oldClient || w.controlInProgress() {
+				t.Fatal("unsettled native state changed the process or retained control")
+			}
+			select {
+			case <-oldClient.Done():
+				t.Fatal("unsettled native process was stopped")
+			default:
+			}
+		})
+	}
+}
+
+func TestArgsSwitchStateQueryFailureKeepsProcessAndSelection(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("5", 64), 1)
+	persistTestSelection(t, w.b, 1)
+	command("/new " + t.TempDir())
+	oldClient, before := w.client, w.binding
+	w.handleArgsCommand("2", 7)
+	if !w.controlInProgress() {
+		t.Fatal("connected preset switch did not schedule an asynchronous state query")
+	}
+	result := waitOperation(t, w)
+	result.err = context.DeadlineExceeded
+	w.operationReturned(result)
+	drainControlOperations(t, w)
+	requireArgsSelection(t, w.b, 1)
+	requireArgsBinding(t, w, before)
+	if w.client != oldClient {
+		t.Fatal("failed native idle check replaced the process")
+	}
+	select {
+	case <-oldClient.Done():
+		t.Fatal("failed native idle check stopped the process")
+	default:
+	}
+}
+
+func TestArgsSwitchCancelledQueryCannotApplyLateResult(t *testing.T) {
+	for _, action := range []string{"stop", "close"} {
+		t.Run(action, func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("9", 64), 1)
+			persistTestSelection(t, w.b, 1)
+			command("/new " + t.TempDir())
+			oldClient, before := w.client, w.binding
+			w.handleArgsCommand("2", 7)
+			late := waitOperation(t, w)
+			if action == "stop" {
+				w.stop()
+			} else {
+				w.closeLogicalSession()
+			}
+			w.operationReturned(late)
+			drainControlOperations(t, w)
+			requireArgsSelection(t, w.b, 1)
+			if action == "stop" {
+				requireArgsBinding(t, w, before)
+				if w.client != oldClient {
+					t.Fatal("cancelled args query restarted the idle stopped session")
+				}
+			} else if w.client != nil || w.binding.Running {
+				t.Fatal("cancelled args query reopened the closed session")
+			}
+		})
+	}
+}
+
+func TestArgsSwitchResumeFailureRetainsBindingAndSavedSelection(t *testing.T) {
+	for _, released := range []bool{false, true} {
+		t.Run(fmt.Sprintf("released=%t", released), func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("6", 64), 1)
+			command("/new " + t.TempDir())
+			before := w.binding
+			if released {
+				w.releaseRuntime(true)
+			}
+			w.b.cfg.OMP = filepath.Join(t.TempDir(), "missing-omp")
+			command("/args 2")
+			requireArgsSelection(t, w.b, 2)
+			requireArgsBinding(t, w, before)
+			if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 {
+				t.Fatal("failed resume retained a runtime or leaked a process slot")
+			}
+			var reply string
+			if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&reply); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(strings.ToLower(reply), "fail") {
+				t.Fatalf("failed restore did not report failure: %q", reply)
+			}
+		})
+	}
+}
+
+func TestArgsDefaultModelFailureRetainsSessionAndReportsFailure(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("6", 64), 1)
+	command("/new " + t.TempDir())
+	before := w.binding
+	t.Setenv("OMP_TELEGRAM_FIXTURE_REJECT_RPC", "model_role")
+	command("/args 2")
+	requireArgsSelection(t, w.b, 2)
+	requireArgsBinding(t, w, before)
+	if w.client != nil || w.runtime != runtimeReleased || len(w.b.slots) != 0 {
+		t.Fatal("unconfirmed default model left a usable runtime or leaked a slot")
+	}
+	var reply string
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&reply))
+	if !strings.Contains(reply, "could not be applied") {
+		t.Fatalf("default model failure was reported as successful args application: %q", reply)
+	}
+}
+
+func TestArgsSwitchRequiresDurableSessionBeforeRetiringProcess(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("7", 64), 1)
+	persistTestSelection(t, w.b, 1)
+	command("/new " + t.TempDir())
+	oldClient, before := w.client, w.binding
+	if err := os.Remove(before.Session); err != nil {
+		t.Fatal(err)
+	}
+	command("/args 2")
+	requireArgsSelection(t, w.b, 1)
+	requireArgsBinding(t, w, before)
+	if w.client != oldClient {
+		t.Fatal("non-durable session was retired by a preset switch")
+	}
+	select {
+	case <-oldClient.Done():
+		t.Fatal("non-durable session process was stopped")
+	default:
+	}
+}
+
+func TestArgsSwitchMatchingLaunchArgumentsDoesNotRestart(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	configureTestArgPresets(w.b, [][]string{{"--profile", "same"}, {"--profile", "same"}}, strings.Repeat("8", 64), 1)
+	command("/new " + t.TempDir())
+	oldClient, before := w.client, w.binding
+	command("/args 2")
+	requireArgsSelection(t, w.b, 2)
+	requireArgsBinding(t, w, before)
+	if w.client != oldClient {
+		t.Fatal("matching launch arguments caused an unnecessary restart")
+	}
+}
+
+func TestArgsSwitchWithoutOpenBindingOnlySavesSelection(t *testing.T) {
+	for _, closed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("closed=%t", closed), func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("9", 64), 1)
+			if closed {
+				command("/new " + t.TempDir())
+				command("/close")
+			}
+			before := w.binding
+			command("/args 2")
+			requireArgsSelection(t, w.b, 2)
+			if w.client != nil || !sameBindingIdentity(w.binding, before) || len(w.b.slots) != 0 {
+				t.Fatal("preset selection opened or mutated an absent/closed session")
+			}
+		})
+	}
+}
+
 func TestArgsCommandMenuFallsBackToPresetNumbersAndPersistsSelection(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	first := "private-args-canary-one"
@@ -380,7 +660,7 @@ func TestArgsLabelsFallbackWarnsWithoutBlockingStartup(t *testing.T) {
 	}
 }
 
-func TestActiveArgsSwitchLeavesClientAndFutureStartUsesNewPreset(t *testing.T) {
+func TestBusyArgsSwitchKeepsSelectionAndActiveClient(t *testing.T) {
 	tracePath := filepath.Join(t.TempDir(), "argv.jsonl")
 	t.Setenv("OMP_TELEGRAM_FIXTURE_ARGV_TRACE", tracePath)
 	t.Setenv("OMP_TELEGRAM_FIXTURE_HOLD_RPC", "prompt")
@@ -388,28 +668,30 @@ func TestActiveArgsSwitchLeavesClientAndFutureStartUsesNewPreset(t *testing.T) {
 	w.b.cfg.QueueCapacity = 4
 	one, two := testConfigOverlay(t), testConfigOverlay(t)
 	configureTestArgPresets(w.b, [][]string{{"--config", one}, {"--config", two}}, strings.Repeat("1", 64), 1)
+	persistTestSelection(t, w.b, 1)
 	w.b.slots = make(chan struct{}, 2)
 	command("/new " + t.TempDir())
-	oldClient := w.client
+	oldClient, before := w.client, w.binding
 	command("active task")
 	w.dispatch()
 	if !w.taskActive() {
 		t.Fatal("fixture did not keep the original client busy")
 	}
 	command("/args 2")
-	if w.client != oldClient || strings.Join(w.launchArgs, "\x00") != strings.Join([]string{"--config", one}, "\x00") {
-		t.Fatal("global preset change restarted or mutated the active client's launch arguments")
+	requireArgsSelection(t, w.b, 1)
+	if w.client != oldClient || !w.taskActive() || !sameBindingIdentity(w.binding, before) || strings.Join(w.launchArgs, "\x00") != strings.Join([]string{"--config", one}, "\x00") {
+		t.Fatal("rejected preset switch interrupted or mutated the active session")
 	}
 	peer := newArgsTestPeer(t, w, 12)
 	if failure := peer.start(false, t.TempDir(), "", false); failure != "" {
 		t.Fatalf("future start failed: %s", failure)
 	}
-	if strings.Join(peer.launchArgs, "\x00") != strings.Join([]string{"--config", two}, "\x00") {
-		t.Fatalf("future client launch arguments = %v", peer.launchArgs)
+	if strings.Join(peer.launchArgs, "\x00") != strings.Join([]string{"--config", one}, "\x00") {
+		t.Fatalf("rejected switch changed future launch arguments: %v", peer.launchArgs)
 	}
 	trace := readStringArgvTrace(t, tracePath)
-	if len(trace) != 2 || !strings.Contains(strings.Join(trace[0], "\x00"), one) || !strings.Contains(strings.Join(trace[1], "\x00"), two) {
-		t.Fatalf("fixture launch argv does not show old then selected args: %v", trace)
+	if len(trace) != 2 || !strings.Contains(strings.Join(trace[0], "\x00"), one) || !strings.Contains(strings.Join(trace[1], "\x00"), one) {
+		t.Fatalf("rejected switch changed fixture launch argv: %v", trace)
 	}
 }
 
@@ -429,15 +711,9 @@ func TestConnectedModelQueryUsesLaunchPresetAfterSelectionChanges(t *testing.T) 
 		t.Fatal(err)
 	}
 	w.handle(incoming{id: 9000, msg: modelUpdate.Message})
-	u := update(9001, w.key.thread, "/args 2")
-	raw, err := json.Marshal(u)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w.b.db.Accept(9001, raw); err != nil {
-		t.Fatal(err)
-	}
-	w.handle(incoming{id: 9001, msg: u.Message})
+	peer := newArgsTestPeer(t, w, 12)
+	peer.handleArgsCommand("2", 7)
+	requireArgsSelection(t, w.b, 2)
 	drainControlOperations(t, w)
 	data, err := os.ReadFile(tracePath)
 	if err != nil {
@@ -461,28 +737,27 @@ func TestConnectedModelQueryUsesLaunchPresetAfterSelectionChanges(t *testing.T) 
 	}
 }
 
-func TestReleasedLazyResumeUsesCurrentArgsPreset(t *testing.T) {
+func TestReleasedArgsSwitchImmediatelyResumesSameSession(t *testing.T) {
 	tracePath := filepath.Join(t.TempDir(), "argv.jsonl")
 	t.Setenv("OMP_TELEGRAM_FIXTURE_ARGV_TRACE", tracePath)
 	w, _, command := setupWorkspaceWorker(t)
 	one, two := testConfigOverlay(t), testConfigOverlay(t)
 	configureTestArgPresets(w.b, [][]string{{"--config", one}, {"--config", two}}, strings.Repeat("3", 64), 1)
 	command("/new " + t.TempDir())
-	oldClient := w.client
+	oldClient, before := w.client, w.binding
 	w.releaseRuntime(true)
 	if w.launchArgs != nil || w.client != nil {
 		t.Fatal("release retained a connected-runtime argument snapshot")
 	}
 	command("/args 2")
-	if _, err := w.ensureRuntime(); err != nil {
-		t.Fatal(err)
-	}
-	if w.client == oldClient || strings.Join(w.launchArgs, "\x00") != strings.Join([]string{"--config", two}, "\x00") {
-		t.Fatalf("lazy resume did not use the current preset: client changed=%t, args=%v", w.client != oldClient, w.launchArgs)
+	requireArgsSelection(t, w.b, 2)
+	requireArgsBinding(t, w, before)
+	if w.client == nil || w.client == oldClient || w.runtime != runtimeConnected || strings.Join(w.launchArgs, "\x00") != strings.Join([]string{"--config", two}, "\x00") {
+		t.Fatalf("preset switch did not immediately resume: client changed=%t, args=%v", w.client != oldClient, w.launchArgs)
 	}
 	trace := readStringArgvTrace(t, tracePath)
-	if len(trace) != 2 || !strings.Contains(strings.Join(trace[1], "\x00"), two) {
-		t.Fatalf("lazy resume fixture argv = %v", trace)
+	if len(trace) != 2 || !strings.Contains(strings.Join(trace[1], "\x00"), two) || !strings.Contains(strings.Join(trace[1], "\x00"), before.Session) {
+		t.Fatalf("immediate resume fixture argv = %v", trace)
 	}
 }
 

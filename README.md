@@ -143,7 +143,9 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 
 Each `omp.args` array item is a complete shell-style argument string, parsed for quoting but passed directly without a shell. OMP's own configuration remains unchanged unless explicitly selected through these arguments or a user-requested command.
 
-`/args` selection applies across all conversations and survives service restarts. Changing the preset definitions or their expanded argument values resets selection to preset 1 on startup; changing display labels alone does not. Connected OMP processes keep their launch arguments.
+`/args` selection applies across all conversations and survives service restarts. Switching requires the current conversation to be idle with no queued work. It immediately restarts this conversation's OMP process with the selected arguments and restores the same saved session; an open released session is restored immediately too. Other connected processes keep their launch arguments until their next start. A closed or absent session is not opened. If the session cannot be safely restored from disk, switching is refused before stopping it. If startup fails after the selection was saved, the new preset and original binding remain saved, and the failure is reported without replaying work. Changing preset definitions or expanded argument values resets selection to preset 1 on service startup; changing display labels alone does not.
+
+After an `/args` restart, the bridge selects the new configuration's native `default` model role instead of retaining the model recorded in the old session. Role resolution and any associated thinking adjustment remain OMP's behavior; the bridge does not send extra thinking or fast-mode changes.
 
 To explicitly restrict OMP children, replace the existing `[omp.environment]` table with the following. Do not configure `allow` and `deny` together, even if one list is empty.
 
@@ -220,7 +222,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
 | `/status` | Show the current workspace, session with its full native ID, model, thinking, fast-mode, context, runtime, and queue status. |
-| `/args [preset-number]` | View configured preset labels and switch the OMP startup preset for future process starts across all conversations. Running OMP processes are unchanged. |
+| `/args [preset-number]` | View preset labels or, while idle, select a preset and immediately apply it to this conversation's open session. Other conversations use it on their next process start. |
 | `/doctor` | Run safe, asynchronous bridge diagnostics, including the current topic's delivery head/wait and global queue counts, without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
 | `/model` | Choose a configured OMP model role with buttons. |

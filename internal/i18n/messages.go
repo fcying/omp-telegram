@@ -313,6 +313,10 @@ var Msg = struct {
 	SelectOMPArgumentPresetArgsNumber                                         Message
 	ArgumentPresetSelected                                                    Message
 	NamedArgumentPresetSelected                                               Message
+	ArgumentPresetApplied                                                     Message
+	ArgumentPresetApplyFailed                                                 Message
+	ArgumentPresetIdleCheckFailed                                             Message
+	ArgumentPresetSessionNotDurable                                           Message
 	Selected                                                                  Message
 	SelectedID                                                                Message
 	SelectionNotChanged                                                       Message
@@ -804,6 +808,10 @@ var Msg = struct {
 	SelectOMPArgumentPresetArgsNumber:      message("Select OMP argument preset: /args [number]", "选择 OMP 参数预设: /args [编号]"),
 	ArgumentPresetSelected:                 message("Selected OMP argument preset %d.", "已选择 OMP 参数预设 %d."),
 	NamedArgumentPresetSelected:            message("Selected OMP argument preset %d: %s.", "已选择 OMP 参数预设 %d: %s."),
+	ArgumentPresetApplied:                  message("Applied OMP argument preset %d to this session. Other running conversations were not changed.", "已将 OMP 参数预设 %d 应用于当前 Session. 其他对话中运行的进程保持不变."),
+	ArgumentPresetApplyFailed:              message("OMP argument preset %d was saved, but could not be applied to this session. The saved binding was retained; no task was replayed.", "已保存 OMP 参数预设 %d, 但未能应用于当前 Session. 已保留原绑定, 未重放任务."),
+	ArgumentPresetIdleCheckFailed:          message("Cannot confirm that OMP is fully idle. The argument preset was not changed and the instance was not stopped.", "无法确认 OMP 已完全空闲. 参数预设未更改, 实例未停止."),
+	ArgumentPresetSessionNotDurable:        message("The current session cannot be safely restored from disk. The argument preset was not changed and the instance was not stopped.", "当前 Session 无法从磁盘安全恢复. 参数预设未更改, 实例未停止."),
 	Selected:                               message("Selected: %s", "已选择: %s"),
 	SelectedID:                             message("Selected: %s\nID: %s", "已选择: %s\nID: %s"),
 	SelectionNotChanged:                    message("Selection was not changed.", "选择未更改."),
