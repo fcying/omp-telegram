@@ -207,6 +207,7 @@ const (
 	controlName
 	controlModel
 	controlNative
+	controlArgs
 )
 
 type sessionOperation uint8
@@ -271,6 +272,8 @@ type worker struct {
 	nativeCatalog       nativeCommandCatalog
 	research            autoresearchState
 	nativeControl       *nativeControlRequest
+	argsApply           *argsApplyRequest
+	argsResuming        bool
 	resumeFailed        bool
 	progressTransport
 	compacting             bool
@@ -1371,6 +1374,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.cancelArgsApply(true)
 	w.cancelNativeControl()
 	w.flushReplyStatus()
 	w.cancelProgressNative()
@@ -1458,7 +1462,9 @@ func (w *worker) closeRuntime() { w.releaseRuntimeWithReason(true, "explicit") }
 func (w *worker) closeFailedStart() {
 	if w.runtimeResuming || w.restoring {
 		w.releaseRuntimeWithReason(true, "failure")
-		w.releaseSession()
+		if !w.argsResuming {
+			w.releaseSession()
+		}
 		return
 	}
 	w.closeLogicalSession()
@@ -1731,6 +1737,10 @@ func (w *worker) run() {
 }
 
 func (w *worker) operationFinished(result operationResult) {
+	if result.kind == "args_state" {
+		w.argsStateFinished(result)
+		return
+	}
 	if result.kind == "native_control" {
 		w.nativeControlFinished(result)
 		return
@@ -2023,6 +2033,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 }
 
 func (w *worker) closeLogicalSession() bool {
+	w.cancelArgsApply(true)
 	if w.migrationLocked() {
 		w.cancelMigration("closed", false)
 		return true
@@ -2135,6 +2146,7 @@ func (w *worker) clearQueue() {
 }
 
 func (w *worker) stop() {
+	w.cancelArgsApply(true)
 	if w.migrationLocked() {
 		w.cancelMigration("cancelled", true)
 		return
@@ -2169,6 +2181,7 @@ func (w *worker) stop() {
 }
 
 func (w *worker) stopActiveTask() {
+	w.cancelArgsApply(true)
 	if w.nativeControl != nil {
 		w.stopNativeControl(w.tr(i18n.Msg.AbortRequestedCurrentTaskQueuedPromptsWillContinue))
 		return
@@ -2581,7 +2594,12 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		}
 		w.runtimeStopped()
 		if w.runtimeResuming || w.restoring {
-			w.releaseSession()
+			if !w.argsResuming {
+				w.releaseSession()
+			} else {
+				w.sessionRuntimeStarting.Store(false)
+				w.sessionRuntimeActive.Store(false)
+			}
 		} else {
 			w.sessionRuntimeStarting.Store(false)
 			w.sessionRuntimeActive.Store(false)
@@ -2626,6 +2644,15 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	if !w.claimSession(info.File, info.ID) {
 		w.closeFailedStart()
 		return w.tr(i18n.Msg.OmpSessionUnavailableAlreadyUseAnotherConversation)
+	}
+	if w.argsResuming {
+		ctx, cancel = context.WithTimeout(w.ctx, 30*time.Second)
+		_, e = c.SetModelRole(ctx, "default")
+		cancel()
+		if e != nil {
+			w.closeFailedStart()
+			return w.tr(i18n.Msg.ModelSwitchCouldNotConfirmedUseStatusCheckActual)
+		}
 	}
 	ctx, cancel = context.WithTimeout(w.ctx, 3*time.Second)
 	configuredThinking, thinkingErr := c.ConfiguredThinking(ctx)
@@ -2694,6 +2721,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	return ""
 }
 func (w *worker) handle(in incoming) {
+	w.cancelArgsApply(true)
 	w.flushReplyStatus()
 	w.statusReleaseClientID = 0
 	w.touchLogicalActivity()
@@ -3613,6 +3641,7 @@ func (w *worker) finishPreview() {
 	// Delivery reconciliation clears any persisted inbox association after success.
 }
 func (w *worker) event(raw []byte) {
+	w.cancelArgsApply(true)
 	w.touchActivity()
 	var e rpcEvent
 	if json.Unmarshal(raw, &e) != nil {

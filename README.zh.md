@@ -143,7 +143,9 @@ format = "text"
 
 `omp.args` 数组中的每项都是一套完整的 shell-style 参数字符串, 只解析引号分组, 直接传递且不经过 shell. 除非通过这些参数或用户请求的命令显式选择, 否则不改变 OMP 自身配置.
 
-`/args` 的选择作用于所有对话, 并跨服务重启保存. 修改预设定义或展开后的参数值会在启动时重置为预设 1; 仅修改展示标签不会重置. 已连接的 OMP 进程保留原启动参数.
+`/args` 的选择作用于所有对话, 并跨服务重启保存. 切换要求当前对话空闲且没有排队任务. 当前 OMP 进程会立即以所选参数重启并恢复同一个已保存 Session; 开启但已 Released 的会话也会立即恢复. 其他对话的已连接进程保留原参数, 下次启动时才使用新预设. 已关闭或尚不存在的会话不会被打开. 如果 Session 无法从磁盘安全恢复, 会在停止进程前拒绝切换. 如果保存选择后启动失败, 保留新预设和原绑定并报告失败, 不重放任务. 修改预设定义或展开后的参数值会在服务启动时重置为预设 1; 仅修改展示标签不会重置.
+
+`/args` 重启后, Bridge 选择新配置的原生 `default` 模型角色, 不继续沿用旧 Session 记录的模型. 角色解析及其附带的 thinking 调整由 OMP 决定; Bridge 不额外发送 thinking 或 fast-mode 修改.
 
 要显式限制 OMP 子进程, 用下面的内容替换已有 `[omp.environment]` table. 不要同时配置 `allow` 和 `deny`, 即使其中一个列表为空.
 
@@ -220,7 +222,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/export html` | 选择已保存的 session, 导出 standalone HTML viewer. |
 | `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
 | `/status` | 查看当前 workspace, session 及完整原生 ID, model, thinking, fast mode, context, runtime 和队列状态. |
-| `/args [预设编号]` | 查看预设标签并切换所有对话后续新启动进程使用的 OMP 参数. 不影响已运行的 OMP 进程. |
+| `/args [预设编号]` | 查看预设标签, 或在空闲时选择预设并立即应用于当前对话已开启的会话. 其他对话在下次启动进程时使用新预设. |
 | `/doctor` | 异步运行安全的 bridge 诊断, 包括当前 topic 的投递队首/等待情况和全局队列计数, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
 | `/model` | 用按钮选择 OMP 配置的 model role. |
