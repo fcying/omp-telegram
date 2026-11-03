@@ -208,7 +208,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 | 命令 | 用途 |
 | --- | --- |
-| `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. Topic 的首次 session 会尝试将标题设为 workspace 名称. |
+| `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. Topic 的首次 session 会尝试使用 workspace 名称作为标题; 仅同一 chat 的其他 Topic 已记录该名称时添加 `[thread ID]` 后缀. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session 供后续使用. |
 | `/queue` | 查看运行及排队任务. Cancel 按钮只删除选中的等待任务, 不中止当前任务. |
@@ -236,6 +236,10 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/autoresearch [goal\|off\|clear]` | 当前 OMP 公布支持时控制原生 autoresearch. 安全边界和停止行为见下文. |
 | `/lang [en\|zh]` | 查看全局 Bridge 界面语言, 或将所有私聊和 topic 统一切换为英文或中文. |
 | `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
+
+Topic 名称查重使用 Bridge 持久化的标题记录和授权收到的创建/编辑事件, 不使用 workspace 或 Session 名称代替. 不会为解决冲突而重命名其他 Topic. 长名称会截短前缀, 在 Telegram 的 128 个 UTF-16 单元内保留完整后缀. Bot API 无法列举全部 Topic 标题: 不会从 Session 路径回填未观察到的旧标题; 未上报的手动改名或删除也可能使记录不完整或过时, 从而漏掉冲突或保留不必要的后缀. 这不能绕过 Telegram 客户端不显示私聊 Topic 改名结果的问题.
+
+自动改名在途时, 标题事件不会释放其名称预留. 如果事件与 HTTP 结果交错导致最终标题不确定, 两个可能名称均保留占用, 直到后续标题事件到达. 优雅停机会结算已知改名结果, 不发送停机提示; 不确定的请求不会重放.
 
 `Binding+Session` 仅在会话文件存在且身份验证通过时调用 OMP 原生删除. 删除确认成功后, 清理本 bot 下同 ID 的全部绑定, 包括其他 Topic 的 Closed 绑定或已释放运行时的绑定. 文件已确认不存在时走下述仅清理引用路径, 不启动 OMP. 能否删除取决于 Session 的实际占用状态, 不取决于 Binding 数量或逻辑 Open 状态. Runtime 已 Released 的 Open Binding 不阻止删除; OMP Runtime 正在使用, 有活跃任务, 正在启动或迁移时拒绝. `Binding` 只删除选中的绑定, 不影响其他 Topic 的绑定或原生 Session.
 

@@ -1382,36 +1382,51 @@ type fakeHTTPResponse struct {
 	body   string
 }
 
+type fakeHTTPResponseBody struct {
+	io.Reader
+	onClose func()
+}
+
+func (b fakeHTTPResponseBody) Close() error {
+	if b.onClose != nil {
+		b.onClose()
+	}
+	return nil
+}
+
 type fakeHTTP struct {
-	mu                    sync.Mutex
-	messages              []map[string]any
-	forumTopicEdits       []map[string]any
-	callbacks             []string
-	updates               chan telegram.Update
-	rejectCommands        bool
-	rejectAllCommands     bool
-	rejectLanguage        string
-	commandRequests       chan map[string]any
-	rejectGetMe           bool
-	files                 map[string][]byte
-	failProgress          bool
-	progressCalls         int
-	downloadGate          <-chan struct{}
-	downloadErr           error
-	fileRequests          int
-	downloadRequests      int
-	uploads               []mediaUpload
-	attachmentResponse    *fakeHTTPResponse
-	attachmentError       error
-	keyboardClears        []map[string]any
-	deletedMessages       []map[string]any
-	progressDeleteStatus  int
-	failKeyboardClear     bool
-	keyboardClearGate     <-chan struct{}
-	typingRequests        chan context.Context
-	sendResponses         map[int64][]fakeHTTPResponse
-	forumTopicEditGate    <-chan struct{}
-	forumTopicEditStarted chan struct{}
+	mu                     sync.Mutex
+	messages               []map[string]any
+	forumTopicEdits        []map[string]any
+	callbacks              []string
+	updates                chan telegram.Update
+	rejectCommands         bool
+	rejectAllCommands      bool
+	rejectLanguage         string
+	commandRequests        chan map[string]any
+	rejectGetMe            bool
+	files                  map[string][]byte
+	failProgress           bool
+	progressCalls          int
+	downloadGate           <-chan struct{}
+	downloadErr            error
+	fileRequests           int
+	downloadRequests       int
+	uploads                []mediaUpload
+	attachmentResponse     *fakeHTTPResponse
+	attachmentError        error
+	keyboardClears         []map[string]any
+	deletedMessages        []map[string]any
+	progressDeleteStatus   int
+	failKeyboardClear      bool
+	keyboardClearGate      <-chan struct{}
+	typingRequests         chan context.Context
+	sendResponses          map[int64][]fakeHTTPResponse
+	forumTopicEditGate     <-chan struct{}
+	forumTopicEditStarted  chan struct{}
+	forumTopicEditResponse *fakeHTTPResponse
+	forumTopicEditError    error
+	forumTopicEditClosed   func()
 }
 
 func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -1487,6 +1502,8 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		f.mu.Lock()
 		f.forumTopicEdits = append(f.forumTopicEdits, req)
 		gate, started := f.forumTopicEditGate, f.forumTopicEditStarted
+		response, err := f.forumTopicEditResponse, f.forumTopicEditError
+		onClose := f.forumTopicEditClosed
 		f.mu.Unlock()
 		if started != nil {
 			select {
@@ -1500,6 +1517,12 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 			case <-r.Context().Done():
 				return nil, r.Context().Err()
 			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		if response != nil {
+			return &http.Response{StatusCode: response.status, Body: fakeHTTPResponseBody{Reader: strings.NewReader(response.body), onClose: onClose}, Header: make(http.Header), Request: r}, nil
 		}
 	case "deleteMessage":
 		f.mu.Lock()

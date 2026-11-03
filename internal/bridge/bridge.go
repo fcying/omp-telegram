@@ -430,8 +430,9 @@ type rpcOperation struct {
 	meta       any
 }
 type topicRenameResult struct {
-	generation int64
-	err        error
+	generation        int64
+	err               error
+	persistenceFailed bool
 }
 
 type callbackResult bool
@@ -2419,30 +2420,57 @@ func (w *worker) renameNewTopic(workspace string) {
 	if name == "" {
 		return
 	}
+	reservation, err := w.b.db.ReserveTopicName(w.b.bot.ID, w.key.chat, w.key.thread, name)
+	if err != nil {
+		w.b.storeLog.Error("topic name reservation failed", "event", "topic_name_write_failed", "reason", "reserve", "error_kind", "persistence")
+		w.say(w.tr(i18n.Msg.SessionStartedButTelegramTopicTitleCouldNotUpdated))
+		return
+	}
 	if w.topicRenameResults == nil {
 		w.topicRenameResults = make(chan topicRenameResult, 1)
 	}
 	generation, chat, thread := w.binding.Generation, w.key.chat, w.key.thread
 	tg, results, workerCtx := w.b.tg, w.topicRenameResults, w.ctx
-	w.background.Add(1)
+	db, bot, storeLog, background := w.b.db, w.b.bot.ID, w.b.storeLog, &w.background
+	background.Add(1)
 	go func() {
-		defer w.background.Done()
+		defer background.Done()
 		ctx, cancel := context.WithTimeout(workerCtx, 10*time.Second)
 		defer cancel()
-		err := tg.EditForumTopic(ctx, chat, thread, name)
+		err := tg.EditForumTopic(ctx, chat, thread, reservation.Name)
+		var settlementErr error
+		var reason string
+		switch {
+		case err == nil:
+			reason = "confirm"
+			settlementErr = db.ConfirmTopicName(bot, chat, thread, reservation)
+		case telegram.ClassifyError(err).Uncertain:
+			reason = "retain"
+			settlementErr = db.RetainTopicName(bot, chat, thread, reservation)
+		default:
+			reason = "release"
+			settlementErr = db.ReleaseTopicName(bot, chat, thread, reservation)
+		}
+		if settlementErr != nil {
+			storeLog.Error("topic name settlement failed", "event", "topic_name_write_failed", "reason", reason, "error_kind", "persistence")
+		}
 		select {
-		case results <- topicRenameResult{generation: generation, err: err}:
+		case results <- topicRenameResult{generation: generation, err: err, persistenceFailed: settlementErr != nil}:
 		case <-workerCtx.Done():
 		}
 	}()
 }
 
 func (w *worker) topicRenameFinished(result topicRenameResult) {
-	if result.generation != w.binding.Generation || result.err == nil {
+	if w.ctx.Err() != nil || result.generation != w.binding.Generation {
 		return
 	}
-	info := telegram.ClassifyError(result.err)
-	w.log.Warn("new topic rename failed", "event", "topic_rename_failed", "error_kind", info.Reason)
+	if result.err == nil && !result.persistenceFailed {
+		return
+	}
+	if result.err != nil {
+		w.log.Warn("new topic rename failed", "event", "topic_rename_failed", "error_kind", telegram.ClassifyError(result.err).Reason)
+	}
 	w.say(w.tr(i18n.Msg.SessionStartedButTelegramTopicTitleCouldNotUpdated))
 }
 
@@ -2721,6 +2749,25 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	return ""
 }
 func (w *worker) handle(in incoming) {
+	if in.callback == nil && in.msg != nil && w.key.thread != 0 && (in.msg.ForumTopicCreated != nil || in.msg.ForumTopicEdited != nil) {
+		name := ""
+		if in.msg.ForumTopicCreated != nil {
+			name = in.msg.ForumTopicCreated.Name
+		}
+		if in.msg.ForumTopicEdited != nil {
+			name = in.msg.ForumTopicEdited.Name
+		}
+		if name != "" {
+			if err := w.b.db.ObserveTopicName(w.b.bot.ID, w.key.chat, w.key.thread, name); err != nil {
+				w.b.storeLog.Error("observed topic name persistence failed", "event", "topic_name_write_failed", "reason", "observe", "error_kind", "persistence")
+				w.b.fail(err)
+				w.cancel()
+				return
+			}
+		}
+		w.mark(in.id, "ignored")
+		return
+	}
 	w.cancelArgsApply(true)
 	w.flushReplyStatus()
 	w.statusReleaseClientID = 0

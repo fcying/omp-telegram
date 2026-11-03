@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 20
+const schemaVersion = 21
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -430,6 +430,15 @@ CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));
 		}
 		version = 20
 	}
+	if version == 20 {
+		if _, e = tx.Exec(`CREATE TABLE topic_names(bot INTEGER NOT NULL,chat INTEGER NOT NULL,thread INTEGER NOT NULL,name TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
+CREATE INDEX idx_topic_names_name ON topic_names(bot,chat,name);
+CREATE TABLE topic_name_reservations(bot INTEGER NOT NULL,chat INTEGER NOT NULL,thread INTEGER NOT NULL,name TEXT NOT NULL,revision INTEGER NOT NULL,active INTEGER NOT NULL CHECK(active IN (0,1)),PRIMARY KEY(bot,chat,thread,revision));
+CREATE INDEX idx_topic_name_reservations_name ON topic_name_reservations(bot,chat,name);`); e != nil {
+			return e
+		}
+		version = 21
+	}
 
 	if e = backfillSessionIDs(tx); e != nil {
 		return e
@@ -441,7 +450,8 @@ CREATE UNIQUE INDEX idx_omp_args_selection_singleton ON omp_args_selection((1));
 	}
 	now := time.Now().Unix()
 	if _, e = tx.Exec(`UPDATE inbox SET state='uncertain',updated_at=? WHERE state='submitted';
- UPDATE outbox SET state='uncertain',updated_at=? WHERE state='sending';`, now, now); e != nil {
+ UPDATE outbox SET state='uncertain',updated_at=? WHERE state='sending';
+ UPDATE topic_name_reservations SET active=0 WHERE active=1;`, now, now); e != nil {
 		return e
 	}
 	return tx.Commit()
