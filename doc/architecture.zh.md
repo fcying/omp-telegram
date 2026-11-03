@@ -278,6 +278,8 @@ Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 w
 
 [`progress_status.go`](../internal/bridge/progress_status.go) 独立于变更通道采样已连接的运行 root: 初始 progress 延迟后至多每五秒一次 `get_state`, 仅一条在途, 三秒 deadline. 它不启动进程, 不改变 idle-watchdog 证据. 结果须匹配 request/client/generation/root/turn/catalog epoch 和绑定/原生 session. 失败只清空 UI block, 不结算或重放任务. Task/session/runtime 变化取消旧采样.
 
+Progress assistant 文本使用 [`markdown.go`](../internal/telegram/markdown.go) 的 `TailForTelegram`, 包括生成围栏的完整 Markdown 片段最多占 2200 个 UTF-16 单元或 progress 剩余容量. 截断时前移到下一完整行, 按转换器相同规则恢复外围代码围栏. 超长单行尾部使用不冲突的围栏按字面显示, 不猜测行内 Markdown 结构. 普通段落换行, 列表转换, 流式未闭合标记, 最终回复分割和 HTML 拒绝回退均不变. 完整预览交付 Telegram 前仍经过 `ClipConvertible`.
+
 [`compact_status.go`](../internal/bridge/compact_status.go) 在一个逻辑行显示有界字面 model ID (不带 provider), 原生 thinking 符号, fast 活动, context 百分比/窗口容量和原生速度. 未知字段省略, 不从 text delta 估算 tokens/s. Thinking 来源是由本地 `/effort` 元数据查询和 `thinking_level_changed` 填充的 runtime configured-selector 缓存, 而非有效 `get_state.thinkingLevel`. 未知/model-default/不可调 selector 不显示 compact 符号, 详细 status 为 `n/a`. Runtime 停止清空缓存. 可选 configured-selector 读取失败不推翻已验证设置变更; 已 stopping client 仍不能复用.
 
 ### 已确认最终渲染与指标

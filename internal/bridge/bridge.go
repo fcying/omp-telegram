@@ -3913,26 +3913,6 @@ func utf16Length(s string) int {
 	return units
 }
 
-func tailUTF16(s string, limit int) string {
-	if utf16Length(s) <= limit {
-		return s
-	}
-	runes := []rune(s)
-	units, start := 0, len(runes)
-	for start > 0 {
-		size := utf16.RuneLen(runes[start-1])
-		if size < 0 {
-			size = 1
-		}
-		if units+size > limit {
-			break
-		}
-		units += size
-		start--
-	}
-	return string(runes[start:])
-}
-
 func (w *worker) startProgressTool(id, name string) {
 	if id == "" || name == "" {
 		return
@@ -4158,7 +4138,7 @@ func (w *worker) renderProgress() string {
 			if available > maxPreviewUnits {
 				available = maxPreviewUnits
 			}
-			text += w.tr(i18n.Msg.Output) + tailUTF16(w.preview, available)
+			text += w.tr(i18n.Msg.Output) + telegram.TailForTelegram(w.preview, available)
 		}
 	}
 	return text

@@ -24,6 +24,45 @@ func allowInitialProgress(w *worker) {
 	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 }
 
+func TestProgressPreviewPreservesFormattingAtTailBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name, text, want, absent string
+	}{
+		{"paragraphs", "First paragraph.\n\nSecond paragraph.\nThird line.", "First paragraph.\n\nSecond paragraph.\nThird line.", ""},
+		{"clipped emphasis", strings.Repeat("x", 80) + "**important** " + strings.Repeat("y", 2187), "<pre>nt** ", "<i>important</i>"},
+		{"clipped fence", strings.Repeat("intro\n", 30) + "```go\n" + strings.Repeat("value := 1\n", 230) + "```\nFinal paragraph.", "</pre>\nFinal paragraph.", "<pre>Final paragraph."},
+		{"closing fence boundary", "```go\ncode\n```\n" + strings.Repeat("y", 2196), strings.Repeat("y", 2196), "<pre>"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w, f, _ := setupWorkspaceWorker(t)
+			w.b.cfg.ProgressMode = "summary"
+			w.active, w.busy, w.previewID = 1, true, 777
+			w.previewResult = make(chan previewResult, 1)
+			event, err := json.Marshal(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": test.text}})
+			requireStoreOK(t, err)
+			w.event(event)
+			w.flushPreview()
+			select {
+			case result := <-w.previewResult:
+				requireStoreOK(t, result.err)
+				w.previewFinished(result)
+			case <-time.After(5 * time.Second):
+				t.Fatal("progress edit did not finish")
+			}
+			f.mu.Lock()
+			request := f.messages[len(f.messages)-1]
+			f.mu.Unlock()
+			text, _ := request["text"].(string)
+			if request["parse_mode"] != "HTML" || request["message_id"] != float64(777) || !strings.Contains(text, test.want) {
+				t.Fatalf("progress edit lost formatting: %+v", request)
+			}
+			if test.absent != "" && strings.Contains(text, test.absent) {
+				t.Fatalf("progress edit reinterpreted clipped markup: %q", text)
+			}
+		})
+	}
+}
+
 func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
