@@ -785,6 +785,112 @@ func hardSplitUnits(s string, limit int) []string {
 	return out
 }
 
+// TailForTelegram retains recent source text without starting inside inline
+// markup. A clipped code block keeps its opening fence; an oversized single
+// line is displayed literally rather than interpreted as broken Markdown.
+func TailForTelegram(md string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	start := previewTailStart(md, limit)
+	if start == 0 {
+		return md
+	}
+	tail := md[start:]
+	if md[start-1] != '\n' {
+		nextLine := strings.IndexByte(tail, '\n')
+		if nextLine < 0 || strings.TrimSpace(tail[nextLine+1:]) == "" {
+			return literalPreview(tail, limit)
+		}
+		start += nextLine + 1
+	}
+	var fence string
+	for prefix := md[:start]; prefix != ""; {
+		line, rest, _ := strings.Cut(prefix, "\n")
+		trimmed := strings.TrimSpace(line)
+		if fence == "" {
+			if isFence(trimmed) {
+				fence = fenceMarker(trimmed)
+			}
+		} else if trimmed == fence {
+			fence = ""
+		}
+		prefix = rest
+	}
+	if fence != "" {
+		if len(fence)+1 >= limit {
+			return literalPreview(tail, limit)
+		}
+		body := md[start:]
+		units := 0
+		for _, r := range body {
+			units += utf16.RuneLen(r)
+		}
+		for units+len(fence)+1 > limit {
+			nextLine := strings.IndexByte(body, '\n')
+			if nextLine < 0 {
+				return literalPreview(body, limit)
+			}
+			if strings.TrimSpace(body[:nextLine]) == fence {
+				return body[nextLine+1:]
+			}
+			for _, r := range body[:nextLine+1] {
+				units -= utf16.RuneLen(r)
+			}
+			body = body[nextLine+1:]
+		}
+		return fence + "\n" + body
+	}
+	return md[start:]
+}
+
+func previewTailStart(text string, limit int) int {
+	start, units := len(text), 0
+	for start > 0 {
+		r, size := utf8.DecodeLastRuneInString(text[:start])
+		if units+utf16.RuneLen(r) > limit {
+			break
+		}
+		units += utf16.RuneLen(r)
+		start -= size
+	}
+	return start
+}
+
+func literalPreview(text string, limit int) string {
+	if limit < 8 {
+		return text[previewTailStart(text, min(limit, 1)):]
+	}
+	for {
+		backticks, tildes, run := 0, 0, 0
+		var previous rune
+		for _, r := range text {
+			if r != previous {
+				run = 0
+			}
+			run++
+			if r == '`' {
+				backticks = max(backticks, run)
+			} else if r == '~' {
+				tildes = max(tildes, run)
+			}
+			previous = r
+		}
+		character, longest := "`", backticks
+		if tildes < backticks {
+			character, longest = "~", tildes
+		}
+		length := max(3, longest+1)
+		available := limit - 2*length - 2
+		if available < 0 {
+			text = text[previewTailStart(text, limit/3):]
+			continue
+		}
+		marker := strings.Repeat(character, length)
+		return marker + "\n" + text[previewTailStart(text, available):] + "\n" + marker
+	}
+}
+
 // ClipConvertible trims text so that its rendered form stays within limit
 // UTF-16 units, marking the cut with an ellipsis. Live previews are edited in
 // place and cannot be split across messages, so they clip instead; without

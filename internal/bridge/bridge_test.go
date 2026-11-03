@@ -2571,11 +2571,6 @@ func TestSplitPreservesUnicodeAndLength(t *testing.T) {
 		}
 	}
 }
-func TestTailUTF16(t *testing.T) {
-	if got := tailUTF16("discard😀keep", 6); got != "😀keep" {
-		t.Fatalf("UTF-16 tail = %q", got)
-	}
-}
 func TestProgressToolPayloadUTF16Boundary(t *testing.T) {
 	exact := `"` + strings.Repeat("a", 98) + `"`
 	if got := progressToolPayload([]byte(exact)); got != exact {

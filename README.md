@@ -365,6 +365,8 @@ Stop does not wait for Telegram callback acknowledgment or button removal. Both 
 
 Progress is best-effort and may not show every task transition. It does not affect task execution or final replies.
 
+Live assistant output shows a bounded tail, not the full response. Truncated previews prefer whole lines and retain code-fence context. A single line longer than the preview budget is shown as literal monospaced text to avoid interpreting cut Markdown markers. Final replies are unchanged.
+
 Final text replies may include a compact model and context status header. Thinking symbols in live progress and reply headers, and the `Thinking` field in `/status`, reflect the configured level rather than its per-turn resolution. Configured `auto` remains `auto` in `/status` and uses `⟳` in compact headers.
 
 ## Attachments

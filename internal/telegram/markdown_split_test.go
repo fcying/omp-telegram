@@ -136,3 +136,24 @@ func TestSplitForTelegramSplitsOversizedFenceLines(t *testing.T) {
 		}
 	}
 }
+
+func TestTailForTelegramKeepsRecentTextAndCodeContext(t *testing.T) {
+	for _, test := range []struct {
+		name, source, want string
+		limit              int
+	}{
+		{"emoji", "discarded prefix😀keep", "<pre>😀keep</pre>", 14},
+		{"whole line", "discarded prefix\n**current**\nlast", "<b>current</b>\nlast", 20},
+		{"tilde fence", "intro\n~~~go\nold\nline\n~~~\nend", "<pre>line</pre>\nend", 16},
+		{"open fence", "intro\n```\nold\n**literal**", "<pre>**literal**</pre>", 15},
+		{"literal markers", "discarded prefix```~~~**&😀", "<pre>```~~~**&amp;😀</pre>", 21},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tail := TailForTelegram(test.source, test.limit)
+			html := ConvertMarkdown(tail)
+			if html != test.want || utf16Len(tail) > test.limit || renderedUTF16Len(html) > test.limit {
+				t.Fatalf("tail lost text, context or UTF-16 bound: %q, want %q", html, test.want)
+			}
+		})
+	}
+}
