@@ -208,7 +208,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 
 | Command | What it does |
 | --- | --- |
-| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On a topic's first session, the bridge attempts to set its title to the workspace name. |
+| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On a topic's first session, the bridge attempts to use the workspace name as its title, adding `[thread ID]` only when that name is already recorded for another topic in the same chat. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
 | `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
@@ -236,6 +236,10 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/autoresearch [goal\|off\|clear]` | Control native autoresearch when advertised by OMP. See the safety and stopping behavior below. |
 | `/lang [en\|zh]` | Show the global Bridge interface language, or switch it to English or Chinese for all chats and topics. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
+
+Topic-name checks use persisted Bridge title records and authorized topic-created/edited updates, not workspace or session names. Other topics are never renamed to resolve a collision. Long names are shortened to preserve the full suffix within Telegram's 128 UTF-16-unit limit. The Bot API cannot list all topic titles: existing unobserved titles are not backfilled from session paths, and unreported manual renames or deletions can leave records incomplete or stale. In those cases, a collision may be missed or an unnecessary suffix retained. This does not work around Telegram clients failing to display a successful private-topic rename.
+
+In-flight auto-renames keep their name claims despite title events. If an event and an HTTP result leave the final title ambiguous, both possible names stay occupied until a later title event. Graceful shutdown settles known rename outcomes without sending shutdown notices; uncertain requests are never replayed.
 
 `Binding+Session` invokes OMP native deletion only when the session file exists and identity checks pass. After confirmed deletion, it clears all same-ID bindings under this bot, including other topics with Closed bindings or released runtimes. A confirmed missing file follows the reference-only path below, without starting OMP. Deletion depends on actual session use, not the number of bindings or their logical Open state. An Open binding with a released runtime does not block deletion; an in-use OMP runtime, active task, startup or migration does. `Binding` removes only the selected binding, preserving other topics' bindings and the native session.
 

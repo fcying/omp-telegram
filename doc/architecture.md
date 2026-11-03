@@ -551,6 +551,10 @@ Acceptance examples:
 
 `/name <title>` calls native `set_session_name` through the control lane, including during an active task, without creating another agent turn, replacing identity, changing workspace or interrupting queued work. OMP persists the title; `/status` reads it back. It does not rename Telegram topics. Only the first successful `/new` in an unbound topic schedules a best-effort topic-title update to the workspace basename; failure does not undo the start.
 
+Topic auto-naming atomically reserves a title before its asynchronous API call. The plain basename is preferred; an exact collision in the same bot/chat adds ` [thread ID]` only to the new topic. If that candidate is also occupied, a numeric suffix is advanced. UTF-16 truncation preserves the complete suffix. `topic_names` stores known titles separately from per-request `topic_name_reservations`; collision checks include both. Reservations survive restarts and serialize concurrent workers. Authorized `forum_topic_created` and nonempty `forum_topic_edited.name` events update known titles without becoming model input or releasing active requests' claims. Icon-only edits do not clear names. Records are independent of session bindings and are not deleted with session history. No workspace-derived backfill or complete Telegram topic inventory is claimed; missing external edit/delete events can leave stale records.
+
+Each HTTP request settles its own reservation before notifying the actor, so graceful worker shutdown waits for durable settlement even when the notification is discarded. Explicit rejection releases only that request's claim; uncertainty retains it without replay. Success commits the reserved title only when no newer title observation or reservation intervened. If a conflicting observation makes ordering ambiguous, both possible names remain occupied until a later title observation. Shutdown and old generations send no rename notices. HTTP effects and SQLite settlement are not atomic across crashes or forced termination.
+
 | Export entry point | Behavior |
 | --- | --- |
 | `/export` | Native session picker, JSONL snapshot by default. |
@@ -644,7 +648,7 @@ Only one doctor request runs per worker. Request identity plus a committed-bindi
 
 ### Schema and migration boundary
 
-`PRAGMA user_version` is currently **20**, independently of the application version. A fresh empty database creates the schema, indexes, and version transactionally. Versions 1-19 follow the built-in migration chain; version 19 adds durable context migrations and version 20 adds the global interface-language singleton. A populated unversioned database, negative version, or future version is rejected. Schema migration, session-ID backfill, and in-flight-state reconciliation commit together.
+`PRAGMA user_version` is currently **21**, independently of the application version. A fresh empty database creates the schema, indexes, and version transactionally. Versions 1-20 follow the built-in migration chain; version 19 adds durable context migrations, version 20 adds the global interface-language singleton, and version 21 adds topic-title records for conditional auto-name suffixes. A populated unversioned database, negative version, or future version is rejected. Schema migration, session-ID backfill, and in-flight-state reconciliation commit together.
 
 | Table | Identity and retained data | Responsibility |
 | --- | --- | --- |
@@ -656,6 +660,8 @@ Only one doctor request runs per worker. Request identity plus a committed-bindi
 | `session_favorites` | `(bot,chat,thread,workspace,session_id)` | Conversation-local pinned native session identities |
 | `omp_args_selection` | Singleton preset index and argument fingerprint | Global startup-preset selection; no raw arguments |
 | `interface_language` | Singleton `id=1`, language `en` or `zh` | Global Bridge interface language; absent row means English |
+| `topic_names` | `(bot,chat,thread)`; known title and monotonic revision | Persistent observed titles and reservation-token allocation; empty-title tombstones prevent revision reuse |
+| `topic_name_reservations` | `(bot,chat,thread,revision)`; reserved title and active/retained state | Per-request title claims; observations preserve active requests, and matching outcomes settle only their own claims |
 | `inbox` | Update ID; typed-update JSON, state, reply target, progress message ID, creation/update times | Deduplication and durable input settlement |
 | `outbox` | Increasing ID; optional inbox ID, chat/thread/reply target, text or attachment kind/path/name, state, retry deadline/counters, timestamps | Ordered durable delivery; attachment bytes remain in the private filesystem spool |
 

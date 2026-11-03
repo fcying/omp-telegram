@@ -46,17 +46,27 @@ type TextQuote struct {
 }
 
 type Message struct {
-	MessageID       int64       `json:"message_id"`
-	MessageThreadID int64       `json:"message_thread_id"`
-	From            *User       `json:"from"`
-	Chat            Chat        `json:"chat"`
-	Text            string      `json:"text"`
-	Caption         string      `json:"caption"`
-	Photo           []PhotoSize `json:"photo"`
-	Document        *Document   `json:"document"`
-	MediaGroupID    string      `json:"media_group_id"`
-	ReplyToMessage  *Message    `json:"reply_to_message"`
-	Quote           *TextQuote  `json:"quote"`
+	MessageID         int64              `json:"message_id"`
+	MessageThreadID   int64              `json:"message_thread_id"`
+	From              *User              `json:"from"`
+	Chat              Chat               `json:"chat"`
+	Text              string             `json:"text"`
+	Caption           string             `json:"caption"`
+	Photo             []PhotoSize        `json:"photo"`
+	Document          *Document          `json:"document"`
+	MediaGroupID      string             `json:"media_group_id"`
+	ReplyToMessage    *Message           `json:"reply_to_message"`
+	Quote             *TextQuote         `json:"quote"`
+	ForumTopicCreated *ForumTopicCreated `json:"forum_topic_created,omitempty"`
+	ForumTopicEdited  *ForumTopicEdited  `json:"forum_topic_edited,omitempty"`
+}
+
+type ForumTopicCreated struct {
+	Name string `json:"name"`
+}
+
+type ForumTopicEdited struct {
+	Name string `json:"name"`
 }
 
 type PhotoSize struct {

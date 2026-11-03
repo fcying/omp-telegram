@@ -551,6 +551,10 @@ Worker teardown 使等待中的 binding-forget confirmation 失效, 但不提前
 
 `/name <title>` 通过控制通道调用原生 `set_session_name`, 可在任务活跃时执行, 不创建新的模型轮次, 不替换身份, 不更换工作目录, 不打断排队工作. 标题由 OMP 持久化, `/status` 读回. 它不重命名 Telegram topic. 仅未绑定 topic 中首次成功 `/new` 会尽力异步将 topic 标题设为工作目录 basename; 失败不撤销启动.
 
+Topic 自动命名在异步 API 调用前原子预留标题. 优先使用无后缀 basename; 同一 bot/chat 内名称精确冲突时, 仅为新 Topic 添加 ` [thread ID]`. 如果候选名称仍被占用, 递增数字后缀. UTF-16 截断保留完整后缀. `topic_names` 保存已知标题, 与逐请求的 `topic_name_reservations` 分开; 查重同时考虑两者. 预留跨重启保留, 并发 worker 串行分配标题. 授权收到的 `forum_topic_created` 和非空 `forum_topic_edited.name` 更新已知标题, 不作为模型输入, 也不释放在途请求的名称占用. 仅图标编辑不清空名称. 记录独立于 session binding, 不随 Session 历史删除. 不按 workspace 推测回填, 不声称掌握全部 Telegram Topic; 缺失的外部编辑/删除事件可能留下过时记录.
+
+每个 HTTP 请求在通知 actor 前结算自身预留, 因此 worker 优雅退出即使丢弃通知, 也会等待持久化结算完成. 明确拒绝仅释放该请求的占用; 结果不确定则保留, 不重放. 成功仅在没有更新的标题观察或预留时提交预留标题. 如果冲突事件使先后顺序不确定, 两个可能名称均保留占用, 直到后续标题事件到达. 停机及旧 generation 不发送改名提示. HTTP 效果与 SQLite 结算在崩溃或强制终止时并非原子操作.
+
 | 导出入口 | 行为 |
 | --- | --- |
 | `/export` | 原生会话选择器, 默认导出 JSONL 快照. |
@@ -644,7 +648,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 ### Schema 与迁移边界
 
-`PRAGMA user_version` 当前为 **20**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-19 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
+`PRAGMA user_version` 当前为 **21**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-20 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
 
 | 表 | 身份与保留内容 | 职责 |
 | --- | --- | --- |
@@ -656,6 +660,8 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 | `session_favorites` | `(bot,chat,thread,workspace,session_id)` | 当前对话收藏的原生 session identity |
 | `omp_args_selection` | 单行预设索引和参数指纹 | 全局启动预设选择, 不保存原始参数 |
 | `interface_language` | 单行 `id=1`, 语言为 `en` 或 `zh` | 全局 Bridge 界面语言; 没有记录时使用英文 |
+| `topic_names` | `(bot,chat,thread)`; 已知标题和单调递增 revision | 持久化已观察标题并分配预留 token; 空标题 tombstone 防止 revision 复用 |
+| `topic_name_reservations` | `(bot,chat,thread,revision)`; 预留标题和在途/保留状态 | 逐请求名称占用; 标题事件保留在途请求, 匹配的结果仅结算自身占用 |
 | `inbox` | Update ID; typed update JSON, 状态, reply target, progress message ID, 创建/更新时间 | 去重和输入的持久化结算 |
 | `outbox` | 递增 ID; 可选 inbox ID, chat/thread/reply target, 文本或附件类型/路径/名称, 状态, 重试时间/计数, 时间戳 | 有序的持久化交付; 附件字节保存在私有文件 spool |
 
