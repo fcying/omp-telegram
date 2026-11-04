@@ -219,7 +219,7 @@ func (w *worker) prepareResearchControlRuntime() (*omp.Client, error) {
 	w.beginRuntimeStart()
 	launchArgs := w.b.selectedArgsSnapshot()
 	client, err := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: w.binding.Workspace,
-		Resume: w.binding.Session, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
+		Resume: w.binding.Session, ResumeModelFallback: true, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
 	if err != nil {
 		<-w.b.slots
 		w.runtimeStopped()
@@ -314,6 +314,7 @@ func (w *worker) researchControlFinished(result operationResult) {
 			w.researchControlFailed(c)
 			return
 		}
+		w.announceDefaultModelFallback(client)
 		catalog := client.CommandCatalog()
 		c.sessionID = catalog.SessionID
 		if catalog.State == omp.CatalogUnknown {

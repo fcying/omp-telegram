@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -45,6 +46,7 @@ func recordFixtureChildEnvironment() {
 
 func TestMain(m *testing.M) {
 	recordFixtureChildEnvironment()
+	fixtureResumeModelChild()
 	if len(os.Args) > 1 && os.Args[1] == "config" {
 		fixtureModelConfig()
 		os.Exit(0)
@@ -54,6 +56,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
+		fixtureResumeModelStart()
 		fixtureDiscoveryStart()
 		if os.Getenv("OMP_TEST_DISCOVERY_WAIT_READY") == "1" {
 			fixtureDiscoveryWrite("waiting", "ready")
@@ -79,6 +82,9 @@ func TestMain(m *testing.M) {
 				os.Exit(1)
 			}
 			fixtureDiscoveryRecord(command)
+			if fixtureResumeModelCommand(command) {
+				continue
+			}
 			if fixtureMigrationCommand(command) {
 				continue
 			}
@@ -452,6 +458,23 @@ func TestReadLargePhysicalFrame(t *testing.T) {
 	}
 	if _, err := readLine(bufio.NewReader(strings.NewReader(payload)), 1024); err == nil {
 		t.Fatal("oversized frame accepted")
+	}
+	if _, err := readLine(bufio.NewReader(strings.NewReader("{}")), maxFrame); !errors.Is(err, errProtocol) {
+		t.Fatalf("unterminated frame error = %v, want protocol error", err)
+	}
+	if _, err := readLine(bufio.NewReader(strings.NewReader("")), maxFrame); !errors.Is(err, io.EOF) {
+		t.Fatalf("empty stream error = %v, want EOF", err)
+	}
+	for _, payload := range []string{"", "{}"} {
+		reader := bufio.NewReader(io.MultiReader(strings.NewReader(payload), iotest.ErrReader(os.ErrClosed)))
+		_, err := readLine(reader, maxFrame)
+		wantErr := os.ErrClosed
+		if payload != "" {
+			wantErr = errProtocol
+		}
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("closed stream with %q: error = %v, want %v", payload, err, wantErr)
+		}
 	}
 }
 

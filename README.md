@@ -141,7 +141,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `logging.format` | Log format: `text` or `json`. Default: `text`. |
 | `[logging.component_levels]` | Optional per-component levels for `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. |
 
-Each `omp.args` array item is a complete shell-style argument string, parsed for quoting but passed directly without a shell. OMP's own configuration remains unchanged unless explicitly selected through these arguments or a user-requested command.
+Each `omp.args` array item is a complete shell-style argument string, parsed for quoting but passed directly without a shell. OMP's own configuration remains unchanged unless explicitly selected through these arguments or a user-requested command. The saved-model restore fallback below is the only automatic model-selection exception.
 
 `/args` selection applies across all conversations and survives service restarts. Switching requires the current conversation to be idle with no queued work. It immediately restarts this conversation's OMP process with the selected arguments and restores the same saved session; an open released session is restored immediately too. Other connected processes keep their launch arguments until their next start. A closed or absent session is not opened. If the session cannot be safely restored from disk, switching is refused before stopping it. If startup fails after the selection was saved, the new preset and original binding remain saved, and the failure is reported without replaying work. Changing preset definitions or expanded argument values resets selection to preset 1 on service startup; changing display labels alone does not.
 
@@ -396,6 +396,8 @@ Replied photos and documents are described, not downloaded again. Reply chains a
 ## Sessions and Recovery
 
 Saved OMP sessions survive service restarts. The first prompt or OMP command after restart may take longer while the session reconnects.
+
+Normal session resumes keep a usable saved model. If OMP exits before RPC readiness with an explicit `SessionModelRestoreError`, the bridge reaps that process and retries the same session once with `--model @default`. The retry replaces existing `--model <value>` and `--model=<value>` options in a private argument copy, preserving other option/value pairs even when values resemble model flags and leaving the configured preset unchanged. OMP resolves the default role from the selected argument preset and its own configuration; no model ID is hardcoded or configuration file rewritten. Both ordinary and research-control restores report the fallback once per runtime after identity validation. Other startup failures, RPC byte-budget errors and a failed fallback remain failures, and no prompt is submitted or replayed by this retry. Migration recovery and session deletion retain their stricter model policy.
 
 Interrupted and uncertain work is not automatically replayed. Waiting tasks are cancelled at shutdown or crash; check the conversation and workspace before resending.
 

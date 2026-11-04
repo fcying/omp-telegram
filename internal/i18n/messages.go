@@ -5,8 +5,9 @@ type taskMessages struct {
 }
 
 type sessionMessages struct {
-	Label         Message
-	RestoreFailed Message
+	Label                Message
+	RestoreFailed        Message
+	DefaultModelFallback Message
 }
 
 type queueMessages struct {
@@ -511,8 +512,9 @@ var Msg = struct {
 		SubmissionUncertain: message("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.", "引导期间无法确认初始提交. 任务结果不确定, 不会自动重放."),
 	},
 	Session: sessionMessages{
-		Label:         message("Session", "会话"),
-		RestoreFailed: message("Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session.", "无法恢复已保存的 omp 会话. 会话文件或工作目录不可用. 未创建替代会话; 使用 /resume 选择会话."),
+		Label:                message("Session", "会话"),
+		RestoreFailed:        message("Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session.", "无法恢复已保存的 omp 会话. 会话文件或工作目录不可用. 未创建替代会话; 使用 /resume 选择会话."),
+		DefaultModelFallback: message("The saved model is unavailable. The session was restored with the OMP default model.", "保存的模型不可用. 已使用 OMP 默认模型恢复会话."),
 	},
 	Queue: queueMessages{
 		Full:      message("The queue is full. This message was not submitted.", "队列已满. 此消息未提交."),
