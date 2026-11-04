@@ -66,6 +66,8 @@ type Config struct {
 	Args                []string
 	Environment         Environment
 	NoSession           bool
+	// ResumeModelFallback retries only native saved-model restoration failures.
+	ResumeModelFallback bool
 }
 type result struct {
 	data json.RawMessage
@@ -83,6 +85,9 @@ type Client struct {
 	log                       *slog.Logger
 	cmd                       *exec.Cmd
 	stdin, stdout             *os.File
+	resumeDiagnostics         *resumeModelDiagnostics
+	usedDefaultModelFallback  bool
+	protocolFailed            atomic.Bool
 	events                    chan json.RawMessage
 	queuedEvents              chan json.RawMessage
 	bytes                     byteBudget
@@ -132,6 +137,21 @@ func ValidateArgs(args []string) error {
 }
 
 func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, error) {
+	c, err := startOnce(ctx, cfg, rpcLogger)
+	if err == nil || !cfg.ResumeModelFallback || cfg.Resume == "" || ctx.Err() != nil || ClassifyError(err) != "model_restore" {
+		return c, err
+	}
+	cfg.Args = defaultModelArgs(cfg.Args)
+	cfg.ResumeModelFallback = false
+	c, err = startOnce(ctx, cfg, rpcLogger)
+	if err == nil {
+		c.usedDefaultModelFallback = true
+		c.log.Info("rpc saved model fallback", "event", "rpc_model_restore_fallback")
+	}
+	return c, err
+}
+
+func startOnce(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, error) {
 	if rpcLogger == nil {
 		return nil, errors.New("omp: RPC logger is required")
 	}
@@ -163,12 +183,17 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	cmd := exec.Command(cfg.Binary, args...)
 	cmd.Env = ChildEnv(cfg.Environment)
 	cmd.Dir = cfg.CWD
-	// A descriptor avoids os/exec copy goroutines waiting on inherited stderr.
-	stderr, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	// Explicit descriptors keep os/exec Wait independent of inherited stderr.
+	stderr, diagnostics, err := openResumeModelDiagnostics(cfg.ResumeModelFallback && cfg.Resume != "")
 	if err != nil {
-		return nil, errors.New("omp: cannot discard process diagnostics")
+		return nil, errors.New("omp: cannot open process diagnostics")
 	}
-	defer stderr.Close()
+	defer func() {
+		stderr.Close()
+		if diagnostics != nil {
+			diagnostics.finish()
+		}
+	}()
 	inRead, inWrite, err := os.Pipe()
 	if err != nil {
 		return nil, errors.New("omp: cannot create input pipe")
@@ -190,7 +215,10 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	}
 	inRead.Close()
 	outWrite.Close()
+	stderr.Close()
 	c := &Client{id: clientID, log: rpcLogger.With("client_id", clientID), cmd: cmd, stdin: inWrite, stdout: outRead, events: make(chan json.RawMessage), queuedEvents: make(chan json.RawMessage, 128), ready: make(chan struct{}), readDone: make(chan struct{}), done: make(chan struct{}), stop: make(chan struct{}), writeGate: make(chan struct{}, 1), pending: make(map[string]request)}
+	c.resumeDiagnostics = diagnostics
+	diagnostics = nil // The supervisor now owns the collector.
 	c.frameLimit.Store(maxFrame)
 	go c.readLoop()
 	go c.forwardEvents()
@@ -200,10 +228,9 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	select {
 	case <-c.ready:
 	case <-c.stop:
-		c.Close()
-		return nil, c.failure()
+		return nil, c.startupFailure(startup)
 	case <-c.done:
-		return nil, c.failure()
+		return nil, c.startupFailure(startup)
 	case <-startup.Done():
 		c.fail(errors.New("omp: ready timeout or startup cancellation"))
 		c.Close()
@@ -217,9 +244,27 @@ func Start(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client, er
 	return c, nil
 }
 
+// startupFailure runs only before negotiation, after fully reaping the process group.
+func (c *Client) startupFailure(ctx context.Context) error {
+	_ = c.Close()
+	err := c.failure()
+	select {
+	case <-c.ready:
+		return err
+	default:
+	}
+	if ctx.Err() == nil && !c.protocolFailed.Load() && ClassifyError(err) == "process_exit" && c.resumeDiagnostics != nil && c.resumeDiagnostics.matched {
+		return &classifiedError{kind: "model_restore", err: errors.New("omp: saved session model could not be restored")}
+	}
+	return err
+}
+
 func (c *Client) Events() <-chan json.RawMessage { return c.events }
 func (c *Client) Done() <-chan struct{}          { return c.done }
 func (c *Client) ID() uint64                     { return c.id }
+
+// UsedDefaultModelFallback reports a successful saved-model startup recovery.
+func (c *Client) UsedDefaultModelFallback() bool { return c.usedDefaultModelFallback }
 
 // Stopping reports a terminal transport signal without waiting for process reaping.
 func (c *Client) Stopping() bool {
@@ -403,6 +448,9 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 	}
 	timer.Stop()
 	c.stdout.Close()
+	if c.resumeDiagnostics != nil {
+		c.resumeDiagnostics.finish()
+	}
 	close(c.done)
 }
 
@@ -579,6 +627,7 @@ func (c *Client) logLifecycle(env envelope, phase string) {
 }
 
 func (c *Client) protocolFailure(err error) {
+	c.protocolFailed.Store(true)
 	c.protocolLogOnce.Do(func() {
 		c.log.LogAttrs(context.Background(), slog.LevelError, "rpc protocol error", slog.String("event", "rpc_protocol_error"))
 	})
@@ -586,6 +635,7 @@ func (c *Client) protocolFailure(err error) {
 }
 
 func (c *Client) queueOverflow(err error) {
+	c.protocolFailed.Store(true)
 	c.queueOverflowLogOnce.Do(func() {
 		c.log.LogAttrs(context.Background(), slog.LevelError, "rpc queue overflow", slog.String("event", "rpc_queue_overflow"))
 	})
@@ -634,6 +684,14 @@ func (c *Client) readLoop() {
 	for {
 		data, err := readLineBudget(reader, decoder.physical, &c.bytes)
 		if err != nil {
+			c.bytes.release(cap(decoder.data))
+			if decoder.id != "" && !errors.Is(err, errQueueOverflow) {
+				err = errProtocol
+			}
+			// Preserve protocol exclusion even when process exit won the stop race.
+			if errors.Is(err, errProtocol) || errors.Is(err, errQueueOverflow) {
+				c.protocolFailed.Store(true)
+			}
 			select {
 			case <-c.stop:
 				return
@@ -820,6 +878,9 @@ func readLineBudget(reader *bufio.Reader, limit int, budget *byteBudget) ([]byte
 		}
 		if err != bufio.ErrBufferFull {
 			budget.release(cap(data))
+			if len(data) != 0 {
+				return nil, errProtocol
+			}
 			return nil, err
 		}
 	}

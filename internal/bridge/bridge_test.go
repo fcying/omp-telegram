@@ -445,6 +445,7 @@ func TestMain(m *testing.M) {
 		sessionID := fmt.Sprintf("%08x-0000-4000-8000-%012x", os.Getpid(), os.Getpid())
 		session := filepath.Join(root, sessionID+".jsonl")
 		var resume string
+		model := ""
 		noSession := false
 		for i, arg := range os.Args {
 			if arg == "--no-session" {
@@ -453,8 +454,15 @@ func TestMain(m *testing.M) {
 			if arg == "--resume" && i+1 < len(os.Args) {
 				resume = os.Args[i+1]
 			}
+			if arg == "--model" && i+1 < len(os.Args) {
+				model = os.Args[i+1]
+			}
 		}
 		if resume != "" {
+			if mode := os.Getenv("OMP_TELEGRAM_FIXTURE_RESUME_MODEL"); mode != "" && (model != "@default" || mode == "fail") {
+				fmt.Fprintln(os.Stderr, "SessionModelRestoreError: Could not restore model PRIVATE_SAVED_MODEL")
+				os.Exit(2)
+			}
 			if filepath.IsAbs(resume) {
 				session = resume
 			} else {
@@ -498,6 +506,9 @@ func TestMain(m *testing.M) {
 			}
 		}
 		sessionID = strings.TrimSuffix(filepath.Base(session), ".jsonl")
+		if resume != "" && os.Getenv("OMP_TELEGRAM_FIXTURE_RESUME_MODEL") == "identity" {
+			sessionID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+		}
 		var migrationFixture *bridgeMigrationFixture
 		if mode := os.Getenv("OMP_TELEGRAM_FIXTURE_MIGRATION"); mode != "" {
 			migrationFixture = newBridgeMigrationFixture(mode, session, sessionID)
@@ -673,6 +684,9 @@ func TestMain(m *testing.M) {
 				recordFixtureRPCTrace(typ, "")
 				if fixtureHoldsRPC(typ) {
 					continue
+				}
+				if fixtureRejectsRPC(typ) {
+					resp["success"], resp["error"] = false, "PRIVATE_HOST_TOOL_FAILURE"
 				}
 			case "get_entries":
 				recordFixtureRPCTrace("get_entries", "")

@@ -36,7 +36,7 @@ Core invariants:
 - Fence asynchronous work by its original worker, client, generation, request, and task/session scope. A stale result cannot mutate a replacement runtime.
 - Persist native session-file identities, not PIDs. Do not automatically replay work whose execution status is uncertain.
 - Commit task settlement and final output atomically. A later `/new` or `/close` does not cancel already committed replies.
-- Start native programs with argument arrays, without a shell. Do not implicitly alter OMP models, tools, configuration, or approval policy.
+- Start native programs with argument arrays, without a shell. Model selection changes only through configured arguments, requested commands, or the documented saved-model default fallback; tools, configuration files and approval policy are not implicitly changed.
 
 ## Components and data flow
 
@@ -429,6 +429,12 @@ A user-requested start follows two durable publication boundaries:
 5. `CommitStart` publishes the validated binding with `running=true` and removes the intent. Only then is the new logical session ready. Lazy restore instead retains the existing committed binding and generation.
 
 [`startInternalWithArgs`](../internal/bridge/bridge.go) owns this sequence; [`Client.SessionInfo`](../internal/omp/session.go) obtains identity without an agent turn. A fresh native session may already have an ID and absolute file path without having written its history file; identity discovery does not create it.
+
+Ordinary topic startup and saved autoresearch-control restoration opt into a single saved-model fallback in `omp.Start`; discovery, migration recovery and destructive session deletion do not. The first launch retains normal saved-model restoration. Only a pre-ready process failure with the native `SessionModelRestoreError: Could not restore model ...` diagnostic permits a second launch of the same session with a private argv copy whose existing `--model <value>` and `--model=<value>` options are replaced by one `--model @default` pair. Built-in string option/value pairs remain intact even when values resemble model flags; other arguments keep their order, and the original preset is unchanged. The failed process is fully reaped first. A bounded in-memory stderr classifier discards raw diagnostics rather than logging or persisting them; unrelated exit, cancellation, timeout, protocol, byte-budget and post-ready errors do not trigger fallback, including reassembly-budget failure after process exit wins the race. Native default resolution, model-history recording and session loading remain OMP-owned. Ordinary startup reports successful fallback only after its identity, file, CWD, claim, host-tool and binding-commit checks. Research-control restoration reports it after fenced identity, file, CWD and claim validation. Both paths report at most once per client, including later controls that reuse the runtime. A failed retry preserves existing startup-intent and no-replay behavior.
+
+The retry places `--model @default` before the retained preset arguments, not after them. This preserves native handling of trailing valueless options such as `--system-prompt` and `--append-system-prompt`, which must not consume the model override or turn `@default` into an `@file` input.
+
+A read that ends with residual physical-frame or chunk data cannot trigger model fallback, whether it terminates with EOF or another I/O error, including supervisor-forced stdout closure. The exclusion is recorded before an already-stopped process can short-circuit the reader. Read termination without residual data retains its existing error behavior.
 
 The transactions do not make subprocess startup exactly once. A launch failure can leave an unresolved intent because the native outcome is uncertain. A failed post-launch validation closes the failed runtime; lazy-restore failures preserve the saved binding and submit no prompt. Recovery retains unresolved, unexpired intents, reports uncertainty, and requires `/close` followed by an explicit `/new` or `/resume`. Intent retention can remove an old bridge intent, but cannot prove that OMP created no session or undo its effects.
 

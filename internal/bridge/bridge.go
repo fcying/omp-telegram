@@ -244,6 +244,7 @@ type worker struct {
 	sessionRuntimeStarting atomic.Bool
 	launchArgs             []string
 	configuredThinking     string
+	modelFallbackNoticeID  uint64
 	binding                store.Binding
 	startIntent            *store.StartIntent
 	migration              *store.Migration
@@ -2615,7 +2616,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	} else {
 		launchArgs = *argsOverride
 	}
-	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
+	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, ResumeModelFallback: true, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
 	if e != nil {
 		if reserved {
 			<-w.b.slots
@@ -2746,7 +2747,16 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	if !w.runtimeResuming {
 		w.say(w.tr(i18n.Msg.OmpReadyWorkspaceSession, info.CWD, info.ID))
 	}
+	w.announceDefaultModelFallback(c)
 	return ""
+}
+
+func (w *worker) announceDefaultModelFallback(client *omp.Client) {
+	if !client.UsedDefaultModelFallback() || w.modelFallbackNoticeID == client.ID() {
+		return
+	}
+	w.modelFallbackNoticeID = client.ID()
+	w.say(w.tr(i18n.Msg.Session.DefaultModelFallback))
 }
 func (w *worker) handle(in incoming) {
 	if in.callback == nil && in.msg != nil && w.key.thread != 0 && (in.msg.ForumTopicCreated != nil || in.msg.ForumTopicEdited != nil) {
