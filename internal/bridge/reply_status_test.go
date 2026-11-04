@@ -95,7 +95,7 @@ func TestFinalReplyUsesWholeTaskAverageAndPostOutputContext(t *testing.T) {
 	if queueState(t, w, 2) != "done" || !strings.HasSuffix(output.Text, "\n\nanswer") {
 		t.Fatalf("confirmed answer was not committed intact: %q", output.Text)
 	}
-	for _, want := range []string{"`safe`", "avg 50 tok/s", "◫ 55% (10k)"} {
+	for _, want := range []string{"`safe`", "50t/s", "55%/10k"} {
 		if !strings.Contains(output.Text, want) {
 			t.Fatalf("final reply missing confirmed metric %q: %s", want, output.Text)
 		}
@@ -171,7 +171,7 @@ func TestFinalReplyRejectsUnconfirmedThinkingSnapshots(t *testing.T) {
 			w.operationReturned(result)
 			output, err := w.b.db.NextOutput()
 			requireStoreOK(t, err)
-			if !strings.HasSuffix(output.Text, "\n\nanswer") || !strings.Contains(output.Text, "100 tok/s") || strings.ContainsAny(output.Text, "⦸○◔◑◒◕◉⟳") {
+			if !strings.HasSuffix(output.Text, "\n\nanswer") || !strings.Contains(output.Text, "100t/s") || strings.ContainsAny(output.Text, "⦸○◔◑◒◕◉⟳") {
 				t.Fatalf("unconfirmed snapshot changed reply or projected configured thinking: %s", output.Text)
 			}
 		})
@@ -189,10 +189,10 @@ func TestFinalReplyMetadataTimeoutDoesNotDiscardConfirmedAnswer(t *testing.T) {
 	w.operationReturned(receiveReplyStatus(t, w))
 	output, err := w.b.db.NextOutput()
 	requireStoreOK(t, err)
-	if queueState(t, w, 2) != "done" || !strings.HasSuffix(output.Text, "\n\nanswer") || !strings.Contains(output.Text, "avg 100 tok/s") {
+	if queueState(t, w, 2) != "done" || !strings.HasSuffix(output.Text, "\n\nanswer") || !strings.Contains(output.Text, "100t/s") {
 		t.Fatalf("read timeout changed confirmed answer or metrics: %q", output.Text)
 	}
-	if strings.Contains(output.Text, "◫") || strings.Contains(output.Text, "duplicate") || w.client == nil {
+	if strings.Contains(output.Text, "%/") || strings.Contains(output.Text, "duplicate") || w.client == nil {
 		t.Fatal("read timeout fabricated final context or retired a healthy runtime")
 	}
 }
@@ -212,7 +212,7 @@ func TestFinalReplyLateSnapshotCannotChangeNewInputOrRPCOwnership(t *testing.T) 
 			}
 			output, err := w.b.db.NextOutput()
 			requireStoreOK(t, err)
-			if !strings.HasSuffix(output.Text, "\n\nanswer") || strings.Contains(output.Text, "◫") || strings.Contains(output.Text, "⟳") {
+			if !strings.HasSuffix(output.Text, "\n\nanswer") || strings.Contains(output.Text, "%/") || strings.Contains(output.Text, "⟳") {
 				t.Fatalf("input delayed answer delivery or used an unaccepted snapshot: %q", output.Text)
 			}
 			w.dispatch()
@@ -231,7 +231,7 @@ func TestFinalReplyLateSnapshotCannotChangeNewInputOrRPCOwnership(t *testing.T) 
 	}
 }
 
-func TestLanguageChangeDuringTaskPreservesOldOutputAndUsesLatestReplyLanguage(t *testing.T) {
+func TestLanguageChangeDuringTaskPreservesTaskAndOldOutput(t *testing.T) {
 	w, _, command, _ := replyStatusWorker(t)
 	taskID := w.active
 	command("/lang")
@@ -250,8 +250,8 @@ func TestLanguageChangeDuringTaskPreservesOldOutputAndUsesLatestReplyLanguage(t 
 	w.operationReturned(receiveReplyStatus(t, w))
 	var final string
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=? ORDER BY id DESC LIMIT 1", taskID).Scan(&final))
-	if !strings.Contains(final, "平均 ") || strings.Contains(final, "avg ") || replyBody(final) != "answer" {
-		t.Fatalf("final Bridge header did not use Chinese or model body changed: %q", final)
+	if replyBody(final) != "answer" {
+		t.Fatalf("language change altered the confirmed model reply: %q", final)
 	}
 	var preserved string
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE id=?", noticeID).Scan(&preserved))

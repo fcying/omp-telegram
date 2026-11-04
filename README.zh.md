@@ -68,6 +68,7 @@ token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
+provider_usage = false
 
 [omp]
 binary = "omp"
@@ -126,6 +127,7 @@ format = "text"
 | `telegram.token` | Telegram bot token. 推荐引用环境变量. |
 | `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单. 可直接填写整数, 或引用逗号分隔的环境变量值. |
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见[进度界面](#进度界面). |
+| `telegram.provider_usage` | 显式启用最终回复状态头中的原生 `/usage` 5h/7d 已用百分比. TOML 布尔值, 默认 `false`, 独立于 progress 模式. |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram picker 标签, 每个预设一个. 未设置、为空或数量不匹配时回退显示 `Preset N`, 并在启动时记录 warning. 过长标签会截短以适配按钮. 标签会展示给能查看对话的人, 不要填凭据. |
@@ -371,7 +373,11 @@ Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变�
 
 实时 assistant 输出只显示有界尾部, 不是完整回复. 截断预览优先保留整行和代码围栏上下文. 单行超过预览容量时按字面等宽文本显示, 避免把被截断的 Markdown 标记误解析为格式. 最终回复不变.
 
-最终文字回复可能附带简短的 model 和 context 状态信息. 实时进度和回复头中的 thinking 图标, 以及 `/status` 的 `Thinking` 字段, 都表示配置等级, 不随每轮生效等级变化. 配置为 `auto` 时, `/status` 显示 `auto`, 精简状态头显示 `⟳`.
+最终文字回复可能附带简短的 model 和 context 状态信息. Context 使用 `46%/500k`, 整轮平均输出速度使用 `3.8t/s`; 实时 Progress 和 `/status` 格式不变. 实时进度和回复头中的 thinking 图标, 以及 `/status` 的 `Thinking` 字段, 都表示配置等级, 不随每轮生效等级变化. 配置为 `auto` 时, `/status` 显示 `auto`, 精简状态头显示 `⟳`.
+
+设置 `telegram.provider_usage = true` 后, 最终 **Result** 状态头可显示原生 provider 用量, 例如 `5h30% 7d65%`. 对 Claude 和 OpenAI Codex, 只读取原生 `/usage` 报告中回复对应 provider 下标记为当前账号的数据. 每次最终回复至多通过现有 OMP session 发起一次尽力查询, 超时三秒, 不重试, 不跨回复缓存. 查询作用域不可用, 正忙或已有 prompt 排队时跳过; 超时或失败时省略用量, 不阻止答案交付. 新普通输入会取消等待中的查询; 若私有 prompt 尚未开始发送, 不因此退役健康的 runtime. 缺失或无法识别的窗口会省略, 只有 token/cost 的回退报告也不展示. 不在五秒 Progress 刷新中轮询用量, 不展示账号邮箱, 鉴权详情或原始报告, 不启动 sidecar CLI, 不读取鉴权数据库.
+
+原生进度条样式不参与解析, 状态头只使用通过校验的账号百分比. 若未确认的查询导致 runtime 终止, 待执行 prompt 保留在队列中, 通过新进程恢复同一 session 后继续执行.
 
 ## 附件
 
@@ -449,6 +455,7 @@ Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 
   - 原生 rewind/redo 的 RPC, 或至少支持仅回退会话的原地 `navigateTree` RPC. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) 提供的是只读 tree 查询, 不能移动 session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) 增加原生 TUI 文件及会话 rewind/redo, 仍需通过 RPC 暴露给 bridge. Tree navigation 本身不恢复文件, bridge 不自行实现文件回退引擎.
 - [ ] **Stop 后复用 OMP 进程.** 等待上游提供取消完成屏障, 阻止旧回调继续派发工作及旧任务事件影响后续任务. 包含 `isSettled=true` 的空闲 `get_state` 快照不等于该屏障. 在此之前, 停止活动任务仍会退役进程并保留 session.
 - [ ] **原生排队 prompt 的精确取消.** 等待上游为每个被移除的 prompt 返回真实且关联原请求 ID 的取消终态. OMP 18.10.4 的 `remove_queued_message` 可能返回 `removed:true`, 被移除的 prompt 却随后收到 `prompt_result(status="completed")`. OMP 已有 `abort_and_restore_queue`, 缺的不是另一个原子清队列 RPC. 当前 `/queue` 只取消 bridge 尚未派发的任务; 中止未决原生 steer 时仍退役进程, 并将执行状态保留为 uncertain.
+- [ ] **Sub2API 上游账号额度.** 暂缓网关接入, 等待实际部署的服务包含修复 [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473) 的 [PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476), 并为受限管理密钥显式授予额度读取权限. 展示上游账号实际提供的 5h/7d 窗口, 而非网关 API Key 或订阅限额. 多账号轮转还需可靠的请求到账号关联, 才能标注当前回复实际使用的账号; 不根据全局最新用量日志猜测.
 
 ## 开发
 

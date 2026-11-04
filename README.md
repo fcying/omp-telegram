@@ -68,6 +68,7 @@ token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
+provider_usage = false
 
 [omp]
 binary = "omp"
@@ -126,6 +127,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.token` | Telegram bot token. Prefer an environment reference. |
 | `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists. Values may be literal integers or comma-separated environment values. |
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
+| `telegram.provider_usage` | Opt in to native `/usage` 5h/7d used percentages in final reply headers. TOML boolean; default `false`. Independent of progress mode. |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
 | `omp.args_labels` | Optional literal Telegram picker labels, one per preset. Missing, blank, or mismatched labels fall back to `Preset N` and log a startup warning. Long labels are shortened to fit buttons. Labels are visible in the conversation; never put credentials in them. |
@@ -371,7 +373,11 @@ Progress is best-effort and may not show every task transition. It does not affe
 
 Live assistant output shows a bounded tail, not the full response. Truncated previews prefer whole lines and retain code-fence context. A single line longer than the preview budget is shown as literal monospaced text to avoid interpreting cut Markdown markers. Final replies are unchanged.
 
-Final text replies may include a compact model and context status header. Thinking symbols in live progress and reply headers, and the `Thinking` field in `/status`, reflect the configured level rather than its per-turn resolution. Configured `auto` remains `auto` in `/status` and uses `⟳` in compact headers.
+Final text replies may include a compact model and context status header. Context uses `46%/500k`, and whole-task average output speed uses `3.8t/s`; live Progress and `/status` formats are unchanged. Thinking symbols in live progress and reply headers, and the `Thinking` field in `/status`, reflect the configured level rather than its per-turn resolution. Configured `auto` remains `auto` in `/status` and uses `⟳` in compact headers.
+
+Set `telegram.provider_usage = true` to add native provider usage to the final **Result** header, for example `5h30% 7d65%`. For Claude and OpenAI Codex, this uses only the account marked as current in the native `/usage` report for the reply's provider. Each final reply makes at most one best-effort query through the existing OMP session, with a three-second timeout and no retries or cross-reply cache. Unavailable or busy scopes and topics with queued prompts skip the query; timeout or failure leaves the answer deliverable without usage. Ordinary new input cancels a pending query without retiring an otherwise healthy runtime if its private prompt has not begun sending. Missing or unrecognized windows are omitted, including the token/cost-only fallback report. This does not poll usage in the five-second Progress refresh, expose account emails, authentication details or raw reports, launch a sidecar CLI, or read authentication databases.
+
+Native progress-bar styling is ignored; only validated account percentages reach the header. If an unconfirmed query stops the runtime, pending prompts remain queued and resume through a fresh process in the same session.
 
 ## Attachments
 
@@ -449,6 +455,7 @@ Logs are written to stderr; use your process manager for storage and rotation. P
   - An RPC operation for native rewind/redo, or at least in-place `navigateTree` for conversation-only undo. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) proposes read-only tree access and cannot move the session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) adds native TUI file-and-conversation rewind/redo but still needs RPC access for the bridge. Tree navigation alone does not restore files; the bridge will not implement its own file rollback engine.
 - [ ] **Reuse the OMP process after Stop.** Waiting for an upstream cancellation barrier that prevents stale callbacks from dispatching more work and old task events from affecting subsequent tasks. An idle `get_state` snapshot, including `isSettled=true`, is not that barrier. Until then, stopping an active task retires the process while preserving the session.
 - [ ] **Precise cancellation of native queued prompts.** Waiting for truthful, request-ID-correlated cancellation results for each removed prompt. In OMP 18.10.4, `remove_queued_message` can return `removed:true` while the removed prompt later receives `prompt_result(status="completed")`. `abort_and_restore_queue` already exists; another atomic queue-clearing RPC is not the missing capability. For now, `/queue` cancels only bridge-pending tasks; stopping unresolved native steering retires the process and leaves its execution status uncertain.
+- [ ] **Sub2API upstream account quota.** Defer gateway integration until the deployed server includes [PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476), which fixes [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473), and the scoped admin key has explicit quota-read permission. Display upstream account 5h/7d windows when available, not gateway API-key or subscription limits. Rotating account pools also require reliable request-to-account correlation before labeling an account as the one used by the current reply; do not infer it from the latest global usage log.
 
 ## Development
 

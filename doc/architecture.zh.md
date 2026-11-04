@@ -218,7 +218,7 @@ Discovery waiter 超时/取消/拒绝不会推翻 reader 已发布的可用目�
 
 明确原生 local acknowledgment `agentInvoked:false`, 或请求关联的 local `prompt_result(status:"completed", agentInvoked:false)`, 无需 assistant 文本即可完成提交. 这不证明后台 operation 已结束. Local `error` 为 uncertain, `aborted` 为 cancelled, 缺失/未知状态为 uncertain; 通用通知与状态一起提交, 不泄露原始 RPC 错误, 不退役健康 runtime, 不重放命令. 仅目录识别不能实现原生 `/plan` 或 `/plan-review` 的 RPC 支持.
 
-RPC client 消费私有元数据查询回复后, 已连接 runtime 的 `command_output.text` 通过 outbox 作为独立对话通知交付, 不关联 inbox. 该事件没有 request ID: 不改变任务预览或完成状态, 迟到输出也不会成为下一个根任务的最终回复. 忽略空白输出; 每个事件复用最终回复的字节, 消息数和 UTF-16 展示预算并在超限时截断. 只展示文字, 不展示 RPC frame, 不记录 payload 日志.
+RPC client 消费私有元数据及 `/usage` 查询回复后, 已连接 runtime 的 `command_output.text` 通过 outbox 作为独立对话通知交付, 不关联 inbox. 该事件没有 request ID: 不改变任务预览或完成状态, 迟到输出也不会成为下一个根任务的最终回复. 忽略空白输出; 每个事件复用最终回复的字节, 消息数和 UTF-16 展示预算并在超限时截断. 只展示文字, 不展示 RPC frame, 不记录 payload 日志.
 
 ### 命令菜单发布
 
@@ -286,9 +286,23 @@ Progress assistant 文本使用 [`markdown.go`](../internal/telegram/markdown.go
 
 [`reply_metrics.go`](../internal/bridge/reply_metrics.go) 独立于 progress 模式, 只在成功文本回复首条消息添加 header. 主 agent assistant `message_end` 提供 model/provider 身份与安全数字 usage/duration; terminal summary 不重复计数. 平均生成速度为 `sum(output tokens) * 1000 / sum(duration_ms)`, 不包含 queue/tool 时间, 要求正输出且总 duration 至少 100 ms. 任一贡献调用指标缺失/非法就省略平均值, 不显示部分聚合. 每个 root 或成功托管研究 round 重置计数.
 
+最终 header 保留完整 model ID 和 thinking/fast 标识, context 使用 `46%/500k`, 平均速度使用 `3.8t/s`. 额度窗口合并为空格分隔的一组 (`5h1% 7d0%`); 实时 Progress 和详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
+
 最终 context 使用最后一次调用包含输出的 usage: 优先显式 `contextTokens`, 否则用正 `totalTokens` 或完整 input/output/cache 总和, 再减 orchestration input/output/cache-read usage, 最低为零. 缺失, 负值或溢出不估算. 这不同于可能仍指向最终 input anchor 的 `get_state.contextUsage.tokens`.
 
 确认文本完成后, [`reply_status.go`](../internal/bridge/reply_status.go) 独立发出一秒 deadline 的 `get_state`, 获取当前窗口/model 和 idle 证据. 只有 model/provider/native session 匹配, 且明确非 streaming/非 compacting 时才显示 context; 百分比由含输出 usage 与采样窗口重新计算. Thinking/fast 也须匹配 model 身份. 该 query 不能释放变更通道. Client/generation/root/turn/catalog epoch/session 围栏拒绝迟到结果; 新输入, 原生活动, retirement 或查询失败时, 使用已知 model/average 字段提交确认答案. 无害元数据/完成尾事件可继续消费而不替换答案.
+
+`telegram.provider_usage` 为 TOML 布尔值, 默认 `false`. 启用后, 已确认最终 Result 的生命周期对每次回复至多尝试一次原生 `prompt("/usage")`, 使用三秒 context deadline, 不重试, 不跨回复缓存, 不属于五秒 Progress 采样. 最终 `get_state` 必须有效, 且匹配最新 assistant 的 model/provider 与原生 session. Provider 不受支持, Bridge prompt 队列非空, 变更/control 通道正忙, 或自主研究 round 仍在运行时跳过查询. 私有 `Client.Usage` 路径要求目录中存在 builtin `/usage` 且返回明确的 `agentInvoked:false`, 在 RPC reader 中有界捕获输出, 不将捕获的原始报告发布为普通事件或 payload 日志. 调用方占用 `reply_usage` operation 通道, 在捕获期间排除竞争的 prompt 和变更操作; `replyStatus.pending` 保留已确认答案, 使现有输入/runtime flush 路径可立即省略用量并发布答案. 超时, 失败或 owner 已过期时省略用量; 提交未确认可能退役 runtime, 但先提交已确认答案. 不增加独立 CLI, 鉴权数据库访问或上游修改.
+
+状态头 parser 只接受回复对应 Claude 或 OpenAI Codex provider 下, 原生报告明确标记为当前账号的已识别 5h/7d **已用**百分比, 仅生成 `5h30% 7d65%` 等精简字段. 缺失或无法识别的数据, 以及只有 token/cost 的回退报告都会省略. 状态头不包含账号身份, 邮箱, 鉴权详情或原始报告; 原生当前账号标记不独立证明轮转上游实际由哪个账号处理了请求.
+
+装饰性方括号进度条行作为不透明文本忽略; 语义字段中的控制字符仍使报告无效. 队列安全依据同步 `Client.Stopping()` 信号, 不依赖稍后才到达的 `Done()` 清理通知: 派发待执行任务前先退役失败 runtime, 保留已确认答案和队列, 供同一 session 恢复后继续执行.
+
+私有 `/usage` 保存获准时的 session ID 和 catalog epoch, 获取 RPC 写门后, 在启用捕获前复核作用域及 builtin 身份. 发送边界前授权失效会返回错误, 不发送或重放 prompt, 不标记执行不确定, 也不退役原本健康的 client. 同一作用域中的 builtin 仍有效时, 仅目录 revision 更新不会取消查询.
+
+进入最终状态渲染时取消残留的 steer settlement probe; 最终元数据或用量查询等待期间, 迟到的探针结果不能退役 runtime. Runtime teardown 只提交等待中的已确认答案, client 关闭及进程 slot 的一次归还由外层释放负责. 新输入触发的 usage flush 先取消查询 context, 再在 client mutex 下检查已发送/不确定状态; 发送 hook 在同一 mutex 下检查取消后才启用捕获. 未发送即取消时保留 runtime, 已发送或不确定的私有工作仍退役 runtime, 且不会从 `runtimeStopped` 重入释放. 后续提交仍由既有 RPC 操作通道串行化, 不改变排队任务的 root 归属.
+
+原生事件触发等待中最终回复的 flush 时, 若 flush 退役或替换了事件所属 client, 就消费并丢弃当前事件, 不再在 teardown 后更新 compaction, progress 或 tool 状态. 若保留同一 client, 则继续正常处理该事件, 包括原生 compaction start/end 状态转换.
 
 被接受的 header 与答案进入同一 inbox-completion/outbox 持久事务; commit 前失败保留 uncertain/不重放恢复语义. Header 空间, Markdown-aware 分割/fence repair 与明确截断共享 1 MiB/32 消息显示预算. Error/cancellation 通知及 local command receipt 不加成功 header. 附件/输出传输仍由 media 和持久投递接口负责.
 

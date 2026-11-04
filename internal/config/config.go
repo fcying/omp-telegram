@@ -37,6 +37,7 @@ type Config struct {
 	QueueCapacity         int
 	DatabaseRetentionDays int
 	ProgressMode          string
+	ProviderUsage         bool
 	IdleTimeout           time.Duration
 	LogLevel              string
 	LogFormat             string
@@ -58,10 +59,11 @@ type fileConfig struct {
 }
 
 type telegramFileConfig struct {
-	Token        string `toml:"token"`
-	AllowedUsers []any  `toml:"allowed_users"`
-	AllowedChats []any  `toml:"allowed_chats"`
-	ProgressMode string `toml:"progress_mode"`
+	Token         string `toml:"token"`
+	AllowedUsers  []any  `toml:"allowed_users"`
+	AllowedChats  []any  `toml:"allowed_chats"`
+	ProgressMode  string `toml:"progress_mode"`
+	ProviderUsage bool   `toml:"provider_usage"`
 }
 
 type ompFileConfig struct {
@@ -287,6 +289,7 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("worker.max_workers or worker.queue_capacity exceeds the configured safety limit")
 	}
 	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
+	c.ProviderUsage = raw.Telegram.ProviderUsage
 	switch progressMode {
 	case "off", "summary", "verbose":
 		c.ProgressMode = progressMode

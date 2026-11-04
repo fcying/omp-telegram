@@ -445,7 +445,6 @@ var Msg = struct {
 	AttachmentMissingFileIDExceedsMBDownloadLimit                             Message
 	AutoresearchSessionActiveAnotherConversation                              Message
 	AutoresearchSessionDeletedUsedElsewhere                                   Message
-	Avg                                                                       Message
 	CannotCreateAttachmentDirectory                                           Message
 	CannotMarkAttachmentDirectory                                             Message
 	CannotOpenAttachmentDirectory                                             Message
@@ -941,7 +940,6 @@ var Msg = struct {
 	AttachmentMissingFileIDExceedsMBDownloadLimit: message("attachment is missing a file ID or exceeds the 20 MB download limit", "附件缺少文件 ID 或超过 20 MB 下载限制"),
 	AutoresearchSessionActiveAnotherConversation:  message("autoresearch session is active in another conversation", "自动研究会话正在另一个对话中运行"),
 	AutoresearchSessionDeletedUsedElsewhere:       message("autoresearch session is being deleted or used elsewhere", "自动研究会话正在被删除或在其他位置使用"),
-	Avg:                                           message("avg %s", "平均 %s"),
 	CannotCreateAttachmentDirectory:               message("cannot create attachment directory", "无法创建附件目录"),
 	CannotMarkAttachmentDirectory:                 message("cannot mark attachment directory", "无法标记附件目录"),
 	CannotOpenAttachmentDirectory:                 message("cannot open attachment directory", "无法打开附件目录"),
