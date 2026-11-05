@@ -53,7 +53,7 @@ func (w *worker) replyUsageFinished(result operationResult) {
 		err := json.Unmarshal(result.data, &suffix)
 		if err == nil && suffix != "" {
 			if w.replyStatus.header != "" {
-				w.replyStatus.header += " | "
+				w.replyStatus.header += compactHeaderSeparator
 			}
 			w.replyStatus.header += suffix
 		}

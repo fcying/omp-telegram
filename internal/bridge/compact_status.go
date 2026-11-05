@@ -7,6 +7,8 @@ import (
 	"omp-telegram/internal/i18n"
 )
 
+const compactHeaderSeparator = " | "
+
 func compactModelStatus(model, thinking string) string {
 	label := progressToolLiteral(model)
 	symbol := ""
@@ -51,38 +53,63 @@ func compactFastStatus(language i18n.Language, s statusState) string {
 	return ""
 }
 
-func compactContextStatus(s statusState) string {
-	usage := s.ContextUsage
-	if usage == nil || usage.Tokens == nil || usage.ContextWindow == nil || *usage.Tokens < 0 || *usage.ContextWindow <= 0 {
+func compactSpeedStatus(speed float64) string {
+	if !validStatusNumber(speed) {
 		return ""
 	}
-	percent := float64(*usage.Tokens) / float64(*usage.ContextWindow) * 100
-	if usage.Percent != nil && validStatusNumber(*usage.Percent) {
-		percent = *usage.Percent
-	}
-	return fmt.Sprintf("◫ %.0f%% (%s)", percent, statusTokens(*usage.ContextWindow))
+	return statusDecimal(speed) + "t/s"
 }
 
-func compactProgressStatus(language i18n.Language, s statusState) string {
-	identity := ""
-	if model := menuText(s.Model.ID, 128); model != "" {
-		identity = compactModelStatus(model, s.ConfiguredThinking)
-	}
-	if fast := compactFastStatus(language, s); fast != "" {
-		if identity != "" {
-			identity += " "
-		}
-		identity += fast
+// Nil metrics selects live native values; reply metrics fence sampled settings
+// and provide output-inclusive context and whole-task average speed.
+func compactHeader(language i18n.Language, s statusState, metrics *replyMetrics) string {
+	modelID := s.Model.ID
+	matchesState := true
+	if metrics != nil && metrics.modelID != "" {
+		modelID = metrics.modelID
+		matchesState = modelID == s.Model.ID && (metrics.provider == "" || metrics.provider == s.Model.Provider)
 	}
 	var parts []string
-	if identity != "" {
+	if model := menuText(modelID, 256); model != "" {
+		thinking := ""
+		if matchesState && s.Model.ID != "" {
+			thinking = s.ConfiguredThinking
+		}
+		identity := compactModelStatus(model, thinking)
+		if matchesState && s.Model.ID != "" {
+			if fast := compactFastStatus(language, s); fast != "" {
+				identity += " " + fast
+			}
+		}
 		parts = append(parts, identity)
 	}
-	if context := compactContextStatus(s); context != "" {
-		parts = append(parts, context)
+	percent, window := 0.0, int64(0)
+	usage := s.ContextUsage
+	if metrics == nil {
+		if usage != nil && usage.Tokens != nil && usage.ContextWindow != nil && *usage.Tokens >= 0 && *usage.ContextWindow > 0 {
+			window = *usage.ContextWindow
+			percent = float64(*usage.Tokens) / float64(window) * 100
+			if usage.Percent != nil && validStatusNumber(*usage.Percent) {
+				percent = *usage.Percent
+			}
+		}
+	} else if matchesState && metrics.modelID != "" && metrics.provider != "" && metrics.lastContextKnown &&
+		s.IsStreaming != nil && !*s.IsStreaming && s.IsCompacting != nil && !*s.IsCompacting &&
+		usage != nil && usage.ContextWindow != nil && *usage.ContextWindow > 0 {
+		window = *usage.ContextWindow
+		percent = float64(metrics.lastContext) / float64(window) * 100
 	}
-	if s.TokensPerSecond != nil && validStatusNumber(*s.TokensPerSecond) {
-		parts = append(parts, s.speedText(language))
+	if window > 0 {
+		parts = append(parts, fmt.Sprintf("%.0f%%/%s", percent, statusTokens(window)))
 	}
-	return strings.Join(parts, " | ")
+	speed := ""
+	if metrics != nil {
+		speed = metrics.speedText()
+	} else if s.TokensPerSecond != nil {
+		speed = compactSpeedStatus(*s.TokensPerSecond)
+	}
+	if speed != "" {
+		parts = append(parts, speed)
+	}
+	return strings.Join(parts, compactHeaderSeparator)
 }

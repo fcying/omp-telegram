@@ -373,7 +373,7 @@ Progress 属于 best-effort 状态提示, 不一定显示每次任务状态变�
 
 实时 assistant 输出只显示有界尾部, 不是完整回复. 截断预览优先保留整行和代码围栏上下文. 单行超过预览容量时按字面等宽文本显示, 避免把被截断的 Markdown 标记误解析为格式. 最终回复不变.
 
-最终文字回复可能附带简短的 model 和 context 状态信息. Context 使用 `46%/500k`, 整轮平均输出速度使用 `3.8t/s`; 实时 Progress 和 `/status` 格式不变. 实时进度和回复头中的 thinking 图标, 以及 `/status` 的 `Thinking` 字段, 都表示配置等级, 不随每轮生效等级变化. 配置为 `auto` 时, `/status` 显示 `auto`, 精简状态头显示 `⟳`.
+实时 Progress 和最终文字回复共用同一个精简状态头格式化接口: context 使用 `46%/500k`, 速度使用 `3.8t/s`. Progress 使用原生采样值; 最终回复使用包含输出的 context 和整轮平均速度, 因此数值可能不同, 但格式保持一致. Provider usage 仅在启用时显示在最终状态头中. 详细 `/status` 格式不变. 实时进度和回复头中的 thinking 图标, 以及 `/status` 的 `Thinking` 字段, 都表示配置等级, 不随每轮生效等级变化. 配置为 `auto` 时, `/status` 显示 `auto`, 精简状态头显示 `⟳`.
 
 设置 `telegram.provider_usage = true` 后, 最终 **Result** 状态头可显示原生 provider 用量, 例如 `5h30% 7d65%`. 对 Claude 和 OpenAI Codex, 只读取原生 `/usage` 报告中回复对应 provider 下标记为当前账号的数据. 每次最终回复至多通过现有 OMP session 发起一次尽力查询, 超时三秒, 不重试, 不跨回复缓存. 查询作用域不可用, 正忙或已有 prompt 排队时跳过; 超时或失败时省略用量, 不阻止答案交付. 新普通输入会取消等待中的查询; 若私有 prompt 尚未开始发送, 不因此退役健康的 runtime. 缺失或无法识别的窗口会省略, 只有 token/cost 的回退报告也不展示. 不在五秒 Progress 刷新中轮询用量, 不展示账号邮箱, 鉴权详情或原始报告, 不启动 sidecar CLI, 不读取鉴权数据库.
 

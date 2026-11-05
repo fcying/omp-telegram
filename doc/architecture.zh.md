@@ -280,13 +280,13 @@ Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 w
 
 Progress assistant 文本使用 [`markdown.go`](../internal/telegram/markdown.go) 的 `TailForTelegram`, 包括生成围栏的完整 Markdown 片段最多占 2200 个 UTF-16 单元或 progress 剩余容量. 截断时前移到下一完整行, 按转换器相同规则恢复外围代码围栏. 超长单行尾部使用不冲突的围栏按字面显示, 不猜测行内 Markdown 结构. 普通段落换行, 列表转换, 流式未闭合标记, 最终回复分割和 HTML 拒绝回退均不变. 完整预览交付 Telegram 前仍经过 `ClipConvertible`.
 
-[`compact_status.go`](../internal/bridge/compact_status.go) 在一个逻辑行显示有界字面 model ID (不带 provider), 原生 thinking 符号, fast 活动, context 百分比/窗口容量和原生速度. 未知字段省略, 不从 text delta 估算 tokens/s. Thinking 来源是由本地 `/effort` 元数据查询和 `thinking_level_changed` 填充的 runtime configured-selector 缓存, 而非有效 `get_state.thinkingLevel`. 未知/model-default/不可调 selector 不显示 compact 符号, 详细 status 为 `n/a`. Runtime 停止清空缓存. 可选 configured-selector 读取失败不推翻已验证设置变更; 已 stopping client 仍不能复用.
+[`compact_status.go`](../internal/bridge/compact_status.go) 中的 `compactHeader` 是实时 Progress 和最终回复共用的格式化接口, 在一个逻辑行显示有界字面 model ID (不带 provider), 原生 thinking 符号, fast 活动, context 百分比/窗口容量和已校验速度. Reply metrics 为 nil 时使用原生采样值; 已确认回复的 metrics 提供整轮速度和包含输出的 context, 同时校验 model 专属设置的归属. 未知字段省略, 不从 text delta 估算 tokens/s. Thinking 来源是由本地 `/effort` 元数据查询和 `thinking_level_changed` 填充的 runtime configured-selector 缓存, 而非有效 `get_state.thinkingLevel`. 未知/model-default/不可调 selector 不显示 compact 符号, 详细 status 为 `n/a`. Runtime 停止清空缓存. 可选 configured-selector 读取失败不推翻已验证设置变更; 已 stopping client 仍不能复用.
 
 ### 已确认最终渲染与指标
 
 [`reply_metrics.go`](../internal/bridge/reply_metrics.go) 独立于 progress 模式, 只在成功文本回复首条消息添加 header. 主 agent assistant `message_end` 提供 model/provider 身份与安全数字 usage/duration; terminal summary 不重复计数. 平均生成速度为 `sum(output tokens) * 1000 / sum(duration_ms)`, 不包含 queue/tool 时间, 要求正输出且总 duration 至少 100 ms. 任一贡献调用指标缺失/非法就省略平均值, 不显示部分聚合. 每个 root 或成功托管研究 round 重置计数.
 
-最终 header 保留完整 model ID 和 thinking/fast 标识, context 使用 `46%/500k`, 平均速度使用 `3.8t/s`. 额度窗口合并为空格分隔的一组 (`5h1% 7d0%`); 实时 Progress 和详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
+Progress 和最终 header 共用 model/thinking/fast 格式, 精简 context (`46%/500k`), 速度单位 (`3.8t/s`) 和字段分隔符. 实时数值仍使用原生采样; 最终数值仍使用包含输出的 context 和整轮平均速度. 可选 provider usage 仅在最终 header 合并为空格分隔的一组 (`5h1% 7d0%`), Progress 不查询或展示它. 详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
 
 最终 context 使用最后一次调用包含输出的 usage: 优先显式 `contextTokens`, 否则用正 `totalTokens` 或完整 input/output/cache 总和, 再减 orchestration input/output/cache-read usage, 最低为零. 缺失, 负值或溢出不估算. 这不同于可能仍指向最终 input anchor 的 `get_state.contextUsage.tokens`.
 
