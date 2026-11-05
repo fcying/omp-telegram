@@ -113,6 +113,7 @@ type Client struct {
 	metadataBusy              bool
 	metadataUnavailable       bool
 	metadata                  *metadataQuery
+	usageFence                *usageQuery
 	commandCatalog            CommandCatalog
 	catalogUpdateRevision     uint64
 	catalogQuery              *commandCatalogQuery
@@ -479,6 +480,12 @@ func (c *Client) Send(ctx context.Context, frame map[string]any) error {
 		return c.failure()
 	default:
 	}
+	if frame["type"] == "prompt" {
+		err := c.prepareUsagePrompt(ctx, frame["id"])
+		if err != nil {
+			return err
+		}
+	}
 	// Pipe deadlines interrupt a blocked write without leaking a writer goroutine.
 	c.stdin.SetWriteDeadline(time.Time{})
 	canceled := make(chan struct{})
@@ -799,6 +806,7 @@ func (c *Client) readLoop() {
 				if env.Command == "get_state" && *env.Success {
 					c.receiveCommandCatalogSession(env.Data)
 				}
+				c.receiveUsageResponse(env)
 				response := result{data: env.Data}
 				if !*env.Success {
 					response.err = &classifiedError{kind: "rejected", err: errors.New("omp: RPC command rejected")}

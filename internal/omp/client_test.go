@@ -88,6 +88,9 @@ func TestMain(m *testing.M) {
 			if fixtureMigrationCommand(command) {
 				continue
 			}
+			if fixtureUsageCommand(command) {
+				continue
+			}
 			if fixtureSessionCommand(command) {
 				continue
 			}

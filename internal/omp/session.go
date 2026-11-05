@@ -19,6 +19,7 @@ type metadataQuery struct {
 	modelRole bool
 	thinking  bool
 	output    chan string
+	usage     *usageQuery
 }
 
 // SessionInfo queries the local /session command without starting an agent turn.
@@ -103,15 +104,39 @@ func (c *Client) SessionInfo(ctx context.Context) (SessionInfo, error) {
 
 func (c *Client) captureMetadata(frame json.RawMessage) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	lateUsage := false
+	defer func() {
+		c.mu.Unlock()
+		if lateUsage {
+			c.fail(errors.New("omp: late private usage output; execution state uncertain"))
+		}
+	}()
 	query := c.metadata
-	if query == nil {
+	if query == nil && c.usageFence == nil {
 		return false
 	}
 	var event struct {
 		Text string `json:"text"`
 	}
 	if json.Unmarshal(frame, &event) != nil {
+		return false
+	}
+	if c.usageFence != nil && matchingUsageOutput(event.Text) {
+		usage := c.usageFence
+		if !usage.open {
+			lateUsage = true
+			c.metadataUnavailable = true
+		} else if usage.seen || len(event.Text) > maxUsageOutput {
+			usage.invalid = true
+			usage.seen = true
+			usage.text = ""
+		} else {
+			usage.seen = true
+			usage.text = event.Text
+		}
+		return true
+	}
+	if query == nil || query.usage != nil {
 		return false
 	}
 	if query.thinking {

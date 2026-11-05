@@ -1378,7 +1378,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 func (w *worker) runtimeStopped() {
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
-	w.flushReplyStatus()
+	w.commitPendingReplyStatus()
 	w.cancelProgressNative()
 	w.configuredThinking = ""
 	w.statusReleaseClientID = 0
@@ -1739,6 +1739,10 @@ func (w *worker) run() {
 }
 
 func (w *worker) operationFinished(result operationResult) {
+	if result.kind == "reply_usage" {
+		w.replyUsageFinished(result)
+		return
+	}
 	if result.kind == "args_state" {
 		w.argsStateFinished(result)
 		return
@@ -2318,6 +2322,11 @@ func (w *worker) operationReturned(result operationResult) {
 	w.rpcOperationClientID = 0
 	pendingExit := result.clientID != 0 && w.rpcExitPendingClientID == result.clientID
 	w.operationFinished(result)
+	if result.kind == "reply_usage" && w.client != nil && w.client.ID() == result.clientID && w.client.Stopping() {
+		w.releaseRuntimeWithReason(true, "usage_unconfirmed")
+		w.rpcExitPendingClientID = 0
+		pendingExit = false
+	}
 	if pendingExit {
 		if client, connected := w.runtimeClient(); connected && client.ID() == result.clientID {
 			w.failed()

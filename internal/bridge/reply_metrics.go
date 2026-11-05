@@ -94,7 +94,7 @@ func (m replyMetrics) speedText() string {
 	if !validStatusNumber(speed) {
 		return ""
 	}
-	return statusDecimal(speed) + " tok/s"
+	return statusDecimal(speed) + "t/s"
 }
 
 func replyHeader(language i18n.Language, s statusState, m replyMetrics) string {
@@ -124,10 +124,10 @@ func replyHeader(language i18n.Language, s statusState, m replyMetrics) string {
 		s.ContextUsage != nil && s.ContextUsage.ContextWindow != nil && *s.ContextUsage.ContextWindow > 0 {
 		window := *s.ContextUsage.ContextWindow
 		percent := float64(m.lastContext) / float64(window) * 100
-		parts = append(parts, fmt.Sprintf("◫ %.0f%% (%s)", percent, statusTokens(window)))
+		parts = append(parts, fmt.Sprintf("%.0f%%/%s", percent, statusTokens(window)))
 	}
 	if speed := m.speedText(); speed != "" {
-		parts = append(parts, i18n.Text(language, i18n.Msg.Avg, speed))
+		parts = append(parts, speed)
 	}
 	return strings.Join(parts, " | ")
 }

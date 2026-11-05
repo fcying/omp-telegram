@@ -24,6 +24,7 @@ type replyStatusRequest struct {
 	epoch      uint64
 	sessionID  string
 	round      bool
+	usage      bool
 	cancel     context.CancelFunc
 }
 
@@ -52,6 +53,7 @@ func (w *worker) finishReplyWithStatus(round bool) {
 	}
 	w.stopTyping()
 	w.resetIdleProbe()
+	w.cancelSteerProbe()
 	w.cancelProgressNative()
 	catalog := client.CommandCatalog()
 	ctx, cancel := context.WithTimeout(w.ctx, replyStatusTimeout)
@@ -81,7 +83,7 @@ func (w *worker) replyStatusMatches(request *replyStatusRequest) bool {
 
 func (w *worker) replyStatusFinished(result operationResult) {
 	sample, ok := result.meta.(replyStatusResult)
-	if !ok || sample.request == nil || w.replyStatus.pending != sample.request {
+	if !ok || sample.request == nil || sample.request.usage || w.replyStatus.pending != sample.request {
 		return
 	}
 	request := sample.request
@@ -94,20 +96,32 @@ func (w *worker) replyStatusFinished(result operationResult) {
 	if sample.valid && request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID && sample.state.SessionID == request.sessionID {
 		sample.state.ConfiguredThinking = w.configuredThinking
 		w.replyStatus.header = replyHeader(w.b.language(), sample.state, w.replyStatus.metrics)
+		if w.beginReplyUsage(request, sample.state) {
+			return
+		}
 	}
 	w.commitReplyStatus(request.round)
 }
 
 func (w *worker) flushReplyStatus() {
+	request := w.commitPendingReplyStatus()
+	if request != nil && request.usage && w.client == request.client && w.binding.Generation == request.generation && request.client.UsageNeedsRetirement() {
+		w.releaseRuntimeWithReason(true, "usage_interrupted")
+	}
+}
+
+// Runtime teardown commits the answer without recursively releasing its client.
+func (w *worker) commitPendingReplyStatus() *replyStatusRequest {
 	request := w.replyStatus.pending
 	if request == nil {
-		return
+		return nil
 	}
 	request.cancel()
 	w.replyStatus.pending = nil
 	if w.replyStatusMatches(request) {
 		w.commitReplyStatus(request.round)
 	}
+	return request
 }
 
 func (w *worker) commitReplyStatus(round bool) {
@@ -130,6 +144,11 @@ func (w *worker) replyStatusEvent(e rpcEvent) bool {
 	case "agent_end":
 		// A repeated completion cannot replace the reply already awaiting its header.
 		return true
+	case "command_output":
+		// The reader captures our usage report; unrelated receipts retain their own path.
+		if w.replyStatus.pending.usage {
+			return false
+		}
 	case "prompt_result":
 		if e.Status == "completed" {
 			return false
@@ -137,6 +156,7 @@ func (w *worker) replyStatusEvent(e rpcEvent) bool {
 	case "session_settled", "available_commands_update", "advisor_cost_changed", "thinking_level_changed":
 		return false
 	}
+	client := w.client
 	w.flushReplyStatus()
-	return false
+	return w.client != client
 }

@@ -18,6 +18,9 @@ allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 # Unset, empty, or invalid values fall back to summary.
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
+# Show native /usage provider windows only in final reply headers. Default: false.
+provider_usage = false
+
 [omp]
 binary = "omp"
 # Each array entry is one ordered preset; shell-style quoting is parsed, never executed.

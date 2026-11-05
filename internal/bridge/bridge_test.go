@@ -568,6 +568,10 @@ func TestMain(m *testing.M) {
 			}
 			nativeCommands = append(nativeCommands, map[string]any{"name": "fast", "source": source})
 		}
+		usageMode := os.Getenv("OMP_TELEGRAM_FIXTURE_USAGE_MODE")
+		if usageMode != "" && usageMode != "unavailable" {
+			nativeCommands = append(nativeCommands, map[string]any{"name": "usage", "source": "builtin"})
+		}
 		autoresearchFixture := strings.HasPrefix(nativeMode, "autoresearch")
 		autoresearchEnabled := os.Getenv("OMP_TELEGRAM_FIXTURE_AUTORESEARCH_MODE") == "on"
 		autoresearchState := session + ".autoresearch"
@@ -986,6 +990,10 @@ func TestMain(m *testing.M) {
 				os.Exit(2)
 			case "prompt":
 				text, _ := cmd["message"].(string)
+				usageHandled := fixtureReplyUsage(cmd, resp, emit)
+				if usageHandled {
+					continue
+				}
 				if text == "/effort" {
 					recordFixtureRPCTrace("effort_query", "")
 					effortCalls++
