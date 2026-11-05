@@ -1,9 +1,7 @@
 package bridge
 
 import (
-	"fmt"
 	"math"
-	"strings"
 
 	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/telegram"
@@ -91,45 +89,7 @@ func (m replyMetrics) speedText() string {
 		return ""
 	}
 	speed := float64(m.output) * 1000 / m.duration
-	if !validStatusNumber(speed) {
-		return ""
-	}
-	return statusDecimal(speed) + "t/s"
-}
-
-func replyHeader(language i18n.Language, s statusState, m replyMetrics) string {
-	modelID := m.modelID
-	matchesState := true
-	if modelID == "" {
-		modelID = s.Model.ID
-	} else {
-		matchesState = modelID == s.Model.ID && (m.provider == "" || m.provider == s.Model.Provider)
-	}
-	var parts []string
-	if model := menuText(modelID, 256); model != "" {
-		thinking := ""
-		if matchesState && s.Model.ID != "" {
-			thinking = s.ConfiguredThinking
-		}
-		identity := compactModelStatus(model, thinking)
-		if matchesState && s.Model.ID != "" {
-			if fast := compactFastStatus(language, s); fast != "" {
-				identity += " " + fast
-			}
-		}
-		parts = append(parts, identity)
-	}
-	if matchesState && m.modelID != "" && m.provider != "" && m.lastContextKnown &&
-		s.IsStreaming != nil && !*s.IsStreaming && s.IsCompacting != nil && !*s.IsCompacting &&
-		s.ContextUsage != nil && s.ContextUsage.ContextWindow != nil && *s.ContextUsage.ContextWindow > 0 {
-		window := *s.ContextUsage.ContextWindow
-		percent := float64(m.lastContext) / float64(window) * 100
-		parts = append(parts, fmt.Sprintf("%.0f%%/%s", percent, statusTokens(window)))
-	}
-	if speed := m.speedText(); speed != "" {
-		parts = append(parts, speed)
-	}
-	return strings.Join(parts, " | ")
+	return compactSpeedStatus(speed)
 }
 
 func replyTaskReplies(language i18n.Language, text, header string, truncated bool) []string {

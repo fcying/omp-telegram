@@ -84,7 +84,7 @@ func TestNativeStatusCannotSupplyConfiguredThinking(t *testing.T) {
 	if got := statusFields(formatStatus("en", state, "/work", "session", "", 0))["Thinking"]; got != "n/a" {
 		t.Fatalf("native state supplied configured thinking to detailed status: %q", got)
 	}
-	for _, text := range []string{compactProgressStatus("en", state), replyHeader("en", state, replyMetrics{})} {
+	for _, text := range []string{compactHeader("en", state, nil), compactHeader("en", state, &replyMetrics{})} {
 		if !strings.Contains(text, "answer-model") || strings.ContainsAny(text, "⦸○◔◑◒◕◉⟳") || strings.Contains(text, "high") {
 			t.Fatalf("unknown configured thinking inferred a native level: %s", text)
 		}

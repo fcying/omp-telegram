@@ -22,6 +22,22 @@ func receiveProgressNative(t *testing.T, w *worker) progressNativeResult {
 	}
 }
 
+func TestCompactHeaderKeepsLiveAndReplyMetricSources(t *testing.T) {
+	state := replyMetricsState(t, `{"model":{"id":"answer-model","provider":"private-provider"},"fastModeActive":true,"fastModeEnabled":true,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":175000,"contextWindow":500000,"percent":35},"tokensPerSecond":25.8}`)
+	state.ConfiguredThinking = "auto"
+	var metrics replyMetrics
+	msg := replyMetricsMessage(10, 1000)
+	contextTokens := int64(210000)
+	msg.Usage.ContextTokens = &contextTokens
+	metrics.observe(msg)
+	if got := compactHeader("en", state, nil); got != "⟳ `answer-model` ⚡ | 35%/500k | 25.8t/s" {
+		t.Fatalf("live header changed sampled values or compact format: %s", got)
+	}
+	if got := compactHeader("en", state, &metrics); got != "⟳ `answer-model` ⚡ | 42%/500k | 10t/s" {
+		t.Fatalf("reply header reused live metrics or changed compact format: %s", got)
+	}
+}
+
 func TestProgressNativeStatusDistinguishesFastSettingAndUnknownMetrics(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
