@@ -3781,13 +3781,21 @@ func (w *worker) event(raw []byte) {
 		if w.research.root && !w.research.roundOpen {
 			return
 		}
-		if e.AssistantMessageEvent.Type == "text_delta" {
+		if e.AssistantMessageEvent.Type == "text_delta" && e.AssistantMessageEvent.Delta != "" {
 			delta := e.AssistantMessageEvent.Delta
+			separator := ""
+			if w.stream.Len() != 0 && w.stream.Len() == w.finalizedStreamBytes {
+				separator = "\n\n"
+			}
 			pendingBytes := w.stream.Len() - w.finalizedStreamBytes
-			if len(delta) > maxAssistantOutputBytes-w.stream.Len() || len(delta) > maxAssistantOutputBytes-w.finalAssistantBytes-pendingBytes {
+			// Cached texts exclude their paragraph separators; pending bytes include them.
+			finalizedBytes := w.finalAssistantBytes + 2*max(0, len(w.finalAssistantTexts)-1)
+			deltaBytes := len(separator) + len(delta)
+			if deltaBytes > maxAssistantOutputBytes-w.stream.Len() || deltaBytes > maxAssistantOutputBytes-finalizedBytes-pendingBytes {
 				w.assistantBudgetExceeded()
 				return
 			}
+			w.stream.WriteString(separator)
 			w.stream.WriteString(delta)
 			w.preview = w.stream.String()
 		}
@@ -3838,7 +3846,7 @@ func (w *worker) event(raw []byte) {
 				ErrorStatus:                m.ErrorStatus,
 			}
 			if text := assistantText(m); text != "" {
-				if len(text) > maxAssistantOutputBytes-w.finalAssistantBytes {
+				if len(text)+2*len(w.finalAssistantTexts) > maxAssistantOutputBytes-w.finalAssistantBytes {
 					w.assistantBudgetExceeded()
 					return
 				}

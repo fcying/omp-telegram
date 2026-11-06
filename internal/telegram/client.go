@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -358,8 +359,32 @@ func applyHTML(fields map[string]any, text string) {
 }
 
 func applyPlain(fields map[string]any, text string) {
+	if literalUTF16Len(text) > MaxMessageUTF16 && fields["parse_mode"] == "HTML" {
+		// The rendered text already fits. Drop only its generated tags rather
+		// than retrying the longer Markdown source or truncating its contents.
+		text = plainHTMLText(fields["text"].(string))
+	}
 	fields["text"] = text
 	delete(fields, "parse_mode")
+}
+
+// plainHTMLText accepts only our generated HTML, whose literal angles are escaped.
+func plainHTMLText(markup string) string {
+	var plain strings.Builder
+	insideTag := false
+	for _, r := range markup {
+		switch r {
+		case '<':
+			insideTag = true
+		case '>':
+			insideTag = false
+		default:
+			if !insideTag {
+				plain.WriteRune(r)
+			}
+		}
+	}
+	return html.UnescapeString(plain.String())
 }
 
 func utf16Len(s string) int {

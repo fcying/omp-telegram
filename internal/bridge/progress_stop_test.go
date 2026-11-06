@@ -29,6 +29,14 @@ func TestProgressPreviewPreservesFormattingAtTailBoundary(t *testing.T) {
 		name, text, want, absent string
 	}{
 		{"paragraphs", "First paragraph.\n\nSecond paragraph.\nThird line.", "First paragraph.\n\nSecond paragraph.\nThird line.", ""},
+		{"list paragraphs", "- first\n\n- second", "Output:\n- first\n\n- second", "- first\n- second"},
+		{"nested emphasis", "***current***", "<b>", "*"},
+		{"bold around code", "**a `b` c**", "<code>b</code>", "**"},
+		{"pending bold", "**current", "Output:\ncurrent", "*"},
+		{"pending bold closer", "**current*", "Output:\ncurrent", "*"},
+		{"complete bold", "**current**", "<b>current</b>", "**"},
+		{"pending code", "`**current**", "<code>**current**</code>", "<b>current"},
+		{"literal fenced markers", "```\n**current", "<pre>**current</pre>", "<b>current"},
 		{"clipped emphasis", strings.Repeat("x", 80) + "**important** " + strings.Repeat("y", 2187), "<pre>nt** ", "<i>important</i>"},
 		{"clipped fence", strings.Repeat("intro\n", 30) + "```go\n" + strings.Repeat("value := 1\n", 230) + "```\nFinal paragraph.", "</pre>\nFinal paragraph.", "<pre>Final paragraph."},
 		{"closing fence boundary", "```go\ncode\n```\n" + strings.Repeat("y", 2196), strings.Repeat("y", 2196), "<pre>"},
@@ -60,6 +68,140 @@ func TestProgressPreviewPreservesFormattingAtTailBoundary(t *testing.T) {
 				t.Fatalf("progress edit reinterpreted clipped markup: %q", text)
 			}
 		})
+	}
+}
+
+func TestSummaryPreviewPreservesAssistantMessageBoundaries(t *testing.T) {
+	const first = `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"First step."}}`
+	const firstEnd = `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"First step."}]}}`
+	const second = `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Second step."}}`
+	const secondEnd = `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Second step."}]}}`
+	const empty = `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":""}}`
+	for _, test := range []struct {
+		name   string
+		events []string
+		want   string
+	}{
+		{"independent messages", []string{first, firstEnd, second, secondEnd}, "First step.\n\nSecond step."},
+		{"same message chunks", []string{first, `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"\n"}}`, second, `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"First step.\nSecond step."}]}}`}, "First step.\nSecond step."},
+		{"empty deltas and messages", []string{empty, first, empty, firstEnd, empty, `{"type":"message_end","message":{"role":"assistant","content":[]}}`, empty, second, empty, secondEnd, empty}, "First step.\n\nSecond step."},
+		{"tool between messages", []string{first, firstEnd, `{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`, `{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"PRIVATE"}]}}`, `{"type":"tool_execution_end","toolCallId":"read-1"}`, second, secondEnd}, "First step.\n\nSecond step."},
+		{"continuation run", []string{`{"type":"agent_start"}`, first, firstEnd, `{"type":"agent_end","isTerminal":false,"messages":[{"role":"assistant","content":[{"type":"text","text":"First step."}]}]}`, `{"type":"agent_start"}`, empty, second, secondEnd}, "First step.\n\nSecond step."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w, f, _ := setupWorkspaceWorker(t)
+			w.b.cfg.ProgressMode = "summary"
+			w.active, w.busy, w.previewID = 1, true, 777
+			w.previewResult = make(chan previewResult, 1)
+			for _, event := range test.events {
+				w.event([]byte(event))
+			}
+			final, found, truncated := boundedAssistantTexts(nil, nil, w.finalAssistantTexts, maxAssistantOutputBytes)
+			if !found || truncated || final != test.want || w.preview != final {
+				t.Fatalf("preview/final paragraph mismatch: preview=%q final=%q want=%q", w.preview, final, test.want)
+			}
+			w.flushPreview()
+			select {
+			case result := <-w.previewResult:
+				requireStoreOK(t, result.err)
+				w.previewFinished(result)
+			case <-time.After(5 * time.Second):
+				t.Fatal("summary progress edit did not finish")
+			}
+			f.mu.Lock()
+			request := f.messages[len(f.messages)-1]
+			f.mu.Unlock()
+			text, _ := request["text"].(string)
+			if request["parse_mode"] != "HTML" || request["message_id"] != float64(777) || !strings.HasSuffix(text, "Output:\n"+test.want) || strings.Contains(text, "PRIVATE") {
+				t.Fatalf("summary edit lost assistant message boundaries: %+v", request)
+			}
+		})
+	}
+}
+
+func TestAssistantMessageSeparatorsRespectOutputBudgets(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		priorSize int
+		cached    bool
+		fits      bool
+	}{
+		{"stream exact", maxAssistantOutputBytes - 3, false, true},
+		{"stream overflow", maxAssistantOutputBytes - 2, false, false},
+		{"cached assistant exact", maxAssistantOutputBytes - 6, true, true},
+		{"cached assistant overflow", maxAssistantOutputBytes - 5, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w, _, _ := setupWorkspaceWorker(t)
+			prior := strings.Repeat("x", test.priorSize)
+			w.finalAssistantTexts = []string{prior}
+			w.finalAssistantBytes = len(prior)
+			if test.cached {
+				// The first message had no deltas, so only the second is in the stream.
+				w.finalAssistantTexts = append(w.finalAssistantTexts, "a")
+				w.finalAssistantBytes++
+				w.stream.WriteString("a")
+			} else {
+				w.stream.WriteString(prior)
+			}
+			w.finalizedStreamBytes = w.stream.Len()
+			w.preview = w.stream.String()
+			before := w.stream.Len()
+			w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"b"}}`))
+			if !test.fits {
+				if w.stream.Len() != before {
+					t.Fatal("over-budget paragraph was appended")
+				}
+			} else {
+				if w.stream.Len() != before+3 || !strings.HasSuffix(w.preview, "\n\nb") {
+					t.Fatal("exact-budget paragraph was rejected")
+				}
+				w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}`))
+				if w.finalizedStreamBytes != w.stream.Len() {
+					t.Fatal("finalized offset excluded the paragraph separator")
+				}
+				before = w.stream.Len()
+				w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":""}}`))
+				if w.stream.Len() != before {
+					t.Fatal("empty delta added a separator at the budget boundary")
+				}
+				if _, err := w.b.db.NextOutput(); err == nil {
+					t.Fatal("exact-budget output was reported as overflow")
+				}
+				w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"c"}}`))
+				if w.stream.Len() != before {
+					t.Fatal("next paragraph exceeded the output budget")
+				}
+			}
+			output, err := w.b.db.NextOutput()
+			requireStoreOK(t, err)
+			if !strings.Contains(output.Text, "budget") {
+				t.Fatalf("missing user-visible output budget notice: %q", output.Text)
+			}
+		})
+	}
+}
+
+func TestAssistantMessageEndCountsUnstreamedParagraphSeparators(t *testing.T) {
+	w, _, _ := setupWorkspaceWorker(t)
+	prior := strings.Repeat("x", maxAssistantOutputBytes-4)
+	w.finalAssistantTexts = []string{prior}
+	w.finalAssistantBytes = len(prior)
+	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"bc"}]}}`))
+	if len(w.finalAssistantTexts) != 2 || w.finalAssistantBytes != maxAssistantOutputBytes-2 {
+		t.Fatal("exact-budget unstreamed message was rejected or cached bytes changed meaning")
+	}
+	if _, err := w.b.db.NextOutput(); err == nil {
+		t.Fatal("exact-budget unstreamed message reported an overflow")
+	}
+	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"d"}]}}`))
+	if len(w.finalAssistantTexts) != 2 {
+		t.Fatal("over-budget unstreamed paragraph was cached")
+	}
+	output, err := w.b.db.NextOutput()
+	requireStoreOK(t, err)
+	if !strings.Contains(output.Text, "budget") {
+		t.Fatalf("missing user-visible output budget notice: %q", output.Text)
 	}
 }
 
