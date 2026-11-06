@@ -117,28 +117,98 @@ func TestLoggingBootstrapBehavior(t *testing.T) {
 	}
 }
 
-func TestCheckRejectsLegacyAndMixedConfiguration(t *testing.T) {
-	for _, layout := range []string{"flat", "mixed"} {
-		t.Run(layout, func(t *testing.T) {
-			path := cliConfig(t, "")
-			var source string
-			if layout == "flat" {
-				source = "token = 'SECRET_LEGACY_TOKEN'\nallowed_users = [7]\nallowed_chats = [7]\nomp = '/bin/true'\nomp_args = ''\n"
-			} else {
-				grouped, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				source = "max_workers = 99\n" + string(grouped)
+func TestUnknownSettingsLogErrorsWithoutBlockingStartup(t *testing.T) {
+	for _, format := range []string{"text", "json"} {
+		for _, daemon := range []bool{false, true} {
+			for _, unknown := range []struct {
+				name  string
+				input string
+			}{
+				{"legacy-enabled", "[telegram]\nprovider_usage = true\n"},
+				{"legacy-disabled", "[telegram]\nprovider_usage = false\n"},
+				{"legacy-unexpanded", "[telegram]\nprovider_usage = '${UNKNOWN_CONFIG_SECRET_MISSING}'\n"},
+				{"root", "future_setting = 'SECRET_UNKNOWN_VALUE'\n"},
+				{"nested", "[omp.environment]\nfuture_setting = false\n"},
+				{"table", "[future]\nsecret = 'SECRET_UNKNOWN_VALUE'\n"},
+				{"component", "[logging.component_levels]\nfuture = ['SECRET_UNKNOWN_VALUE']\n"},
+				{"unsafe-name", "[logging.component_levels]\n\"SECRET_KEY\\nhttps://api.telegram.org/botSECRET_TOKEN\" = '${UNKNOWN_CONFIG_SECRET_MISSING}'\n"},
+			} {
+				t.Run(fmt.Sprintf("%s/daemon=%t/%s", format, daemon, unknown.name), func(t *testing.T) {
+					path := cliConfig(t, "[logging]\nformat = '"+format+"'\nlevel = 'error'\n")
+					source, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					updated := unknown.input + string(source)
+					switch unknown.name {
+					case "legacy-enabled", "legacy-disabled", "legacy-unexpanded":
+						updated = strings.Replace(string(source), "[telegram]\n", unknown.input, 1)
+					case "nested", "table", "component", "unsafe-name":
+						updated = string(source) + unknown.input
+					}
+					if err := os.WriteFile(path, []byte(updated), 0600); err != nil {
+						t.Fatal(err)
+					}
+					args := []string{"--config", path}
+					if !daemon {
+						args = append(args, "--check")
+					}
+					out, errout, err := cliCommand(t, daemon, args...)
+					if err != nil {
+						t.Fatalf("unknown setting prevented startup/check: %v, stderr=%q", err, errout)
+					}
+					if daemon && out != "" || !daemon && out != "configuration valid\n" {
+						t.Fatalf("unexpected CLI output: %q", out)
+					}
+					if strings.Contains(errout, "SECRET") || strings.Contains(errout, path) || strings.Contains(errout, "api.telegram.org") {
+						t.Fatalf("unknown configuration diagnostic exposed input: %q", errout)
+					}
+					for _, line := range strings.Split(strings.TrimSpace(errout), "\n") {
+						if format == "json" {
+							var record map[string]any
+							if err := json.Unmarshal([]byte(line), &record); err != nil {
+								t.Fatal(err)
+							}
+							row, _ := record["line"].(float64)
+							column, _ := record["column"].(float64)
+							if record["level"] != "ERROR" || record["component"] != "daemon" || record["event"] != "unknown_config" || row < 1 || column < 1 {
+								t.Fatalf("missing error-level source location: %+v", record)
+							}
+						} else if !strings.Contains(line, " ERROR [daemon] ") || !strings.Contains(line, "event=unknown_config") || !strings.Contains(line, " line=") || !strings.Contains(line, " column=") {
+							t.Fatalf("missing error-level source location: %q", line)
+						}
+					}
+				})
 			}
-			if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+		}
+	}
+}
+
+func TestKnownConfigErrorsRemainFatalWithUnknownSettings(t *testing.T) {
+	for _, invalid := range []string{
+		"[worker]\nmax_workers = 'SECRET_INVALID_WORKERS'\n",
+		"[logging]\nlevel = 'SECRET_INVALID_LEVEL'\n",
+		"[logging.component_levels]\ndaemon = false\n",
+		"[telegram.status_bar]\nfinal = ['SECRET_INVALID_FIELD']\n",
+		"[telegram.status_bar]\nfinal = true\n",
+	} {
+		path := cliConfig(t, invalid)
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, input := range []string{
+			"future = 'SECRET_UNKNOWN_VALUE'\n" + string(source),
+			string(source) + "[future]\nsecret = 'SECRET_UNKNOWN_VALUE'\n",
+		} {
+			if err := os.WriteFile(path, []byte(input), 0600); err != nil {
 				t.Fatal(err)
 			}
 			out, errout, err := cliCommand(t, false, "--check", "--config", path)
-			if err == nil || out != "" || strings.Contains(errout, "SECRET") {
-				t.Fatalf("legacy layout was accepted or exposed values: stdout=%q stderr=%q err=%v", out, errout, err)
+			if err == nil || out != "" || strings.TrimSpace(errout) == "" || strings.Contains(errout, "SECRET") {
+				t.Fatalf("known invalid setting was ignored or exposed input: stdout=%q stderr=%q err=%v", out, errout, err)
 			}
-		})
+		}
 	}
 }
 

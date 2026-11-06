@@ -1059,17 +1059,21 @@ func TestStructuredLoggingConfigExpansionIsSinglePass(t *testing.T) {
 	}
 }
 
-func TestStructuredLoggingConfigInvalidMapDoesNotExposeKeys(t *testing.T) {
+func TestUnknownLoggingComponentsDoNotChangeKnownPolicy(t *testing.T) {
 	path, source := configFixture(t)
-	source = setTOMLField(source, "logging.component_levels", "zeta", `"debug"`)
-	source = setTOMLField(source, "logging.component_levels", "alpha", `"info"`)
-	_, err := loadSource(t, path, source)
-	if err == nil || !strings.Contains(err.Error(), "unknown log component") || strings.Contains(err.Error(), "alpha") || strings.Contains(err.Error(), "zeta") {
-		t.Fatalf("invalid map diagnostic exposed a key or lacked semantic validation: %v", err)
+	source = setTOMLField(source, "logging.component_levels", "bridge", `"warn"`)
+	source = setTOMLField(source, "logging.component_levels", "zeta", `false`)
+	source = setTOMLField(source, "logging.component_levels", "alpha", `"${UNSET_UNKNOWN_COMPONENT}"`)
+	c, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.LogComponentLevels) != 1 || c.LogComponentLevels["bridge"] != "warn" || len(c.UnknownFields) != 2 {
+		t.Fatalf("unknown components changed the logging policy or lost diagnostics: %+v", c.LogComponentLevels)
 	}
 }
 
-func TestStructuredLoggingConfigRejectsUnsafeKeysBeforeExpansion(t *testing.T) {
+func TestUnknownConfigKeysAreIgnoredWithoutExpansion(t *testing.T) {
 	path, source := configFixture(t)
 	const unsafeKey = "/private/omp-telegram/config.toml https://api.telegram.org/bot123456:FAKE_TOKEN\nUNKNOWN_COMPONENT_CANARY"
 	const missingEnv = "BRIDGE_TEST_MISSING_COMPONENT_LEVEL"
@@ -1086,14 +1090,12 @@ func TestStructuredLoggingConfigRejectsUnsafeKeysBeforeExpansion(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			config := setTOMLField(source, "logging.component_levels", strconv.Quote(unsafeKey), tc.value)
-			_, err := loadSource(t, path, config)
-			if err == nil || !strings.Contains(err.Error(), "unknown log component") {
-				t.Fatalf("unsafe component key was not rejected semantically: %v", err)
+			c, err := loadSource(t, path, config)
+			if err != nil {
+				t.Fatal(err)
 			}
-			for _, canary := range []string{"/private/omp-telegram/config.toml", "api.telegram.org", "FAKE_TOKEN", "UNKNOWN_COMPONENT_CANARY", unsafeKey, missingEnv} {
-				if strings.Contains(err.Error(), canary) {
-					t.Fatalf("configuration error exposed component or value canary %q: %v", canary, err)
-				}
+			if len(c.LogComponentLevels) != 0 || len(c.UnknownFields) != 1 || c.UnknownFields[0].Line < 1 || c.UnknownFields[0].Column < 1 {
+				t.Fatal("unknown component was applied or lost its safe source location")
 			}
 		})
 	}
@@ -1273,15 +1275,21 @@ func TestOMPEnvironmentRejectsInvalidPoliciesWithoutLeakingValues(t *testing.T) 
 			}
 		})
 	}
-	input := setTOMLField(source, "omp.environment", "unknown_policy_key", `"private-provider-credential"`)
-	if _, err := loadSource(t, path, input); err == nil || strings.Contains(err.Error(), "private-provider-credential") {
-		t.Fatalf("unknown environment key accepted or leaked a credential: %v", err)
-	}
-	for _, key := range []string{"inherit", "include", "exclude"} {
+}
+
+func TestUnknownEnvironmentSettingsDoNotChangeChildPolicy(t *testing.T) {
+	path, source := configFixture(t)
+	t.Setenv("BRIDGE_TEST_PROVIDER_API_KEY", "fixture-credential")
+	for _, key := range []string{"unknown_policy_key", "inherit", "include", "exclude"} {
 		for _, value := range []string{`[]`, `["BRIDGE_TEST_PROVIDER_API_KEY"]`} {
 			input := setTOMLField(source, "omp.environment", key, value)
-			if _, err := loadSource(t, path, input); err == nil || strings.Contains(err.Error(), "private-provider-credential") {
-				t.Fatalf("legacy environment key %s=%s accepted or leaked a credential: %v", key, value, err)
+			c, err := loadSource(t, path, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, allowed := c.OMPEnvironment.Lookup("BRIDGE_TEST_PROVIDER_API_KEY")
+			if !allowed || value != "fixture-credential" || len(c.UnknownFields) != 1 {
+				t.Fatalf("unknown environment setting %s changed the child policy", key)
 			}
 		}
 	}
@@ -1344,30 +1352,26 @@ allowed_chats = [-10]
 	}
 }
 
-func TestGroupedSchemaRejectsLegacyAndMixedLayouts(t *testing.T) {
+func TestUnknownSettingsPreserveKnownValues(t *testing.T) {
 	path, source := configFixture(t)
-	flat := `token = "flat-secret"
-allowed_users = [7]
-allowed_chats = [-10]
-omp = "omp"
-data_dir = "."
-`
 	cases := map[string]string{
-		"legacy flat":                flat,
-		"mixed root field":           "max_workers = 8\n" + source,
+		"mixed root field":           "max_workers = 99\n" + source,
 		"mixed legacy logging field": "log_level = \"debug\"\n" + source,
 		"old logging table":          source + "\n[log_component_levels]\nbridge = \"debug\"\n",
-		"unknown nested worker key":  setTOMLField(source, "worker", "unexpected_worker_key", `"secret-value"`),
-		"unknown nested logging key": setTOMLField(source, "logging", "unexpected_logging_key", `"secret-value"`),
+		"unknown nested worker key":  setTOMLField(source, "worker", "unexpected_worker_key", `"${UNSET_UNKNOWN_WORKER}"`),
+		"unknown nested logging key": setTOMLField(source, "logging", "unexpected_logging_key", `{level = "SECRET_VALUE"}`),
+		"unknown status-bar key":     setTOMLField(source, "telegram.status_bar", "future", `[false]`),
+		"unknown nested table":       source + "\n[worker.future]\nmax_workers = 99\n",
+		"unknown array of tables":    source + "\n[[future]]\nmax_workers = 99\n",
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := loadSource(t, path, input)
-			if err == nil {
-				t.Fatal("legacy, mixed, or unknown grouped layout was accepted")
+			c, err := loadSource(t, path, input)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if strings.Contains(err.Error(), "flat-secret") || strings.Contains(err.Error(), "secret-value") || strings.Contains(err.Error(), "unexpected_") {
-				t.Fatalf("schema error exposed untrusted configuration data: %v", err)
+			if c.MaxWorkers != 4 || c.QueueCapacity != 16 || c.LogLevel != "info" || len(c.LogComponentLevels) != 0 || len(c.UnknownFields) == 0 {
+				t.Fatal("unknown fields changed known settings or were silently dropped")
 			}
 		})
 	}

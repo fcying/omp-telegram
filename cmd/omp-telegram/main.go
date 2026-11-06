@@ -64,7 +64,7 @@ func run() int {
 		fmt.Fprintln(os.Stderr, e)
 		return 1
 	}
-	if *check {
+	if *check && len(c.UnknownFields) == 0 {
 		fmt.Println("configuration valid")
 		return 0
 	}
@@ -76,6 +76,14 @@ func run() int {
 		return 1
 	}
 	logger := logs.Logger(logging.Daemon)
+	for _, field := range c.UnknownFields {
+		logger.Error("unknown configuration setting ignored",
+			"event", "unknown_config", "line", field.Line, "column", field.Column)
+	}
+	if *check {
+		fmt.Println("configuration valid")
+		return 0
+	}
 	syscall.Umask(0077)
 	lock, e := openDaemonLock(filepath.Join(c.DataDir, "daemon.lock"))
 	if e != nil {

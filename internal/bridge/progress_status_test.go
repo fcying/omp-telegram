@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"omp-telegram/internal/config"
 	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/telegram"
@@ -23,7 +24,7 @@ func receiveProgressNative(t *testing.T, w *worker) progressNativeResult {
 	}
 }
 
-func TestCompactHeaderKeepsLiveAndReplyMetricSources(t *testing.T) {
+func TestCompactFieldsKeepsLiveAndReplyMetricSources(t *testing.T) {
 	state := replyMetricsState(t, `{"model":{"id":"answer-model","provider":"private-provider"},"fastModeActive":true,"fastModeEnabled":true,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":175000,"contextWindow":500000,"percent":35},"tokensPerSecond":25.8}`)
 	state.ConfiguredThinking = "auto"
 	var metrics replyMetrics
@@ -31,15 +32,17 @@ func TestCompactHeaderKeepsLiveAndReplyMetricSources(t *testing.T) {
 	contextTokens := int64(210000)
 	msg.Usage.ContextTokens = &contextTokens
 	metrics.observe(msg)
-	if got := compactHeader("en", state, nil); got != "⟳ `answer-model` ⚡ | 35% (500k) | 25.8 t/s" {
-		t.Fatalf("live header changed sampled values or compact format: %s", got)
+	live := compactFields("en", state, nil, false, true)
+	if live.model != "`answer-model`" || live.thinking != "⟳" || live.fast != "⚡" || live.context != "35% (500k)" || live.speed != "25.8 t/s" {
+		t.Fatalf("live fields changed sampled values: %+v", live)
 	}
-	if got := compactHeader("en", state, &metrics); got != "⟳ `answer-model` ⚡ | 42% (500k) | 10 t/s" {
-		t.Fatalf("reply header reused live metrics or changed compact format: %s", got)
+	reply := compactFields("en", state, &metrics, false, true)
+	if reply.model != live.model || reply.thinking != live.thinking || reply.fast != live.fast || reply.context != "42% (500k)" || reply.speed != "10 t/s" {
+		t.Fatalf("reply fields reused live metrics: %+v", reply)
 	}
 }
 
-func TestContextPlaceholderUpdatesProgressButNotDeliveredReplies(t *testing.T) {
+func TestContextSamplingUpdatesProgressButNotDeliveredReplies(t *testing.T) {
 	w, f, _, _ := replyStatusWorker(t)
 	w.b.cfg.ProgressMode = "summary"
 	w.previewResult = make(chan previewResult, 1)
@@ -75,8 +78,8 @@ func TestContextPlaceholderUpdatesProgressButNotDeliveredReplies(t *testing.T) {
 	}
 	message("Earlier question?")
 	before := researchReplies(t, w, 2)
-	if len(before) != 1 || !strings.Contains(before[0], "ctx ?") {
-		t.Fatalf("early reply omitted unknown context: %q", before)
+	if len(before) != 1 || strings.Contains(before[0], "ctx ?") || strings.Contains(before[0], "% (") {
+		t.Fatalf("early reply fabricated unknown context: %q", before)
 	}
 	nativeRPC(t, w, "fixture_get_state_update", map[string]any{
 		"contextUsage": map[string]any{"tokens": 1100, "contextWindow": 10000, "percent": 11},
@@ -85,8 +88,8 @@ func TestContextPlaceholderUpdatesProgressButNotDeliveredReplies(t *testing.T) {
 	w.progressNativeFinished(receiveProgressNative(t, w))
 	known := preview()
 	knownHeader, _, _ := strings.Cut(known.text, "\n")
-	if !known.created || known.id <= initial.id || !strings.HasPrefix(knownHeader, w.tr(i18n.Msg.Processing)+compactHeaderSeparator) || !strings.Contains(knownHeader, "11% (10k)") || strings.Contains(known.text, "ctx ?") {
-		t.Fatalf("known context did not replace its progress placeholder: %+v", known)
+	if !known.created || known.id <= initial.id || !strings.Contains(knownHeader, w.tr(i18n.Msg.Processing)) || !strings.Contains(knownHeader, "11% (10k)") || strings.Contains(known.text, "ctx ?") {
+		t.Fatalf("known context did not reach progress: %+v", known)
 	}
 	message("Later answer.")
 	w.refreshProgressNative(w.progressNative.next)
@@ -95,7 +98,7 @@ func TestContextPlaceholderUpdatesProgressButNotDeliveredReplies(t *testing.T) {
 	w.progressNativeFinished(failed)
 	unknown := preview()
 	unknownHeader, _, _ := strings.Cut(unknown.text, "\n")
-	if !unknown.created || unknown.id <= known.id || !strings.HasPrefix(unknownHeader, w.tr(i18n.Msg.Processing)+compactHeaderSeparator) || !strings.Contains(unknownHeader, "ctx ?") || strings.Contains(unknown.text, "11% (10k)") {
+	if !unknown.created || unknown.id <= known.id || !strings.Contains(unknownHeader, w.tr(i18n.Msg.Processing)) || strings.Contains(unknownHeader, "ctx ?") || strings.Contains(unknown.text, "% (") {
 		t.Fatalf("failed sample retained stale context: %+v", unknown)
 	}
 	after := researchReplies(t, w, 2)
@@ -109,7 +112,7 @@ func TestContextPlaceholderUpdatesProgressButNotDeliveredReplies(t *testing.T) {
 		text, _ := request["text"].(string)
 		if strings.Contains(text, "Earlier question?") {
 			earlier++
-			if request["message_id"] != nil || !strings.Contains(text, "ctx ?") {
+			if request["message_id"] != nil || strings.Contains(text, "ctx ?") || strings.Contains(text, "% (") {
 				t.Fatalf("sampling edited an existing assistant reply: %+v", request)
 			}
 		}
@@ -390,10 +393,9 @@ func TestProgressNativeKeepsLatestStatusThroughMetadataAndActivity(t *testing.T)
 				context         int64
 				speed           float64
 				fast            bool
-				want            string
 			}{
-				{"safe", "auto", 1100, 12.5, false, "⟳ `safe` | 11% (10k) | 12.5 t/s"},
-				{"answer-model", "max", 2500, 25.8, true, "◉ `answer-model` ⚡ | 25% (10k) | 25.8 t/s"},
+				{"safe", "auto", 1100, 12.5, false},
+				{"answer-model", "max", 2500, 25.8, true},
 			} {
 				nativeRPC(t, w, "set_model", map[string]any{"provider": "fixture", "modelId": sample.model})
 				nativeRPC(t, w, "set_fast_mode", map[string]any{"enabled": sample.fast})
@@ -423,11 +425,20 @@ func TestProgressNativeKeepsLatestStatusThroughMetadataAndActivity(t *testing.T)
 				if w.progressNative.pending != result.request || !w.progressNative.next.Equal(next) {
 					t.Fatal("same-session metadata or ordinary activity cancelled or rescheduled the sample")
 				}
-				if !w.progressNativeFinished(result) || w.progress.NativeStatus != sample.want {
-					t.Fatalf("latest native status was not accepted: %q", w.progress.NativeStatus)
+				if !w.progressNativeFinished(result) {
+					t.Fatal("latest native status was not accepted")
+				}
+				accepted := w.progress.NativeStatus
+				for _, want := range []string{progressToolLiteral(sample.model), compactThinkingStatus(sample.thinking), compactSpeedStatus(sample.speed)} {
+					if !strings.Contains(accepted, want) {
+						t.Fatalf("latest native status lost %q: %q", want, accepted)
+					}
+				}
+				if !strings.Contains(accepted, "% (10k)") || strings.Contains(accepted, "⚡") != sample.fast {
+					t.Fatalf("latest native status lost context or fast state: %q", accepted)
 				}
 				w.event(metadata)
-				if w.progress.NativeStatus != sample.want || w.replyStatus.liveScope != result.request {
+				if w.progress.NativeStatus != accepted || w.replyStatus.liveScope != result.request {
 					t.Fatal("same-session metadata erased accepted native status")
 				}
 				w.flushPreview()
@@ -442,7 +453,7 @@ func TestProgressNativeKeepsLatestStatusThroughMetadataAndActivity(t *testing.T)
 					requireStoreOK(t, preview.err)
 					w.previewFinished(preview)
 					header, _, _ := strings.Cut(preview.text, "\n")
-					if !strings.Contains(header, sample.want) {
+					if !strings.Contains(header, accepted) {
 						t.Fatalf("latest status did not reach the live preview: %q", preview.text)
 					}
 					if i > 0 && (preview.created || preview.id != previous.id) {
@@ -505,13 +516,14 @@ func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
 		want  string
 	}{
 		{"known", map[string]any{"tokens": 1100, "contextWindow": 10000}, true, "11% (10k)"},
-		{"missing", nil, true, compactUnknownContext},
-		{"invalid", map[string]any{"tokens": 1100, "contextWindow": 0}, true, compactUnknownContext},
-		{"query_failure", nil, false, compactUnknownContext},
+		{"missing", nil, true, ""},
+		{"invalid", map[string]any{"tokens": 1100, "contextWindow": 0}, true, ""},
+		{"query_failure", nil, false, ""},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, _, _, _ := replyStatusWorker(t)
-			w.b.cfg.ProviderUsage = true
+			fields := []string{"status", "thinking", "model", "fast", "context", "speed", "quota"}
+			w.b.cfg.StatusBar = config.StatusBar{Progress: fields, Intermediate: fields, Final: fields}
 			allowInitialProgress(w)
 			nativeRPC(t, w, "fixture_get_state_update", map[string]any{"contextUsage": scenario.usage})
 			messageHeader := func(text string) string {
@@ -550,15 +562,19 @@ func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
 			if !w.progressNativeFinished(result) || !w.progressContextReadCompleted() {
 				t.Fatal("current-scope completed read was not recorded")
 			}
-			if !strings.Contains(w.renderProgress(), scenario.want) || !strings.Contains(messageHeader("After read"), scenario.want) {
-				t.Fatalf("completed context did not reach progress and formal message: progress=%q", w.renderProgress())
+			for _, header := range []string{w.renderProgress(), messageHeader("After read")} {
+				if scenario.want != "" && !strings.Contains(header, scenario.want) || scenario.want == "" && strings.Contains(header, "% (") {
+					t.Fatalf("completed context was fabricated or lost: %q", header)
+				}
 			}
-			if !strings.Contains(w.unconfirmedAssistantHeader(), compactUnknownContext) {
-				t.Fatal("completed read was lost for an unconfirmed streamed message")
+			if header := w.unconfirmedAssistantHeader(); strings.Contains(header, "% (") {
+				t.Fatalf("unconfirmed streamed message invented completed context: %q", header)
 			}
-			for _, h := range []string{w.renderProgress(), w.intermediateAssistantHeader(), w.unconfirmedAssistantHeader()} {
-				if !strings.Contains(h, "quota ?") {
-					t.Fatalf("completed read did not expose unavailable quota: %q", h)
+			for _, header := range []string{w.renderProgress(), w.intermediateAssistantHeader(), w.unconfirmedAssistantHeader()} {
+				for _, placeholder := range []string{"ctx ?", "quota ?", "n/a"} {
+					if strings.Contains(header, placeholder) {
+						t.Fatalf("completed read displayed unavailable field %q: %q", placeholder, header)
+					}
 				}
 			}
 			rows := researchReplies(t, w, w.active)

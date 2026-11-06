@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,11 +37,18 @@ type Config struct {
 	DatabaseRetentionDays int
 	ProgressMode          string
 	ProgressRecentTools   int
-	ProviderUsage         bool
+	StatusBar             StatusBar
+	UnknownFields         []UnknownField
 	IdleTimeout           time.Duration
 	LogLevel              string
 	LogFormat             string
 	LogComponentLevels    map[string]string
+}
+
+// UnknownField identifies ignored input without retaining keys or values.
+type UnknownField struct {
+	Line   int
+	Column int
 }
 
 const (
@@ -61,12 +67,12 @@ type fileConfig struct {
 }
 
 type telegramFileConfig struct {
-	Token               string `toml:"token"`
-	AllowedUsers        []any  `toml:"allowed_users"`
-	AllowedChats        []any  `toml:"allowed_chats"`
-	ProgressMode        string `toml:"progress_mode"`
-	ProgressRecentTools any    `toml:"progress_recent_tools"`
-	ProviderUsage       bool   `toml:"provider_usage"`
+	Token               string              `toml:"token"`
+	AllowedUsers        []any               `toml:"allowed_users"`
+	AllowedChats        []any               `toml:"allowed_chats"`
+	ProgressMode        string              `toml:"progress_mode"`
+	ProgressRecentTools any                 `toml:"progress_recent_tools"`
+	StatusBar           statusBarFileConfig `toml:"status_bar"`
 }
 
 type ompFileConfig struct {
@@ -96,9 +102,18 @@ type workerFileConfig struct {
 }
 
 type loggingFileConfig struct {
-	Level           string            `toml:"level"`
-	Format          string            `toml:"format"`
-	ComponentLevels map[string]string `toml:"component_levels"`
+	Level           string                     `toml:"level"`
+	Format          string                     `toml:"format"`
+	ComponentLevels loggingComponentFileConfig `toml:"component_levels"`
+}
+
+type loggingComponentFileConfig struct {
+	Daemon   *string `toml:"daemon"`
+	Bridge   *string `toml:"bridge"`
+	RPC      *string `toml:"rpc"`
+	Telegram *string `toml:"telegram"`
+	Store    *string `toml:"store"`
+	Media    *string `toml:"media"`
 }
 
 func Load(path string) (Config, error) {
@@ -160,8 +175,23 @@ func load(path, baseDir string) (Config, error) {
 	}
 	d := toml.NewDecoder(reader).DisallowUnknownFields()
 	if err = d.Decode(&raw); err != nil {
-		// Decoder errors can include source lines containing credentials.
-		return c, errors.New("invalid TOML configuration: check syntax, field names and value types")
+		var unknown *toml.StrictMissingError
+		if !errors.As(err, &unknown) {
+			// Decoder errors can include source lines containing credentials.
+			return c, errors.New("invalid TOML configuration: check syntax and value types")
+		}
+		c.UnknownFields = make([]UnknownField, 0, len(unknown.Errors))
+		for _, field := range unknown.Errors {
+			line, column := field.Position()
+			c.UnknownFields = append(c.UnknownFields, UnknownField{Line: line, Column: column})
+		}
+	}
+	c.StatusBar, err = raw.Telegram.StatusBar.statusBar()
+	if err != nil {
+		return c, err
+	}
+	if err = c.StatusBar.validate(); err != nil {
+		return c, err
 	}
 	for _, field := range []struct {
 		name  string
@@ -185,25 +215,30 @@ func load(path, baseDir string) (Config, error) {
 		progressMode = ""
 	}
 
-	keys := make([]string, 0, len(raw.Logging.ComponentLevels))
-	for component := range raw.Logging.ComponentLevels {
-		keys = append(keys, component)
-	}
-	sort.Strings(keys)
-	for _, component := range keys {
-		if err := logging.ValidateComponent(component); err != nil {
-			return c, err
+	for _, field := range []struct {
+		component string
+		level     *string
+	}{
+		{"bridge", raw.Logging.ComponentLevels.Bridge},
+		{"daemon", raw.Logging.ComponentLevels.Daemon},
+		{"media", raw.Logging.ComponentLevels.Media},
+		{"rpc", raw.Logging.ComponentLevels.RPC},
+		{"store", raw.Logging.ComponentLevels.Store},
+		{"telegram", raw.Logging.ComponentLevels.Telegram},
+	} {
+		if field.level == nil {
+			continue
 		}
-	}
-	for _, component := range keys {
-		level := raw.Logging.ComponentLevels[component]
-		expanded, e := expand(level)
+		expanded, e := expand(*field.level)
 		if e != nil {
-			return c, fmt.Errorf("logging.component_levels.%s: %w", component, e)
+			return c, fmt.Errorf("logging.component_levels.%s: %w", field.component, e)
 		}
-		raw.Logging.ComponentLevels[component] = expanded
+		if c.LogComponentLevels == nil {
+			c.LogComponentLevels = make(map[string]string)
+		}
+		c.LogComponentLevels[field.component] = expanded
 	}
-	if err = logging.Validate(logging.Options{Level: raw.Logging.Level, Format: raw.Logging.Format, ComponentLevels: raw.Logging.ComponentLevels}); err != nil {
+	if err = logging.Validate(logging.Options{Level: raw.Logging.Level, Format: raw.Logging.Format, ComponentLevels: c.LogComponentLevels}); err != nil {
 		return c, err
 	}
 
@@ -256,7 +291,7 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("omp.environment has an invalid mode, variable name, or policy combination")
 	}
 	c.Token, c.OMP, c.DataDir = raw.Telegram.Token, raw.OMP.Binary, raw.Storage.DataDir
-	c.LogLevel, c.LogFormat, c.LogComponentLevels = raw.Logging.Level, raw.Logging.Format, raw.Logging.ComponentLevels
+	c.LogLevel, c.LogFormat = raw.Logging.Level, raw.Logging.Format
 	if c.Token == "" || c.OMP == "" || c.DataDir == "" {
 		return c, errors.New("telegram.token, omp.binary and storage.data_dir must be nonempty")
 	}
@@ -301,7 +336,6 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("telegram.progress_recent_tools must be between 1 and 100")
 	}
 	c.ProgressRecentTools = int(recentTools)
-	c.ProviderUsage = raw.Telegram.ProviderUsage
 	switch progressMode {
 	case "off", "summary", "verbose":
 		c.ProgressMode = progressMode

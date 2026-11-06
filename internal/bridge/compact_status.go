@@ -8,37 +8,35 @@ import (
 )
 
 const compactHeaderSeparator = " | "
-const compactUnknownContext = "ctx ?"
 
-func compactModelStatus(model, thinking string) string {
-	label := progressToolLiteral(model)
-	symbol := ""
+type compactStatusFields struct {
+	status, model, thinking, fast, context, speed, quota, git string
+}
+
+func compactThinkingStatus(thinking string) string {
 	switch thinking {
 	case "off":
-		symbol = "⦸"
+		return "⦸"
 	case "minimal":
-		symbol = "○"
+		return "○"
 	case "low":
-		symbol = "◔"
+		return "◔"
 	case "medium":
-		symbol = "◑"
+		return "◑"
 	case "high":
-		symbol = "◒"
+		return "◒"
 	case "xhigh":
-		symbol = "◕"
+		return "◕"
 	case "max":
-		symbol = "◉"
+		return "◉"
 	case "auto":
-		symbol = "⟳"
+		return "⟳"
 	default:
 		if level := menuText(thinking, 32); level != "" && level != "n/a" {
-			return label + " (" + progressToolLiteral(level) + ")"
+			return progressToolLiteral(level)
 		}
+		return ""
 	}
-	if symbol != "" {
-		return symbol + " " + label
-	}
-	return label
 }
 
 func compactFastStatus(language i18n.Language, s statusState) string {
@@ -61,38 +59,24 @@ func compactSpeedStatus(speed float64) string {
 	return statusDecimal(speed) + " t/s"
 }
 
-// Nil metrics selects live native values from a completed status read; reply
+// Nil metrics selects live native values from a completed status read. Reply
 // metrics fence sampled settings and provide output-inclusive context and speed.
-func compactHeader(language i18n.Language, s statusState, metrics *replyMetrics) string {
-	return formatCompactHeader(language, s, metrics, false, true)
-}
-
-// Completed messages already confirm output-inclusive usage, even while their
-// root is still streaming. Capacity and identity must still match the sample.
-func compactMessageHeader(language i18n.Language, s statusState, metrics *replyMetrics, contextRead bool) string {
-	return formatCompactHeader(language, s, metrics, true, contextRead)
-}
-
-func formatCompactHeader(language i18n.Language, s statusState, metrics *replyMetrics, completed, contextRead bool) string {
+// Completed messages confirm context usage even while the root is streaming;
+// capacity and identity must still match the sample.
+func compactFields(language i18n.Language, s statusState, metrics *replyMetrics, completed, contextRead bool) compactStatusFields {
 	modelID := s.Model.ID
 	matchesState := true
 	if metrics != nil && metrics.modelID != "" {
 		modelID = metrics.modelID
 		matchesState = modelID == s.Model.ID && (metrics.provider == "" || metrics.provider == s.Model.Provider)
 	}
-	var parts []string
+	var values compactStatusFields
 	if model := menuText(modelID, 256); model != "" {
-		thinking := ""
+		values.model = progressToolLiteral(model)
 		if matchesState && s.Model.ID != "" {
-			thinking = s.ConfiguredThinking
+			values.thinking = compactThinkingStatus(s.ConfiguredThinking)
+			values.fast = compactFastStatus(language, s)
 		}
-		identity := compactModelStatus(model, thinking)
-		if matchesState && s.Model.ID != "" {
-			if fast := compactFastStatus(language, s); fast != "" {
-				identity += " " + fast
-			}
-		}
-		parts = append(parts, identity)
 	}
 	percent, window := 0.0, int64(0)
 	usage := s.ContextUsage
@@ -111,18 +95,66 @@ func formatCompactHeader(language i18n.Language, s statusState, metrics *replyMe
 		percent = float64(metrics.lastContext) / float64(window) * 100
 	}
 	if window > 0 {
-		parts = append(parts, fmt.Sprintf("%.0f%% (%s)", percent, statusTokens(window)))
-	} else if contextRead {
-		parts = append(parts, compactUnknownContext)
+		values.context = fmt.Sprintf("%.0f%% (%s)", percent, statusTokens(window))
 	}
-	speed := ""
 	if metrics != nil {
-		speed = metrics.speedText()
+		values.speed = metrics.speedText()
 	} else if s.TokensPerSecond != nil {
-		speed = compactSpeedStatus(*s.TokensPerSecond)
+		values.speed = compactSpeedStatus(*s.TokensPerSecond)
 	}
-	if speed != "" {
-		parts = append(parts, speed)
+	return values
+}
+
+func renderCompactFields(fields []string, values compactStatusFields) string {
+	return renderCompactFieldsLimit(fields, values, 0)
+}
+
+func renderCompactFieldsLimit(fields []string, values compactStatusFields, limit int) string {
+	var result strings.Builder
+	remaining := limit
+	for _, field := range fields {
+		value := ""
+		switch field {
+		case "status":
+			value = values.status
+		case "model":
+			value = values.model
+		case "thinking":
+			value = values.thinking
+		case "fast":
+			value = values.fast
+		case "context":
+			value = values.context
+		case "speed":
+			value = values.speed
+		case "quota":
+			value = values.quota
+		case "git":
+			value = values.git
+		}
+		if value == "" {
+			continue
+		}
+		// A long inline-code delimiter at paragraph start is also a block
+		// fence. Emphasis keeps it inline without adding visible text; the
+		// Telegram converter leaves code entities outside emphasis styles.
+		if result.Len() == 0 && strings.HasPrefix(value, "```") {
+			value = "**" + value + "**"
+		}
+		if limit > 0 {
+			units := utf16Length(value)
+			if result.Len() > 0 {
+				units += len(compactHeaderSeparator)
+			}
+			if units > remaining {
+				continue
+			}
+			remaining -= units
+		}
+		if result.Len() > 0 {
+			result.WriteString(compactHeaderSeparator)
+		}
+		result.WriteString(value)
 	}
-	return strings.Join(parts, compactHeaderSeparator)
+	return result.String()
 }

@@ -44,7 +44,8 @@ DROP TABLE progress_messages;
 DROP INDEX idx_outbox_assistant_header;
 ALTER TABLE outbox DROP COLUMN header;
 ALTER TABLE outbox DROP COLUMN message_id;
-ALTER TABLE outbox DROP COLUMN header_pending;`)
+ALTER TABLE outbox DROP COLUMN header_pending;
+ALTER TABLE outbox DROP COLUMN header_editable;`)
 	requireStoreOK(t, err)
 }
 
@@ -2042,68 +2043,82 @@ func TestOnlyFirstTextReplyQuotesRootAcrossAppendsAndCompletion(t *testing.T) {
 }
 
 func TestAssistantHeaderUpdatesBeforeDuringAndAfterSend(t *testing.T) {
-	for _, stage := range []string{"before", "during", "after"} {
-		t.Run(stage, func(t *testing.T) {
-			s := openTestStore(t, t.TempDir())
-			ctx := context.Background()
-			requireStoreOK(t, s.Accept(10, []byte(`{}`)))
-			requireStoreOK(t, s.Submit(10, 42))
-			const body = "  immutable 正文🙂\n\nlast line  "
-			id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{body, "second page"}, "initial")
-			requireStoreOK(t, err)
-			if id <= 0 {
-				t.Fatalf("assistant output ID = %d", id)
-			}
-			if stage == "before" {
-				requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
-			}
-			out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
-			requireStoreOK(t, err)
-			wantHeader := "initial"
-			if stage == "before" {
-				wantHeader = "updated"
-			}
-			if out.ID != id || out.Text != body || out.Header != wantHeader || out.ReplyTo != 42 || out.MessageID != 0 {
-				t.Fatalf("claimed assistant output = %+v", out)
-			}
-			if stage == "during" {
-				requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
-			}
-			requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
-			if stage == "after" {
-				requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
-			}
-			header, err := s.NextAssistantHeader()
-			if stage == "before" {
-				if !errors.Is(err, sql.ErrNoRows) {
-					t.Fatalf("already-sent latest header became pending: %+v, %v", header, err)
-				}
-			} else {
+	for _, transition := range []struct {
+		name, initial, updated string
+	}{
+		{"replace", "initial", "updated"},
+		{"add", "", "updated"},
+		{"remove", "initial", ""},
+	} {
+		for _, stage := range []string{"before", "during", "after"} {
+			t.Run(transition.name+"/"+stage, func(t *testing.T) {
+				s := openTestStore(t, t.TempDir())
+				ctx := context.Background()
+				requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+				requireStoreOK(t, s.Submit(10, 42))
+				const body = "  immutable 正文🙂\n\nlast line  "
+				id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{body, "second page"}, transition.initial)
 				requireStoreOK(t, err)
-				if header.ID != id || header.Text != body || header.Header != "updated" || header.MessageID != 100 {
-					t.Fatalf("status-only delivery = %+v", header)
+				if id <= 0 {
+					t.Fatalf("assistant output ID = %d", id)
 				}
-				requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header))
-			}
-			var storedBody, state string
-			requireStoreOK(t, s.DB.QueryRow("SELECT text FROM outbox WHERE id=?", id).Scan(&storedBody))
-			requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
-			if storedBody != body || state != "submitted" {
-				t.Fatalf("header delivery changed body/owner: %q/%q", storedBody, state)
-			}
-			second, err := s.ClaimNextOutput(ctx, time.Now().Unix())
-			requireStoreOK(t, err)
-			if second.Text != "second page" || second.Header != "" || second.ReplyTo != 0 {
-				t.Fatalf("continuation page acquired a header or repeated the original quote: %+v", second)
-			}
-			requireStoreOK(t, s.MarkOutputDelivered(second.ID, 101, ""))
-			if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
-				t.Fatalf("body was replayed after header update: %v", err)
-			}
-			if err := s.MarkOutputDelivered(id, 102, "updated"); !errors.Is(err, ErrOutboxStateTransition) {
-				t.Fatalf("duplicate body delivery transition = %v", err)
-			}
-		})
+				if stage == "before" {
+					requireStoreOK(t, s.SetAssistantHeader(ctx, id, transition.updated))
+				}
+				out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+				requireStoreOK(t, err)
+				wantHeader := transition.initial
+				if stage == "before" {
+					wantHeader = transition.updated
+				}
+				if out.ID != id || out.Text != body || out.Header != wantHeader || !out.HeaderEditable || out.ReplyTo != 42 || out.MessageID != 0 {
+					t.Fatalf("claimed assistant output = %+v", out)
+				}
+				if stage == "during" {
+					requireStoreOK(t, s.SetAssistantHeader(ctx, id, transition.updated))
+				}
+				requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+				if stage == "after" {
+					requireStoreOK(t, s.SetAssistantHeader(ctx, id, transition.updated))
+				}
+				header, err := s.NextAssistantHeader()
+				if stage == "before" {
+					if !errors.Is(err, sql.ErrNoRows) {
+						t.Fatalf("already-sent latest header became pending: %+v, %v", header, err)
+					}
+				} else {
+					requireStoreOK(t, err)
+					if header.ID != id || header.Text != body || header.Header != transition.updated || !header.HeaderEditable || header.MessageID != 100 {
+						t.Fatalf("status-only delivery = %+v", header)
+					}
+					requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header))
+				}
+				var storedBody, state string
+				requireStoreOK(t, s.DB.QueryRow("SELECT text FROM outbox WHERE id=?", id).Scan(&storedBody))
+				requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+				if storedBody != body || state != "submitted" {
+					t.Fatalf("header delivery changed body/owner: %q/%q", storedBody, state)
+				}
+				second, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+				requireStoreOK(t, err)
+				if second.Text != "second page" || second.Header != "" || second.HeaderEditable || second.ReplyTo != 0 {
+					t.Fatalf("continuation page acquired a header or repeated the original quote: %+v", second)
+				}
+				if err := s.SetAssistantHeader(ctx, second.ID, "not first"); !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("split continuation accepted header: %v", err)
+				}
+				requireStoreOK(t, s.MarkOutputDelivered(second.ID, 101, ""))
+				if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("body was replayed after header update: %v", err)
+				}
+				if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("settled header remained pending: %v", err)
+				}
+				if err := s.MarkOutputDelivered(id, 102, transition.updated); !errors.Is(err, ErrOutboxStateTransition) {
+					t.Fatalf("duplicate body delivery transition = %v", err)
+				}
+			})
+		}
 	}
 }
 
@@ -2377,10 +2392,10 @@ func TestAssistantReplyAppendAndHeaderCompletionAreAtomic(t *testing.T) {
 	if header != "" || replyTo != 0 {
 		t.Fatalf("final notice acquired header/reply target: %q/%d", header, replyTo)
 	}
-	targetID, err = s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, 0, "", []string{"ordinary completion"})
+	targetID, err = s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, 0, "", []string{"headerless assistant completion"})
 	requireStoreOK(t, err)
-	if targetID != 0 {
-		t.Fatalf("headerless completion returned target %d", targetID)
+	if targetID == 0 {
+		t.Fatal("headerless assistant completion lost its editable target")
 	}
 	if _, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"late body"}, "late"); err == nil {
 		t.Fatal("terminal owner accepted new assistant body")

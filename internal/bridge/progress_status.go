@@ -80,20 +80,24 @@ func (w *worker) progressContextReadCompleted() bool {
 	return w.progressNativeMatches(w.progressNative.completed)
 }
 
-// Empty means context has not been read in this scope, not a failed read.
-func (w *worker) progressNativeStatus() string {
+func (w *worker) progressStatusFields() compactStatusFields {
 	readCompleted := w.progressContextReadCompleted()
-	header := ""
-	if readCompleted {
-		header = w.progress.NativeStatus
+	if !readCompleted {
+		return compactStatusFields{}
 	}
-	return w.withProviderUsage(header, w.replyStatus.liveState.Model.Provider, readCompleted)
+	fields := compactFields(w.b.language(), w.replyStatus.liveState, nil, false, readCompleted)
+	fields.quota = w.providerUsageText(w.replyStatus.liveState.Model.Provider, readCompleted)
+	return fields
+}
+
+func (w *worker) progressNativeStatus() string {
+	return renderCompactFields(w.b.cfg.StatusBar.Fields("progress"), w.progressStatusFields())
 }
 
 // Assistant headers share this bounded sampler even when progress UI is disabled.
 func (w *worker) refreshProgressNative(now time.Time) {
 	client, connected := w.runtimeClient()
-	if !connected || !w.taskRunning() || w.finishing || w.replyStatus.pending != nil || now.Sub(w.progress.StartedAt) < progressInitialDelay {
+	if !connected || !w.liveStatusNeedsNative() || !w.taskRunning() || w.finishing || w.replyStatus.pending != nil || now.Sub(w.progress.StartedAt) < progressInitialDelay {
 		return
 	}
 	if w.progressNative.pending != nil || now.Before(w.progressNative.next) {
@@ -119,7 +123,8 @@ func (w *worker) refreshProgressNative(now time.Time) {
 		result := progressNativeResult{request: request}
 		raw, err := client.Call(ctx, "get_state", nil)
 		result.valid = err == nil && json.Unmarshal(raw, &result.state) == nil
-		if result.valid && result.state.SessionID == request.sessionID {
+		quota := w.b.cfg.StatusBar.Has("intermediate", "quota") || w.b.cfg.ProgressMode != "off" && w.b.cfg.StatusBar.Has("progress", "quota")
+		if quota && result.valid && result.state.SessionID == request.sessionID {
 			result.account = w.readProviderUsageScope(ctx, client, result.state)
 		}
 		select {
@@ -145,7 +150,7 @@ func (w *worker) progressNativeFinished(result progressNativeResult) bool {
 	}
 	w.progressNative.completed = request
 	w.setProviderUsageScope(result.state.Model.Provider, result.account)
-	w.progress.NativeStatus = compactUnknownContext
+	w.progress.NativeStatus = ""
 	w.replyStatus.liveState = statusState{}
 	w.replyStatus.liveScope = nil
 	if !result.valid {
@@ -157,10 +162,11 @@ func (w *worker) progressNativeFinished(result progressNativeResult) bool {
 	w.replyStatus.liveState = statusState{
 		Model:           omp.Model{ID: result.state.Model.ID, Provider: result.state.Model.Provider},
 		FastModeEnabled: result.state.FastModeEnabled, FastModeActive: result.state.FastModeActive,
+		ConfiguredThinking: result.state.ConfiguredThinking, TokensPerSecond: result.state.TokensPerSecond,
 		IsStreaming: result.state.IsStreaming, IsCompacting: result.state.IsCompacting,
 		ContextUsage: result.state.ContextUsage,
 	}
 	w.replyStatus.liveScope = request
-	w.progress.NativeStatus = compactHeader(w.b.language(), result.state, nil)
+	w.progress.NativeStatus = w.progressNativeStatus()
 	return true
 }

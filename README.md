@@ -69,7 +69,11 @@ allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 progress_recent_tools = 5
-provider_usage = false
+
+[telegram.status_bar]
+progress = ["status", "thinking", "model", "fast", "context", "speed"]
+intermediate = ["status", "thinking", "model", "fast", "context", "speed"]
+final = ["status", "thinking", "model", "fast", "context", "speed"]
 
 [omp]
 binary = "omp"
@@ -112,7 +116,7 @@ Configuration is selected in this order:
 2. `config.toml` beside the real executable, after resolving symlinks.
 3. The embedded defaults when that default file does not exist.
 
-An explicitly selected missing file, unreadable file, or invalid TOML causes startup to fail. Configuration uses the grouped tables shown above; legacy flat fields and mixed layouts are not accepted.
+An explicitly selected missing file, unreadable file, invalid TOML or invalid known setting causes startup to fail. Unknown keys and tables, including old flat fields, are ignored without migration or environment expansion. Startup and `--check` emit ERROR logs with each ignored item's line and column, never its raw key or value.
 
 Explicit relative `--config` paths use the launch directory. Relative `storage.data_dir` and `storage.workspace_root` paths always use the real executable directory, not the config file's directory.
 
@@ -129,7 +133,9 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists. Values may be literal integers or comma-separated environment values. |
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `telegram.progress_recent_tools` | Maximum completed tools retained in verbose Recent history. Default: `5`; range: `1..100`. Display may show fewer to fit Telegram's message limit. |
-| `telegram.provider_usage` | Opt in to native `/usage` 5h/7d used percentages from a shared last-good cache in Progress and intermediate/final reply status bars. TOML boolean; default `false`. Independent of progress mode; refresh is idle-only. |
+| `telegram.status_bar.progress`, `.intermediate`, `.final` | Ordered field arrays for Progress, intermediate assistant messages, and final results. `[]` disables that header. Omitted arrays default to `["status", "thinking", "model", "fast", "context", "speed"]`. See [Status bars](#status-bars). |
+| `telegram.status_bar.git_command` | Optional literal argv for the final `git` field. Omitted or `[]` uses the built-in safe Git probe. Custom commands run without a shell in the current session workspace; users own their safety and side effects. |
+| `telegram.status_bar.git_timeout` | Positive literal Go duration for both built-in and custom Git sampling, default `"450ms"`. Increase to e.g. `"2s"` for large repositories. Empty, zero, negative, invalid, overflowing or non-string values are rejected; environment references are not expanded and the timeout cannot be disabled. |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
 | `omp.args_labels` | Optional Telegram picker labels, one per preset; invalid labels fall back to `Preset N`. Labels are visible in the conversation, so never put credentials in them. |
@@ -349,19 +355,72 @@ Very large output or many replies may be truncated with an explicit notice. OMP'
 - `summary` shows active tools, task state, and the current assistant text preview.
 - `verbose` additionally shows recent observable tool activity. Tool details are unredacted and may contain credentials or private content visible to everyone who can read the conversation.
 
-Progress appears after about three seconds and includes a **Stop** button for the current task. Its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies.
+Progress appears after about three seconds and includes a **Stop** button for the current task. With the `status` field selected, its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies.
 
 Steer input and completed assistant messages remove the task's older Progress bubbles without restarting OMP. A new preview waits for preceding formal replies to be delivered and appears below the latest input/reply. Remaining temporary Progress bubbles are cleaned up when the task ends; formal replies remain.
 
-Completed assistant messages use **💬** and are sent immediately, even with progress off. Confirmed task success changes only the latest formal status bar to **✅**; cancellation, failure, uncertainty and ongoing research rounds do not. Only the first formal message quotes the original request. Bodies stay unchanged for Telegram Reply, with no body resend or separate completion message.
+Completed assistant messages are sent immediately, even with progress off. With the `status` field selected, intermediate headers show **💬** and confirmed task success changes only the latest formal header to **✅**; cancellation, failure, uncertainty and ongoing research rounds do not gain a success marker. Only the first formal message quotes the original request. Bodies stay unchanged for Telegram Reply, with no body resend or separate completion message.
 
-Status bars show available model, configured thinking, fast-mode, context and speed information, for example `46% (500k)` and `3.8 t/s`. Context is omitted before the first status read completes; `ctx ?` means a completed read could not confirm context usage. Use `/status` for details.
+### Status bars
+
+Configure the three header types independently. Fields appear in array order; unknown or duplicate names are rejected. `[]` removes the entire header, including its icon and separator. Disabling the Progress header does not hide its tool body, text preview or **Stop** button; use `progress_mode = "off"` to disable Progress itself.
+
+```toml
+[telegram.status_bar]
+progress = ["status", "model", "context"]
+intermediate = []
+final = ["status", "model", "thinking", "fast", "context", "speed", "quota", "git"]
+```
+
+| Field | Display |
+| --- | --- |
+| `status` | Processing, assistant or confirmed-completion icon. |
+| `model` | Literal model ID, without provider. |
+| `thinking` | Configured thinking selector symbol. |
+| `fast` | Confirmed fast-mode activity/setting. |
+| `context` | Confirmed usage and window, e.g. `46% (500k)`. |
+| `speed` | Native live speed or confirmed reply average, e.g. `3.8 t/s`. |
+| `quota` | Native 5h/7d used percentages from the same-account cache. |
+| `git` | Final results only: current branch and optional dirty `*`, or custom command stdout. |
+
+Unavailable or unread values are omitted, including failed reads: no `ctx ?`, `quota ?` or `n/a` placeholders. Already confirmed values may appear immediately. Refreshes do not backfill older intermediate messages. Fields that are not selected do not enable display-only sampling; task-safety and command queries are unchanged. Detailed `/status` is unchanged.
+
+`git` is sampled at completion in the session's current workspace, not at task startup. With `git_command` omitted or empty, the built-in read-only probe shows `main` when clean and `main*` for staged, unstaged or nonignored untracked changes; ahead/behind alone is not dirty. Detached HEAD shows `HEAD`. Outside a repository, on failure or when the bounded probe cannot finish, the field is omitted, never presented as known clean. Ongoing research rounds do not sample Git; root settlement does.
+
+The built-in probe checks tracked-file attributes and initialized submodules before reading status. If content filters would make a safe read-only result unavailable, it omits the Git field instead of executing them; unused global filter definitions do not hide ordinary repositories. Trace2 output is explicitly disabled even when global/system Git configuration enables it. The bounded probe is not an atomic snapshot of concurrent Git configuration or attribute changes.
+
+To override the `git` field, configure a nonempty `git_command` argv:
+
+```toml
+[telegram.status_bar]
+final = ["status", "model", "context", "speed", "git"]
+
+# Empty uses the built-in safe Git status implementation.
+git_command = []
+# Shared by built-in and custom Git sampling; increase to "2s" for large repositories.
+git_timeout = "450ms"
+
+# Custom commands run with the session workspace as the working directory.
+# Users are responsible for the safety and side effects of custom commands.
+# git_command = ["git", "log", "-1", "--format=%h"] # a1b2c3d
+# git_command = ["/usr/local/bin/my-git-status"]    # dev@a1b2c3d*
+```
+
+Custom argv entries are literal: no shell, environment-reference expansion or extra Git arguments. The command uses the existing `omp.environment` child policy, without the built-in probe's Git-specific environment rewriting or safety preflight. It runs only when `final` selects `git`. Its stdout is displayed literally, not parsed as Git output: trailing CR/LF is removed, other spaces are preserved, and a single valid UTF-8 line is clipped to 64 bytes at a character boundary before Telegram escaping. Commands use `git_timeout` and retain the 64 KiB stdout cap; failures, timeouts, empty output, embedded line breaks/control characters or invalid UTF-8 omit the field, with no built-in fallback. Stderr is discarded. Research settlement may re-probe; do not rely on exactly-once invocation. Later quota edits retain the captured output rather than rerunning the command.
+
+`git_timeout` applies to the entire built-in safety preflight/status probe or to the custom command, without retries. Its default is `"450ms"`; large repositories can use e.g. `"2s"`. It must be a positive literal Go duration string: environment references are not expanded, and empty, zero, negative, invalid, overflowing or non-string values are rejected. The timeout cannot be disabled. Increasing it does not relax the built-in safety checks, the 64 KiB output cap or the 64-byte label limit; large repositories can still omit the field if they exceed the output cap.
+
+Git's budget is separate from native status/account RPC deadlines: each ordinary final-sampling RPC remains bounded to 1 second, each research-settlement RPC to 5 seconds. Ordinary sampling shares cancellation while giving Git its own configured budget. Research settlement keeps operation cancellation and ownership/session fences, but no longer has a generic 30-second operation cap: its finite RPCs and Git probe each enforce their own deadlines.
+
+Migration: the old `telegram.provider_usage` key is ignored and produces an ERROR log, but no longer prevents startup. Remove it and add `"quota"` only to the arrays where it should appear; omit it everywhere to disable quota reads. Quota and Git are not selected by default.
+
+When only intermediate/Progress quota is selected, an idle runtime can still identify the account and warm the cache after a short task; completion never waits for it. Quota selected only in disabled Progress does not enable reads. Oversized headers omit whole fields rather than cutting a literal value or its dirty marker.
 
 Replies support Markdown and split long text automatically. Large tables may use a plain-text layout; formatting unsupported by Telegram falls back to readable text.
 
-Set `telegram.provider_usage = true` to show native Claude (`anthropic`) or OpenAI Codex (`openai-codex`) account quota in Progress and intermediate/final reply status bars, independently of progress mode. Like context, the quota field is omitted until the first status read in the current scope completes. It then shows the same last-good cache, for example `5h30% 7d65%`, or `quota ?` when no usable value exists. Only 5h/7d used percentages are shown, without a reading timestamp; account identities, emails, credential IDs and raw reports are not sent to Telegram or written to logs or the database.
+Selecting `quota` enables native Claude (`anthropic`) or OpenAI Codex (`openai-codex`) account quota in the selected headers, independently of progress mode. The field appears only after a current-scope account read confirms a usable same-account cache value, for example `5h30% 7d65%`. Only 5h/7d used percentages are shown, without a reading timestamp; account identities, emails, credential IDs and raw reports are not sent to Telegram or written to logs or the database.
 
-Cache visibility does not trigger or wait for refresh. Refresh uses the existing native builtin `/usage` only while idle, with at least five minutes between attempts for the same account scope and a three-second deadline; queued prompts and controls take priority. Busy or long-running tasks show the cache or unavailable, and failed, skipped or empty reads do not clear a last-good value. A successful refresh may update the latest matching final status bar through its editable header, never its body. No direct provider API request is made.
+Cache visibility does not trigger or wait for refresh. Refresh uses the existing native builtin `/usage` only while idle, with at least five minutes between attempts for the same account scope and a three-second deadline; queued prompts and controls take priority. Busy or long-running tasks show the cache when available, otherwise omit the field. Failed, skipped or empty reads do not clear a last-good value. A successful refresh may update the latest matching final header only when its array selects `quota`, never its body or captured Git result. No direct provider API request is made.
 
 Final answers supplied only by `agent_end.messages` also keep an editable header. Later quota refreshes update that final answer, not an earlier intermediate reply.
 

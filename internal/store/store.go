@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 22
+const schemaVersion = 23
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -88,6 +88,7 @@ type Output struct {
 	NextAttemptAt, AttemptCount        int64
 	ServerRetryCount                   int64
 	Header                             string
+	HeaderEditable                     bool
 	MessageID                          int64
 }
 
@@ -452,6 +453,15 @@ CREATE INDEX idx_outbox_assistant_header ON outbox(id) WHERE state='done' AND he
 			return e
 		}
 		version = 22
+	}
+	if version == 22 {
+		if _, e = tx.Exec(`ALTER TABLE outbox ADD COLUMN header_editable INTEGER NOT NULL DEFAULT 0 CHECK(header_editable IN (0,1));
+UPDATE outbox SET header_editable=1 WHERE kind='text' AND header<>'';
+DROP INDEX idx_outbox_assistant_header;
+CREATE INDEX idx_outbox_assistant_header ON outbox(id) WHERE state='done' AND header_editable=1 AND header_pending=1 AND message_id>0;`); e != nil {
+			return e
+		}
+		version = 23
 	}
 	if e = backfillProgressChats(tx); e != nil {
 		return e
@@ -1249,7 +1259,7 @@ func (s *Store) cleanupOutboxBatch(ctx context.Context, cutoff int64) (int64, []
 	}
 	defer tx.Rollback()
 	// Only a deliverable header edit can keep a terminal body past retention.
-	const query = "SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND NOT (candidate.state='done' AND candidate.header_pending=1 AND candidate.message_id>0 AND candidate.header<>'') AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM progress_messages WHERE inbox_id=candidate.inbox_id) ORDER BY candidate.id LIMIT ?"
+	const query = "SELECT candidate.id FROM outbox AS candidate WHERE candidate.state IN ('done','sent','failed','uncertain','cancelled') AND NOT (candidate.state='done' AND candidate.header_editable=1 AND candidate.header_pending=1 AND candidate.message_id>0) AND candidate.updated_at<? AND NOT EXISTS (SELECT 1 FROM progress_messages WHERE inbox_id=candidate.inbox_id) ORDER BY candidate.id LIMIT ?"
 	rows, err := tx.QueryContext(ctx, "SELECT path FROM outbox WHERE id IN ("+query+") AND kind IN ('photo','document')", cutoff, messageCleanupBatchSize)
 	if err != nil {
 		return 0, nil, err
@@ -1417,16 +1427,16 @@ func (s *Store) Enqueue(chat, thread int64, text string) error {
 // AppendInboxReplies durably queues completed replies without completing their owner.
 // A failed transaction leaves both the submitted input and its output unchanged.
 func (s *Store) AppendInboxReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.appendInboxReplies(ctx, id, chat, thread, replies, "")
+	_, err := s.appendInboxReplies(ctx, id, chat, thread, replies, "", false)
 	return err
 }
 
 // AppendAssistantReplies queues immutable assistant bodies with a separately editable first header.
 func (s *Store) AppendAssistantReplies(ctx context.Context, id, chat, thread int64, replies []string, header string) (int64, error) {
-	return s.appendInboxReplies(ctx, id, chat, thread, replies, header)
+	return s.appendInboxReplies(ctx, id, chat, thread, replies, header, true)
 }
 
-func (s *Store) appendInboxReplies(ctx context.Context, id, chat, thread int64, replies []string, header string) (int64, error) {
+func (s *Store) appendInboxReplies(ctx context.Context, id, chat, thread int64, replies []string, header string, headerEditable bool) (int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1442,7 +1452,7 @@ func (s *Store) appendInboxReplies(ctx context.Context, id, chat, thread int64, 
 	now := time.Now().Unix()
 	var firstID int64
 	for i, reply := range replies {
-		result, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,header,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, header, replyTo, now, now, now)
+		result, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,header,header_editable,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, header, headerEditable, replyTo, now, now, now)
 		if err != nil {
 			return 0, err
 		}
@@ -1453,6 +1463,7 @@ func (s *Store) appendInboxReplies(ctx context.Context, id, chat, thread int64, 
 				return 0, err
 			}
 			header = ""
+			headerEditable = false
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1463,7 +1474,7 @@ func (s *Store) appendInboxReplies(ctx context.Context, id, chat, thread int64, 
 
 // SetAssistantHeader changes only the status header of the captured assistant output.
 func (s *Store) SetAssistantHeader(ctx context.Context, id int64, header string) error {
-	result, err := s.DB.ExecContext(ctx, "UPDATE outbox SET header=?,header_pending=1,updated_at=? WHERE id=? AND kind='text' AND header<>''", header, time.Now().Unix(), id)
+	result, err := s.DB.ExecContext(ctx, "UPDATE outbox SET header=?,header_pending=CASE WHEN header<>? THEN 1 ELSE header_pending END,updated_at=? WHERE id=? AND kind='text' AND header_editable=1", header, header, time.Now().Unix(), id)
 	if err != nil {
 		return err
 	}
@@ -1480,33 +1491,33 @@ func (s *Store) SetAssistantHeader(ctx context.Context, id int64, header string)
 // CompleteInboxWithReplies commits the complete final result and input completion together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, 0, "")
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, 0, "", false)
 	return err
 }
 
 // CompleteInboxWithAssistantHeader atomically settles the owner, replies, and final status header.
-// An existing target must belong to the owner; new replies remain headerless.
-// Without a target, a nonempty header is attached only to the first new reply.
+// An existing target must be editable and belong to the owner; new replies remain noneditable.
+// Without a target, the first new reply is editable even when its header is empty.
 // It returns the final header target after commit, or zero when no target exists or any step failed.
 func (s *Store) CompleteInboxWithAssistantHeader(ctx context.Context, id, chat, thread, targetID int64, header string, replies []string) (int64, error) {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header)
+	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header, true)
 }
 
 // CompleteInboxUncertainWithReplies commits a terminal result that cannot be confirmed.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxUncertainWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies, 0, "")
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies, 0, "", false)
 	return err
 }
 
 // CompleteInboxCancelledWithReplies commits an aborted terminal result and its replies together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxCancelledWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies, 0, "")
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies, 0, "", false)
 	return err
 }
 
-func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string, targetID int64, header string) (int64, error) {
+func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string, targetID int64, header string, headerEditable bool) (int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1532,26 +1543,28 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 		return 0, fmt.Errorf("input is not submitted")
 	}
 	var replyHeader string
-	if targetID == 0 {
+	if targetID == 0 && headerEditable {
 		replyHeader = header
 	}
+	headerEditable = headerEditable && targetID == 0
 	finalTargetID := targetID
 	for _, reply := range replies {
-		result, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,header,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, replyHeader, replyTo, now, now, now)
+		result, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,header,header_editable,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, replyHeader, headerEditable, replyTo, now, now, now)
 		if err != nil {
 			return 0, err
 		}
-		if replyHeader != "" {
+		if headerEditable {
 			finalTargetID, err = result.LastInsertId()
 			if err != nil {
 				return 0, err
 			}
 			replyHeader = ""
+			headerEditable = false
 		}
 		replyTo = 0
 	}
 	if targetID != 0 {
-		result, err := tx.ExecContext(ctx, "UPDATE outbox SET header=?,header_pending=1,updated_at=? WHERE id=? AND inbox_id=? AND kind='text' AND header<>''", header, now, targetID, id)
+		result, err := tx.ExecContext(ctx, "UPDATE outbox SET header=?,header_pending=CASE WHEN header<>? THEN 1 ELSE header_pending END,updated_at=? WHERE id=? AND inbox_id=? AND kind='text' AND header_editable=1", header, header, now, targetID, id)
 		if err != nil {
 			return 0, err
 		}
@@ -1584,11 +1597,11 @@ type rowScanner interface {
 
 func scanOutput(row rowScanner) (Output, error) {
 	var o Output
-	err := row.Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name, &o.NextAttemptAt, &o.AttemptCount, &o.ServerRetryCount, &o.Header, &o.MessageID)
+	err := row.Scan(&o.ID, &o.InboxID, &o.Chat, &o.Thread, &o.Text, &o.ReplyTo, &o.Kind, &o.Path, &o.Name, &o.NextAttemptAt, &o.AttemptCount, &o.ServerRetryCount, &o.Header, &o.HeaderEditable, &o.MessageID)
 	return o, err
 }
 
-const outputColumns = "id,inbox_id,chat,thread,text,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count,header,message_id"
+const outputColumns = "id,inbox_id,chat,thread,text,reply_to,kind,path,name,next_attempt_at,attempt_count,server_retry_count,header,header_editable,message_id"
 
 func (s *Store) NextOutput() (Output, error) {
 	return scanOutput(s.DB.QueryRow("SELECT " + outputColumns + " FROM outbox WHERE state='pending' ORDER BY id LIMIT 1"))
@@ -1730,7 +1743,7 @@ func (s *Store) MarkOutput(id int64, state OutboxState) error {
 // MarkOutputDelivered preserves header updates racing with the Telegram send snapshot.
 func (s *Store) MarkOutputDelivered(id, messageID int64, sentHeader string) error {
 	result, err := s.DB.Exec(`UPDATE outbox SET state='done',message_id=?,
-header_pending=CASE WHEN header<>'' AND header<>? THEN 1 ELSE 0 END,next_attempt_at=0,updated_at=?
+header_pending=CASE WHEN header_editable=1 AND header<>? THEN 1 ELSE 0 END,next_attempt_at=0,updated_at=?
 WHERE id=? AND state='sending'`, messageID, sentHeader, time.Now().Unix(), id)
 	if err != nil {
 		return err
@@ -1747,12 +1760,12 @@ WHERE id=? AND state='sending'`, messageID, sentHeader, time.Now().Unix(), id)
 
 // NextAssistantHeader selects status-only edits without replaying delivered bodies.
 func (s *Store) NextAssistantHeader() (Output, error) {
-	return scanOutput(s.DB.QueryRow("SELECT " + outputColumns + " FROM outbox WHERE state='done' AND header_pending=1 AND message_id>0 AND header<>'' ORDER BY id LIMIT 1"))
+	return scanOutput(s.DB.QueryRow("SELECT " + outputColumns + " FROM outbox WHERE state='done' AND header_editable=1 AND header_pending=1 AND message_id>0 ORDER BY id LIMIT 1"))
 }
 
 // MarkAssistantHeaderDelivered settles only the exact header snapshot attempted by the consumer.
 func (s *Store) MarkAssistantHeaderDelivered(id int64, header string) error {
-	_, err := s.DB.Exec("UPDATE outbox SET header_pending=0 WHERE id=? AND header=? AND state='done'", id, header)
+	_, err := s.DB.Exec("UPDATE outbox SET header_pending=0 WHERE id=? AND header=? AND header_editable=1 AND state='done'", id, header)
 	return err
 }
 

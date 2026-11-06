@@ -69,7 +69,11 @@ allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 progress_recent_tools = 5
-provider_usage = false
+
+[telegram.status_bar]
+progress = ["status", "thinking", "model", "fast", "context", "speed"]
+intermediate = ["status", "thinking", "model", "fast", "context", "speed"]
+final = ["status", "thinking", "model", "fast", "context", "speed"]
 
 [omp]
 binary = "omp"
@@ -112,7 +116,7 @@ format = "text"
 2. 解析符号链接后的真实二进制所在目录中的 `config.toml`.
 3. 默认文件不存在时使用内嵌默认配置.
 
-显式指定的文件不存在, 文件不可读或 TOML 无效时, 启动都会失败. 配置必须使用上面示例中的分组 table; 旧的 flat 字段和 flat/grouped 混合布局不再接受.
+显式指定的文件不存在, 文件不可读, TOML 无效或已知配置项非法时, 启动会失败. 未知键和 table, 包括旧 flat 字段, 直接忽略, 不迁移也不展开环境变量. 启动和 `--check` 均打印 ERROR 日志, 用行号和列号定位被忽略项, 不打印原始键名或值.
 
 显式相对 `--config` 路径以启动目录为基准. 相对 `storage.data_dir` 和 `storage.workspace_root` 始终以真实可执行文件目录为基准, 不以配置文件目录为基准.
 
@@ -129,7 +133,9 @@ format = "text"
 | `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单. 可直接填写整数, 或引用逗号分隔的环境变量值. |
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见[进度界面](#进度界面). |
 | `telegram.progress_recent_tools` | verbose Recent 历史保留的已完成工具上限. 默认 `5`, 范围 `1..100`; 受 Telegram 消息长度限制, 实际显示可能更少. |
-| `telegram.provider_usage` | 显式启用 Progress 和中间/最终回复状态栏共享 last-good 缓存中的原生 `/usage` 5h/7d 已用百分比. TOML 布尔值, 默认 `false`, 独立于 progress 模式; 仅 idle 时刷新. |
+| `telegram.status_bar.progress`, `.intermediate`, `.final` | 按顺序选择 Progress, 中间 assistant 消息和最终结果的字段. `[]` 关闭对应状态栏. 未配置的数组默认 `["status", "thinking", "model", "fast", "context", "speed"]`. 见[状态栏](#状态栏). |
+| `telegram.status_bar.git_command` | 最终 `git` 字段的可选字面 argv. 未配置或 `[]` 使用内置安全 Git 探针. 自定义命令在当前 session workspace 中执行, 不经过 shell; 安全与副作用由用户负责. |
+| `telegram.status_bar.git_timeout` | 内置和自定义 Git 采样共用的正数字面 Go duration, 默认 `"450ms"`. 大仓库可增至如 `"2s"`. 空串, 零, 负数, 非法, 溢出或非字符串均拒绝; 不展开环境引用, 不允许关闭超时. |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram 预设标签, 每个预设一个; 无效标签回退为 `Preset N`. 标签对能查看对话的人可见, 不要填写凭据. |
@@ -349,19 +355,72 @@ omp --resume /path/to/session.jsonl
 - `summary` - 显示活动工具, 任务状态及当前 assistant 正文预览.
 - `verbose` - 额外显示近期可观察的工具活动. 工具详情不脱敏, 可能含有凭据或私人内容, 能查看对话的人都可见.
 
-Progress 延迟约三秒显示, 带有中止当前任务的 **Stop** 按钮. **⚙️** 标记与可用状态字段位于同一首行. `/stop` 还会清空等待任务. 进度更新和清理属于尽力而为, 不延迟正式回复.
+Progress 延迟约三秒显示, 带有中止当前任务的 **Stop** 按钮. 选择 `status` 字段后, **⚙️** 标记与可用状态字段位于同一首行. `/stop` 还会清空等待任务. 进度更新和清理属于尽力而为, 不延迟正式回复.
 
 Steer 输入和已完成的 assistant 消息都会删除该任务较早的 Progress, 不重启 OMP. 后续预览等待前面的正式回复投递后, 出现在最新输入/回复下方. 任务结束后清理剩余临时 Progress, 保留正式回复.
 
-已完成的 assistant 消息使用 **💬** 并立即独立发送, 关闭 progress 也不受影响. 整个任务确认成功后, 仅将最新正式消息的状态栏改为 **✅**; 取消, 失败, 结果不确定或研究轮次仍在继续时不标成功. 仅首条正式消息引用原始请求. 正文保持不变, 方便 Telegram Reply 引用, 不重发正文或额外发送完成消息.
+已完成的 assistant 消息立即独立发送, 关闭 progress 也不受影响. 选择 `status` 字段后, 中间状态栏显示 **💬**, 整个任务确认成功后仅将最新正式消息的状态栏改为 **✅**; 取消, 失败, 结果不确定或研究轮次仍在继续时不标成功. 仅首条正式消息引用原始请求. 正文保持不变, 方便 Telegram Reply 引用, 不重发正文或额外发送完成消息.
 
-状态栏显示可用的 model, 配置的 thinking, fast mode, context 和速度, 例如 `46% (500k)` 和 `3.8 t/s`. 首次状态读取完成前省略 context; `ctx ?` 表示读取完成但未能确认 context 用量. 详细信息见 `/status`.
+### 状态栏
+
+三种状态栏独立配置, 按数组顺序显示字段, 未知或重复名称会报错. `[]` 删除整个状态栏, 包括图标和分隔符. 关闭 Progress 状态栏不隐藏工具正文, 文本预览或 **Stop** 按钮; 关闭整个 Progress 仍使用 `progress_mode = "off"`.
+
+```toml
+[telegram.status_bar]
+progress = ["status", "model", "context"]
+intermediate = []
+final = ["status", "model", "thinking", "fast", "context", "speed", "quota", "git"]
+```
+
+| 字段 | 显示内容 |
+| --- | --- |
+| `status` | 处理中, assistant 或已确认完成的图标. |
+| `model` | 字面 model ID, 不带 provider. |
+| `thinking` | 配置的 thinking selector 符号. |
+| `fast` | 已确认的 fast mode 活动/设置. |
+| `context` | 已确认用量与窗口容量, 如 `46% (500k)`. |
+| `speed` | 原生实时速度或已确认回复的平均速度, 如 `3.8 t/s`. |
+| `quota` | 同账号缓存中的原生 5h/7d 已用百分比. |
+| `git` | 仅最终结果: 当前分支和可选的 dirty `*`, 或自定义命令 stdout. |
+
+没有数据或尚未读取的字段直接省略, 读取失败也不显示 `ctx ?`, `quota ?` 或 `n/a` 占位. 已确认的数据可以立即显示. 刷新不回填较早的中间消息. 未选择的字段不启动仅为显示服务的采样; 任务安全和命令所需的查询不变. 详细 `/status` 不变.
+
+`git` 在完成时采样 session 当前 workspace, 不使用任务启动时的快照. 未配置 `git_command` 或为空时, 内置只读探针在干净时显示 `main`, 存在 staged, unstaged 或未忽略的 untracked 改动时显示 `main*`; 仅 ahead/behind 不算 dirty. Detached HEAD 显示 `HEAD`. 非 Git 仓库, 查询失败或有界探针未能完成时省略字段, 不假装已确认干净. 研究中间轮次不采样 Git, 仅在 root 结算时采样.
+
+内置探针读取状态前会检查已跟踪文件属性及已初始化的子模块. 内容过滤器使只读结果无法安全确认时, 省略 Git 字段而不执行过滤器; 未使用的全局过滤器定义不影响普通仓库. 即使全局/系统 Git 配置启用了 Trace2, 探测也会显式关闭输出. 有界探测不提供 Git 配置或属性并发变化的原子快照.
+
+配置非空 `git_command` argv 可覆盖 `git` 字段:
+
+```toml
+[telegram.status_bar]
+final = ["status", "model", "context", "speed", "git"]
+
+# Empty uses the built-in safe Git status implementation.
+git_command = []
+# Shared by built-in and custom Git sampling; increase to "2s" for large repositories.
+git_timeout = "450ms"
+
+# Custom commands run with the session workspace as the working directory.
+# Users are responsible for the safety and side effects of custom commands.
+# git_command = ["git", "log", "-1", "--format=%h"] # a1b2c3d
+# git_command = ["/usr/local/bin/my-git-status"]    # dev@a1b2c3d*
+```
+
+自定义 argv 保持字面值, 不经过 shell, 不展开环境变量引用, 不额外添加 Git 参数. 命令沿用现有 `omp.environment` 子进程策略, 不做内置探针的 Git 专用环境改写或安全预检. 只有 `final` 选择 `git` 才执行. Stdout 直接作为字面显示文本, 不做 Git 格式解析: 去掉末尾 CR/LF, 保留其他空格, 仅接受有效 UTF-8 单行文本, 在字符边界裁剪至 64 字节后进行 Telegram 转义. 命令使用 `git_timeout`, 保留 64 KiB stdout 上限; 命令失败, 超时, 空输出, 内嵌换行/控制字符或非法 UTF-8 时省略字段, 不回退到内置探针. Stderr 丢弃. 研究结算可能重新采样, 不保证恰好调用一次. 后续额度编辑保留已捕获的输出, 不重新执行命令.
+
+`git_timeout` 覆盖完整的内置安全预检/状态探针或自定义命令, 不增加重试. 默认 `"450ms"`, 大仓库可增至如 `"2s"`. 必须是正数字面 Go duration 字符串: 不展开环境引用, 空串, 零, 负数, 非法, 溢出或非字符串均拒绝, 不允许关闭超时. 增大超时不放宽内置安全检查, 64 KiB 输出上限或 64 字节 label 上限; 大仓库超过输出上限时仍可能省略字段.
+
+Git 预算独立于原生状态/账号 RPC deadline: 普通最终采样的每次 RPC 仍限制为 1 秒, 研究结算的每次 RPC 仍为 5 秒. 普通采样共享取消, Git 使用独立的配置预算. 研究结算保留 operation 取消及所有权/session 围栏, 仅移除通用的 30 秒 operation 上限: 有限次 RPC 和 Git 探针各自执行自己的 deadline.
+
+迁移: 旧 `telegram.provider_usage` 键会被忽略并打印 ERROR 日志, 不再阻止启动. 请删除它, 仅在需要显示额度的数组中加入 `"quota"`; 三处都不选则关闭额度读取. 默认不选择 quota 和 Git.
+
+仅在中间/Progress 状态栏选择 quota 时, 空闲 runtime 仍可在短任务之后识别账号并预热缓存, 完成不等待它. 如果 quota 只选在已关闭的 Progress 中, 不启动读取. 状态栏过长时省略整个字段, 不截断字面值或 dirty 标记.
 
 回复支持 Markdown, 长文本自动分片. 大表格可能改用纯文本布局; Telegram 不支持的格式回退为可读文本.
 
-设置 `telegram.provider_usage = true` 后, Progress 和中间/最终回复状态栏可显示原生 Claude (`anthropic`) 或 OpenAI Codex (`openai-codex`) 账号额度, 独立于 progress 模式. 与 context 一样, 当前 scope 的首次状态读取完成前省略额度字段. 读取完成后, 各处显示同一份 last-good 缓存, 例如 `5h30% 7d65%`; 没有可用值时显示 `quota ?`. 只展示 5h/7d 已用百分比, 不附加读取时间; 账号身份, 邮箱, credential ID 和原始报告不发送到 Telegram, 不写入日志或数据库.
+选择 `quota` 后, 对应状态栏可显示原生 Claude (`anthropic`) 或 OpenAI Codex (`openai-codex`) 账号额度, 独立于 progress 模式. 只有当前 scope 的账号读取确认存在可用的同账号缓存时才显示, 例如 `5h30% 7d65%`. 只展示 5h/7d 已用百分比, 不附加读取时间; 账号身份, 邮箱, credential ID 和原始报告不发送到 Telegram, 不写入日志或数据库.
 
-显示缓存不会触发或等待刷新. 刷新仅在 idle 时通过现有原生 builtin `/usage` 尝试, 同一账号 scope 的尝试间隔至少五分钟, deadline 为三秒; 排队 prompt 和控制操作优先. 忙碌或长任务显示缓存或不可用, 查询失败, 跳过或结果为空都不清除 last-good 值. 刷新成功后可通过可编辑 header 更新最近匹配的最终状态栏, 不修改正文. 不直接请求供应商 API.
+显示缓存不会触发或等待刷新. 刷新仅在 idle 时通过现有原生 builtin `/usage` 尝试, 同一账号 scope 的尝试间隔至少五分钟, deadline 为三秒; 排队 prompt 和控制操作优先. 忙碌或长任务有缓存就显示, 否则省略字段. 查询失败, 跳过或结果为空都不清除 last-good 值. 刷新成功后仅在 final 数组选择了 `quota` 时更新最近匹配的最终 header, 不修改正文或已捕获的 Git 结果. 不直接请求供应商 API.
 
 仅由 `agent_end.messages` 提供的最终答案也保留可编辑 header. 后续额度刷新更新该最终答案, 不更新之前的中间回复.
 

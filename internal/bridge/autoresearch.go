@@ -206,7 +206,7 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 
 func (w *worker) commitResearchRound() bool {
 	metadata := w.replyStatus.header
-	if metadata == "" {
+	if !w.replyStatus.prepared {
 		metadata = w.intermediateAssistantHeader()
 	}
 	target := w.assistantDelivery.statusOutboxID
@@ -215,8 +215,8 @@ func (w *worker) commitResearchRound() bool {
 			return false
 		}
 		target = w.assistantDelivery.statusOutboxID
-	} else if target != 0 && metadata != "" {
-		if err := w.b.db.SetAssistantHeader(w.ctx, target, w.assistantHeader(metadata, false)); err != nil {
+	} else if target != 0 {
+		if err := w.b.db.SetAssistantHeader(w.ctx, target, metadata); err != nil {
 			w.b.fail(err)
 			w.cancel()
 			return false
@@ -224,11 +224,12 @@ func (w *worker) commitResearchRound() bool {
 	}
 	if target != 0 {
 		w.replyStatus.roundStatusOutboxID = target
-		w.replyStatus.roundStatusHeader = metadata
+		w.replyStatus.roundMetrics = w.replyStatus.metrics
 	}
 	w.research.roundOpen = false
 	w.resetAssistantResult()
 	w.replyStatus.header = ""
+	w.replyStatus.prepared = false
 	w.replyStatus.metrics = replyMetrics{}
 	w.awaitTaskContinuation()
 	return true

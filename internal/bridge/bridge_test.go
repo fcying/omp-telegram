@@ -695,6 +695,10 @@ func TestMain(m *testing.M) {
 					accounts = append(accounts, map[string]any{"credentialId": 1, "provider": provider, "label": usageAccount, "detail": "oauth #1", "type": "oauth", "active": true})
 				}
 				resp["data"] = map[string]any{"accounts": accounts}
+				if holdResearchControl("get_logout_accounts") {
+					heldResearchControl = resp
+					continue
+				}
 			case "fixture_fast_mode":
 				fastMode, _ = cmd["mode"].(string)
 			case "fixture_fast_release":

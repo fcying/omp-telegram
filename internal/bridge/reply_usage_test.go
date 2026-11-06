@@ -50,9 +50,32 @@ func replyUsageWorker(t *testing.T, mode string) (*worker, func(string), string)
 	t.Helper()
 	t.Setenv("OMP_TELEGRAM_FIXTURE_USAGE_MODE", mode)
 	w, _, command, trace := replyStatusWorker(t)
-	w.b.cfg.ProviderUsage = true
+	setProviderUsageFields(w, true)
 	nativeRPC(t, w, "set_model", map[string]any{"provider": "openai-codex", "modelId": "safe"})
 	return w, command, trace
+}
+
+func setProviderUsageFields(w *worker, enabled bool) {
+	for _, kind := range []string{"progress", "intermediate", "final"} {
+		fields := w.b.cfg.StatusBar.Fields(kind)
+		selected := make([]string, 0, len(fields)+1)
+		for _, field := range fields {
+			if field != "quota" {
+				selected = append(selected, field)
+			}
+		}
+		if enabled {
+			selected = append(selected, "quota")
+		}
+		switch kind {
+		case "progress":
+			w.b.cfg.StatusBar.Progress = selected
+		case "intermediate":
+			w.b.cfg.StatusBar.Intermediate = selected
+		case "final":
+			w.b.cfg.StatusBar.Final = selected
+		}
+	}
 }
 
 func endUsageReply(w *worker) {
@@ -99,7 +122,7 @@ func TestFinalReplyProviderUsage(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		t.Run(map[bool]string{false: "disabled", true: "enabled"}[enabled], func(t *testing.T) {
 			w, _, trace := replyUsageWorker(t, "normal")
-			w.b.cfg.ProviderUsage = enabled
+			setProviderUsageFields(w, enabled)
 			endUsageReply(w)
 			awaitReplyStatus(t, w)
 			if queueState(t, w, 2) != "done" {
@@ -138,7 +161,7 @@ func TestSnapshotFinalReplyProviderUsage(t *testing.T) {
 			t.Setenv("OMP_TELEGRAM_FIXTURE_USAGE_MODE", "hold-report")
 			w, f, _, trace := replyStatusWorker(t)
 			t.Cleanup(func() { requireStoreOK(t, os.WriteFile(gate, nil, 0600)) })
-			w.b.cfg.ProviderUsage = true
+			setProviderUsageFields(w, true)
 			nativeRPC(t, w, "set_model", map[string]any{"provider": "openai-codex", "modelId": "safe"})
 			bodies := []string{"answer"}
 			snapshot := answer

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"omp-telegram/internal/config"
 	"omp-telegram/internal/telegram"
 )
 
@@ -42,11 +43,11 @@ func TestReplyMetricsWeightsCallsAndResetsBetweenReplies(t *testing.T) {
 	tool.Role, tool.ModelID = "toolResult", "tool-model"
 	metrics.observe(tool)
 	metrics.observe(message{Role: "user"})
-	if got := compactHeader("en", statusState{}, &metrics); !strings.Contains(got, "answer-model") || strings.Contains(got, "tool-model") || !strings.Contains(got, "50 t/s") {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", statusState{}, &metrics, false, true)); !strings.Contains(got, "answer-model") || strings.Contains(got, "tool-model") || !strings.Contains(got, "50 t/s") {
 		t.Fatalf("non-assistant changed reply metadata: %s", got)
 	}
 	metrics = replyMetrics{}
-	if got := compactMessageHeader("en", statusState{}, &metrics, false); got != "" {
+	if got := renderCompactFields((config.StatusBar{}).Fields("intermediate"), compactFields("en", statusState{}, &metrics, true, false)); got != "" {
 		t.Fatalf("new reply inherited metadata: %q", got)
 	}
 	metrics.observe(replyMetricsMessage(30, 2000))
@@ -83,7 +84,7 @@ func TestReplyMetricsRejectsIncompleteAndInvalidCalls(t *testing.T) {
 				t.Fatalf("incomplete aggregate invented speed: %q", got)
 			}
 			metrics.observe(bad)
-			header := compactHeader("en", statusState{}, &metrics)
+			header := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", statusState{}, &metrics, false, true))
 			if !strings.Contains(header, "last-model") || strings.Contains(header, "t/s") || strings.Contains(header, "% (") {
 				t.Fatalf("invalid metrics lost model fallback or invented fields: %s", header)
 			}
@@ -140,7 +141,7 @@ func TestReplyHeaderShowsLiteralModelAndConfiguredSettings(t *testing.T) {
 	contextTokens := int64(64000)
 	msg.Usage.ContextTokens = &contextTokens
 	metrics.observe(msg)
-	header := compactHeader("en", state, &metrics)
+	header := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true))
 	rendered := telegram.ConvertMarkdown(header)
 	for _, want := range []string{
 		"<code>" + html.EscapeString(state.Model.ID) + "</code>",
@@ -166,19 +167,19 @@ func TestReplyHeaderDoesNotAttachOtherModelSettings(t *testing.T) {
 		metrics.observe(replyMetricsMessage(10, 1000))
 		state := replyMetricsState(t, raw)
 		state.ConfiguredThinking = "high"
-		header := compactHeader("en", state, &metrics)
+		header := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true))
 		if !strings.Contains(header, "answer-model") || !strings.Contains(header, "10 t/s") || strings.Contains(header, "◒") || strings.Contains(header, "⚡") || strings.Contains(header, "other-") {
 			t.Fatalf("queried model settings crossed model identity: %s", header)
 		}
 	}
 	state := replyMetricsState(t, `{"model":{"id":"answer-model"},"fastModeEnabled":true}`)
-	if header := compactHeader("en", state, &replyMetrics{}); strings.Contains(header, "⚡") || strings.Contains(header, "fast ") || strings.Contains(header, "n/a") || !strings.Contains(header, "answer-model") {
+	if header := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &replyMetrics{}, false, true)); strings.Contains(header, "⚡") || strings.Contains(header, "fast ") || strings.Contains(header, "n/a") || !strings.Contains(header, "answer-model") {
 		t.Fatalf("configured-only fast state became actual activity: %s", header)
 	}
 	var metrics replyMetrics
 	metrics.observe(replyMetricsMessage(10, 1000))
 	metrics.observe(message{Role: "assistant"})
-	if header := compactHeader("en", statusState{}, &metrics); strings.Contains(header, "answer-model") || strings.Contains(header, "t/s") || strings.Contains(header, "% (") {
+	if header := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", statusState{}, &metrics, false, true)); strings.Contains(header, "answer-model") || strings.Contains(header, "t/s") || strings.Contains(header, "% (") {
 		t.Fatalf("missing latest identity reused earlier assistant: %s", header)
 	}
 }
@@ -191,7 +192,7 @@ func TestReplyHeaderUsesLastAfterOutputContextAndQueriedCapacity(t *testing.T) {
 		msg.Usage.TotalTokens = &total
 		var metrics replyMetrics
 		metrics.observe(msg)
-		if got := compactHeader("en", state, &metrics); !strings.Contains(got, "92% (10k)") {
+		if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); !strings.Contains(got, "92% (10k)") {
 			t.Fatalf("after-output usage was omitted or counted twice (state tokens %s): %s", stateTokens, got)
 		}
 	}
@@ -235,7 +236,7 @@ func TestReplyHeaderAccountsForContextUsageAndOrchestration(t *testing.T) {
 			}
 			var metrics replyMetrics
 			metrics.observe(msg)
-			header := compactHeader("en", state, &metrics)
+			header := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true))
 			if tc.want == "" {
 				if strings.Contains(header, "% (") {
 					t.Fatalf("incomplete context fabricated: %s", header)
@@ -259,23 +260,23 @@ func TestReplyHeaderRequiresConfirmedIdleAndMatchingContextIdentity(t *testing.T
 		`"isStreaming":false,"isCompacting":true,`,
 	} {
 		state := replyMetricsState(t, `{`+flags+`"model":{"id":"answer-model","provider":"private-provider"},"contextUsage":{"tokens":9000,"contextWindow":10000}}`)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
+		if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); strings.Contains(got, "% (") {
 			t.Fatalf("unconfirmed final context displayed: %s", got)
 		}
 	}
 	for _, model := range []string{`{}`, `{"id":"other-model","provider":"private-provider"}`, `{"id":"answer-model","provider":"other-provider"}`, `{"id":"answer-model"}`} {
 		state := replyMetricsState(t, `{"model":`+model+`,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":9000,"contextWindow":10000}}`)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
+		if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); strings.Contains(got, "% (") {
 			t.Fatalf("context crossed model identity: %s", got)
 		}
 	}
 	for _, usage := range []string{`null`, `{}`, `{"tokens":9233}`, `{"contextWindow":0}`, `{"contextWindow":-1}`} {
 		state := replyMetricsState(t, `{"model":{"id":"answer-model","provider":"private-provider"},"isStreaming":false,"isCompacting":false,"contextUsage":`+usage+`}`)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
+		if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); strings.Contains(got, "% (") {
 			t.Fatalf("missing context capacity fabricated: %s", got)
 		}
 	}
-	if got := compactHeader("en", statusState{}, &metrics); strings.Contains(got, "% (") || !strings.Contains(got, "233 t/s") || !strings.Contains(got, "answer-model") {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", statusState{}, &metrics, false, true)); strings.Contains(got, "% (") || !strings.Contains(got, "233 t/s") || !strings.Contains(got, "answer-model") {
 		t.Fatalf("failed state query lost confirmed metrics or fabricated context: %s", got)
 	}
 }
@@ -288,15 +289,15 @@ func TestReplyHeaderContextIsIndependentOfSpeedAndDoesNotCarryForward(t *testing
 	msg.Duration = nil
 	var metrics replyMetrics
 	metrics.observe(msg)
-	if got := compactHeader("en", state, &metrics); !strings.Contains(got, "92% (10k)") || strings.Contains(got, "t/s") {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); !strings.Contains(got, "92% (10k)") || strings.Contains(got, "t/s") {
 		t.Fatalf("valid context was coupled to unknown speed: %s", got)
 	}
 	metrics.observe(message{Role: "toolResult"})
-	if got := compactHeader("en", state, &metrics); !strings.Contains(got, "% (") {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); !strings.Contains(got, "% (") {
 		t.Fatalf("non-assistant discarded last assistant context: %s", got)
 	}
 	metrics.observe(replyMetricsMessage(233, 1000))
-	if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); strings.Contains(got, "% (") {
 		t.Fatalf("missing latest usage inherited earlier context: %s", got)
 	}
 	for _, missingIdentity := range []message{
@@ -305,12 +306,12 @@ func TestReplyHeaderContextIsIndependentOfSpeedAndDoesNotCarryForward(t *testing
 		{Role: "assistant", Provider: msg.Provider, Usage: msg.Usage},
 	} {
 		metrics.observe(missingIdentity)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
+		if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); strings.Contains(got, "% (") {
 			t.Fatalf("missing assistant identity fabricated matching context: %s", got)
 		}
 	}
 	metrics = replyMetrics{}
-	if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", state, &metrics, false, true)); strings.Contains(got, "% (") {
 		t.Fatalf("new reply reused state prompt usage: %s", got)
 	}
 }
