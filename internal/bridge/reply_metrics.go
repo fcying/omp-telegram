@@ -1,11 +1,6 @@
 package bridge
 
-import (
-	"math"
-
-	"omp-telegram/internal/i18n"
-	"omp-telegram/internal/telegram"
-)
+import "math"
 
 // replyMetrics belongs to one complete reply, including its tool continuations.
 // Assign replyMetrics{} before the next reply (or autoresearch round).
@@ -90,46 +85,4 @@ func (m replyMetrics) speedText() string {
 	}
 	speed := float64(m.output) * 1000 / m.duration
 	return compactSpeedStatus(speed)
-}
-
-func replyTaskReplies(language i18n.Language, text, header string, truncated bool) []string {
-	if header == "" {
-		return taskReplies(language, text, "", truncated)
-	}
-	// Bound and split the body first: prepending the small header must never
-	// copy the entire, potentially 4 MiB, assistant output.
-	notice := i18n.Text(language, i18n.Msg.ReplyTruncated)
-	budget := maxFinalReplyBytes - len(header) - 2 - len(notice)
-	if len(text) > maxFinalReplyBytes-len(header)-2 || truncated && len(text) > budget {
-		text = truncateUTF8(text, budget)
-		truncated = true
-	}
-	maxParts := maxFinalReplyMessages
-	if truncated {
-		maxParts--
-	}
-	parts, overflow := splitTaskText(text, maxParts)
-	if len(parts) == 0 {
-		parts, overflow = splitTaskText(header, maxParts)
-	} else {
-		firstLimit := telegram.MaxMessageUTF16 - utf16Length(header) - 2
-		first := telegram.SplitForTelegram(parts[0], firstLimit)
-		// Raw fence repair can exceed the byte budget despite fitting on screen.
-		if len(first) == 0 {
-			first = []string{header}
-		} else if len(first[0]) > maxFinalReplyBytes-len(header)-2-len(notice) {
-			first = append([]string{header}, first...)
-		} else {
-			first[0] = header + "\n\n" + first[0]
-		}
-		if len(first) == 1 {
-			parts[0] = first[0]
-		} else {
-			withHeader := make([]string, 0, len(first)+len(parts)-1)
-			withHeader = append(withHeader, first...)
-			parts = append(withHeader, parts[1:]...)
-		}
-	}
-	truncated = truncated || overflow || len(parts) > maxFinalReplyMessages
-	return fitTaskReplyBudget(language, parts, "", truncated)
 }

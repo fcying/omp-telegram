@@ -86,7 +86,7 @@ func TestRunningTextSteersRootAndFollowupRunsSeparately(t *testing.T) {
 		t.Fatal("root and steer did not reach independent durable terminal states")
 	}
 	var finalText string
-	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=2 AND reply_to=2").Scan(&finalText); err != nil || replyBody(finalText) != "answer: correct direction" {
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=2 AND reply_to=2").Scan(&finalText); err != nil || replyBody(t, finalText) != "answer: correct direction" {
 		t.Fatalf("steered root final reply = %q, err=%v", finalText, err)
 	}
 	var steerReplies int

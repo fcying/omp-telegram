@@ -18,6 +18,11 @@ allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 # Unset, empty, or invalid values fall back to summary.
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 
+# Completed tool outcomes retained in verbose Recent history (1..100). Default: 5.
+# Accepts an integer or a quoted numeric environment reference. Active Tools stay at 6.
+# Long histories show the newest rows that fit, with an omitted count for older rows.
+progress_recent_tools = 5
+
 # Show native /usage provider windows only in final reply headers. Default: false.
 provider_usage = false
 

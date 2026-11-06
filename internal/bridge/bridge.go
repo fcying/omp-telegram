@@ -153,6 +153,7 @@ type albumEvent struct {
 type confirmation struct {
 	action, uiID, method            string
 	uiTitle                         string
+	uiSelected                      string
 	uiClientID                      uint64
 	workspace                       string
 	exportFormat                    string
@@ -182,6 +183,15 @@ type confirmation struct {
 	uiSelectMenu                    bool
 	autoresearchText                string
 }
+
+type nativeSelectionReceipt struct {
+	messageID          int64
+	text               string
+	clientID           uint64
+	generation, active int64
+	turn               uint64
+}
+
 type runtimeState uint8
 
 const (
@@ -219,12 +229,16 @@ const (
 )
 
 type progressTransport struct {
-	finishing          bool
-	previewBusy        bool
-	previewID          int64
-	previewStopToken   string
-	progressSuppressed bool
-	lastPreview        string
+	finishing            bool
+	previewBusy          bool
+	previewEpoch         uint64
+	previewDiscardBefore uint64
+	previewCancel        context.CancelFunc
+	previewReplyTo       int64
+	previewID            int64
+	previewStopToken     string
+	progressSuppressed   bool
+	lastPreview          string
 }
 
 type runtimeLifecycle struct {
@@ -258,12 +272,9 @@ type worker struct {
 	sessionID              string
 	claimedSession         string
 	runtimeLifecycle
-	queue                []queued
-	stream               strings.Builder
-	preview              string
-	finalAssistantBytes  int
-	finalizedStreamBytes int
-	finalOutputTruncated bool
+	queue  []queued
+	stream strings.Builder
+	assistantDelivery
 	taskState
 	turn                uint64
 	steers              map[string]steerRequest
@@ -305,10 +316,9 @@ type worker struct {
 	typingCancel        context.CancelFunc
 	idleProbe           idleProbeState
 	lastAssistant       *terminalAssistant
-	finalAssistantTexts []string
-	assistantRunStart   int
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
+	uiSelection         nativeSelectionReceipt
 	keyboardCleanup     chan int64
 	stopCallbackReplies chan stopCallbackReply
 	mediaResults        chan mediaResult
@@ -357,12 +367,12 @@ type previewResult struct {
 	stopToken  string
 	generation int64
 	turn       uint64
+	epoch      uint64
 	err        error
 }
 
 const (
 	maxActiveTools       = 6
-	maxRecentTools       = 5
 	maxToolNameUnits     = 64
 	maxToolDetailUnits   = 100
 	maxToolDetailsUnits  = 1600
@@ -466,6 +476,7 @@ type rpcEvent struct {
 	IsError               bool                         `json:"isError"`
 	AssistantMessageEvent struct{ Type, Delta string } `json:"assistantMessageEvent"`
 	Messages              []message                    `json:"messages"`
+	MessageCount          *int                         `json:"messageCount"`
 }
 
 type message struct {
@@ -958,6 +969,9 @@ func deliveryRetryDelaySeconds(output store.Output, info telegram.ErrorInfo) int
 
 func (b *Bridge) deliver(ctx context.Context) error {
 	for ctx.Err() == nil {
+		if err := b.deliverAssistantHeader(ctx); err != nil {
+			return err
+		}
 		o, err := b.db.ClaimNextOutput(ctx, time.Now().Unix())
 		if errors.Is(err, sql.ErrNoRows) {
 			timer := time.NewTimer(200 * time.Millisecond)
@@ -979,9 +993,10 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			}
 			return err
 		}
+		var message telegram.Message
 		switch o.Kind {
 		case "text":
-			_, err = b.tg.Send(ctx, o.Chat, o.Thread, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
+			message, err = b.tg.Send(ctx, o.Chat, o.Thread, assistantOutputText(o), telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		case "photo", "document":
 			_, err = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		default:
@@ -1045,7 +1060,12 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			}
 		}
 		if !retryExhausted {
-			if err = b.db.MarkOutput(o.ID, state); err != nil {
+			if state == store.OutboxDone && o.Header != "" {
+				err = b.db.MarkOutputDelivered(o.ID, message.MessageID, o.Header)
+			} else {
+				err = b.db.MarkOutput(o.ID, state)
+			}
+			if err != nil {
 				b.storeLog.Error("outbox state persistence failed", "event", "outbox_state_write_failed", "outbox_id", o.ID, "chat_id", o.Chat, "thread_id", o.Thread, "state", string(state))
 				return err
 			}
@@ -1079,7 +1099,7 @@ func (b *Bridge) deliver(ctx context.Context) error {
 	return nil
 }
 func (b *Bridge) reconcileProgressCleanup(ctx context.Context) {
-	messages, err := b.db.CompletedProgressMessages()
+	messages, err := b.db.CompletedProgressMessages(0)
 	if err != nil {
 		b.storeLog.Warn("completed progress lookup failed", "event", "progress_cleanup_state_failed")
 	} else {
@@ -1090,12 +1110,12 @@ func (b *Bridge) reconcileProgressCleanup(ctx context.Context) {
 }
 
 func (b *Bridge) cleanupDeliveredProgress(ctx context.Context, inboxID int64) {
-	message, ready, err := b.db.CompletedProgressMessage(inboxID)
+	messages, err := b.db.CompletedProgressMessages(inboxID)
 	if err != nil {
 		b.storeLog.Warn("completed progress lookup failed", "event", "progress_cleanup_state_failed")
 		return
 	}
-	if ready {
+	for _, message := range messages {
 		b.deleteProgressMessage(ctx, message)
 	}
 }
@@ -1216,8 +1236,10 @@ func (w *worker) taskActive() bool { return w.active != 0 }
 func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
+	w.rotatePreview(0)
 	w.cancelProgressNative()
 	w.resetReplyStatus()
+	w.uiSelection = nativeSelectionReceipt{}
 	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true, activeInputKind: q.kind}
 	w.activeAttachmentDir = q.directory
 	w.rootRequestID = ""
@@ -1228,6 +1250,7 @@ func (w *worker) beginTask(q queued) {
 func (w *worker) clearTask() {
 	w.cancelProgressNative()
 	w.resetReplyStatus()
+	w.uiSelection = nativeSelectionReceipt{}
 	w.finishActiveIncoming()
 	w.active = 0
 	w.activeReplyTo = 0
@@ -1376,6 +1399,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.uiSelection = nativeSelectionReceipt{}
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
 	w.commitPendingReplyStatus()
@@ -1537,6 +1561,7 @@ func (w *worker) run() {
 	defer func() {
 		w.cancel()
 		w.background.Wait()
+		w.drainPreviewResults()
 		w.drainMigrationResults()
 		w.drainMediaResults()
 		w.drainExportResults()
@@ -1617,7 +1642,9 @@ func (w *worker) run() {
 			w.dispatch()
 			continue
 		case result := <-w.progressNative.results:
-			w.progressNativeFinished(result)
+			if w.progressNativeFinished(result) {
+				w.flushPreview()
+			}
 			continue
 		case result := <-w.topicRenameResults:
 			w.topicRenameFinished(result)
@@ -1728,7 +1755,9 @@ func (w *worker) run() {
 		case result := <-w.steerFence.probeResults:
 			w.steeredQuiescenceFinished(result)
 		case result := <-w.progressNative.results:
-			w.progressNativeFinished(result)
+			if w.progressNativeFinished(result) {
+				w.flushPreview()
+			}
 		case <-tick.C:
 			if onTick() {
 				return
@@ -1986,6 +2015,11 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 		w.cancelMigration("shutdown", false)
 	}
 	w.flushReplyStatus()
+	w.rotatePreview(0)
+	var interruptedReplies []string
+	if w.taskActive() && w.assistantDelivery.body {
+		interruptedReplies = w.remainingAssistantReplies(w.tr(i18n.Msg.OmpExitedTaskOutcomeUncertainWillNotReplayedAutomatically))
+	}
 	w.interruptModelMenu()
 	w.b.removeCommandMenu(w)
 	completion := w.taskCompletionAttrs(w.active, "uncertain")
@@ -2012,8 +2046,6 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.compacting = false
 	w.endSessionOperation()
 	w.endControlOperation()
-	w.preview = ""
-	w.finalizedStreamBytes = 0
 	w.activeReplyTo = 0
 	w.stream.Reset()
 	w.resetAssistantResult()
@@ -2021,7 +2053,21 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.releaseRuntime(releaseSlot)
 	w.releaseSession()
 	if activeID := w.active; activeID != 0 {
-		if w.mark(activeID, "uncertain") {
+		committed := false
+		if len(interruptedReplies) != 0 {
+			commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := w.b.db.CompleteInboxUncertainWithReplies(commitCtx, activeID, w.key.chat, w.key.thread, interruptedReplies)
+			cancel()
+			if err != nil {
+				w.b.storeLog.Error("incomplete result commit failed", "event", "final_commit_failed")
+				w.b.fail(err)
+			} else {
+				committed = true
+			}
+		} else {
+			committed = w.mark(activeID, "uncertain")
+		}
+		if committed {
 			w.log.LogAttrs(context.Background(), slog.LevelInfo, "task completed", completion...)
 		}
 		if w.binding.Running && w.ctx.Err() != nil {
@@ -2726,7 +2772,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	w.binding = binding
 	w.configuredThinking = configuredThinking
 	w.startIntent = nil
-	w.preview, w.lastPreview = "", ""
+	w.lastPreview = ""
 	w.previewID = 0
 	w.touchActivity()
 	if !w.runtimeResuming {
@@ -3169,11 +3215,7 @@ func (w *worker) dispatch() {
 	w.progress = progressState{StartedAt: time.Now(), ActiveTools: make(map[string]progressTool)}
 	w.logTaskSubmit(q.id)
 	w.progressSuppressed = false
-	w.preview = ""
-	w.stream.Reset()
-	w.finalAssistantBytes = 0
-	w.finalizedStreamBytes = 0
-	w.finalOutputTruncated = false
+	w.resetAssistantResult()
 	w.lastPreview = ""
 	w.previewID = 0
 	w.previewStopToken = ""
@@ -3305,9 +3347,13 @@ func truncateUTF8(text string, limit int) string {
 
 // Split only as much input as needed to fill the allowed Telegram pages.
 func splitTaskText(text string, maxParts int) ([]string, bool) {
+	return splitTaskTextLimit(text, maxParts, telegram.MaxMessageUTF16)
+}
+
+func splitTaskTextLimit(text string, maxParts, limit int) ([]string, bool) {
 	size := min(len(text), 64<<10)
 	for {
-		parts := telegram.SplitForTelegram(truncateUTF8(text, size), telegram.MaxMessageUTF16)
+		parts := telegram.SplitForTelegram(truncateUTF8(text, size), limit)
 		if len(parts) > maxParts {
 			return parts[:maxParts+1], true
 		}
@@ -3405,9 +3451,8 @@ func (w *worker) assistantBudgetExceeded() {
 
 func (w *worker) resetAssistantResult() {
 	w.lastAssistant = nil
-	w.finalAssistantTexts, w.assistantRunStart = nil, 0
-	w.finalAssistantBytes = 0
-	w.finalOutputTruncated = false
+	w.stream.Reset()
+	w.assistantDelivery = assistantDelivery{}
 }
 
 func (w *worker) finish() {
@@ -3417,7 +3462,17 @@ func (w *worker) finish() {
 	// Progress state is finalized only after the durable result transaction.
 	if w.active != 0 {
 		taskID := w.active
-		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, replyTaskReplies(w.b.language(), w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
+		target := w.assistantDelivery.statusOutboxID
+		metadata := w.replyStatus.header
+		if target == 0 && w.research.root && w.replyStatus.roundStatusOutboxID != 0 {
+			target = w.replyStatus.roundStatusOutboxID
+			metadata = w.replyStatus.roundStatusHeader
+		} else if metadata == "" {
+			metadata = w.intermediateAssistantHeader()
+		}
+		header := w.assistantHeader(metadata, true)
+		parts, _ := w.boundedAssistantRepliesWithHeader(w.stream.String(), header)
+		if err := w.b.db.CompleteInboxWithAssistantHeader(w.ctx, taskID, w.key.chat, w.key.thread, target, header, parts); err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
@@ -3428,12 +3483,10 @@ func (w *worker) finish() {
 		w.cancelHostRequests()
 		w.logTaskComplete(taskID, "done")
 		w.clearTask()
-		w.preview = ""
-		w.stream.Reset()
-		w.finalizedStreamBytes = 0
 		w.clearTaskConfirmations()
-	} else if w.preview != "" {
-		for _, part := range taskReplies(w.b.language(), w.preview, "", w.finalOutputTruncated) {
+		w.cleanupCompletedProgress(taskID)
+	} else if w.stream.Len() != 0 {
+		for _, part := range taskReplies(w.b.language(), w.stream.String(), "", false) {
 			w.say(part)
 		}
 	}
@@ -3454,17 +3507,16 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.resetIdleProbe()
 	w.clearAwaitingContinuation()
 	if w.active == 0 {
-		w.lastAssistant = nil
-		w.finalAssistantTexts, w.assistantRunStart = nil, 0
+		w.resetAssistantResult()
 		return false
 	}
 	taskID := w.active
 	var err error
 	switch state {
 	case "uncertain":
-		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.b.language(), w.preview, notice, w.finalOutputTruncated))
+		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, w.remainingAssistantReplies(notice))
 	case "cancelled":
-		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, taskReplies(w.b.language(), w.preview, notice, w.finalOutputTruncated))
+		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, w.remainingAssistantReplies(notice))
 	default:
 		panic("invalid terminal state")
 	}
@@ -3479,11 +3531,9 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	w.cancelHostRequests()
 	w.logTaskComplete(taskID, state)
 	w.clearTask()
-	w.preview = ""
 	w.resetAssistantResult()
-	w.stream.Reset()
-	w.finalizedStreamBytes = 0
 	w.clearTaskConfirmations()
+	w.cleanupCompletedProgress(taskID)
 	w.finishProgressWhenReady()
 	return true
 }
@@ -3509,59 +3559,6 @@ func assistantText(m message) string {
 		}
 	}
 	return strings.Join(texts, "\n")
-}
-
-func boundedAssistantTexts(messages []message, priorTexts, currentTexts []string, limit int) (string, bool, bool) {
-	var preview strings.Builder
-	found := false
-	appendText := func(text string) bool {
-		if text == "" {
-			return true
-		}
-		found = true
-		separator := ""
-		if preview.Len() != 0 {
-			separator = "\n\n"
-		}
-		remaining := limit - preview.Len()
-		if len(separator)+len(text) > remaining {
-			if remaining > len(separator) {
-				preview.WriteString(separator)
-				preview.WriteString(truncateUTF8(text, remaining-len(separator)))
-			}
-			return false
-		}
-		preview.WriteString(separator)
-		preview.WriteString(text)
-		return true
-	}
-	for _, text := range priorTexts {
-		if !appendText(text) {
-			return preview.String(), found, true
-		}
-	}
-	terminalFound := false
-	for _, m := range messages {
-		if m.Role != "assistant" {
-			continue
-		}
-		text := assistantText(m)
-		if text == "" {
-			continue
-		}
-		terminalFound = true
-		if !appendText(text) {
-			return preview.String(), found, true
-		}
-	}
-	if !terminalFound {
-		for _, text := range currentTexts {
-			if !appendText(text) {
-				return preview.String(), found, true
-			}
-		}
-	}
-	return preview.String(), found, false
 }
 
 func assistantTerminalState(m message) terminalResult {
@@ -3683,13 +3680,40 @@ func (w *worker) finishTerminal(e rpcEvent) {
 	case terminalCancelled:
 		w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion))
 	case terminalDone:
-		if w.preview == "" {
+		if !w.hasAssistantBody() {
 			w.finishUncertain(w.tr(i18n.Msg.OmpEndedWithoutConfirmedTextResultTaskOutcomeUncertain))
 			return
 		}
 		w.finishReplyWithStatus(false)
 	}
 }
+
+// Empty terminal tails still need cleanup when their earlier bodies are sent.
+// An in-flight preview is reconciled after its actual message identity arrives.
+func (w *worker) cleanupCompletedProgress(taskID int64) {
+	if taskID == 0 || w.ctx == nil || w.b == nil || w.b.db == nil || w.b.tg == nil {
+		return
+	}
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		w.b.cleanupDeliveredProgress(w.ctx, taskID)
+	}()
+}
+
+func (w *worker) cleanupSupersededProgress(messages ...store.ProgressMessage) {
+	if len(messages) == 0 {
+		return
+	}
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		for _, message := range messages {
+			w.b.deleteProgressMessage(w.ctx, message)
+		}
+	}()
+}
+
 func (w *worker) finishProgressWhenReady() {
 	if w.previewBusy {
 		w.finishing = true
@@ -3699,12 +3723,50 @@ func (w *worker) finishProgressWhenReady() {
 }
 
 func (w *worker) finishPreview() {
+	w.rotatePreview(0)
 	w.finishing = false
 	w.progress = progressState{}
+	// Delivery reconciliation clears persisted progress identities after success.
+}
+
+func (w *worker) rotatePreview(replyTo int64) {
+	if w.previewCancel != nil {
+		// Initial sends must return their message identity for later cleanup.
+		if w.previewID != 0 {
+			w.previewCancel()
+		}
+		w.previewCancel = nil
+	}
+	w.previewEpoch++
+	w.previewBusy = false
 	w.previewID = 0
+	w.previewReplyTo = replyTo
 	w.lastPreview = ""
 	w.previewStopToken = ""
-	// Delivery reconciliation clears any persisted inbox association after success.
+	w.progressSuppressed = false
+}
+
+func (w *worker) supersedePreview(replyTo int64) {
+	w.rotatePreview(replyTo)
+	w.previewDiscardBefore = w.previewEpoch
+	previews, err := w.b.db.ProgressMessages(w.active)
+	if err != nil {
+		w.b.storeLog.Warn("superseded progress lookup failed", "event", "progress_cleanup_state_failed")
+		return
+	}
+	w.cleanupSupersededProgress(previews...)
+}
+
+func (w *worker) drainPreviewResults() {
+	for {
+		select {
+		case result := <-w.previewResult:
+			w.recordProgressMessage(result)
+			w.b.cleanupDeliveredProgress(context.Background(), result.taskID)
+		default:
+			return
+		}
+	}
 }
 func (w *worker) event(raw []byte) {
 	w.cancelArgsApply(true)
@@ -3721,6 +3783,9 @@ func (w *worker) event(raw []byte) {
 		return
 	}
 	if w.replyStatusEvent(e) {
+		return
+	}
+	if assistantContinuationEvent(e) && !w.flushStagedAssistant() {
 		return
 	}
 	if w.statusReleaseClientID != 0 {
@@ -3754,7 +3819,8 @@ func (w *worker) event(raw []byte) {
 	case "available_commands_update":
 		w.commandCatalogUpdated()
 	case "session_info_update":
-		w.cancelProgressNative()
+		w.uiSelection = nativeSelectionReceipt{}
+		w.progressNativeSessionChanged()
 		// The reader invalidates the catalog before publishing session changes.
 		w.syncCommandMenu()
 		if client, ok := w.runtimeClient(); ok && client.CommandCatalog().State == omp.CatalogUnknown {
@@ -3777,27 +3843,19 @@ func (w *worker) event(raw []byte) {
 	case "tool_execution_end":
 		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 		w.endProgressTool(e.ToolCallID, e.IsError)
+	case "message_start":
+		w.uiSelection = nativeSelectionReceipt{}
 	case "message_update":
 		if w.research.root && !w.research.roundOpen {
 			return
 		}
 		if e.AssistantMessageEvent.Type == "text_delta" && e.AssistantMessageEvent.Delta != "" {
 			delta := e.AssistantMessageEvent.Delta
-			separator := ""
-			if w.stream.Len() != 0 && w.stream.Len() == w.finalizedStreamBytes {
-				separator = "\n\n"
-			}
-			pendingBytes := w.stream.Len() - w.finalizedStreamBytes
-			// Cached texts exclude their paragraph separators; pending bytes include them.
-			finalizedBytes := w.finalAssistantBytes + 2*max(0, len(w.finalAssistantTexts)-1)
-			deltaBytes := len(separator) + len(delta)
-			if deltaBytes > maxAssistantOutputBytes-w.stream.Len() || deltaBytes > maxAssistantOutputBytes-finalizedBytes-pendingBytes {
+			if len(delta) > maxAssistantOutputBytes-w.assistantDelivery.bytes-w.stream.Len() {
 				w.assistantBudgetExceeded()
 				return
 			}
-			w.stream.WriteString(separator)
 			w.stream.WriteString(delta)
-			w.preview = w.stream.String()
 		}
 	case "auto_compaction_start":
 		w.compacting = true
@@ -3808,6 +3866,7 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		w.uiSelection = nativeSelectionReceipt{}
 		if w.research.root {
 			w.invalidateResearchSettlement()
 			w.research.roundOpen = true
@@ -3822,40 +3881,26 @@ func (w *worker) event(raw []byte) {
 		w.busy = true
 		w.progress.ActiveTools = make(map[string]progressTool)
 		w.lastAssistant = nil
+		w.assistantDelivery.messages = 0
 		if w.research.root {
-			w.finalAssistantTexts, w.assistantRunStart = nil, 0
-			w.finalAssistantBytes = 0
-		} else {
-			w.assistantRunStart = len(w.finalAssistantTexts)
+			w.assistantDelivery = assistantDelivery{}
 		}
-		w.finalizedStreamBytes = w.stream.Len()
 		w.routeDeferredResearchToggle()
 	case "message_end":
 		if w.research.root && !w.research.roundOpen {
 			return
 		}
 		var m message
-		if json.Unmarshal(e.Message, &m) == nil && m.Role == "assistant" {
-			if w.taskActive() {
-				w.replyStatus.metrics.observe(m)
+		if json.Unmarshal(e.Message, &m) == nil {
+			if !w.acceptAssistantMessage(m, true, false) {
+				return
 			}
-			w.lastAssistant = &terminalAssistant{
-				StopReason:                 m.StopReason,
-				ErrorMessage:               m.ErrorMessage,
-				ErrorClassificationMessage: m.ErrorClassificationMessage,
-				ErrorStatus:                m.ErrorStatus,
-			}
-			if text := assistantText(m); text != "" {
-				if len(text)+2*len(w.finalAssistantTexts) > maxAssistantOutputBytes-w.finalAssistantBytes {
-					w.assistantBudgetExceeded()
-					return
-				}
-				w.finalAssistantTexts = append(w.finalAssistantTexts, text)
-				w.finalAssistantBytes += len(text)
-			}
-			w.finalizedStreamBytes = w.stream.Len()
+			w.assistantDelivery.messages++
 		}
 	case "agent_end":
+		if !w.reconcileAssistantMessages(e) {
+			return
+		}
 		if w.research.root {
 			terminal := w.terminalState(e)
 			w.flushResearchRound(e)
@@ -3865,29 +3910,13 @@ func (w *worker) event(raw []byte) {
 			return
 		}
 		if e.IsTerminal != nil && !*e.IsTerminal {
-			text, found, truncated := boundedAssistantTexts(e.Messages, nil, nil, maxAssistantOutputBytes)
-			if found {
-				priorBytes := w.finalAssistantBytes
-				for _, cached := range w.finalAssistantTexts[w.assistantRunStart:] {
-					priorBytes -= len(cached)
-				}
-				if truncated || len(text) > maxAssistantOutputBytes-priorBytes {
-					w.assistantBudgetExceeded()
-					return
-				}
-				clear(w.finalAssistantTexts[w.assistantRunStart:])
-				w.finalAssistantTexts = append(w.finalAssistantTexts[:w.assistantRunStart], text)
-				w.finalAssistantBytes = priorBytes + len(text)
+			if !w.queueYieldedAssistantTail(e) {
+				return
 			}
 			w.awaitTaskContinuation()
 			return
 		}
 		w.clearAwaitingContinuation()
-		text, found, truncated := boundedAssistantTexts(e.Messages, w.finalAssistantTexts[:w.assistantRunStart], w.finalAssistantTexts[w.assistantRunStart:], maxFinalReplyBytes)
-		if found {
-			w.preview = text
-			w.finalOutputTruncated = truncated
-		}
 		if w.steerFence.active {
 			w.deferSteeredTerminal(e)
 			return
@@ -4076,6 +4105,13 @@ func (w *worker) renameProgressTool(id, name string) bool {
 	return true
 }
 
+func (w *worker) progressRecentToolsLimit() int {
+	if w.b == nil || w.b.cfg.ProgressRecentTools == 0 {
+		return config.DefaultProgressRecentTools
+	}
+	return w.b.cfg.ProgressRecentTools
+}
+
 func (w *worker) endProgressTool(id string, failed bool) {
 	tool, ok := w.progress.ActiveTools[id]
 	if !ok {
@@ -4086,11 +4122,12 @@ func (w *worker) endProgressTool(id string, failed bool) {
 		return
 	}
 	result := progressToolResult{Name: tool.Name, Args: tool.Args, Detail: tool.Detail, DetailKind: tool.DetailKind, Duration: time.Since(tool.StartedAt).Round(time.Second), Failed: failed}
-	if len(w.progress.RecentTools) < maxRecentTools {
+	limit := w.progressRecentToolsLimit()
+	if len(w.progress.RecentTools) < limit {
 		w.progress.RecentTools = append(w.progress.RecentTools, result)
 		return
 	}
-	w.progress.RecentTools[w.progress.EarlierTools%maxRecentTools] = result
+	w.progress.RecentTools[w.progress.EarlierTools%limit] = result
 	w.progress.EarlierTools++
 }
 
@@ -4162,16 +4199,18 @@ func (w *worker) renderProgress() string {
 	if !w.taskRunning() {
 		return ""
 	}
-	var sections []string
-	if w.progress.NativeStatus != "" {
-		sections = append(sections, w.progress.NativeStatus)
+	nativeStatus := w.progressNativeStatus()
+	header := w.tr(i18n.Msg.Processing)
+	if nativeStatus != "" {
+		header += compactHeaderSeparator + nativeStatus
 	}
-	sections = append(sections, w.tr(i18n.Msg.Processing))
+	sections := make([]string, 1, 3)
+	sections[0] = header
 	if status := w.progressStatus(); status != "" {
 		sections = append(sections, w.tr(i18n.Msg.StatusValue, status))
 	}
 	verbose := w.b != nil && w.b.cfg.ProgressMode == "verbose"
-	detailBudget := max(0, maxToolDetailsUnits-utf16Length(w.progress.NativeStatus))
+	detailBudget := max(0, maxToolDetailsUnits-utf16Length(nativeStatus))
 	active := sortedProgressTools(w.progress.ActiveTools)
 	if len(active) > 0 {
 		lines := []string{w.tr(i18n.Msg.Tools)}
@@ -4188,31 +4227,48 @@ func (w *worker) renderProgress() string {
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
+	text := strings.Join(sections, "\n\n")
 	if verbose && len(w.progress.RecentTools) > 0 {
-		lines := []string{w.tr(i18n.Msg.RecentTools)}
-		if w.progress.EarlierTools > 0 {
-			lines = append(lines, w.tr(i18n.Msg.EarlierOmitted, w.progress.EarlierTools))
-		}
+		rows := make([]string, 0, len(w.progress.RecentTools))
+		rowUnits := 0
 		for i := range w.progress.RecentTools {
 			tool := w.progress.RecentTools[(w.progress.EarlierTools+i)%len(w.progress.RecentTools)]
 			status := w.tr(i18n.Msg.Completed)
 			if tool.Failed {
 				status = w.tr(i18n.Msg.Failed)
 			}
-			lines = append(lines, w.tr(i18n.Msg.RecentToolOutcome, tool.Name, status, tool.Duration))
+			lines := []string{w.tr(i18n.Msg.RecentToolOutcome, tool.Name, status, tool.Duration)}
 			lines = appendProgressToolDetail(lines, w.tr(i18n.Msg.Args), tool.Args, &detailBudget)
 			lines = appendProgressToolDetail(lines, w.tr(tool.DetailKind), tool.Detail, &detailBudget)
+			row := strings.Join(lines, "\n")
+			rows = append(rows, row)
+			rowUnits += utf16Length(row) + 1
 		}
-		sections = append(sections, strings.Join(lines, "\n"))
-	}
-	text := strings.Join(sections, "\n\n")
-	if w.preview != "" {
-		available := maxProgressUnits - utf16Length(text) - utf16Length(w.tr(i18n.Msg.Output))
-		if available > 0 {
-			if available > maxPreviewUnits {
-				available = maxPreviewUnits
+		header := w.tr(i18n.Msg.RecentTools)
+		available := maxProgressUnits - utf16Length(text) - 2 - utf16Length(header)
+		omitted := w.progress.EarlierTools
+		first := 0
+		omission := ""
+		for {
+			if omitted > 0 {
+				omission = "\n" + w.tr(i18n.Msg.EarlierOmitted, omitted)
 			}
-			text += w.tr(i18n.Msg.Output) + telegram.TailForTelegram(w.preview, available)
+			if rowUnits+utf16Length(omission) <= available || first == len(rows) {
+				break
+			}
+			// Drop only the oldest complete rows; retained outcomes stay chronological.
+			rowUnits -= utf16Length(rows[first]) + 1
+			first++
+			omitted++
+		}
+		if first < len(rows) {
+			text += "\n\n" + header + omission + "\n" + strings.Join(rows[first:], "\n")
+		}
+	}
+	if w.stream.Len() != 0 {
+		available := min(maxPreviewUnits, maxProgressUnits-utf16Length(text)-utf16Length(w.tr(i18n.Msg.Output)))
+		if available > 0 {
+			text += w.tr(i18n.Msg.Output) + telegram.TailForTelegram(w.stream.String(), available)
 		}
 	}
 	return text
@@ -4272,21 +4328,43 @@ func (w *worker) recordProgressMessage(result previewResult) {
 	if !result.created || result.err != nil || result.id == 0 || result.taskID == 0 || w.b.db == nil {
 		return
 	}
-	if err := w.b.db.SetProgressMessage(result.taskID, result.id); err != nil {
+	if err := w.b.db.SetProgressMessage(result.taskID, w.key.chat, result.id); err != nil {
 		w.b.storeLog.Error("progress message association failed", "event", "progress_message_write_failed", "inbox_id", result.taskID, "message_id", result.id)
 		w.deleteOrphanProgressMessage(result.id)
 		w.b.fail(err)
 		return
 	}
-	if w.ctx != nil && (result.generation != w.binding.Generation || result.turn != w.turn || w.active == 0) {
-		w.b.cleanupDeliveredProgress(w.ctx, result.taskID)
-	}
 }
 
 func (w *worker) previewFinished(result previewResult) {
 	w.recordProgressMessage(result)
+	if result.epoch != w.previewEpoch || result.generation != w.binding.Generation || result.turn != w.turn {
+		if result.stopToken != "" {
+			c, exists := w.confirms[result.stopToken]
+			if exists && result.err == nil && c.active == w.active && c.turn == w.turn && c.generation == w.binding.Generation {
+				c.messageID = result.id
+				w.confirms[result.stopToken] = c
+			} else {
+				delete(w.confirms, result.stopToken)
+			}
+		}
+		if result.created && result.err == nil && result.epoch < w.previewDiscardBefore {
+			w.cleanupSupersededProgress(store.ProgressMessage{InboxID: result.taskID, Chat: w.key.chat, MessageID: result.id})
+		} else {
+			w.cleanupCompletedProgress(result.taskID)
+		}
+		return
+	}
 	w.previewBusy = false
-	if result.generation != w.binding.Generation || result.turn != w.turn {
+	if w.previewCancel != nil {
+		w.previewCancel()
+		w.previewCancel = nil
+	}
+	if result.taskID != w.active {
+		w.cleanupCompletedProgress(result.taskID)
+		if w.finishing {
+			w.finishPreview()
+		}
 		if result.stopToken != "" {
 			if c, ok := w.confirms[result.stopToken]; ok && c.action == "stop" && c.generation == result.generation && c.turn == result.turn {
 				delete(w.confirms, result.stopToken)
@@ -4333,23 +4411,38 @@ func (w *worker) previewFinished(result previewResult) {
 }
 
 func (w *worker) flushPreview() {
+	w.refreshProgressNative(time.Now())
 	if w.b.cfg.ProgressMode == "off" || w.progressSuppressed || w.replyStatus.pending != nil {
 		return
 	}
 	if w.previewID == 0 && time.Since(w.progress.StartedAt) < progressInitialDelay {
 		return
 	}
-	w.refreshProgressNative(time.Now())
 	snapshot := w.renderProgress()
 	if w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
 		return
+	}
+	if w.previewID == 0 {
+		pending, err := w.b.db.HasPendingOutputs(w.key.chat, w.key.thread)
+		if err != nil {
+			w.b.fail(err)
+			w.cancel()
+			return
+		}
+		if pending {
+			return
+		}
 	}
 	text := telegram.ClipConvertible(snapshot, telegram.MaxMessageUTF16)
 	id := w.previewID
 	creating := id == 0
 	gen := w.binding.Generation
 	turn := w.turn
+	epoch := w.previewEpoch
 	replyTo := w.activeReplyTo
+	if w.previewReplyTo != 0 {
+		replyTo = w.previewReplyTo
+	}
 	taskID := w.active
 	stopToken := ""
 	if id == 0 && w.taskRunning() && !w.finishing {
@@ -4361,10 +4454,11 @@ func (w *worker) flushPreview() {
 	}
 	keyboard := w.progressKeyboard(stopToken)
 	w.previewBusy = true
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	w.previewCancel = cancel
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
-		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 		defer cancel()
 		var err error
 		if id == 0 {
@@ -4377,8 +4471,11 @@ func (w *worker) flushPreview() {
 			err = w.b.tg.Edit(ctx, w.key.chat, id, text, keyboard)
 		}
 		select {
-		case w.previewResult <- previewResult{id: id, taskID: taskID, created: creating, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, err: err}:
+		case w.previewResult <- previewResult{id: id, taskID: taskID, created: creating, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, epoch: epoch, err: err}:
 		case <-w.ctx.Done():
+			result := previewResult{id: id, taskID: taskID, created: creating, err: err}
+			w.recordProgressMessage(result)
+			w.b.cleanupDeliveredProgress(context.Background(), taskID)
 		}
 	}()
 }
@@ -4717,7 +4814,24 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 			}
 		}
 	}
-	w.finishMenu(c.messageID, text)
+	text = truncateUTF8(text, 3700)
+	previous := truncateUTF8(c.uiSelected, max(0, 3699-len(text)))
+	if previous != "" {
+		text = previous + "\n" + text
+	}
+	finished := w.finishMenu(c.messageID, text)
+	if c.uiSelectMenu && finished && !cancelled && c.active != 0 && c.turn != 0 &&
+		c.active == w.active && c.turn == w.turn {
+		for _, pending := range w.confirms {
+			if pending.action == "ui" {
+				return
+			}
+		}
+		w.uiSelection = nativeSelectionReceipt{
+			messageID: c.messageID, text: text, clientID: c.uiClientID,
+			generation: c.generation, active: c.active, turn: c.turn,
+		}
+	}
 }
 
 func (w *worker) finishMenu(messageID int64, text string) bool {
@@ -4856,6 +4970,11 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	if pages > 1 {
 		text += w.tr(i18n.Msg.Page, page+1, pages)
 	}
+	text = truncateUTF8(text, 3700)
+	previous := truncateUTF8(c.uiSelected, max(0, 3699-len(text)))
+	if previous != "" {
+		text = previous + "\n" + text
+	}
 	keyboard := &telegram.Keyboard{}
 	start, end := page*uiSelectPageSize, min((page+1)*uiSelectPageSize, len(c.options))
 	for i := start; i < end; i++ {
@@ -4875,7 +4994,14 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	var err error
 	if messageID != 0 {
 		err = w.b.tg.Edit(ctx, w.key.chat, messageID, text, keyboard)
-	} else {
+		var apiErr *telegram.APIError
+		// Only a missing receipt from a completed menu can fall back to a new message.
+		if c.messageID == 0 && !telegram.DeliveryUncertain(err) && errors.As(err, &apiErr) && apiErr != nil &&
+			apiErr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(apiErr.Description), "message to edit not found") {
+			messageID = 0
+		}
+	}
+	if messageID == 0 {
 		var message telegram.Message
 		message, err = w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, telegram.SendOptions{Keyboard: keyboard})
 		messageID = message.MessageID
@@ -4901,6 +5027,8 @@ func (w *worker) ui(e rpcEvent) {
 		var msg string
 		_ = json.Unmarshal(e.Message, &msg)
 		c := confirmation{action: "ui", uiID: e.ID, uiClientID: client.ID(), method: e.Method, options: e.Options}
+		previous := w.uiSelection
+		w.uiSelection = nativeSelectionReceipt{}
 		if e.Method == "confirm" {
 			w.confirm(c, e.Title+"\n"+msg, []string{w.tr(i18n.Msg.Confirm), w.tr(i18n.Msg.Cancel)})
 			return
@@ -4911,16 +5039,25 @@ func (w *worker) ui(e rpcEvent) {
 			return
 		}
 		c.user, c.generation, c.uiSelectMenu = w.owner, w.binding.Generation, true
+		c.active, c.turn = w.active, w.turn
 		parts := split(e.Title+"\n"+msg, 3700)
 		c.uiTitle = w.tr(i18n.Msg.ChooseOption)
 		if len(parts) != 0 {
 			c.uiTitle = parts[0]
 		}
-		w.showUISelectPage(c, 0, 0)
+		messageID := int64(0)
+		if w.taskActive() && previous.messageID != 0 && previous.clientID == client.ID() &&
+			previous.generation == w.binding.Generation && previous.active == w.active && previous.turn == w.turn {
+			messageID = previous.messageID
+			c.uiSelected = previous.text
+		}
+		w.showUISelectPage(c, 0, messageID)
 	case "input", "editor":
+		w.uiSelection = nativeSelectionReceipt{}
 		w.cancelUI(confirmation{uiID: e.ID, uiClientID: client.ID()})
 		w.say(w.tr(i18n.Msg.InputDialogsNotSupportedCanceledProvideInformationNormalMessage))
 	case "cancel":
+		w.uiSelection = nativeSelectionReceipt{}
 		for token, c := range w.confirms {
 			if c.action == "ui" && c.uiID != "" && c.uiID == e.TargetID {
 				w.dropConfirmation(token, c)
@@ -4947,12 +5084,14 @@ func (w *worker) dropConfirmation(token string, c confirmation) {
 }
 
 func (w *worker) clearConfirmations() {
+	w.uiSelection = nativeSelectionReceipt{}
 	for token, c := range w.confirms {
 		w.dropConfirmation(token, c)
 	}
 }
 
 func (w *worker) clearTaskConfirmations() {
+	w.uiSelection = nativeSelectionReceipt{}
 	for token, c := range w.confirms {
 		if c.action == "queue" || c.action == "resume" || c.action == "export" || c.action == "session_delete" {
 			continue

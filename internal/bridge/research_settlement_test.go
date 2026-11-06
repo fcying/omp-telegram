@@ -17,6 +17,10 @@ func TestAutoresearchNaturalOffCompletesRootAndReleasesQueuedWork(t *testing.T) 
 	researchRoot(t, w, 100, "/autoresearch finite goal")
 	nativeInput(t, w, 101, "/followup work after natural off", false)
 	researchRound(t, w, "intermediate result")
+	roundHeader, _ := attachedReplyBody(t, researchReplies(t, w, 100)[0])
+	if !strings.HasPrefix(roundHeader, "💬") {
+		t.Fatal("an intermediate research round was marked as task completion")
+	}
 	if queueState(t, w, 100) != "submitted" || queueState(t, w, 101) != "pending" {
 		t.Fatal("mode-on settlement ended research or released its queue")
 	}
@@ -32,6 +36,12 @@ func TestAutoresearchNaturalOffCompletesRootAndReleasesQueuedWork(t *testing.T) 
 		if strings.Count(replies, text) != 1 {
 			t.Fatalf("natural completion lost or duplicated round output: %q", replies)
 		}
+	}
+	rows := researchReplies(t, w, 100)
+	firstHeader, _ := attachedReplyBody(t, rows[0])
+	lastHeader, _ := attachedReplyBody(t, rows[1])
+	if !strings.HasPrefix(firstHeader, "💬") || !strings.HasPrefix(lastHeader, "✅") {
+		t.Fatal("natural research completion did not mark only the last formal reply")
 	}
 	if researchTraceCount(trace, "prompt", "/autoresearch finite goal") != 1 || researchTraceCount(trace, "prompt", "work after natural off") != 1 {
 		t.Fatal("natural completion replayed research or omitted queued work")
@@ -69,9 +79,17 @@ func TestAutoresearchOffWithPendingWorkRetainsRootUntilSettled(t *testing.T) {
 	if queueState(t, w, 100) != "submitted" || !w.taskActive() || w.resumeFailed {
 		t.Fatal("off mode alone completed a root with pending native work")
 	}
+	header, _ := attachedReplyBody(t, researchReplies(t, w, 100)[0])
+	if !strings.HasPrefix(header, "💬") {
+		t.Fatal("pending native work was marked successful")
+	}
 	nativeRPC(t, w, "fixture_autoresearch_metadata", map[string]any{"pending": false})
 	nativeRPC(t, w, "fixture_autoresearch_settled", nil)
 	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
+	header, _ = attachedReplyBody(t, researchReplies(t, w, 100)[0])
+	if !strings.HasPrefix(header, "✅") {
+		t.Fatal("confirmed research settlement did not update its last reply")
+	}
 }
 
 func TestAutoresearchIncompleteSettlementStateIsUncertain(t *testing.T) {

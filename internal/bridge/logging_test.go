@@ -206,7 +206,7 @@ func TestFailedFinalCommitDoesNotLogSuccessfulCompletion(t *testing.T) {
 	if _, err := w.b.db.DB.Exec("CREATE TRIGGER reject_final BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'SECRET_DATABASE_DIAGNOSTIC'); END"); err != nil {
 		t.Fatal(err)
 	}
-	w.preview = "SECRET_OUTPUT"
+	w.stream.WriteString("SECRET_OUTPUT")
 	w.finish()
 	record := capturedEvent(t, capture, "final_commit_failed")
 	if record["component"] != "store" || record["level"] != slog.LevelError.String() {

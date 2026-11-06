@@ -474,8 +474,7 @@ func (w *worker) queuedCommandDispatchReady(client *omp.Client) bool {
 
 // Local acknowledgment settles submission, not any later background output.
 func (w *worker) finishLocalCommandSubmission() {
-	w.preview = ""
-	w.finalOutputTruncated = false
+	w.stream.Reset()
 	w.finish()
 }
 

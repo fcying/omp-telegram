@@ -276,6 +276,7 @@ var Msg = struct {
 	Preset                                                                    Message
 	Previous                                                                  Message
 	Processing                                                                Message
+	Assistant                                                                 Message
 	PromptExceedsOmpRPCFrameLimitNoTaskSubmitted                              Message
 	ProvideOldFullSessionIDAbsolutePathNewJSONL                               Message
 	QueueRunningPending                                                       Message
@@ -770,7 +771,8 @@ var Msg = struct {
 	PreparingAttachment: message("Preparing attachment...", "正在准备附件..."),
 	Preset:              message("Preset %d", "预设 %d"),
 	Previous:            message("Previous", "上一页"),
-	Processing:          message("Processing...", "处理中..."),
+	Processing:          message("⚙️", "⚙️"),
+	Assistant:           message("💬", "💬"),
 	PromptExceedsOmpRPCFrameLimitNoTaskSubmitted: message("Prompt exceeds the omp RPC frame limit. No task was submitted.", "提示词超过 omp RPC 帧大小限制. 未提交任务."),
 	ProvideOldFullSessionIDAbsolutePathNewJSONL:  message("Provide old, a full session ID, or the absolute path to the new JSONL file.", "请提供 old, 完整会话 ID, 或新 JSONL 的绝对路径."),
 	QueueRunningPending:                          message("Queue\nRunning: %s\nPending: %d", "队列\n运行中: %s\n待处理: %d"),

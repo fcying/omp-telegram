@@ -568,11 +568,7 @@ func TestPendingSlashDiscoveryDuringAbortRunsOnReplacementClient(t *testing.T) {
 	if w.client == nil || w.client == client || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("pending slash input did not resume the same session on a replacement client")
 	}
-	var replies int
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=101").Scan(&replies))
-	if replies != 1 {
-		t.Fatal("pending slash input did not receive its own final reply")
-	}
+	finalReplyStatus(t, w, 101, "answer: /unknown")
 	count := 0
 	for _, entry := range fixtureRPCTrace(trace) {
 		if entry.kind == "prompt" && entry.payload == "/unknown" {

@@ -92,8 +92,8 @@ func TestFastNativeDuringRootPreservesOwnershipQueueAndFinalReply(t *testing.T) 
 	}
 	nativeRPC(t, w, "fixture_finish_root", nil)
 	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" && queueState(t, w, 101) == "done" })
-	rootReply := strings.Join(researchReplies(t, w, 100), "\n")
-	if replyBody(rootReply) != "root completed" || strings.Contains(rootReply, "Fast mode:") || strings.Contains(rootReply, "late native output") {
+	rootReply := researchBody(t, w, 100)
+	if rootReply != "root completed" || strings.Contains(rootReply, "Fast mode:") || strings.Contains(rootReply, "late native output") {
 		t.Fatalf("native output polluted root final reply: %q", rootReply)
 	}
 	if researchTraceCount(trace, "prompt", "wait") != 1 || researchTraceCount(trace, "prompt", "queued after root") != 1 {
@@ -222,7 +222,7 @@ func TestFastNativeRootFinishesBeforeControlAcknowledgment(t *testing.T) {
 	if queueState(t, w, 101) != "submitted" || researchTraceCount(trace, "prompt", "wait") != 2 {
 		t.Fatal("control acknowledgment consumed or lost the queued root")
 	}
-	if replyBody(strings.Join(researchReplies(t, w, 100), "\n")) != "root completed" {
+	if researchBody(t, w, 100) != "root completed" {
 		t.Fatal("fast acknowledgment replaced the completed root's final answer")
 	}
 	nativeRPC(t, w, "fixture_finish_root", nil)

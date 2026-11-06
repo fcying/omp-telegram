@@ -215,6 +215,7 @@ func TestTopicNamesSchema20UpgradePreservesBindingWithoutGuessingTitle(t *testin
 	s := openTestStore(t, dir)
 	before := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace/project", Session: "/session", Generation: 7}
 	requireStoreOK(t, s.Save(before))
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec("DROP TABLE topic_name_reservations; DROP TABLE topic_names; PRAGMA user_version=20")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())

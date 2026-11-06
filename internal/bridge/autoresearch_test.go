@@ -75,7 +75,7 @@ func researchRound(t *testing.T, w *worker, text string) {
 
 func researchReplies(t *testing.T, w *worker, id int64) []string {
 	t.Helper()
-	rows, err := w.b.db.DB.Query("SELECT text FROM outbox WHERE inbox_id=? ORDER BY id", id)
+	rows, err := w.b.db.DB.Query("SELECT CASE WHEN header='' THEN text ELSE header||char(10)||char(10)||text END FROM outbox WHERE inbox_id=? ORDER BY id", id)
 	requireStoreOK(t, err)
 	defer rows.Close()
 	var replies []string
@@ -140,8 +140,8 @@ func TestAutoresearchRoundsRetainRootAndDurablyFlushWithoutDuplicates(t *testing
 		researchRound(t, w, text)
 		awaitReplyStatus(t, w)
 		roundReplies := researchReplies(t, w, 100)
-		if len(roundReplies) != i+1 || !strings.Contains(roundReplies[i], "`safe`") || replyBody(roundReplies[i]) != text {
-			t.Fatalf("round did not persist its own status header and intact reply: %q", roundReplies)
+		if len(roundReplies) != i+1 || replyBody(t, roundReplies[i]) != text || !strings.Contains(roundReplies[i], "`safe`") {
+			t.Fatalf("round did not persist its intact reply with an attached status: %q", roundReplies)
 		}
 		if queueState(t, w, 100) != "submitted" || w.active != 100 || !w.taskActive() || w.client != client || w.turn != turn || w.binding.Generation != generation {
 			t.Fatal("round yield closed or replaced the explicitly managed root")
@@ -149,7 +149,7 @@ func TestAutoresearchRoundsRetainRootAndDurablyFlushWithoutDuplicates(t *testing
 		if queueState(t, w, 101) != "pending" || researchTraceCount(trace, "prompt", "deferred ordinary task") != 0 {
 			t.Fatal("round yield dispatched the queued followup")
 		}
-		if w.preview != "" || w.stream.Len() != 0 || len(w.finalAssistantTexts) != 0 {
+		if w.stream.Len() != 0 {
 			t.Fatal("round text remained in growing in-memory reply buffers")
 		}
 	}
@@ -228,7 +228,7 @@ func TestAutoresearchLocalCompletionPreservesImmediateOrdinaryInput(t *testing.T
 			}
 			researchRound(t, w, "queued ordinary research reply")
 			awaitReplyStatus(t, w)
-			if got := replyBody(strings.Join(researchReplies(t, w, 101), "\n")); got != "queued ordinary research reply" {
+			if got := researchBody(t, w, 101); got != "queued ordinary research reply" {
 				t.Fatalf("queued ordinary input lost its durable reply: %q", got)
 			}
 			nativeInput(t, w, 103, "/autoresearch off", false)
@@ -247,6 +247,7 @@ func TestAutoresearchPendingStatusDoesNotBlockStopOrClose(t *testing.T) {
 			researchRoot(t, w, 100, "/autoresearch responsive stop")
 			oldClient := w.client
 			if control == "progress" {
+				deliverReplies(t, w)
 				w.b.cfg.ProgressMode = "summary"
 				w.previewResult = make(chan previewResult, 1)
 				allowInitialProgress(w)
@@ -356,7 +357,7 @@ func TestAutoresearchEnabledModeWaitsForDiscoveryBeforeOrdinaryRoot(t *testing.T
 	nativeUntil(t, w, func() bool { return w.research.roundOpen && !w.rpcOperationActive })
 	researchRound(t, w, "restored research round")
 	awaitReplyStatus(t, w)
-	if queueState(t, w, 100) != "submitted" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "restored research round" {
+	if queueState(t, w, 100) != "submitted" || researchBody(t, w, 100) != "restored research round" {
 		t.Fatal("discovered research lost its owner or round reply")
 	}
 }
@@ -561,6 +562,7 @@ func TestAutoresearchStopAndOffRetireBeforeQueuedWork(t *testing.T) {
 			case "off":
 				nativeInput(t, w, 102, "/autoresearch off", false)
 			case "progress":
+				deliverReplies(t, w)
 				w.b.cfg.ProgressMode = "summary"
 				w.previewResult = make(chan previewResult, 1)
 				allowInitialProgress(w)
@@ -860,7 +862,7 @@ func TestAutoresearchRoundRepliesStayBoundedAcrossLongRuns(t *testing.T) {
 		}
 		researchRound(t, w, strings.Repeat("bounded research output ", 8192))
 		awaitReplyStatus(t, w)
-		if w.preview != "" || w.stream.Len() != 0 || w.finalAssistantBytes != 0 || len(w.finalAssistantTexts) != 0 || queueState(t, w, 100) != "submitted" {
+		if w.stream.Len() != 0 || queueState(t, w, 100) != "submitted" {
 			t.Fatal("long research accumulated previous round buffers or finalized the root")
 		}
 	}

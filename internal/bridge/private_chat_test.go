@@ -106,7 +106,11 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 
 	active := send(7, 0, "private", "wait")
 	waitFor(t, func() bool { return state(active) == "submitted" })
-	waitFor(t, func() bool { return has(7, 0, "Processing...") })
+	waitFor(t, func() bool {
+		var visible bool
+		err := d.db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM progress_messages WHERE inbox_id=? AND chat=?)", active, 7).Scan(&visible)
+		return err == nil && visible
+	})
 	queued := send(7, 0, "private", "/followup must-not-run")
 	command(7, 0, "private", "/stop")
 	waitFor(t, func() bool { return state(queued) == "cancelled" })

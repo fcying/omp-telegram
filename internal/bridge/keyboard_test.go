@@ -1,9 +1,11 @@
 package bridge
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -800,7 +802,7 @@ func TestModelPickerInvalidationClearsKeyboard(t *testing.T) {
 				command("wait")
 				w.dispatch()
 				if reason == "completed" {
-					w.preview = "Finished"
+					w.stream.WriteString("Finished")
 					w.finish()
 				} else {
 					w.finishCancelled("Cancelled")
@@ -865,6 +867,391 @@ func TestNativeUISelectionDisplaysResult(t *testing.T) {
 			after, _ := pickerView(t, f)
 			if after != text {
 				t.Fatal("a consumed callback changed the displayed review result")
+			}
+		})
+	}
+}
+
+func TestNativeUISequentialSelectionsShareReceipt(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {
+			w, f, _, _ := replyStatusWorker(t)
+			first := "3. Review a specific commit"
+			w.ui(rpcEvent{ID: "review-mode", Method: "select", Title: "Choose review mode", Options: []string{first}})
+			messageID := int64(f.messageCount())
+			click := func(data string) {
+				w.callback(&telegram.CallbackQuery{ID: "review-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+			}
+			_, rows := pickerView(t, f)
+			click(rows[0][0]["callback_data"].(string))
+			options := make([]string, uiSelectPageSize+1)
+			for i := range options {
+				options[i] = fmt.Sprintf("%07x fix: commit %d", i+1, i)
+			}
+			w.ui(rpcEvent{ID: "review-commit", Method: "select", Title: "Choose commit", Options: options})
+			f.mu.Lock()
+			reusedID := f.messages[len(f.messages)-1]["message_id"]
+			f.mu.Unlock()
+			if reusedID != float64(messageID) {
+				t.Fatal("second native selection created another bubble")
+			}
+			_, rows = pickerView(t, f)
+			stale := rows[0][0]["callback_data"].(string)
+			click(rows[uiSelectPageSize][0]["callback_data"].(string))
+			_, rows = pickerView(t, f)
+			choice := rows[0][0]["callback_data"].(string)
+			want := options[uiSelectPageSize]
+			if cancel {
+				choice = rows[1][1]["callback_data"].(string)
+				want = "Cancel"
+			}
+			click(choice)
+			text, rows := pickerView(t, f)
+			if !strings.Contains(text, first) || !strings.Contains(text, want) || len(rows) != 0 || len(w.confirms) != 0 {
+				t.Fatalf("combined native receipt lost a choice or retained buttons: %q", text)
+			}
+			click(stale)
+			click(choice)
+			raw, err := w.call("get_state", nil)
+			var state struct {
+				Replies int `json:"fixtureUIReplies"`
+			}
+			if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 2 {
+				t.Fatalf("navigation/stale buttons submitted extra native choices: %s, %v", raw, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for _, request := range f.messages[int(messageID):] {
+				if request["message_id"] != float64(messageID) {
+					t.Fatalf("multi-step choice sent another receipt: %+v", request)
+				}
+			}
+		})
+	}
+}
+
+func TestNativeUISequentialSelectionInvalidationPreservesReceipt(t *testing.T) {
+	for _, invalidation := range []string{"native-cancel", "task-cleanup"} {
+		for _, paginate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/paginate=%t", invalidation, paginate), func(t *testing.T) {
+				w, f, _, _ := replyStatusWorker(t)
+				first := "Review a specific commit"
+				w.ui(rpcEvent{ID: "review-mode", Method: "select", Title: "Choose review mode", Options: []string{first}})
+				messageID := int64(f.messageCount())
+				click := func(data string) {
+					w.callback(&telegram.CallbackQuery{ID: "review-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+				}
+				_, rows := pickerView(t, f)
+				firstChoice := rows[0][0]["callback_data"].(string)
+				click(firstChoice)
+				receipt := assertFinishedMenu(t, f, int(messageID), "Selected: "+first)
+				options := make([]string, uiSelectPageSize+1)
+				for i := range options {
+					options[i] = fmt.Sprintf("commit %02d", i)
+				}
+				raw, err := json.Marshal(map[string]any{"type": "extension_ui_request", "id": "review-commit", "method": "select", "title": "Choose commit", "options": options})
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.event(raw)
+				text, rows := pickerView(t, f)
+				if !strings.Contains(text, receipt) || !strings.Contains(text, "Choose commit") {
+					t.Errorf("pending selection hid the completed choice: %q", text)
+				}
+				stale := rows[0][0]["callback_data"].(string)
+				pending := stale
+				if paginate {
+					click(rows[uiSelectPageSize][0]["callback_data"].(string))
+					text, rows = pickerView(t, f)
+					if !strings.Contains(text, receipt) || !strings.Contains(text, "Page 2/2") {
+						t.Errorf("pagination hid the completed choice: %q", text)
+					}
+					if _, exists := w.confirms[strings.SplitN(stale, ":", 2)[0]]; exists {
+						t.Fatal("pagination retained the old selection token")
+					}
+					pending = rows[0][0]["callback_data"].(string)
+				}
+				if invalidation == "native-cancel" {
+					w.event([]byte(`{"type":"extension_ui_request","id":"cancel-review-commit","method":"cancel","targetId":"review-commit"}`))
+				} else {
+					w.clearTaskConfirmations()
+				}
+				if len(w.confirms) != 0 {
+					t.Fatal("invalidated native selection retained actionable tokens")
+				}
+				waitKeyboardClears(t, f, int(messageID))
+				text, _ = pickerView(t, f)
+				if !strings.Contains(text, receipt) {
+					t.Errorf("invalidating the second selection erased the completed choice: %q", text)
+				}
+				click(firstChoice)
+				click(stale)
+				click(pending)
+				if after, _ := pickerView(t, f); after != text {
+					t.Fatal("invalidated callbacks changed the visible receipt")
+				}
+				raw, err = w.call("get_state", nil)
+				var state struct {
+					Replies int    `json:"fixtureUIReplies"`
+					Value   string `json:"fixtureUIValue"`
+				}
+				if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 1 || state.Value != first {
+					t.Fatalf("invalidation/navigation submitted an unchosen native answer: %s, %v", raw, err)
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				markup, err := json.Marshal(f.keyboardClears[0]["reply_markup"])
+				var keyboard telegram.Keyboard
+				if err != nil || json.Unmarshal(markup, &keyboard) != nil || len(keyboard.InlineKeyboard) != 0 {
+					t.Fatalf("invalidated selection retained its keyboard: %s, %v", markup, err)
+				}
+				for _, request := range f.messages[int(messageID):] {
+					if request["message_id"] != float64(messageID) {
+						t.Fatalf("second selection created a duplicate menu or receipt: %+v", request)
+					}
+				}
+			})
+		}
+	}
+}
+
+type nativeSelectEditHTTP struct {
+	base     *fakeHTTP
+	response fakeHTTPResponse
+	err      error
+}
+
+func (f *nativeSelectEditHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/editMessageText") {
+		if f.err != nil {
+			return nil, f.err
+		}
+		return &http.Response{
+			StatusCode: f.response.status,
+			Body:       io.NopCloser(strings.NewReader(f.response.body)),
+			Header:     make(http.Header),
+			Request:    r,
+		}, nil
+	}
+	return f.base.RoundTrip(r)
+}
+
+func TestNativeUISelectionMissingReceiptCreatesUsableMenu(t *testing.T) {
+	w, f, _, _ := replyStatusWorker(t)
+	first := "Review a specific commit"
+	w.ui(rpcEvent{ID: "review-mode", Method: "select", Title: "Choose review mode", Options: []string{first}})
+	oldMessageID := int64(f.messageCount())
+	_, rows := pickerView(t, f)
+	oldChoice := rows[0][0]["callback_data"].(string)
+	click := func(user, messageID int64, data string) {
+		w.callback(&telegram.CallbackQuery{ID: "review-choice", From: telegram.User{ID: user}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+	}
+	click(7, oldMessageID, oldChoice)
+	http.DefaultTransport = &nativeSelectEditHTTP{base: f, response: fakeHTTPResponse{
+		status: http.StatusBadRequest,
+		body:   `{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}`,
+	}}
+	options := make([]string, uiSelectPageSize+1)
+	for i := range options {
+		options[i] = fmt.Sprintf("commit %02d", i)
+	}
+	w.ui(rpcEvent{ID: "review-commit", Method: "select", Title: "Choose commit", Options: options})
+	http.DefaultTransport = f
+	messageID := int64(f.messageCount())
+	text, rows := pickerView(t, f)
+	if messageID <= oldMessageID || !strings.Contains(text, "Choose commit") || len(rows) != uiSelectPageSize+1 || len(w.confirms) != 1 {
+		t.Fatalf("missing receipt did not produce a usable new menu: %q; %v", text, rows)
+	}
+	f.mu.Lock()
+	editedID := f.messages[len(f.messages)-1]["message_id"]
+	f.mu.Unlock()
+	if editedID != nil {
+		t.Fatal("missing receipt fallback did not send a new message")
+	}
+	assertReplies := func(want int, value string) {
+		t.Helper()
+		raw, err := w.call("get_state", nil)
+		var state struct {
+			Replies int    `json:"fixtureUIReplies"`
+			Value   string `json:"fixtureUIValue"`
+		}
+		if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != want || state.Value != value {
+			t.Fatalf("native choices = %+v, want %d replies and %q, error %v", state, want, value, err)
+		}
+	}
+	assertReplies(1, first)
+	next := rows[uiSelectPageSize][0]["callback_data"].(string)
+	click(8, messageID, next)
+	click(7, oldMessageID, next)
+	click(7, oldMessageID, oldChoice)
+	assertReplies(1, first)
+	click(7, messageID, next)
+	_, rows = pickerView(t, f)
+	choice := rows[0][0]["callback_data"].(string)
+	click(7, messageID, choice)
+	text = assertFinishedMenu(t, f, int(messageID), options[uiSelectPageSize])
+	if !strings.Contains(text, first) {
+		t.Fatalf("replacement menu lost its earlier choice: %q", text)
+	}
+	click(7, messageID, next)
+	click(7, messageID, choice)
+	assertReplies(2, options[uiSelectPageSize])
+}
+
+func TestNativeUISelectionEditFailureDoesNotResendMenu(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		pagination bool
+		response   fakeHTTPResponse
+		err        error
+	}{
+		{name: "reuse-other-400", response: fakeHTTPResponse{status: 400, body: `{"ok":false,"error_code":400,"description":"Bad Request: message cannot be edited"}`}},
+		{name: "reuse-server-error", response: fakeHTTPResponse{status: 500, body: `{"ok":false,"error_code":500,"description":"message to edit not found"}`}},
+		{name: "reuse-transport", err: errors.New("message to edit not found")},
+		{name: "reuse-timeout", err: context.DeadlineExceeded},
+		{name: "reuse-uncertain-400", response: fakeHTTPResponse{status: 400, body: `{"error_code":400,"description":"message to edit not found"}`}},
+		{name: "pagination-missing-message", pagination: true, response: fakeHTTPResponse{status: 400, body: `{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}`}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, f, _, _ := replyStatusWorker(t)
+			options := make([]string, uiSelectPageSize+1)
+			for i := range options {
+				options[i] = fmt.Sprintf("commit %02d", i)
+			}
+			w.ui(rpcEvent{ID: "first-menu", Method: "select", Title: "First menu", Options: options})
+			messageID := int64(f.messageCount())
+			_, rows := pickerView(t, f)
+			if !scenario.pagination {
+				w.callback(&telegram.CallbackQuery{ID: "first-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
+			}
+			before := f.messageCount()
+			http.DefaultTransport = &nativeSelectEditHTTP{base: f, response: scenario.response, err: scenario.err}
+			if scenario.pagination {
+				w.callback(&telegram.CallbackQuery{ID: "next-page", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[uiSelectPageSize][0]["callback_data"].(string)})
+			} else {
+				w.ui(rpcEvent{ID: "second-menu", Method: "select", Title: "Second menu", Options: options})
+			}
+			http.DefaultTransport = f
+			f.mu.Lock()
+			for _, message := range f.messages[before:] {
+				if message["reply_markup"] != nil {
+					f.mu.Unlock()
+					t.Fatalf("failed edit blindly resent a selection menu: %+v", message)
+				}
+			}
+			f.mu.Unlock()
+			if len(w.confirms) != 0 {
+				t.Fatal("failed edit retained an actionable selection menu")
+			}
+			raw, err := w.call("get_state", nil)
+			var state struct {
+				Replies int    `json:"fixtureUIReplies"`
+				Value   string `json:"fixtureUIValue"`
+			}
+			want := 2
+			if scenario.pagination {
+				want = 1
+			}
+			if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != want || state.Value != "" {
+				t.Fatalf("failed menu cancellation = %+v, error %v", state, err)
+			}
+		})
+	}
+}
+
+func TestNativeUIIdleSelectionCannotBecomeNewRootReceipt(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.ProgressMode = "off"
+	w.b.cfg.QueueCapacity = 4
+	command("/new " + t.TempDir())
+	w.owner = 7
+	w.ui(rpcEvent{ID: "idle-choice", Method: "select", Title: "Choose while idle", Options: []string{"Idle choice"}})
+	messageID := int64(f.messageCount())
+	_, rows := pickerView(t, f)
+	choice := rows[0][0]["callback_data"].(string)
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	if !w.taskActive() || w.turn == 0 {
+		t.Fatal("new root did not start")
+	}
+	w.callback(&telegram.CallbackQuery{ID: "idle-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: choice})
+	text := assertFinishedMenu(t, f, int(messageID), "Idle choice")
+	raw, err := w.call("get_state", nil)
+	var state struct {
+		Replies int    `json:"fixtureUIReplies"`
+		Value   string `json:"fixtureUIValue"`
+	}
+	if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 1 || state.Value != "Idle choice" {
+		t.Fatalf("old idle menu did not answer OMP normally: %+v, error %v", state, err)
+	}
+	w.ui(rpcEvent{ID: "new-root-choice", Method: "select", Title: "Choose for new root", Options: []string{"New root choice"}})
+	f.mu.Lock()
+	newMessage := f.messages[len(f.messages)-1]
+	f.mu.Unlock()
+	if newMessage["message_id"] != nil {
+		t.Fatal("new root selection overwrote the old idle receipt")
+	}
+	if after := assertFinishedMenu(t, f, int(messageID), "Idle choice"); after != text {
+		t.Fatal("new root menu changed the old idle receipt")
+	}
+}
+
+func TestNativeUIPendingSelectionKeepsOriginalScope(t *testing.T) {
+	for _, boundary := range []string{"active", "turn", "zero-turn"} {
+		t.Run(boundary, func(t *testing.T) {
+			w, f, _, _ := replyStatusWorker(t)
+			turn := w.turn
+			if boundary == "zero-turn" {
+				w.turn = 0
+			}
+			w.ui(rpcEvent{ID: "old-scope-choice", Method: "select", Title: "Choose in original scope", Options: []string{"Original choice"}})
+			messageID := int64(f.messageCount())
+			_, rows := pickerView(t, f)
+			switch boundary {
+			case "active":
+				w.active++
+			case "turn":
+				w.turn++
+			case "zero-turn":
+				w.turn = turn
+			}
+			w.callback(&telegram.CallbackQuery{ID: "old-scope-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
+			assertFinishedMenu(t, f, int(messageID), "Original choice")
+			w.ui(rpcEvent{ID: "current-scope-choice", Method: "select", Title: "Choose in current scope", Options: []string{"Current choice"}})
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.messages[len(f.messages)-1]["message_id"] != nil {
+				t.Fatal("current selection overwrote a receipt borrowed from another scope")
+			}
+		})
+	}
+}
+
+func TestNativeUISelectionReceiptDoesNotCrossScope(t *testing.T) {
+	for _, boundary := range []string{"turn", "generation", "agent", "pending"} {
+		t.Run(boundary, func(t *testing.T) {
+			w, f, _, _ := replyStatusWorker(t)
+			w.ui(rpcEvent{ID: "first-choice", Method: "select", Title: "Choose first", Options: []string{"First"}})
+			messageID := int64(f.messageCount())
+			_, rows := pickerView(t, f)
+			if boundary == "pending" {
+				w.ui(rpcEvent{ID: "parallel-choice", Method: "select", Title: "Choose parallel", Options: []string{"Parallel"}})
+			}
+			w.callback(&telegram.CallbackQuery{ID: "first-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
+			switch boundary {
+			case "turn":
+				w.turn++
+			case "generation":
+				w.binding.Generation++
+			case "agent":
+				w.event([]byte(`{"type":"agent_start"}`))
+			}
+			w.ui(rpcEvent{ID: "unrelated-choice", Method: "select", Title: "Choose unrelated", Options: []string{"Second"}})
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.messages[len(f.messages)-1]["message_id"] != nil {
+				t.Fatal("unrelated selection rewrote an earlier receipt")
 			}
 		})
 	}
