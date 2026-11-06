@@ -511,6 +511,7 @@ func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, _, _, _ := replyStatusWorker(t)
+			w.b.cfg.ProviderUsage = true
 			allowInitialProgress(w)
 			nativeRPC(t, w, "fixture_get_state_update", map[string]any{"contextUsage": scenario.usage})
 			messageHeader := func(text string) string {
@@ -535,6 +536,11 @@ func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
 					strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(w.unconfirmedAssistantHeader(), "ctx ?") {
 					t.Fatalf("unread context appeared in progress or assistant header: %q", header)
 				}
+				for _, h := range []string{w.renderProgress(), header, w.unconfirmedAssistantHeader()} {
+					if strings.Contains(h, "quota ?") {
+						t.Fatalf("unread quota appeared in progress or assistant header: %q", h)
+					}
+				}
 			}
 			assertUnread(messageHeader("Before read"))
 			w.refreshProgressNative(time.Now())
@@ -550,10 +556,15 @@ func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
 			if !strings.Contains(w.unconfirmedAssistantHeader(), compactUnknownContext) {
 				t.Fatal("completed read was lost for an unconfirmed streamed message")
 			}
+			for _, h := range []string{w.renderProgress(), w.intermediateAssistantHeader(), w.unconfirmedAssistantHeader()} {
+				if !strings.Contains(h, "quota ?") {
+					t.Fatalf("completed read did not expose unavailable quota: %q", h)
+				}
+			}
 			rows := researchReplies(t, w, w.active)
 			for _, row := range rows[:2] {
 				header, _ := attachedReplyBody(t, row)
-				if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") {
+				if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(header, "quota ?") {
 					t.Fatal("completed read rewrote an already queued preread header")
 				}
 			}

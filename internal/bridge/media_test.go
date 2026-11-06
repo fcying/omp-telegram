@@ -322,6 +322,9 @@ func TestPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 	f.mu.Lock()
 	var answers []string
 	for _, message := range f.messages {
+		if message["message_id"] != nil {
+			continue
+		}
 		if text, ok := message["text"].(string); ok && strings.Contains(text, "\n\nanswer: ") {
 			_, body, _ := strings.Cut(text, "\n")
 			answers = append(answers, strings.TrimLeft(body, "\n"))

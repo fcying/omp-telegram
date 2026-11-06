@@ -2203,7 +2203,8 @@ func TestCleanupMessagesReleasesUndeliverableAssistantHeaders(t *testing.T) {
 						requireStoreOK(t, s.MarkOutput(id, state))
 					}
 					if update == "completion" {
-						requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "final", nil))
+						_, err = s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "final", nil)
+						requireStoreOK(t, err)
 					} else {
 						requireStoreOK(t, s.SetAssistantHeader(ctx, id, "final"))
 						requireStoreOK(t, s.FinishSubmitted(10, InboxDone))
@@ -2243,7 +2244,8 @@ func TestCleanupMessagesRetainsActiveAssistantBodies(t *testing.T) {
 				_, err = s.ClaimNextOutput(ctx, time.Now().Unix())
 				requireStoreOK(t, err)
 			}
-			requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "final", nil))
+			_, err = s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "final", nil)
+			requireStoreOK(t, err)
 			old := time.Now().AddDate(0, 0, -91).Unix()
 			requireStoreOK(t, setMessageTimes(s, old, old, []int64{10}, []int64{id}))
 			result, err := s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
@@ -2323,18 +2325,29 @@ func TestAssistantReplyAppendAndHeaderCompletionAreAtomic(t *testing.T) {
 	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("failed assistant append left partial body: %v", err)
 	}
+	if targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, 0, "final", []string{"first final part", "rejected"}); err == nil || targetID != 0 {
+		t.Fatalf("failed final completion returned success/ID: %d, %v", targetID, err)
+	}
+	var rootState string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&rootState))
+	if rootState != "submitted" {
+		t.Fatalf("failed final completion changed owner to %q", rootState)
+	}
+	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("failed final completion left its first header/body: %v", err)
+	}
 	id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"immutable body"}, "initial")
 	requireStoreOK(t, err)
-	if err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "done", []string{"rejected"}); err == nil {
-		t.Fatal("completion ignored failed reply insertion")
+	if targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "done", []string{"rejected"}); err == nil || targetID != 0 {
+		t.Fatalf("failed reply insertion returned success/ID: %d, %v", targetID, err)
 	}
-	if err := s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, id, "wrong root", []string{"must roll back"}); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("completion accepted a header from another owner: %v", err)
+	if targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, id, "wrong root", []string{"must roll back"}); !errors.Is(err, sql.ErrNoRows) || targetID != 0 {
+		t.Fatalf("wrong-owner completion returned success/ID: %d, %v", targetID, err)
 	}
 	_, err = s.DB.Exec(`CREATE TRIGGER reject_assistant_header BEFORE UPDATE OF header ON outbox WHEN NEW.header='rejected header' BEGIN SELECT RAISE(FAIL,'injected header failure'); END`)
 	requireStoreOK(t, err)
-	if err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "rejected header", []string{"must also roll back"}); err == nil {
-		t.Fatal("completion ignored failed header update")
+	if targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "rejected header", []string{"must also roll back"}); err == nil || targetID != 0 {
+		t.Fatalf("failed header update returned success/ID: %d, %v", targetID, err)
 	}
 	var count, pending int
 	var body, header, state string
@@ -2349,14 +2362,106 @@ func TestAssistantReplyAppendAndHeaderCompletionAreAtomic(t *testing.T) {
 			t.Fatalf("failed completion changed owner %d to %q", inboxID, state)
 		}
 	}
-	requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "done", []string{"final notice"}))
+	targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "done", []string{"final notice"})
+	requireStoreOK(t, err)
+	if targetID != id {
+		t.Fatalf("completion header target = %d, want %d", targetID, id)
+	}
 	requireStoreOK(t, s.DB.QueryRow("SELECT text,header,header_pending FROM outbox WHERE id=?", id).Scan(&body, &header, &pending))
 	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
 	if body != "immutable body" || header != "done" || pending != 1 || state != "done" {
 		t.Fatalf("atomic completion = %q/%q/%d/%q", body, header, pending, state)
 	}
-	requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, 0, "ignored", []string{"ordinary completion"}))
+	var replyTo int64
+	requireStoreOK(t, s.DB.QueryRow("SELECT header,reply_to FROM outbox WHERE inbox_id=10 AND id<>?", id).Scan(&header, &replyTo))
+	if header != "" || replyTo != 0 {
+		t.Fatalf("final notice acquired header/reply target: %q/%d", header, replyTo)
+	}
+	targetID, err = s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, 0, "", []string{"ordinary completion"})
+	requireStoreOK(t, err)
+	if targetID != 0 {
+		t.Fatalf("headerless completion returned target %d", targetID)
+	}
 	if _, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"late body"}, "late"); err == nil {
 		t.Fatal("terminal owner accepted new assistant body")
+	}
+}
+
+func TestFinalAssistantHeaderTargetsFirstNewBody(t *testing.T) {
+	for _, prior := range []bool{false, true} {
+		t.Run(strconv.FormatBool(prior), func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			ctx := context.Background()
+			requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+			requireStoreOK(t, s.Submit(10, 42))
+			var priorID int64
+			if prior {
+				id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"intermediate body"}, "intermediate header")
+				requireStoreOK(t, err)
+				priorID = id
+				out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+				requireStoreOK(t, err)
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, 100, out.Header))
+			}
+			targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, 0, "final header", []string{"final body", "final split part"})
+			requireStoreOK(t, err)
+			if targetID == 0 || targetID == priorID {
+				t.Fatalf("new final body did not acquire its own target: %d", targetID)
+			}
+			var state string
+			requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+			if state != "done" {
+				t.Fatalf("final header did not complete its owner: %q", state)
+			}
+			for i, text := range []string{"final body", "final split part"} {
+				out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+				requireStoreOK(t, err)
+				var header string
+				var replyTo int64
+				if i == 0 {
+					header = "final header"
+					if !prior {
+						replyTo = 42
+					}
+					if out.ID != targetID {
+						t.Fatalf("final header target = %d, first body = %d", targetID, out.ID)
+					}
+				}
+				if out.InboxID != 10 || out.Text != text || out.Header != header || out.ReplyTo != replyTo {
+					t.Fatalf("final part = %+v, want %q/%q/%d", out, text, header, replyTo)
+				}
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header))
+			}
+			requireStoreOK(t, s.SetAssistantHeader(ctx, targetID, "updated final header"))
+			out, err := s.NextAssistantHeader()
+			requireStoreOK(t, err)
+			if out.ID != targetID || out.Text != "final body" || out.Header != "updated final header" || out.MessageID != targetID+100 {
+				t.Fatalf("late final header lost immutable body/target: %+v", out)
+			}
+			if prior {
+				var body, header string
+				requireStoreOK(t, s.DB.QueryRow("SELECT text,header FROM outbox WHERE id=?", priorID).Scan(&body, &header))
+				if body != "intermediate body" || header != "intermediate header" {
+					t.Fatalf("final completion changed intermediate output: %q/%q", body, header)
+				}
+			}
+			if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("late final header replayed a delivered body: %v", err)
+			}
+		})
+	}
+}
+
+func TestFinalCompletionWithoutBodyDoesNotCreateStatusOutput(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	targetID, err := s.CompleteInboxWithAssistantHeader(context.Background(), 10, 7, 8, 0, "unused header", nil)
+	requireStoreOK(t, err)
+	if targetID != 0 {
+		t.Fatalf("completion without body returned target %d", targetID)
+	}
+	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("completion without body created output: %v", err)
 	}
 }

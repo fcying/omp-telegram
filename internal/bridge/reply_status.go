@@ -28,7 +28,6 @@ type replyStatusRequest struct {
 	epoch      uint64
 	sessionID  string
 	round      bool
-	usage      bool
 	cancel     context.CancelFunc
 }
 
@@ -36,6 +35,7 @@ type replyStatusResult struct {
 	request *replyStatusRequest
 	state   statusState
 	valid   bool
+	account [32]byte
 }
 
 func (w *worker) resetReplyStatus() {
@@ -45,12 +45,18 @@ func (w *worker) resetReplyStatus() {
 	w.replyStatus = replyStatusState{}
 }
 
-// Streamed text without a completed message has no confirmed model or usage.
+// Streamed text without a completed message has no confirmed reply metrics.
 func (w *worker) unconfirmedAssistantHeader() string {
-	if w.progressContextReadCompleted() {
-		return compactUnknownContext
+	readCompleted := w.progressContextReadCompleted()
+	header := ""
+	if readCompleted {
+		header = compactUnknownContext
 	}
-	return ""
+	provider := w.replyStatus.metrics.provider
+	if provider == "" {
+		provider = w.replyStatus.liveState.Model.Provider
+	}
+	return w.withProviderUsage(header, provider, readCompleted)
 }
 
 // Reuse only a validated, same-run status projection. No formatted status is
@@ -68,14 +74,19 @@ func (w *worker) intermediateAssistantHeader() string {
 		state = statusState{Model: omp.Model{ID: metrics.modelID, Provider: metrics.provider}}
 	}
 	state.ConfiguredThinking = w.configuredThinking
-	return compactMessageHeader(w.b.language(), state, metrics, w.progressContextReadCompleted())
+	readCompleted := w.progressContextReadCompleted()
+	header := compactMessageHeader(w.b.language(), state, metrics, readCompleted)
+	return w.withProviderUsage(header, metrics.provider, readCompleted)
 }
 
 func (w *worker) finishReplyWithStatus(round bool) {
 	if w.replyStatus.pending != nil {
 		return
 	}
-	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, w.progressContextReadCompleted())
+	readCompleted := w.progressContextReadCompleted()
+	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, readCompleted)
+	w.providerUsage.baseHeader = w.replyStatus.header
+	w.replyStatus.header = w.withProviderUsage(w.replyStatus.header, w.replyStatus.metrics.provider, readCompleted)
 	client, connected := w.runtimeClient()
 	if !connected || !w.taskActive() || !w.hasAssistantBody() || w.ctx.Err() != nil {
 		w.commitReplyStatus(round)
@@ -100,6 +111,9 @@ func (w *worker) finishReplyWithStatus(round bool) {
 		sample := replyStatusResult{request: request}
 		raw, err := client.Call(ctx, "get_state", nil)
 		sample.valid = err == nil && json.Unmarshal(raw, &sample.state) == nil
+		if sample.valid && sample.state.SessionID == request.sessionID {
+			sample.account = w.readProviderUsageScope(ctx, client, sample.state)
+		}
 		select {
 		case w.operations <- operationResult{kind: "reply_status", meta: sample}:
 		case <-w.ctx.Done():
@@ -113,7 +127,7 @@ func (w *worker) replyStatusMatches(request *replyStatusRequest) bool {
 
 func (w *worker) replyStatusFinished(result operationResult) {
 	sample, ok := result.meta.(replyStatusResult)
-	if !ok || sample.request == nil || sample.request.usage || w.replyStatus.pending != sample.request {
+	if !ok || sample.request == nil || w.replyStatus.pending != sample.request {
 		return
 	}
 	request := sample.request
@@ -125,25 +139,28 @@ func (w *worker) replyStatusFinished(result operationResult) {
 	catalog := request.client.CommandCatalog()
 	// A stale response is not evidence that this scope's context was read.
 	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, false)
+	readCompleted := false
 	if request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID {
 		if !sample.valid {
+			readCompleted = true
+			w.setProviderUsageScope("", [32]byte{})
 			w.replyStatus.header = compactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics)
 		} else if sample.state.SessionID == request.sessionID {
+			readCompleted = true
 			sample.state.ConfiguredThinking = w.configuredThinking
+			w.setProviderUsageScope(sample.state.Model.Provider, sample.account)
 			w.replyStatus.header = compactHeader(w.b.language(), sample.state, &w.replyStatus.metrics)
-			if w.beginReplyUsage(request, sample.state) {
-				return
-			}
 		}
 	}
+	w.providerUsage.baseHeader = w.replyStatus.header
+	w.replyStatus.header = w.withProviderUsage(w.replyStatus.header, w.replyStatus.metrics.provider, readCompleted)
 	w.commitReplyStatus(request.round)
+	w.refreshProviderUsage(time.Now())
 }
 
 func (w *worker) flushReplyStatus() {
-	request := w.commitPendingReplyStatus()
-	if request != nil && request.usage && w.client == request.client && w.binding.Generation == request.generation && request.client.UsageNeedsRetirement() {
-		w.releaseRuntimeWithReason(true, "usage_interrupted")
-	}
+	w.commitPendingReplyStatus()
+	w.flushProviderUsage()
 }
 
 // Runtime teardown commits the answer without recursively releasing its client.
@@ -174,6 +191,13 @@ func (w *worker) commitReplyStatus(round bool) {
 }
 
 func (w *worker) replyStatusEvent(e rpcEvent) bool {
+	if w.providerUsage.pending != nil && (assistantContinuationEvent(e) || e.Type == "auto_compaction_start") {
+		client := w.client
+		w.flushProviderUsage()
+		if w.client != client {
+			return true
+		}
+	}
 	if w.replyStatus.pending == nil {
 		return false
 	}
@@ -181,11 +205,6 @@ func (w *worker) replyStatusEvent(e rpcEvent) bool {
 	case "agent_end":
 		// A repeated completion cannot replace the reply already awaiting its header.
 		return true
-	case "command_output":
-		// The reader captures our usage report; unrelated receipts retain their own path.
-		if w.replyStatus.pending.usage {
-			return false
-		}
 	case "prompt_result":
 		if e.Status == "completed" {
 			return false

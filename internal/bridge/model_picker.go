@@ -51,20 +51,17 @@ func modelSelectionWithThinking(ctx context.Context, client *omp.Client, model o
 
 func (w *worker) beginModelState(request modelOperationRequest) bool {
 	if w.controlInProgress() {
-		w.say(w.tr(i18n.Msg.SessionOperationStillLoading))
-		w.finishMenu(request.messageID, w.tr(i18n.Msg.SessionOperationStillLoading))
+		w.finishMenuOrSay(request.messageID, w.tr(i18n.Msg.SessionOperationStillLoading))
 		return false
 	}
 	if w.sessionControlBusy() || len(w.queue) != 0 {
-		w.say(w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeChangingModelSettings))
-		w.finishMenu(request.messageID, w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeChangingModelSettings))
+		w.finishMenuOrSay(request.messageID, w.tr(i18n.Msg.WaitCurrentTaskQueueFinishBeforeChangingModelSettings))
 		return false
 	}
 	client, err := w.ensureRuntime()
 	if err != nil {
 		text := w.errorText(err)
-		w.say(text)
-		w.finishMenu(request.messageID, text)
+		w.finishMenuOrSay(request.messageID, text)
 		return false
 	}
 	w.beginControlOperation(controlModel)
@@ -111,8 +108,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 				w.releaseRuntimeWithReason(true, "failure")
 			}
 		}
-		w.say(w.modelOperationFailure(request.action))
-		w.finishMenu(request.messageID, w.modelOperationFailure(request.action))
+		w.finishMenuOrSay(request.messageID, w.modelOperationFailure(request.action))
 		return
 	}
 	client, connected := w.runtimeClient()
@@ -126,14 +122,12 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		var state modelSettings
 		if json.Unmarshal(result.data, &state) != nil {
 			w.endControlOperation()
-			w.say(w.modelOperationFailure(request.action))
-			w.finishMenu(request.messageID, w.modelOperationFailure(request.action))
+			w.finishMenuOrSay(request.messageID, w.modelOperationFailure(request.action))
 			return
 		}
 		if state.IsStreaming || state.IsCompacting {
 			w.endControlOperation()
-			w.say(w.tr(i18n.Msg.WaitCurrentTaskFinishBeforeChangingModelSettings))
-			w.finishMenu(request.messageID, w.tr(i18n.Msg.WaitCurrentTaskFinishBeforeChangingModelSettings))
+			w.finishMenuOrSay(request.messageID, w.tr(i18n.Msg.WaitCurrentTaskFinishBeforeChangingModelSettings))
 			return
 		}
 		switch request.action {
@@ -171,8 +165,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		var roles []omp.ModelRole
 		if json.Unmarshal(result.data, &roles) != nil {
 			w.endControlOperation()
-			w.say(w.tr(i18n.Msg.CannotReadOMPSCycleRolesConfigurationUseModel))
-			w.finishMenu(request.messageID, w.tr(i18n.Msg.CannotReadOMPSCycleRolesConfigurationUseModel))
+			w.finishMenuOrSay(request.messageID, w.tr(i18n.Msg.CannotReadOMPSCycleRolesConfigurationUseModel))
 			return
 		}
 		w.showModelPickerReady(request.user, request.current, roles)
@@ -183,8 +176,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 			if result.kind == "model_set_model" {
 				w.releaseRuntimeWithReason(true, "failure")
 			}
-			w.say(w.modelOperationFailure(request.action))
-			w.finishMenu(request.messageID, w.modelOperationFailure(request.action))
+			w.finishMenuOrSay(request.messageID, w.modelOperationFailure(request.action))
 			return
 		}
 		w.endControlOperation()
@@ -204,10 +196,10 @@ func (w *worker) modelOperationFinished(result operationResult) {
 			// Retire before the actor can dispatch another call to this client.
 			w.releaseRuntimeWithReason(true, "failure")
 		}
-		w.say(text)
 		if result.kind == "model_set_role" {
-			w.finishMenu(request.messageID, text+w.tr(i18n.Msg.Role, menuText(request.role, 120)))
+			text += w.tr(i18n.Msg.Role, menuText(request.role, 120))
 		}
+		w.finishMenuOrSay(request.messageID, text)
 	case "model_set_thinking":
 		w.startOperation("model_verify_thinking", client, func(ctx context.Context) (json.RawMessage, error) {
 			raw, err := client.Call(ctx, "get_state", nil)
@@ -231,8 +223,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 		if json.Unmarshal(result.data, &state) != nil || state.ThinkingLevel == "" {
 			w.endControlOperation()
 			w.releaseRuntimeWithReason(true, "failure")
-			w.say(w.tr(i18n.Msg.OMPDidNotReportResultingThinkingLevelChangeCould))
-			w.finishMenu(request.messageID, w.tr(i18n.Msg.OMPDidNotReportResultingThinkingLevelChangeCould))
+			w.finishMenuOrSay(request.messageID, w.tr(i18n.Msg.OMPDidNotReportResultingThinkingLevelChangeCould))
 			return
 		}
 		w.endControlOperation()
@@ -255,8 +246,7 @@ func (w *worker) modelOperationFinished(result operationResult) {
 			// Retire before the actor can dispatch another call to this client.
 			w.releaseRuntimeWithReason(true, "failure")
 		}
-		w.say(text)
-		w.finishMenu(request.messageID, text)
+		w.finishMenuOrSay(request.messageID, text)
 	default:
 		w.endControlOperation()
 		w.finishMenu(request.messageID, w.modelOperationFailure(request.action))

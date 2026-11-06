@@ -1380,6 +1380,8 @@ func TestNativeUIExportRejectionTerminatesOriginalMenu(t *testing.T) {
 				}
 				data := buttons[index]["callback_data"].(string)
 				w.exportingSession = w.sessionID
+				var outboxBefore int
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxBefore))
 				click := func() {
 					w.callback(&telegram.CallbackQuery{ID: "export-blocked-dialog", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: int64(messageID)}, Data: data})
 				}
@@ -1389,8 +1391,10 @@ func TestNativeUIExportRejectionTerminatesOriginalMenu(t *testing.T) {
 				if strings.Contains(text, "Selected") || strings.Contains(text, "Confirmed") || strings.Contains(text, "Cancel") {
 					t.Fatalf("rejected native dialog falsely displays a submitted decision: %q", text)
 				}
-				if !strings.Contains(nativeOutputs(t, w), reason) {
-					t.Fatal("native export rejection lost its existing separate notice")
+				var outboxAfter int
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&outboxAfter))
+				if outboxAfter != outboxBefore {
+					t.Fatal("native export rejection queued a duplicate menu result")
 				}
 				if w.client != client || w.runtime != runtime || !sameBindingIdentity(w.binding, before) || w.exportingSession != before.SessionID || len(w.confirms) != 0 {
 					t.Fatal("rejected native dialog changed runtime, binding, export, or retained choices")

@@ -13,10 +13,14 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-func modelThinkingFailureReceipt(t *testing.T, w *worker, model string, stopped bool) string {
+func modelThinkingFailureReceipt(t *testing.T, w *worker, f *fakeHTTP, messageID int, model string, stopped bool) string {
 	t.Helper()
 	var text string
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE text LIKE 'Model switched to %' ORDER BY id DESC LIMIT 1").Scan(&text))
+	if messageID != 0 {
+		text = settingsMenuResult(t, f, messageID)
+	} else {
+		requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE text LIKE 'Model switched to %' ORDER BY id DESC LIMIT 1").Scan(&text))
+	}
 	if !strings.Contains(text, "Model switched to "+model+".") || !strings.Contains(text, "Thinking: n/a") || !strings.Contains(text, "model switch succeeded, but the follow-up thinking query failed") {
 		t.Fatalf("optional thinking failure lost the confirmed model outcome: %q", text)
 	}
@@ -26,7 +30,11 @@ func modelThinkingFailureReceipt(t *testing.T, w *worker, model string, stopped 
 	var receipts, failures int
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE text LIKE 'Model switched to %'").Scan(&receipts))
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE text LIKE '%switch could not be confirmed%' OR text LIKE '%PRIVATE_EFFORT%' OR text LIKE '%task outcome is uncertain%'").Scan(&failures))
-	if receipts != 1 || failures != 0 {
+	wantReceipts := 1
+	if messageID != 0 {
+		wantReceipts = 0
+	}
+	if receipts != wantReceipts || failures != 0 || strings.Contains(text, "PRIVATE_EFFORT") {
 		t.Fatalf("model operation emitted duplicate or misleading receipts: successes=%d failures=%d", receipts, failures)
 	}
 	return text
@@ -79,11 +87,10 @@ func TestModelSwitchOptionalThinkingFailure(t *testing.T) {
 					t.Fatalf("fixture mode %s stopped=%t, want %t", mode, client.Stopping(), stopped)
 				}
 				w.operationReturned(result)
-				receipt := modelThinkingFailureReceipt(t, w, "fixture/"+wantModel, stopped)
+				receipt := modelThinkingFailureReceipt(t, w, f, messageID, "fixture/"+wantModel, stopped)
 				if selection == "role" {
-					menu := settingsMenuResult(t, f, messageID)
-					if menu != receipt+"\nRole: slow" {
-						t.Fatalf("role menu lost its confirmed outcome or selected role: %q", menu)
+					if !strings.Contains(receipt, "\nRole: slow") {
+						t.Fatalf("role menu lost the selected role: %q", receipt)
 					}
 					assertSettingsMenuNeverInterrupted(t, f, messageID)
 				}
@@ -146,7 +153,7 @@ func TestModelThinkingFailureDoneBeforeOperationReturn(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_TRACE", trace)
 	t.Setenv("OMP_TELEGRAM_FIXTURE_EFFORT_MODE", "unknown-ack")
 	t.Setenv("OMP_TELEGRAM_FIXTURE_EFFORT_AFTER", "2")
-	w, _, command := setupWorkspaceWorker(t)
+	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 4
 	command("/new " + t.TempDir())
 	before, client, claim := w.binding, w.client, w.claimedSession
@@ -189,7 +196,7 @@ func TestModelThinkingFailureDoneBeforeOperationReturn(t *testing.T) {
 	requireStoreOK(t, result.err)
 	w.operationReturned(result)
 	assertRetiredOperationClient(t, w, client, before)
-	modelThinkingFailureReceipt(t, w, "fixture/deep", true)
+	modelThinkingFailureReceipt(t, w, f, 0, "fixture/deep", true)
 	if w.rpcExitPendingClientID != 0 || len(w.b.slots) != 0 || w.claimedSession != claim || !w.b.sessionInUse(w.sessionID) || len(w.queue) != 1 {
 		t.Fatal("early Done lost the session claim, runtime slot, queued request, or exit fence")
 	}
@@ -211,7 +218,7 @@ func TestModelThinkingFailureDoneBeforeOperationReturn(t *testing.T) {
 func TestModelThinkingOptionalQueryUsesParentDeadline(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_EFFORT_MODE", "hold")
 	t.Setenv("OMP_TELEGRAM_FIXTURE_EFFORT_AFTER", "2")
-	w, _, command := setupWorkspaceWorker(t)
+	w, f, command := setupWorkspaceWorker(t)
 	command("/new " + t.TempDir())
 	before, client := w.binding, w.client
 	w.beginControlOperation(controlModel)
@@ -237,5 +244,5 @@ func TestModelThinkingOptionalQueryUsesParentDeadline(t *testing.T) {
 	requireStoreOK(t, result.err)
 	w.operationReturned(result)
 	assertRetiredOperationClient(t, w, client, before)
-	modelThinkingFailureReceipt(t, w, "fixture/deadline", true)
+	modelThinkingFailureReceipt(t, w, f, 0, "fixture/deadline", true)
 }

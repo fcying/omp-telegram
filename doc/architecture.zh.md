@@ -288,7 +288,7 @@ Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 w
 
 [`assistant_delivery.go`](../internal/bridge/assistant_delivery.go) 在 root 仍为 submitted 时, 通过 `AppendAssistantReplies` 立即排入每条完成的 assistant `message_end`, 包括模型 stop 正文. Outbox 将首片状态栏与不可变正文分开保存, 保留 bot 消息顺序. 只有该 inbox 首条持久文本回复引用原始请求; 后续消息及分片不设置回复目标. 投递不等待最终 metadata. 只有缺少 `message_end` 的 terminal-only 文字可继续 staged 并等待最终采样. 内存仅保留当前未提交文字, 最多一条 staged 正文及位置/资源计数, 不保存另一份已完成正文历史. `message_end` 不结束 root, 不派发下一个 prompt. 不增加问题检测器, 自动审批, RPC 模式变化或原生 Ask 支持.
 
-位置去重区分 staged 文字与不可变的已排入历史. `agent_end` 快照包括 `isTerminal:false` 时只能修正未提交正文; 重复位置可更新终结 metadata, 但不能改写已提交文字或重复累计指标. 只有 metadata 的快照保留未提交文字. 非终结修正在排入输出前仍受任务剩余输入预算限制. UI 请求仅 `confirm`, `select`, `input` 和 `editor` 属于交互式 continuation. 被动 UI metadata 不冲刷 staged 文字, 也不中断正在等待的最终状态/provider usage 采样.
+位置去重区分 staged 文字与不可变的已排入历史. `agent_end` 快照包括 `isTerminal:false` 时只能修正未提交正文; 重复位置可更新终结 metadata, 但不能改写已提交文字或重复累计指标. 只有 metadata 的快照保留未提交文字. 非终结修正在排入输出前仍受任务剩余输入预算限制. UI 请求仅 `confirm`, `select`, `input` 和 `editor` 属于交互式 continuation. 被动 UI metadata 不冲刷 staged 文字, 也不中断正在等待的最终状态采样.
 
 原生 `agent_end` 可能重复已流送消息, 也可能只包含压缩后的后缀. 对账按所有 role 的位置计数, 包括 user 和 tool-result, 存在原始 `messageCount` 时使用它定位后缀; 不同位置的相同 assistant 正文仍是独立消息. 缺少最终 `message_end` 或原生 continuation/中断时保留未提交正文, 不重发此前内容. 原有每 root 或研究 round 的字节/消息预算跨所有正文消息累计, 预留终结状态及单次明确截断提示. 普通输入, steer, 所有权, session 围栏及交付不确定时不重放的策略不变.
 
@@ -302,21 +302,27 @@ Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 w
 
 [`reply_metrics.go`](../internal/bridge/reply_metrics.go) 独立于 progress 模式记录 model/provider 及安全 usage/duration. 中间状态栏使用已确认数据. 最终完成原子记录任务结算与最新正式消息首片的状态栏, 或将 terminal-only 正文和最终状态栏一起排入队列. 现有投递循环发送待发正文时使用最新状态栏; 已投递正文则使用保存的 Telegram 消息 ID 及不变正文尽力 Edit. 状态栏完成按快照 fencing, 不丢失更新后的 pending 状态. 编辑失败不重发答案, 不另发孤立状态气泡. 状态栏字节及分片计入累计输出预算. 主 agent assistant `message_end` 只贡献一次指标, 重复 terminal summary 不再计数. 平均生成速度为 `sum(output tokens) * 1000 / sum(duration_ms)`, 不包含 queue/tool 时间, 要求正输出且总 duration 至少 100 ms. 缺失/非法贡献指标时省略聚合. 每个 root 或成功托管研究 round 重置计数.
 
-Progress 和中间/最终回复 header 共用 model/thinking/fast 格式, 精简 context (`46% (500k)`), 速度单位 (`3.8 t/s`) 和字段分隔符. 实时数值仍使用原生采样; 最终数值仍使用包含输出的 context 和整轮平均速度. 可选 provider usage 仅在最终 header 合并为空格分隔的一组 (`5h1% 7d0%`), Progress 不查询或展示它. 详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
+Progress 和中间/最终回复 header 共用 model/thinking/fast 格式, 精简 context (`46% (500k)`), 速度单位 (`3.8 t/s`) 和字段分隔符. 实时数值仍使用原生采样; 最终数值仍使用包含输出的 context 和整轮平均速度. 三类 header 从同一份 last-good 缓存读取可选 provider 额度, 渲染不触发查询. 详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
 
 最终 context 使用最后一次调用包含输出的 usage: 优先显式 `contextTokens`, 否则用正 `totalTokens` 或完整 input/output/cache 总和, 再减 orchestration input/output/cache-read usage, 最低为零. 缺失, 负值或溢出不估算. 这不同于可能仍指向最终 input anchor 的 `get_state.contextUsage.tokens`.
 
 确认文本完成后, [`reply_status.go`](../internal/bridge/reply_status.go) 独立发出一秒 deadline 的 `get_state`, 获取当前窗口/model 和 idle 证据. 只有 model/provider/native session 匹配, 且明确非 streaming/非 compacting 时才显示 context; 百分比由含输出 usage 与采样窗口重新计算. Thinking/fast 也须匹配 model 身份. 该 query 不能释放变更通道. Client/generation/root/turn/catalog epoch/session 围栏拒绝迟到结果; 新输入, 原生活动, retirement 或查询失败时, 使用已知 model/average 字段提交确认答案. 无害元数据/完成尾事件可继续消费而不替换答案.
 
-`telegram.provider_usage` 为 TOML 布尔值, 默认 `false`. 启用后, 已确认的最终状态生命周期对每次回复至多尝试一次原生 `prompt("/usage")`, 使用三秒 context deadline, 不重试, 不跨回复缓存, 不属于五秒 Progress 采样. 最终 `get_state` 必须有效, 且匹配最新 assistant 的 model/provider 与原生 session. Provider 不受支持, Bridge prompt 队列非空, 变更/control 通道正忙, 或自主研究 round 仍在运行时跳过查询. 私有 `Client.Usage` 路径要求目录中存在 builtin `/usage` 且返回明确的 `agentInvoked:false`, 在 RPC reader 中有界捕获输出, 不将捕获的原始报告发布为普通事件或 payload 日志. 调用方占用 `reply_usage` operation 通道, 在捕获期间排除竞争的 prompt 和变更操作; `replyStatus.pending` 保留最终状态生命周期, 使现有输入/runtime flush 路径可立即省略用量并完成终结. 不为此查询延迟或重发已排入的 assistant 正文. 超时, 失败或 owner 已过期时省略用量; 提交未确认可能退役 runtime, 但先提交已确认的终结结果. 不增加独立 CLI, 鉴权数据库访问或上游修改.
+`telegram.provider_usage` 为 TOML 布尔值, 默认 `false`. 启用后, Progress 和中间/最终状态栏从 Bridge 进程内的 last-good 缓存读取额度, 独立于刷新及 progress 模式. 与 context 一样, 当前 scope 的首次状态读取完成前省略额度; 被中断或过期的读取不算完成. 读取完成后, 受支持的 provider 没有同 scope 可用值时显示 `quota ?`; 有缓存时只显示已识别的 5h/7d **已用**百分比, 例如 `5h30% 7d65%`, 不附加读取时间. 读取失败, 跳过, 不受支持或结果为空都不清除已有缓存. 缓存跨消息及同 scope 原生 session 共享, 但不跨 daemon restart 持久化, 不增加数据库表或配置.
 
-状态头 parser 只接受回复对应 Claude 或 OpenAI Codex provider 下, 原生报告明确标记为当前账号的已识别 5h/7d **已用**百分比, 仅生成 `5h30% 7d65%` 等精简字段. 缺失或无法识别的数据, 以及只有 token/cost 的回退报告都会省略. 状态头不包含账号身份, 邮箱, 鉴权详情或原始报告; 原生当前账号标记不独立证明轮转上游实际由哪个账号处理了请求.
+缓存键包含 provider, 启动 argv namespace 及只读 `get_logout_accounts` RPC 返回的唯一 active OAuth credential 所确定的保守账号 scope. 不按 provider 单独回退缓存. Scope 未知或不明确时隐藏其他账号的缓存, 不删除已有值. Metadata 采样只通过只读账号 RPC 建立 scope, 不调用 `/usage` 或账号变更操作. 刷新在额度查询前后读取账号 scope, 只有两次 scope 一致才接受结果. Client/generation/native-session 和 operation 所有权围栏也拒绝迟到结果; 编辑 header 还必须匹配最近对应的最终状态栏目标. 这些分开的 RPC 读取不能原子绑定账号与额度样本, scope 检查和报告的当前账号标记都不能识别每次轮换请求实际结算的账号.
+
+额度刷新是仅在 idle 时进行的 best-effort 工作, 独立于任务结算, 最终 metadata 及五秒 Progress 采样. 同一账号 scope 的尝试间隔至少五分钟, deadline 为三秒, 不重置 runtime 的空闲活动计时. 排队 prompt, 控制操作, 活动 root/研究 round, 原生活动和忙碌的变更通道优先; 不会只为查询额度而启动进程. 因此忙碌或长任务显示缓存或不可用, 不等待最终 `/usage` 查询. 刷新成功后可通过现有可编辑 header 更新最近匹配的最终消息, 不修改不可变正文. 刷新失败不延迟结算, 不重发答案, 不另建状态气泡.
+
+Terminal-only 最终正文与首片 header 在同一完成事务中分开存储. 提交后的 outbox ID 作为额度刷新目标, 即使之前已有中间消息也不会更新其中间 header. 完成失败会同时回滚最终输出和 owner 状态.
+
+刷新只为 `anthropic` 或 `openai-codex` 使用现有原生 builtin `prompt("/usage")`, 不直接请求供应商. 私有 `Client.Usage` 路径要求目录中存在 builtin `/usage` 且返回明确的 `agentInvoked:false`, 在 RPC reader 中有界捕获输出, 并在捕获期间排除竞争的原生 prompt 和变更操作. Parser 只接受所选 provider 下, 原生报告明确标记为当前账号的已识别 5h/7d 已用百分比. 缺失或无法识别的数据, 以及只有 token/cost 的回退报告都不替换缓存. 原始报告, 账号身份, 邮箱及 credential ID 不作为普通事件发布, 不发送到 Telegram, 不写入日志或数据库. 不增加独立 CLI, 鉴权数据库访问或上游修改.
 
 装饰性方括号进度条行作为不透明文本忽略; 语义字段中的控制字符仍使报告无效. 队列安全依据同步 `Client.Stopping()` 信号, 不依赖稍后才到达的 `Done()` 清理通知: 派发待执行任务前先退役失败 runtime, 保留已确认答案和队列, 供同一 session 恢复后继续执行.
 
 私有 `/usage` 保存获准时的 session ID 和 catalog epoch, 获取 RPC 写门后, 在启用捕获前复核作用域及 builtin 身份. 发送边界前授权失效会返回错误, 不发送或重放 prompt, 不标记执行不确定, 也不退役原本健康的 client. 同一作用域中的 builtin 仍有效时, 仅目录 revision 更新不会取消查询.
 
-进入最终状态渲染时取消残留的 steer settlement probe; 最终元数据或用量查询等待期间, 迟到的探针结果不能退役 runtime. Runtime teardown 只提交等待中的已确认答案, client 关闭及进程 slot 的一次归还由外层释放负责. 新输入触发的 usage flush 先取消查询 context, 再在 client mutex 下检查已发送/不确定状态; 发送 hook 在同一 mutex 下检查取消后才启用捕获. 未发送即取消时保留 runtime, 已发送或不确定的私有工作仍退役 runtime, 且不会从 `runtimeStopped` 重入释放. 后续提交仍由既有 RPC 操作通道串行化, 不改变排队任务的 root 归属.
+进入最终状态渲染时取消残留的 steer settlement probe; 最终 metadata 等待期间, 迟到的探针结果不能退役 runtime. Runtime teardown 只提交等待中的已确认答案, client 关闭及进程 slot 的一次归还由外层释放负责. 新输入或控制工作在后续提交前取消 idle 额度刷新. 取消检查及私有发送 hook 在 client mutex 下串行: 未发送即取消时保留 runtime, 已发送或不确定的私有工作仍退役 runtime, 不重放, 不从 `runtimeStopped` 重入释放. 后续提交仍由既有 RPC 操作通道串行化, 不改变排队任务的 root 归属. 额度刷新不占住最终结算.
 
 原生事件触发等待中最终回复的 flush 时, 若 flush 退役或替换了事件所属 client, 就消费并丢弃当前事件, 不再在 teardown 后更新 compaction, progress 或 tool 状态. 若保留同一 client, 则继续正常处理该事件, 包括原生 compaction start/end 状态转换.
 
@@ -526,6 +532,8 @@ Bridge 独立比较原生身份/CWD, 有界新 journal, RPC entries 和 active l
 桥接选择 token 随机生成, 绑定用户并受代际栅栏保护, 通常两分钟过期, 重启后丢失. 会话选择器与删除确认还绑定来源消息和全桥接 mutation epoch. 选择时重新检查持久化代际与规范化工作目录; 消费后的 token 不能重放修改. 恢复选择器保留列目录时的 preset 索引/fingerprint, 全局选择变化后拒绝旧选择, 有效选择使用经核对的 argv 快照启动. 后续全局变化不能改写已经准入的启动.
 
 选择回执或 `Confirmed` 只记录用户决定, 不是恢复/导出/删除成功证明. 设置菜单在结果确认前显示 `Applying...`; 中断不显示成功. 决定回执编辑和键盘清理是有界的尽力 UI 操作; 编辑失败不会重新授权已消费 token, 也不阻止请求操作.
+
+Model, thinking 和参数预设的完成回执使用 `finishMenuOrSay`: 优先把原菜单替换为实际结果, 保留所选 role 及可选查询失败警告; 没有菜单或无法编辑时, 才将一次结果通知加入 outbox. 成功和失败都不通过两条路径重复发布同一结果. 恢复, 导出和删除的选择/确认回执仍与执行结果分开.
 
 ### 绑定列表与遗忘
 

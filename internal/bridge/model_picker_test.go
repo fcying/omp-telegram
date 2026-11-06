@@ -111,10 +111,6 @@ func TestModelPickerUsesCycleRolesAndOwner(t *testing.T) {
 		t.Fatalf("completed model menu omitted actual identity or chosen role: %q", completed)
 	}
 	assertPickerModel(t, w, "fixture", "deep")
-	var reply bool
-	if err := w.b.db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM outbox WHERE text LIKE '%fixture/deep%')").Scan(&reply); err != nil || !reply {
-		t.Fatal("successful selection did not display resolved RPC model identity")
-	}
 	if !sameBindingIdentity(w.binding, original) {
 		t.Fatal("model selection replaced the session")
 	}
@@ -435,6 +431,82 @@ func TestThinkingLevelLabelsPreserveProtocolValues(t *testing.T) {
 			if got := w.thinkingLevelLabel(native); got != native {
 				t.Fatalf("native thinking value changed: got %q, want %q", got, native)
 			}
+		}
+	}
+}
+
+func TestSettingsMenusPublishOneCompletion(t *testing.T) {
+	for _, selection := range []struct {
+		command string
+		index   int
+	}{
+		{"/model", 0},
+		{"/thinking", 4},
+		{"/args", 0},
+	} {
+		for _, editFails := range []bool{false, true} {
+			name := selection.command + "/edit"
+			if editFails {
+				name = selection.command + "/fallback"
+			}
+			t.Run(name, func(t *testing.T) {
+				w, f, command := setupWorkspaceWorker(t)
+				if selection.command == "/args" {
+					configureTestArgPresets(w.b, [][]string{nil}, strings.Repeat("1", 64), 1)
+				}
+				command("/new " + t.TempDir())
+				deliverReplies(t, w)
+				command(selection.command)
+				buttons := resumeButtons(t, f)
+				messageID := f.messageCount()
+				var before int
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&before))
+				f.mu.Lock()
+				offset := len(f.messages)
+				f.failProgress = editFails
+				f.mu.Unlock()
+				clickKeyboard(w, 7, buttons[selection.index]["callback_data"].(string))
+				f.mu.Lock()
+				f.failProgress = false
+				f.mu.Unlock()
+				var after int
+				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&after))
+				wantNew := 0
+				if editFails {
+					wantNew = 1
+				} else {
+					settingsMenuResult(t, f, messageID)
+				}
+				if after-before != wantNew {
+					t.Fatalf("selection queued %d extra replies, want %d", after-before, wantNew)
+				}
+				deliverReplies(t, w)
+				f.mu.Lock()
+				newMessages := 0
+				for _, request := range f.messages[offset:] {
+					if request["message_id"] == nil {
+						newMessages++
+					}
+				}
+				f.mu.Unlock()
+				if newMessages != wantNew {
+					t.Fatalf("selection sent %d new Telegram bubbles, want %d", newMessages, wantNew)
+				}
+				switch selection.command {
+				case "/model":
+					assertPickerModel(t, w, "fixture", "quick")
+				case "/thinking":
+					raw, err := w.call("get_state", nil)
+					requireStoreOK(t, err)
+					var state modelSettings
+					requireStoreOK(t, json.Unmarshal(raw, &state))
+					if state.ThinkingLevel != "high" {
+						t.Fatal("receipt routing changed the requested thinking level")
+					}
+				case "/args":
+					requireArgsSelection(t, w.b, 1)
+				}
+			})
 		}
 	}
 }

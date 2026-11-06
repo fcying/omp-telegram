@@ -521,6 +521,8 @@ func TestMain(m *testing.M) {
 		emit(map[string]any{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": []int{1, 2}, "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
 		var streaming atomic.Bool
 		modelProvider, modelID := "fixture", "safe"
+		usageAccount := "PRIVATE_USAGE_ACCOUNT"
+		usageAccountReads, usageFlipAfter := 0, 0
 		thinkingLevel := "medium"
 		configuredThinking := os.Getenv("OMP_TELEGRAM_FIXTURE_CONFIGURED_THINKING")
 		if configuredThinking == "" {
@@ -674,6 +676,25 @@ func TestMain(m *testing.M) {
 				continue
 			}
 			switch typ {
+			case "fixture_usage_mode":
+				usageMode, _ = cmd["mode"].(string)
+			case "fixture_usage_account":
+				usageAccount, _ = cmd["account"].(string)
+				usageAccountReads, usageFlipAfter = 0, 0
+				if after, ok := cmd["flipAfter"].(float64); ok {
+					usageFlipAfter = int(after)
+				}
+			case "get_logout_accounts":
+				usageAccountReads++
+				if usageFlipAfter > 0 && usageAccountReads == usageFlipAfter {
+					usageAccount = "PRIVATE_USAGE_OTHER"
+				}
+				provider, _ := cmd["providerId"].(string)
+				accounts := []map[string]any{}
+				if usageAccount != "" {
+					accounts = append(accounts, map[string]any{"credentialId": 1, "provider": provider, "label": usageAccount, "detail": "oauth #1", "type": "oauth", "active": true})
+				}
+				resp["data"] = map[string]any{"accounts": accounts}
 			case "fixture_fast_mode":
 				fastMode, _ = cmd["mode"].(string)
 			case "fixture_fast_release":
@@ -991,7 +1012,7 @@ func TestMain(m *testing.M) {
 				os.Exit(2)
 			case "prompt":
 				text, _ := cmd["message"].(string)
-				usageHandled := fixtureReplyUsage(cmd, resp, emit)
+				usageHandled := fixtureReplyUsage(cmd, resp, emit, usageMode, usageAccount)
 				if usageHandled {
 					continue
 				}
@@ -3014,7 +3035,7 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 			w.stream.WriteString("answer")
 			w.finish()
 			output, err := db.NextOutput()
-			if err != nil || replyBody(t, output.Text) != "answer" {
+			if err != nil || replyBody(t, assistantOutputText(output)) != "answer" {
 				t.Fatalf("durable output = %#v, err = %v", output, err)
 			}
 			var state string
@@ -3277,7 +3298,7 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	w.stream.WriteString("answer")
 	w.finish()
 	o, e := db.NextOutput()
-	if e != nil || replyBody(t, o.Text) != "answer" {
+	if e != nil || replyBody(t, assistantOutputText(o)) != "answer" {
 		t.Fatalf("final was not persisted before preview completion: %v", e)
 	}
 	if !w.finishing {
@@ -3473,7 +3494,7 @@ func TestNormalTerminalCompletionIsDone(t *testing.T) {
 		t.Fatalf("normal terminal state = %q, error %v", state, err)
 	}
 	o, err := db.NextOutput()
-	if err != nil || replyBody(t, o.Text) != "final answer" {
+	if err != nil || replyBody(t, assistantOutputText(o)) != "final answer" {
 		t.Fatalf("normal terminal output = %q, error %v", o.Text, err)
 	}
 }

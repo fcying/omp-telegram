@@ -34,6 +34,7 @@ type progressNativeResult struct {
 	request *progressNativeRequest
 	state   statusState
 	valid   bool
+	account [32]byte
 }
 
 func (w *worker) cancelProgressNative() {
@@ -81,10 +82,12 @@ func (w *worker) progressContextReadCompleted() bool {
 
 // Empty means context has not been read in this scope, not a failed read.
 func (w *worker) progressNativeStatus() string {
-	if !w.progressContextReadCompleted() {
-		return ""
+	readCompleted := w.progressContextReadCompleted()
+	header := ""
+	if readCompleted {
+		header = w.progress.NativeStatus
 	}
-	return w.progress.NativeStatus
+	return w.withProviderUsage(header, w.replyStatus.liveState.Model.Provider, readCompleted)
 }
 
 // Assistant headers share this bounded sampler even when progress UI is disabled.
@@ -116,6 +119,9 @@ func (w *worker) refreshProgressNative(now time.Time) {
 		result := progressNativeResult{request: request}
 		raw, err := client.Call(ctx, "get_state", nil)
 		result.valid = err == nil && json.Unmarshal(raw, &result.state) == nil
+		if result.valid && result.state.SessionID == request.sessionID {
+			result.account = w.readProviderUsageScope(ctx, client, result.state)
+		}
 		select {
 		case results <- result:
 		case <-w.ctx.Done():
@@ -138,6 +144,7 @@ func (w *worker) progressNativeFinished(result progressNativeResult) bool {
 		return false
 	}
 	w.progressNative.completed = request
+	w.setProviderUsageScope(result.state.Model.Provider, result.account)
 	w.progress.NativeStatus = compactUnknownContext
 	w.replyStatus.liveState = statusState{}
 	w.replyStatus.liveScope = nil
