@@ -8,6 +8,7 @@ import (
 )
 
 const compactHeaderSeparator = " | "
+const compactUnknownContext = "ctx ?"
 
 func compactModelStatus(model, thinking string) string {
 	label := progressToolLiteral(model)
@@ -57,12 +58,22 @@ func compactSpeedStatus(speed float64) string {
 	if !validStatusNumber(speed) {
 		return ""
 	}
-	return statusDecimal(speed) + "t/s"
+	return statusDecimal(speed) + " t/s"
 }
 
-// Nil metrics selects live native values; reply metrics fence sampled settings
-// and provide output-inclusive context and whole-task average speed.
+// Nil metrics selects live native values from a completed status read; reply
+// metrics fence sampled settings and provide output-inclusive context and speed.
 func compactHeader(language i18n.Language, s statusState, metrics *replyMetrics) string {
+	return formatCompactHeader(language, s, metrics, false, true)
+}
+
+// Completed messages already confirm output-inclusive usage, even while their
+// root is still streaming. Capacity and identity must still match the sample.
+func compactMessageHeader(language i18n.Language, s statusState, metrics *replyMetrics, contextRead bool) string {
+	return formatCompactHeader(language, s, metrics, true, contextRead)
+}
+
+func formatCompactHeader(language i18n.Language, s statusState, metrics *replyMetrics, completed, contextRead bool) string {
 	modelID := s.Model.ID
 	matchesState := true
 	if metrics != nil && metrics.modelID != "" {
@@ -85,7 +96,7 @@ func compactHeader(language i18n.Language, s statusState, metrics *replyMetrics)
 	}
 	percent, window := 0.0, int64(0)
 	usage := s.ContextUsage
-	if metrics == nil {
+	if contextRead && metrics == nil {
 		if usage != nil && usage.Tokens != nil && usage.ContextWindow != nil && *usage.Tokens >= 0 && *usage.ContextWindow > 0 {
 			window = *usage.ContextWindow
 			percent = float64(*usage.Tokens) / float64(window) * 100
@@ -93,14 +104,16 @@ func compactHeader(language i18n.Language, s statusState, metrics *replyMetrics)
 				percent = *usage.Percent
 			}
 		}
-	} else if matchesState && metrics.modelID != "" && metrics.provider != "" && metrics.lastContextKnown &&
-		s.IsStreaming != nil && !*s.IsStreaming && s.IsCompacting != nil && !*s.IsCompacting &&
+	} else if contextRead && matchesState && metrics.modelID != "" && metrics.provider != "" && metrics.lastContextKnown &&
+		(completed || s.IsStreaming != nil && !*s.IsStreaming && s.IsCompacting != nil && !*s.IsCompacting) &&
 		usage != nil && usage.ContextWindow != nil && *usage.ContextWindow > 0 {
 		window = *usage.ContextWindow
 		percent = float64(metrics.lastContext) / float64(window) * 100
 	}
 	if window > 0 {
-		parts = append(parts, fmt.Sprintf("%.0f%%/%s", percent, statusTokens(window)))
+		parts = append(parts, fmt.Sprintf("%.0f%% (%s)", percent, statusTokens(window)))
+	} else if contextRead {
+		parts = append(parts, compactUnknownContext)
 	}
 	speed := ""
 	if metrics != nil {

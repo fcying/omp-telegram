@@ -36,6 +36,18 @@ func requireNoActivityTable(t *testing.T, s *Store) {
 	}
 }
 
+func restoreLegacyProgressSchema(t *testing.T, s *Store) {
+	t.Helper()
+	_, err := s.DB.Exec(`ALTER TABLE inbox ADD COLUMN progress_message_id INTEGER NOT NULL DEFAULT 0;
+UPDATE inbox SET progress_message_id=COALESCE((SELECT MAX(message_id) FROM progress_messages WHERE inbox_id=inbox.id),0);
+DROP TABLE progress_messages;
+DROP INDEX idx_outbox_assistant_header;
+ALTER TABLE outbox DROP COLUMN header;
+ALTER TABLE outbox DROP COLUMN message_id;
+ALTER TABLE outbox DROP COLUMN header_pending;`)
+	requireStoreOK(t, err)
+}
+
 func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
@@ -50,6 +62,12 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 		t.Fatalf("fresh database args selection table count = %d, want 1", selectionTableCount)
 	}
 	requireNoActivityTable(t, s)
+	var legacyColumns, progressTables int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('inbox') WHERE name='progress_message_id'").Scan(&legacyColumns))
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='progress_messages'").Scan(&progressTables))
+	if legacyColumns != 0 || progressTables != 1 {
+		t.Fatalf("progress schema = legacy columns %d, tables %d, want 0/1", legacyColumns, progressTables)
+	}
 	var indexCount int
 	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_outbox_inbox_state'").Scan(&indexCount))
 	if indexCount != 1 {
@@ -151,6 +169,7 @@ func TestOMPArgsSelectionPersistenceAndReset(t *testing.T) {
 func TestVersionSixteenMigratesOMPArgsSelection(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec("DROP TABLE topic_name_reservations; DROP TABLE topic_names; DROP TABLE interface_language; DROP TABLE migrations; DROP TABLE omp_args_selection; PRAGMA user_version=16")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -171,6 +190,7 @@ func TestVersionSixteenMigratesOMPArgsSelection(t *testing.T) {
 func TestVersionSeventeenDropsWorkspaceTrackingTables(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec(`CREATE TABLE workspace_users(root TEXT,bot INTEGER,chat INTEGER,thread INTEGER,session TEXT);
 CREATE TABLE workspace_leases(root TEXT,bot INTEGER,chat INTEGER,thread INTEGER,session TEXT);
 INSERT INTO workspace_users VALUES('/root',1,2,3,'session');
@@ -220,6 +240,7 @@ func TestVersionElevenMigratesToCurrent(t *testing.T) {
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec("DROP TABLE topic_name_reservations; DROP TABLE topic_names; DROP TABLE interface_language; DROP TABLE migrations; DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=11")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -246,6 +267,7 @@ func TestVersionTwelveMigrationRollsBackOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec(`DROP TABLE topic_name_reservations; DROP TABLE topic_names; DROP TABLE interface_language; DROP TABLE migrations; DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id)); PRAGMA user_version=12; DROP TABLE inbox`)
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -272,7 +294,8 @@ func TestVersionTwelveMigratesToCurrentWithoutOtherDataLoss(t *testing.T) {
 	requireStoreOK(t, s.Save(Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/session", Generation: 1}))
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Submit(10, 42))
-	requireStoreOK(t, s.SetProgressMessage(10, 99))
+	requireStoreOK(t, s.SetProgressMessage(10, 2, 99))
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec(`DROP TABLE omp_args_selection; INSERT INTO outbox(inbox_id,chat,thread,text,state) VALUES (10,2,3,'pending reply','pending');
 CREATE TABLE activity_messages(inbox_id INTEGER NOT NULL,chat INTEGER NOT NULL,message_id INTEGER NOT NULL,PRIMARY KEY(inbox_id,message_id));
 INSERT INTO activity_messages(inbox_id,chat,message_id) VALUES (10,2,91);
@@ -298,10 +321,14 @@ PRAGMA user_version=12;`)
 	}
 	var state string
 	var raw []byte
-	var progress int
-	requireStoreOK(t, s.DB.QueryRow("SELECT state,raw,progress_message_id FROM inbox WHERE id=10").Scan(&state, &raw, &progress))
-	if state != string(InboxUncertain) || string(raw) != `{"update_id":10}` || progress != 99 {
-		t.Fatalf("v12 migration lost inbox metadata: state=%q raw=%q progress=%d", state, raw, progress)
+	requireStoreOK(t, s.DB.QueryRow("SELECT state,raw FROM inbox WHERE id=10").Scan(&state, &raw))
+	if state != string(InboxUncertain) || string(raw) != `{"update_id":10}` {
+		t.Fatalf("v12 migration lost inbox metadata: state=%q raw=%q", state, raw)
+	}
+	var progress ProgressMessage
+	requireStoreOK(t, s.DB.QueryRow("SELECT inbox_id,chat,message_id FROM progress_messages WHERE inbox_id=10").Scan(&progress.InboxID, &progress.Chat, &progress.MessageID))
+	if progress != (ProgressMessage{InboxID: 10, Chat: 2, MessageID: 99}) {
+		t.Fatalf("v12 migration lost progress: %+v", progress)
 	}
 	var text, outboxState string
 	requireStoreOK(t, s.DB.QueryRow("SELECT text,state FROM outbox WHERE inbox_id=10").Scan(&text, &outboxState))
@@ -316,6 +343,7 @@ func TestVersionThirteenStartsRetentionAtMigration(t *testing.T) {
 	previous := Binding{Bot: 1, Chat: 2, Thread: 3}
 	intent := StartIntent{Bot: 1, Chat: 2, Thread: 3, Kind: "new", Workspace: "/new", Generation: 1}
 	requireStoreOK(t, s.PrepareStart(previous, intent))
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec("DROP TABLE topic_name_reservations; DROP TABLE topic_names; DROP TABLE interface_language; DROP TABLE migrations; DROP TABLE omp_args_selection; ALTER TABLE startup_intents DROP COLUMN created_at; PRAGMA user_version=13")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -342,6 +370,7 @@ func TestVersionTwelveMissingTableLeavesDataUntouched(t *testing.T) {
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec("DROP TABLE topic_name_reservations; DROP TABLE topic_names; DROP TABLE interface_language; DROP TABLE migrations; DROP TABLE omp_args_selection; PRAGMA user_version=12")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
@@ -492,11 +521,15 @@ func TestRootReplyTargetSurvivesCompletionAndRestart(t *testing.T) {
 	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 1, 2, []string{"first", "second"}))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
-	for _, want := range []string{"first", "second"} {
+	for i, want := range []string{"first", "second"} {
 		out, err := s.NextOutput()
 		requireStoreOK(t, err)
-		if out.Text != want || out.ReplyTo != 42 {
-			t.Fatalf("durable reply target = %+v, want text %q replying to 42", out, want)
+		var replyTo int64
+		if i == 0 {
+			replyTo = 42
+		}
+		if out.Text != want || out.ReplyTo != replyTo {
+			t.Fatalf("durable reply target = %+v, want text %q replying to %d", out, want, replyTo)
 		}
 		requireStoreOK(t, s.MarkOutput(out.ID, "sending"))
 		requireStoreOK(t, s.MarkOutput(out.ID, "done"))
@@ -516,13 +549,19 @@ func TestMarkOutputRequiresSendingState(t *testing.T) {
 }
 
 func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
-	s := openTestStore(t, t.TempDir())
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, s.Submit(10, 42))
+	requireStoreOK(t, s.SetProgressMessage(10, 7, 98))
+	requireStoreOK(t, s.SetProgressMessage(10, 7, 99))
+	requireStoreOK(t, s.SetProgressMessage(10, 7, 99))
+	if targets, err := s.CompletedProgressMessages(10); err != nil || len(targets) != 0 {
+		t.Fatalf("running progress cleanup = %+v, err=%v", targets, err)
+	}
 	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"first", "second"}))
-	requireStoreOK(t, s.SetProgressMessage(10, 99))
-	if target, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
-		t.Fatalf("pending progress cleanup = %+v, ready=%t, err=%v", target, ready, err)
+	if targets, err := s.CompletedProgressMessages(10); err != nil || len(targets) != 0 {
+		t.Fatalf("pending progress cleanup = %+v, err=%v", targets, err)
 	}
 	first, err := s.NextOutput()
 	requireStoreOK(t, err)
@@ -531,26 +570,148 @@ func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
 	}
 	requireStoreOK(t, s.MarkOutput(first.ID, "sending"))
 	requireStoreOK(t, s.MarkOutput(first.ID, "done"))
-	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
-		t.Fatalf("partial progress cleanup became ready=%t, err=%v", ready, err)
+	if targets, err := s.CompletedProgressMessages(10); err != nil || len(targets) != 0 {
+		t.Fatalf("partial progress cleanup = %+v, err=%v", targets, err)
 	}
 	second, err := s.NextOutput()
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.MarkOutput(second.ID, "sending"))
+	if targets, err := s.CompletedProgressMessages(0); err != nil || len(targets) != 0 {
+		t.Fatalf("sending progress cleanup = %+v, err=%v", targets, err)
+	}
 	requireStoreOK(t, s.MarkOutput(second.ID, "done"))
-	target, ready, err := s.CompletedProgressMessage(10)
-	requireStoreOK(t, err)
-	if !ready || target.InboxID != 10 || target.Chat != 7 || target.MessageID != 99 {
-		t.Fatalf("completed progress target = %+v, ready=%t", target, ready)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	for _, inboxID := range []int64{0, 10} {
+		targets, err := s.CompletedProgressMessages(inboxID)
+		requireStoreOK(t, err)
+		if len(targets) != 2 || targets[0] != (ProgressMessage{InboxID: 10, Chat: 7, MessageID: 98}) || targets[1] != (ProgressMessage{InboxID: 10, Chat: 7, MessageID: 99}) {
+			t.Fatalf("restarted progress targets for %d = %+v", inboxID, targets)
+		}
 	}
-	targets, err := s.CompletedProgressMessages()
+	requireStoreOK(t, s.ClearProgressMessage(10, 98))
+	requireStoreOK(t, s.ClearProgressMessage(11, 99))
+	targets, err := s.CompletedProgressMessages(10)
 	requireStoreOK(t, err)
-	if len(targets) != 1 || targets[0] != target {
-		t.Fatalf("startup progress targets = %+v, want [%+v]", targets, target)
+	if len(targets) != 1 || targets[0].MessageID != 99 {
+		t.Fatalf("precise progress cleanup = %+v", targets)
 	}
-	requireStoreOK(t, s.ClearProgressMessage(target.InboxID, target.MessageID))
-	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
-		t.Fatalf("cleared progress cleanup remained ready=%t, err=%v", ready, err)
+	requireStoreOK(t, s.ClearProgressMessage(10, 99))
+	if targets, err := s.CompletedProgressMessages(0); err != nil || len(targets) != 0 {
+		t.Fatalf("cleared progress cleanup = %+v, err=%v", targets, err)
+	}
+}
+
+func TestProgressWithoutOutboxAndLateCreatedMessage(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	for _, id := range []int64{10, 11} {
+		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
+		requireStoreOK(t, s.Mark(id, InboxDone))
+		requireStoreOK(t, s.SetProgressMessage(id, -7, 99))
+	}
+	requireStoreOK(t, s.ClearProgressMessage(10, 99))
+	requireStoreOK(t, s.SetProgressMessage(10, -7, 100))
+	requireStoreOK(t, s.SetProgressMessage(10, -8, 100))
+	targets, err := s.CompletedProgressMessages(10)
+	requireStoreOK(t, err)
+	if len(targets) != 1 || targets[0] != (ProgressMessage{InboxID: 10, Chat: -7, MessageID: 100}) {
+		t.Fatalf("late-created progress without outbox = %+v", targets)
+	}
+	targets, err = s.CompletedProgressMessages(11)
+	requireStoreOK(t, err)
+	if len(targets) != 1 || targets[0] != (ProgressMessage{InboxID: 11, Chat: -7, MessageID: 99}) {
+		t.Fatalf("clearing another root removed progress = %+v", targets)
+	}
+	if err := s.SetProgressMessage(12, -7, 100); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing inbox registration error = %v, want sql.ErrNoRows", err)
+	}
+	for _, identity := range [][3]int64{{0, -7, 100}, {10, 0, 100}, {10, -7, 0}} {
+		if err := s.SetProgressMessage(identity[0], identity[1], identity[2]); err == nil {
+			t.Fatalf("invalid progress identity accepted: %v", identity)
+		}
+	}
+}
+
+func TestVersionTwentyOneMigratesProgressChatsWithoutGuessing(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	cases := []struct {
+		id   int64
+		raw  string
+		chat int64
+	}{
+		{id: 1, raw: `{}`, chat: 7},
+		{id: 2, raw: `{"message":{"chat":{"id":-9}}}`, chat: -9},
+		{id: 3, raw: `{"callback_query":{"message":{"chat":{"id":8}}}}`, chat: 8},
+		{id: 4, raw: `{}`},
+		{id: 5, raw: `{}`},
+		{id: 6, raw: `{"message":{"chat":{"id":7}}}`},
+		{id: 7, raw: `malformed`, chat: 9},
+		{id: 8, raw: `{"message":{"chat":{"id":7}},"callback_query":{"message":{"chat":{"id":8}}}}`},
+		{id: 9, raw: `{"message":{"chat":{"id":0}}}`},
+	}
+	for _, tc := range cases {
+		requireStoreOK(t, s.Accept(tc.id, []byte(tc.raw)))
+		requireStoreOK(t, s.Mark(tc.id, InboxDone))
+	}
+	restoreLegacyProgressSchema(t, s)
+	_, err := s.DB.Exec(`UPDATE inbox SET progress_message_id=id+100;
+INSERT INTO outbox(inbox_id,chat,text,state) VALUES(1,7,'final body','done'),(1,7,'second final body','done'),(5,7,'ambiguous one','done'),(5,8,'ambiguous two','done'),(6,8,'conflicting context','done'),(7,9,'malformed raw fallback','done'),(9,0,'unknown zero chat','done');
+INSERT INTO history(bot,chat,thread,workspace,session,generation) VALUES(1,7,0,'/workspace','/native-history.jsonl',3);
+PRAGMA user_version=21;`)
+	requireStoreOK(t, err)
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	requireStoreOK(t, setMessageTimes(s, old, old, nil, nil))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var legacyColumns int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('inbox') WHERE name='progress_message_id'").Scan(&legacyColumns))
+	if legacyColumns != 0 {
+		t.Fatalf("migration kept %d legacy progress columns", legacyColumns)
+	}
+	var nondefaultHeaders int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE header<>'' OR message_id<>0 OR header_pending<>0").Scan(&nondefaultHeaders))
+	if nondefaultHeaders != 0 {
+		t.Fatalf("migration invented assistant headers or Telegram IDs for %d outputs", nondefaultHeaders)
+	}
+	for _, tc := range cases {
+		var chat sql.NullInt64
+		var messageID int64
+		var raw []byte
+		requireStoreOK(t, s.DB.QueryRow("SELECT p.chat,p.message_id,i.raw FROM progress_messages p JOIN inbox i ON i.id=p.inbox_id WHERE i.id=?", tc.id).Scan(&chat, &messageID, &raw))
+		if chat.Valid != (tc.chat != 0) || chat.Int64 != tc.chat || messageID != tc.id+100 || string(raw) != tc.raw {
+			t.Fatalf("migrated progress %d = chat %+v, message %d, raw %q", tc.id, chat, messageID, raw)
+		}
+	}
+	targets, err := s.CompletedProgressMessages(0)
+	requireStoreOK(t, err)
+	if len(targets) != 4 {
+		t.Fatalf("safe migrated cleanup candidates = %+v, want four known chats", targets)
+	}
+	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 0 || result.Outbox != 0 {
+		t.Fatalf("migration retention discarded progress/context: %+v", result)
+	}
+	var historySession, finalBody string
+	requireStoreOK(t, s.DB.QueryRow("SELECT session FROM history WHERE bot=1 AND chat=7").Scan(&historySession))
+	requireStoreOK(t, s.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=1 ORDER BY id LIMIT 1").Scan(&finalBody))
+	if historySession != "/native-history.jsonl" || finalBody != "final body" {
+		t.Fatalf("migration changed history/body: %q/%q", historySession, finalBody)
+	}
+	_, err = s.DB.Exec("INSERT INTO outbox(inbox_id,chat,text,state) VALUES(4,-10,'new reliable context','done')")
+	requireStoreOK(t, err)
+	targets, err = s.CompletedProgressMessages(4)
+	requireStoreOK(t, err)
+	if len(targets) != 1 || targets[0] != (ProgressMessage{InboxID: 4, Chat: -10, MessageID: 104}) {
+		t.Fatalf("unknown chat did not recover from reliable context: %+v", targets)
+	}
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	targets, err = s.CompletedProgressMessages(4)
+	requireStoreOK(t, err)
+	if len(targets) != 1 || targets[0].Chat != -10 {
+		t.Fatalf("recovered chat did not survive restart: %+v", targets)
 	}
 }
 
@@ -572,18 +733,18 @@ func TestTerminalProgressWaitsForFinalReplyDelivery(t *testing.T) {
 			err = s.CompleteInboxUncertainWithReplies(context.Background(), tc.id, 7, 8, []string{"terminal"})
 		}
 		requireStoreOK(t, err)
-		requireStoreOK(t, s.SetProgressMessage(tc.id, tc.id+100))
-		if _, ready, err := s.CompletedProgressMessage(tc.id); err != nil || ready {
-			t.Fatalf("%s progress became ready before delivery: ready=%t, err=%v", tc.state, ready, err)
+		requireStoreOK(t, s.SetProgressMessage(tc.id, 7, tc.id+100))
+		if targets, err := s.CompletedProgressMessages(tc.id); err != nil || len(targets) != 0 {
+			t.Fatalf("%s progress became ready before delivery: %+v, err=%v", tc.state, targets, err)
 		}
 		out, err := s.NextOutput()
 		requireStoreOK(t, err)
 		requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
 		requireStoreOK(t, s.MarkOutput(out.ID, OutboxDone))
-		target, ready, err := s.CompletedProgressMessage(tc.id)
+		targets, err := s.CompletedProgressMessages(tc.id)
 		requireStoreOK(t, err)
-		if !ready || target.InboxID != tc.id || target.MessageID != tc.id+100 {
-			t.Fatalf("%s progress after delivery = %+v, ready=%t", tc.state, target, ready)
+		if len(targets) != 1 || targets[0].InboxID != tc.id || targets[0].MessageID != tc.id+100 {
+			t.Fatalf("%s progress after delivery = %+v", tc.state, targets)
 		}
 	}
 }
@@ -660,23 +821,24 @@ func TestFailedReplyMakesProgressCleanupReady(t *testing.T) {
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
 	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, s.SetProgressMessage(10, 99))
+	requireStoreOK(t, s.SetProgressMessage(10, 7, 99))
 	out, err := s.NextOutput()
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
-	if _, ready, err := s.CompletedProgressMessage(10); err != nil || ready {
-		t.Fatalf("in-flight reply progress became ready=%t, err=%v", ready, err)
+	if targets, err := s.CompletedProgressMessages(10); err != nil || len(targets) != 0 {
+		t.Fatalf("in-flight reply progress = %+v, err=%v", targets, err)
 	}
 	requireStoreOK(t, s.MarkOutput(out.ID, OutboxFailed))
-	target, ready, err := s.CompletedProgressMessage(10)
+	targets, err := s.CompletedProgressMessages(10)
 	requireStoreOK(t, err)
-	if !ready || target != (ProgressMessage{InboxID: 10, Chat: 7, MessageID: 99}) {
-		t.Fatalf("failed reply progress = %+v, ready=%t", target, ready)
+	want := ProgressMessage{InboxID: 10, Chat: 7, MessageID: 99}
+	if len(targets) != 1 || targets[0] != want {
+		t.Fatalf("failed reply progress = %+v", targets)
 	}
-	messages, err := s.CompletedProgressMessages()
+	messages, err := s.CompletedProgressMessages(0)
 	requireStoreOK(t, err)
-	if len(messages) != 1 || messages[0] != target {
-		t.Fatalf("startup failed-reply progress = %+v, want [%+v]", messages, target)
+	if len(messages) != 1 || messages[0] != want {
+		t.Fatalf("startup failed-reply progress = %+v, want [%+v]", messages, want)
 	}
 }
 
@@ -745,6 +907,38 @@ func TestClaimNextOutputDoesNotBlockOtherConversations(t *testing.T) {
 	}
 	if _, err = s.ClaimNextOutput(context.Background(), now+60); err != nil {
 		t.Fatalf("rate-limited output did not become claimable: %v", err)
+	}
+}
+
+func TestHasPendingOutputsScopesActiveAndRetryingDeliveries(t *testing.T) {
+	for _, state := range []string{"pending", "sending", "retry-pending", "done", "failed", "uncertain", "cancelled", "sent"} {
+		t.Run(state, func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			requireStoreOK(t, s.Enqueue(-10, 11, "queued body"))
+			out, err := s.NextOutput()
+			requireStoreOK(t, err)
+			if state != "pending" {
+				requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
+				if state == "retry-pending" {
+					requireStoreOK(t, s.RetryOutput(out.ID, time.Now().Add(time.Hour).Unix()))
+				} else if state != "sending" {
+					requireStoreOK(t, s.MarkOutput(out.ID, OutboxState(state)))
+				}
+			}
+			pending, err := s.HasPendingOutputs(-10, 11)
+			requireStoreOK(t, err)
+			want := state == "pending" || state == "sending" || state == "retry-pending"
+			if pending != want {
+				t.Fatalf("HasPendingOutputs = %t, want %t for %s", pending, want, state)
+			}
+			for _, other := range [][2]int64{{-10, 22}, {-20, 11}} {
+				pending, err := s.HasPendingOutputs(other[0], other[1])
+				requireStoreOK(t, err)
+				if pending {
+					t.Fatalf("another conversation inherited pending delivery: %v", other)
+				}
+			}
+		})
 	}
 }
 
@@ -838,12 +1032,12 @@ func TestAcceptIgnoredAtomicMinimalDedupAndOffset(t *testing.T) {
 
 	var rawType, state string
 	var rawLength int
-	var replyTo, progressMessageID, createdAt, updatedAt int64
-	requireStoreOK(t, s.DB.QueryRow("SELECT typeof(raw),length(raw),state,reply_to,progress_message_id,created_at,updated_at FROM inbox WHERE id=30").Scan(
-		&rawType, &rawLength, &state, &replyTo, &progressMessageID, &createdAt, &updatedAt,
+	var replyTo, createdAt, updatedAt int64
+	requireStoreOK(t, s.DB.QueryRow("SELECT typeof(raw),length(raw),state,reply_to,created_at,updated_at FROM inbox WHERE id=30").Scan(
+		&rawType, &rawLength, &state, &replyTo, &createdAt, &updatedAt,
 	))
-	if rawType != "blob" || rawLength != 0 || state != string(InboxIgnored) || replyTo != 0 || progressMessageID != 0 || createdAt <= 0 || updatedAt != createdAt {
-		t.Fatalf("ignored row retained data or missed receive time: raw=%s/%d state=%s reply=%d progress=%d created=%d updated=%d", rawType, rawLength, state, replyTo, progressMessageID, createdAt, updatedAt)
+	if rawType != "blob" || rawLength != 0 || state != string(InboxIgnored) || replyTo != 0 || createdAt <= 0 || updatedAt != createdAt {
+		t.Fatalf("ignored row retained data or missed receive time: raw=%s/%d state=%s reply=%d created=%d updated=%d", rawType, rawLength, state, replyTo, createdAt, updatedAt)
 	}
 	offset, err := s.Offset()
 	requireStoreOK(t, err)
@@ -1252,7 +1446,7 @@ PRAGMA user_version=3;`)
 	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM inbox WHERE id=1").Scan(&inboxReplyTo))
 	requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM outbox WHERE id=1").Scan(&outboxReplyTo))
 	requireStoreOK(t, s.DB.QueryRow("SELECT session_id FROM bindings WHERE bot=1 AND chat=2 AND thread=3").Scan(&sessionID))
-	requireStoreOK(t, s.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=1").Scan(&progressMessageID))
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM progress_messages WHERE inbox_id=1").Scan(&progressMessageID))
 	requireStoreOK(t, s.DB.QueryRow("SELECT inbox_id FROM outbox WHERE id=1").Scan(&outboxInboxID))
 	if version != schemaVersion || inboxCreated <= 0 || inboxUpdated <= 0 || outboxCreated <= 0 || outboxUpdated <= 0 || inboxReplyTo != 0 || outboxReplyTo != 0 || progressMessageID != 0 || outboxInboxID != 0 || sessionID != "01a0afcf-303b-775f-adda-fe30af90a116" {
 		t.Fatalf("version/message migration = version=%d times=%d/%d/%d/%d replies=%d/%d progress=%d/%d session=%q", version, inboxCreated, inboxUpdated, outboxCreated, outboxUpdated, inboxReplyTo, outboxReplyTo, progressMessageID, outboxInboxID, sessionID)
@@ -1330,7 +1524,7 @@ func TestCleanupMessagesRetainsProgressAssociationWithActiveOutbox(t *testing.T)
 	requireStoreOK(t, s.Accept(1, []byte(`{}`)))
 	requireStoreOK(t, s.Mark(1, "submitted"))
 	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 1, 2, 3, []string{"reply"}))
-	requireStoreOK(t, s.SetProgressMessage(1, 77))
+	requireStoreOK(t, s.SetProgressMessage(1, 2, 77))
 	out, err := s.NextOutput()
 	requireStoreOK(t, err)
 	old := time.Now().AddDate(0, 0, -91).Unix()
@@ -1345,12 +1539,18 @@ func TestCleanupMessagesRetainsProgressAssociationWithActiveOutbox(t *testing.T)
 	requireStoreOK(t, setMessageTimes(s, old, old, nil, []int64{out.ID}))
 	result, err = s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)
+	if result.Inbox != 0 || result.Outbox != 0 {
+		t.Fatalf("retention discarded undeleted terminal progress: %+v", result)
+	}
+	requireStoreOK(t, s.ClearProgressMessage(1, 77))
+	result, err = s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
 	if result.Inbox != 1 || result.Outbox != 1 {
-		t.Fatalf("cleanup after outbox became terminal = %+v, want inbox=1 outbox=1", result)
+		t.Fatalf("cleanup after progress deletion = %+v, want inbox=1 outbox=1", result)
 	}
 }
 
-func TestCleanupMessagesReleasesExpiredTerminalProgressAssociations(t *testing.T) {
+func TestCleanupMessagesRetainsExpiredTerminalProgressUntilDeletion(t *testing.T) {
 	s := openTestStore(t, t.TempDir())
 	cases := []struct {
 		id          int64
@@ -1380,16 +1580,33 @@ func TestCleanupMessagesReleasesExpiredTerminalProgressAssociations(t *testing.T
 		requireStoreOK(t, err)
 		requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
 		requireStoreOK(t, s.MarkOutput(out.ID, tc.outboxState))
-		requireStoreOK(t, s.SetProgressMessage(tc.id, tc.id+100))
+		requireStoreOK(t, s.SetProgressMessage(tc.id, 7, tc.id+100))
+		requireStoreOK(t, s.SetProgressMessage(tc.id, 7, tc.id+200))
 		requireStoreOK(t, setMessageTimes(s, old, old, []int64{tc.id}, []int64{out.ID}))
 	}
 	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 0 || result.Outbox != 0 {
+		t.Fatalf("expired terminal progress was discarded: %+v", result)
+	}
+	for _, tc := range cases {
+		requireStoreOK(t, s.ClearProgressMessage(tc.id, tc.id+100))
+	}
+	result, err = s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 0 || result.Outbox != 0 {
+		t.Fatalf("retention discarded a root with another preview: %+v", result)
+	}
+	for _, tc := range cases {
+		requireStoreOK(t, s.ClearProgressMessage(tc.id, tc.id+200))
+	}
+	result, err = s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)
 	if result.Inbox != int64(len(cases)) || result.Outbox != int64(len(cases)) {
 		t.Fatalf("expired terminal progress cleanup = %+v, want inbox=%d outbox=%d", result, len(cases), len(cases))
 	}
 	var remaining int
-	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM inbox WHERE progress_message_id>0").Scan(&remaining))
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM progress_messages").Scan(&remaining))
 	if remaining != 0 {
 		t.Fatalf("expired progress associations remained: %d", remaining)
 	}
@@ -1477,7 +1694,7 @@ PRAGMA user_version=10;`)
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	out, err := s.NextOutput()
 	requireStoreOK(t, err)
-	if version != schemaVersion || out.ID != 1 || out.AttemptCount != 11 || out.ServerRetryCount != 0 || out.NextAttemptAt != 123 {
+	if version != schemaVersion || out.ID != 1 || out.AttemptCount != 11 || out.ServerRetryCount != 0 || out.NextAttemptAt != 123 || out.Header != "" || out.MessageID != 0 {
 		t.Fatalf("v10 retry migration = version %d, output %+v, want separate retry count initialized to zero", version, out)
 	}
 }
@@ -1766,4 +1983,380 @@ func setMessageTimes(s *Store, created, updated int64, inbox, outbox []int64) er
 		}
 	}
 	return nil
+}
+
+func TestOnlyFirstTextReplyQuotesRootAcrossAppendsAndCompletion(t *testing.T) {
+	for _, assistant := range []bool{false, true} {
+		t.Run(strconv.FormatBool(assistant), func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			ctx := context.Background()
+			requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+			requireStoreOK(t, s.Submit(10, 42))
+			appendReplies := func(replies []string) error {
+				if assistant {
+					_, err := s.AppendAssistantReplies(ctx, 10, 7, 8, replies, "status")
+					return err
+				}
+				return s.AppendInboxReplies(ctx, 10, 7, 8, replies)
+			}
+			requireStoreOK(t, appendReplies(nil))
+			_, err := s.DB.Exec(`CREATE TRIGGER reject_quote_reply BEFORE INSERT ON outbox WHEN NEW.text='rejected' BEGIN SELECT RAISE(FAIL,'injected reply failure'); END`)
+			requireStoreOK(t, err)
+			if err := appendReplies([]string{"rolled back append", "rejected"}); err == nil {
+				t.Fatal("append ignored a failed split part")
+			}
+			if err := s.CompleteInboxWithReplies(ctx, 10, 7, 8, []string{"rolled back completion", "rejected"}); err == nil {
+				t.Fatal("completion ignored a failed split part")
+			}
+			consume := func(replies []string, firstReplyTo int64) {
+				t.Helper()
+				for i, text := range replies {
+					out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+					requireStoreOK(t, err)
+					var replyTo int64
+					if i == 0 {
+						replyTo = firstReplyTo
+					}
+					if out.Text != text || out.ReplyTo != replyTo || out.InboxID != 10 {
+						t.Fatalf("text reply = %+v, want %q replying to %d with original owner", out, text, replyTo)
+					}
+					requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header))
+				}
+			}
+			first := []string{"first body", "first split part"}
+			requireStoreOK(t, appendReplies(first))
+			consume(first, 42)
+			second := []string{"second body", "second split part"}
+			requireStoreOK(t, appendReplies(second))
+			final := []string{"final body", "final split part"}
+			requireStoreOK(t, s.CompleteInboxWithReplies(ctx, 10, 7, 8, final))
+			consume(second, 0)
+			consume(final, 0)
+			var rootReplyTo int64
+			requireStoreOK(t, s.DB.QueryRow("SELECT reply_to FROM inbox WHERE id=10").Scan(&rootReplyTo))
+			if rootReplyTo != 42 {
+				t.Fatalf("presentation policy changed root identity: %d", rootReplyTo)
+			}
+		})
+	}
+}
+
+func TestAssistantHeaderUpdatesBeforeDuringAndAfterSend(t *testing.T) {
+	for _, stage := range []string{"before", "during", "after"} {
+		t.Run(stage, func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			ctx := context.Background()
+			requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+			requireStoreOK(t, s.Submit(10, 42))
+			const body = "  immutable 正文🙂\n\nlast line  "
+			id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{body, "second page"}, "initial")
+			requireStoreOK(t, err)
+			if id <= 0 {
+				t.Fatalf("assistant output ID = %d", id)
+			}
+			if stage == "before" {
+				requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
+			}
+			out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+			requireStoreOK(t, err)
+			wantHeader := "initial"
+			if stage == "before" {
+				wantHeader = "updated"
+			}
+			if out.ID != id || out.Text != body || out.Header != wantHeader || out.ReplyTo != 42 || out.MessageID != 0 {
+				t.Fatalf("claimed assistant output = %+v", out)
+			}
+			if stage == "during" {
+				requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
+			}
+			requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+			if stage == "after" {
+				requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
+			}
+			header, err := s.NextAssistantHeader()
+			if stage == "before" {
+				if !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("already-sent latest header became pending: %+v, %v", header, err)
+				}
+			} else {
+				requireStoreOK(t, err)
+				if header.ID != id || header.Text != body || header.Header != "updated" || header.MessageID != 100 {
+					t.Fatalf("status-only delivery = %+v", header)
+				}
+				requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header))
+			}
+			var storedBody, state string
+			requireStoreOK(t, s.DB.QueryRow("SELECT text FROM outbox WHERE id=?", id).Scan(&storedBody))
+			requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+			if storedBody != body || state != "submitted" {
+				t.Fatalf("header delivery changed body/owner: %q/%q", storedBody, state)
+			}
+			second, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+			requireStoreOK(t, err)
+			if second.Text != "second page" || second.Header != "" || second.ReplyTo != 0 {
+				t.Fatalf("continuation page acquired a header or repeated the original quote: %+v", second)
+			}
+			requireStoreOK(t, s.MarkOutputDelivered(second.ID, 101, ""))
+			if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("body was replayed after header update: %v", err)
+			}
+			if err := s.MarkOutputDelivered(id, 102, "updated"); !errors.Is(err, ErrOutboxStateTransition) {
+				t.Fatalf("duplicate body delivery transition = %v", err)
+			}
+		})
+	}
+}
+
+func TestAssistantHeaderSnapshotCASAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	ctx := context.Background()
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	var ids []int64
+	for _, body := range []string{"first immutable body", "second immutable body"} {
+		id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{body}, "initial")
+		requireStoreOK(t, err)
+		ids = append(ids, id)
+		out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+		requireStoreOK(t, err)
+		requireStoreOK(t, s.MarkOutputDelivered(out.ID, id+100, out.Header))
+		requireStoreOK(t, s.SetAssistantHeader(ctx, id, "snapshot one"))
+	}
+	first, err := s.NextAssistantHeader()
+	requireStoreOK(t, err)
+	if first.ID != ids[0] {
+		t.Fatalf("oldest header = %+v, want ID %d", first, ids[0])
+	}
+	requireStoreOK(t, s.SetAssistantHeader(ctx, first.ID, "snapshot two"))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(first.ID, first.Header))
+	first, err = s.NextAssistantHeader()
+	requireStoreOK(t, err)
+	if first.ID != ids[0] || first.Header != "snapshot two" {
+		t.Fatalf("old snapshot cleared a new update: %+v", first)
+	}
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(first.ID, first.Header))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	second, err := s.NextAssistantHeader()
+	requireStoreOK(t, err)
+	if second.ID != ids[1] || second.Text != "second immutable body" || second.Header != "snapshot one" || second.MessageID != second.ID+100 {
+		t.Fatalf("restarted header delivery = %+v", second)
+	}
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(second.ID, second.Header))
+	if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("settled status header remained pending: %v", err)
+	}
+	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("restart replayed delivered assistant body: %v", err)
+	}
+}
+
+func TestAssistantHeaderSendingRecoveryDoesNotGuessDelivery(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	ctx := context.Background()
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"possibly delivered body"}, "initial")
+	requireStoreOK(t, err)
+	_, err = s.ClaimNextOutput(ctx, time.Now().Unix())
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.SetAssistantHeader(ctx, id, "late status"))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var state, body string
+	var messageID int64
+	requireStoreOK(t, s.DB.QueryRow("SELECT state,text,message_id FROM outbox WHERE id=?", id).Scan(&state, &body, &messageID))
+	if state != "uncertain" || body != "possibly delivered body" || messageID != 0 {
+		t.Fatalf("ambiguous recovery guessed delivery: %q/%q/%d", state, body, messageID)
+	}
+	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("ambiguous body was replayed: %v", err)
+	}
+	if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("header edit guessed a Telegram message ID: %v", err)
+	}
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	requireStoreOK(t, setMessageTimes(s, old, old, []int64{10}, []int64{id}))
+	result, err := s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Inbox != 1 || result.Outbox != 1 {
+		t.Fatalf("ambiguous body did not expire after recovery: %+v", result)
+	}
+}
+
+func TestCleanupMessagesReleasesUndeliverableAssistantHeaders(t *testing.T) {
+	for _, state := range []OutboxState{OutboxFailed, OutboxUncertain, OutboxCancelled, OutboxSent, OutboxDone} {
+		for _, stage := range []string{"before", "after"} {
+			for _, update := range []string{"status", "completion"} {
+				t.Run(string(state)+"/"+stage+"/"+update, func(t *testing.T) {
+					s := openTestStore(t, t.TempDir())
+					ctx := context.Background()
+					requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+					requireStoreOK(t, s.Submit(10, 42))
+					id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"undeliverable body"}, "initial")
+					requireStoreOK(t, err)
+					_, err = s.ClaimNextOutput(ctx, time.Now().Unix())
+					requireStoreOK(t, err)
+					if stage == "after" {
+						requireStoreOK(t, s.MarkOutput(id, state))
+					}
+					if update == "completion" {
+						requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "final", nil))
+					} else {
+						requireStoreOK(t, s.SetAssistantHeader(ctx, id, "final"))
+						requireStoreOK(t, s.FinishSubmitted(10, InboxDone))
+					}
+					if stage == "before" {
+						requireStoreOK(t, s.MarkOutput(id, state))
+					}
+					if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+						t.Fatalf("terminal assistant body became replayable: %v", err)
+					}
+					if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
+						t.Fatalf("undeliverable body acquired an editable header: %v", err)
+					}
+					old := time.Now().AddDate(0, 0, -91).Unix()
+					requireStoreOK(t, setMessageTimes(s, old, old, []int64{10}, []int64{id}))
+					result, err := s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
+					requireStoreOK(t, err)
+					if result.Inbox != 1 || result.Outbox != 1 {
+						t.Fatalf("undeliverable assistant body did not expire: %+v", result)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCleanupMessagesRetainsActiveAssistantBodies(t *testing.T) {
+	for _, state := range []OutboxState{OutboxPending, OutboxSending} {
+		t.Run(string(state), func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			ctx := context.Background()
+			requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+			requireStoreOK(t, s.Submit(10, 42))
+			id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"active immutable body"}, "initial")
+			requireStoreOK(t, err)
+			if state == OutboxSending {
+				_, err = s.ClaimNextOutput(ctx, time.Now().Unix())
+				requireStoreOK(t, err)
+			}
+			requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "final", nil))
+			old := time.Now().AddDate(0, 0, -91).Unix()
+			requireStoreOK(t, setMessageTimes(s, old, old, []int64{10}, []int64{id}))
+			result, err := s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
+			requireStoreOK(t, err)
+			if result.Outbox != 0 {
+				t.Fatalf("active assistant body expired: %+v", result)
+			}
+			if state == OutboxPending {
+				out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+				requireStoreOK(t, err)
+				if out.ID != id || out.Text != "active immutable body" || out.Header != "final" {
+					t.Fatalf("retained pending body changed: %+v", out)
+				}
+			} else {
+				requireStoreOK(t, s.MarkOutputDelivered(id, 100, "initial"))
+				out, err := s.NextAssistantHeader()
+				requireStoreOK(t, err)
+				if out.ID != id || out.Text != "active immutable body" || out.Header != "final" || out.MessageID != 100 {
+					t.Fatalf("retained sending body lost its header update: %+v", out)
+				}
+			}
+		})
+	}
+}
+
+func TestAssistantHeaderDoesNotModifyOrdinaryOutputAndSurvivesRetention(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	ctx := context.Background()
+	requireStoreOK(t, s.Enqueue(7, 8, "ordinary text"))
+	ordinary, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+	requireStoreOK(t, err)
+	if err := s.SetAssistantHeader(ctx, ordinary.ID, "not assistant"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("ordinary output accepted assistant header: %v", err)
+	}
+	requireStoreOK(t, s.MarkOutputDelivered(ordinary.ID, 90, ""))
+	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, s.Submit(10, 42))
+	id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"retained immutable body"}, "initial")
+	requireStoreOK(t, err)
+	out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+	requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
+	requireStoreOK(t, s.FinishSubmitted(10, InboxDone))
+	old := time.Now().AddDate(0, 0, -91).Unix()
+	requireStoreOK(t, setMessageTimes(s, old, old, []int64{10}, []int64{id}))
+	result, err := s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Outbox != 0 {
+		t.Fatalf("retention discarded pending status header: %+v", result)
+	}
+	header, err := s.NextAssistantHeader()
+	requireStoreOK(t, err)
+	if header.ID != id || header.Text != "retained immutable body" {
+		t.Fatalf("retained header lost body: %+v", header)
+	}
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header))
+	result, err = s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
+	requireStoreOK(t, err)
+	if result.Outbox != 1 {
+		t.Fatalf("settled header was not released for retention: %+v", result)
+	}
+}
+
+func TestAssistantReplyAppendAndHeaderCompletionAreAtomic(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	ctx := context.Background()
+	for _, id := range []int64{10, 11} {
+		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
+		requireStoreOK(t, s.Submit(id, 42))
+	}
+	_, err := s.DB.Exec(`CREATE TRIGGER reject_assistant_reply BEFORE INSERT ON outbox WHEN NEW.text='rejected' BEGIN SELECT RAISE(FAIL,'injected reply failure'); END`)
+	requireStoreOK(t, err)
+	if id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"first", "rejected"}, "initial"); err == nil || id != 0 {
+		t.Fatalf("failed append returned success/ID: %d, %v", id, err)
+	}
+	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("failed assistant append left partial body: %v", err)
+	}
+	id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"immutable body"}, "initial")
+	requireStoreOK(t, err)
+	if err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "done", []string{"rejected"}); err == nil {
+		t.Fatal("completion ignored failed reply insertion")
+	}
+	if err := s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, id, "wrong root", []string{"must roll back"}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("completion accepted a header from another owner: %v", err)
+	}
+	_, err = s.DB.Exec(`CREATE TRIGGER reject_assistant_header BEFORE UPDATE OF header ON outbox WHEN NEW.header='rejected header' BEGIN SELECT RAISE(FAIL,'injected header failure'); END`)
+	requireStoreOK(t, err)
+	if err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "rejected header", []string{"must also roll back"}); err == nil {
+		t.Fatal("completion ignored failed header update")
+	}
+	var count, pending int
+	var body, header, state string
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&count))
+	requireStoreOK(t, s.DB.QueryRow("SELECT text,header,header_pending FROM outbox WHERE id=?", id).Scan(&body, &header, &pending))
+	if count != 1 || body != "immutable body" || header != "initial" || pending != 0 {
+		t.Fatalf("failed completion changed outbox: %d/%q/%q/%d", count, body, header, pending)
+	}
+	for _, inboxID := range []int64{10, 11} {
+		requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=?", inboxID).Scan(&state))
+		if state != "submitted" {
+			t.Fatalf("failed completion changed owner %d to %q", inboxID, state)
+		}
+	}
+	requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, "done", []string{"final notice"}))
+	requireStoreOK(t, s.DB.QueryRow("SELECT text,header,header_pending FROM outbox WHERE id=?", id).Scan(&body, &header, &pending))
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if body != "immutable body" || header != "done" || pending != 1 || state != "done" {
+		t.Fatalf("atomic completion = %q/%q/%d/%q", body, header, pending, state)
+	}
+	requireStoreOK(t, s.CompleteInboxWithAssistantHeader(ctx, 11, 7, 8, 0, "ignored", []string{"ordinary completion"}))
+	if _, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"late body"}, "late"); err == nil {
+		t.Fatal("terminal owner accepted new assistant body")
+	}
 }

@@ -23,7 +23,7 @@ Each ordinary private chat or topic has its own OMP session. Different conversat
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
 
-Tested with OMP 18.12.2. See the [architecture document](doc/architecture.md) for verification scenarios and limitations.
+Tested with OMP 18.17.0. See the [architecture document](doc/architecture.md) for verification scenarios and limitations.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -68,6 +68,7 @@ token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
+progress_recent_tools = 5
 provider_usage = false
 
 [omp]
@@ -127,10 +128,11 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.token` | Telegram bot token. Prefer an environment reference. |
 | `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists. Values may be literal integers or comma-separated environment values. |
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
+| `telegram.progress_recent_tools` | Maximum completed tools retained in verbose Recent history. Default: `5`; range: `1..100`. Display may show fewer to fit Telegram's message limit. |
 | `telegram.provider_usage` | Opt in to native `/usage` 5h/7d used percentages in final reply headers. TOML boolean; default `false`. Independent of progress mode. |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
-| `omp.args_labels` | Optional literal Telegram picker labels, one per preset. Missing, blank, or mismatched labels fall back to `Preset N` and log a startup warning. Long labels are shortened to fit buttons. Labels are visible in the conversation; never put credentials in them. |
+| `omp.args_labels` | Optional Telegram picker labels, one per preset; invalid labels fall back to `Preset N`. Labels are visible in the conversation, so never put credentials in them. |
 | `omp.migration_extension` | Load the bundled migration Extension on every OMP startup, including resume, for all argument presets. Default: `false`. No separate Extension installation is required. |
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
 | `storage.data_dir` | Database, lock, incoming/outgoing attachment storage, and generated bridge Extension cache. Default: the executable directory. |
@@ -143,11 +145,9 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `logging.format` | Log format: `text` or `json`. Default: `text`. |
 | `[logging.component_levels]` | Optional per-component levels for `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. |
 
-Each `omp.args` array item is a complete shell-style argument string, parsed for quoting but passed directly without a shell. OMP's own configuration remains unchanged unless explicitly selected through these arguments or a user-requested command. The saved-model restore fallback below is the only automatic model-selection exception.
+Each `omp.args` item is a complete argument preset, with shell-style quoting but no shell execution. OMP configuration changes only through explicit arguments or user commands, apart from the saved-model recovery fallback described below.
 
-`/args` selection applies across all conversations and survives service restarts. Switching requires the current conversation to be idle with no queued work. It immediately restarts this conversation's OMP process with the selected arguments and restores the same saved session; an open released session is restored immediately too. Other connected processes keep their launch arguments until their next start. A closed or absent session is not opened. If the session cannot be safely restored from disk, switching is refused before stopping it. If startup fails after the selection was saved, the new preset and original binding remain saved, and the failure is reported without replaying work. Changing preset definitions or expanded argument values resets selection to preset 1 on service startup; changing display labels alone does not.
-
-After an `/args` restart, the bridge selects the new configuration's native `default` model role instead of retaining the model recorded in the old session. Role resolution and any associated thinking adjustment remain OMP's behavior; the bridge does not send extra thinking or fast-mode changes.
+`/args` selects a global preset that survives service restarts. Switching requires an idle conversation with no queued work. It restarts the current open session with the new preset and its native `default` model role; other conversations use it on their next process start. Closed sessions stay closed. A failed restart preserves the selected preset and saved session. Changing preset values resets selection to preset 1; changing labels alone does not.
 
 To explicitly restrict OMP children, replace the existing `[omp.environment]` table with the following. Do not configure `allow` and `deny` together, even if one list is empty.
 
@@ -210,22 +210,22 @@ A named workspace is created when it does not exist. Existing files are not copi
 
 | Command | What it does |
 | --- | --- |
-| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. On a topic's first session, the bridge attempts to use the workspace name as its title, adding `[thread ID]` only when that name is already recorded for another topic in the same chat. |
+| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
 | `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
 | `/followup <message>` | Queue a separate prompt instead of steering the active task. |
 | `/close` | Close the current session while preserving its files and OMP history. |
-| `/bindings` | List this chat's saved conversation/session bindings as name, topic, logical session icon (`📖` Open / `📕` Closed / `⏳` pending), age and home-abbreviated workspace. Ages use one untranslated unit (`m/h/d/w/mo/y`), `now` under one minute, or `-` when unknown. Icons do not indicate OMP process liveness. Tap an eligible entry, then choose `Binding` to keep local session history, `Binding+Session` to delete an existing, verified native session and its artifacts or clean Bridge references to a confirmed missing file, or `Cancel`. Workspace files are preserved. |
-| `/bindings old` | Cleanup order: Closed first, then Open, each least recently used first; Pending entries last. Open includes released runtimes. Unknown times follow known times within each group. |
-| `/resume` | Choose a saved native OMP session from the current workspace. Pin/Unpin entries or Delete a session after confirmation. Re-selecting the current open session keeps its binding and runtime state. |
+| `/bindings` | List and manage this chat's saved conversation/session bindings. Icons show logical Open, Closed, or Pending state, not process liveness. See deletion options below. |
+| `/bindings old` | List Closed before Open, oldest first in each group; Pending entries last. |
+| `/resume` | Choose a saved OMP session from the current workspace, pin/unpin it, or delete it after confirmation. |
 | `/resume <session ID>` | Resume the specified native OMP session; OMP may restore its recorded working directory. |
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
 | `/status` | Show the current workspace, session with its full native ID, model, thinking, fast-mode, context, runtime, and queue status. |
 | `/args [preset-number]` | View preset labels or, while idle, select a preset and immediately apply it to this conversation's open session. Other conversations use it on their next process start. |
-| `/doctor` | Run safe, asynchronous bridge diagnostics, including the current topic's delivery head/wait and global queue counts, without starting or changing the OMP session. |
+| `/doctor` | Run safe bridge diagnostics without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
 | `/model` | Choose a configured OMP model role with buttons. |
 | `/model provider/model` | Switch to a specific model while idle. |
@@ -239,23 +239,11 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/lang [en\|zh]` | Show the global Bridge interface language, or switch it to English or Chinese for all chats and topics. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
 
-Topic-name checks use persisted Bridge title records and authorized topic-created/edited updates, not workspace or session names. Other topics are never renamed to resolve a collision. Long names are shortened to preserve the full suffix within Telegram's 128 UTF-16-unit limit. The Bot API cannot list all topic titles: existing unobserved titles are not backfilled from session paths, and unreported manual renames or deletions can leave records incomplete or stale. In those cases, a collision may be missed or an unnecessary suffix retained. This does not work around Telegram clients failing to display a successful private-topic rename.
-
-In-flight auto-renames keep their name claims despite title events. If an event and an HTTP result leave the final title ambiguous, both possible names stay occupied until a later title event. Graceful shutdown settles known rename outcomes without sending shutdown notices; uncertain requests are never replayed.
-
-`Binding+Session` invokes OMP native deletion only when the session file exists and identity checks pass. After confirmed deletion, it clears all same-ID bindings under this bot, including other topics with Closed bindings or released runtimes. A confirmed missing file follows the reference-only path below, without starting OMP. Deletion depends on actual session use, not the number of bindings or their logical Open state. An Open binding with a released runtime does not block deletion; an in-use OMP runtime, active task, startup or migration does. `Binding` removes only the selected binding, preserving other topics' bindings and the native session.
-
-If the bound native Session file is already missing, `Binding+Session` rechecks its absence before clearing related bindings and pins. A restored file, a failed recheck, or a different/empty path in any same-ID binding under this bot preserves all references. A database cleanup failure is reported separately and does not claim native deletion. Unless cancelled, each outcome returns to the bindings list. This path does not start OMP or recreate the workspace.
-
-Closing or replacing the requesting conversation invalidates pending target-close replies and cancels missing-file reference cleanup. Cancellation and timeout handling includes database-connection waits and the cleanup transaction. The target may already be Closed; confirmed native deletion still requires reference settlement even after cancellation. On Linux, existing workspace ancestors need directory search permission, not permission to read directory entries.
-
-Graceful shutdown still settles references for confirmed native deletions before closing the database; cleanup failures are logged. It sends no shutdown deletion notices or picker refreshes. Native deletion and SQLite cleanup are not atomic across crashes or forced termination.
-
-Session-reference cleanup is limited to this bot's same-ID bindings, Bridge history rows matching the file paths currently recorded by those bindings, and this bot's same-ID pins. It does not sweep unrelated/orphan history across the database, remove other bots' references, or clear all project history. The missing-file path neither searches for nor removes remaining OMP artifacts. Workspace files are preserved.
+On a topic's first session, the bridge attempts to use the workspace name as its title, adding `[thread ID]` for a known duplicate in the same chat. Telegram cannot provide a complete topic list, so unobserved or manually renamed titles may cause missed collisions or unnecessary suffixes. Other topics are not renamed.
 
 A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
 
-`/fast` bypasses the prompt queue and steer path. OMP interprets its arguments, provider/model support, and output; receipts are separate from the running task's answer. Changes apply to subsequent provider requests, not a request already in flight. An unconfirmed control is never replayed automatically; an uncertain runtime is closed.
+`/fast` runs immediately, including during a task. OMP determines supported arguments and models. Changes affect subsequent model requests, not one already in flight; its receipt is separate from the task's answer.
 
 Ordinary text starts a task when the conversation is idle. While an OMP task is active, OMP may accept ordinary text as a steer. Use `/followup <message>` to queue a separate prompt instead. Attachments, `/review`, and native commands without dedicated control handling use the conversation queue and run sequentially. Different conversations can run concurrently up to the configured worker capacity.
 
@@ -278,19 +266,9 @@ The exact native `/autoresearch` extension has dedicated support. The following 
 
 The Telegram menu lists bridge commands and available native commands. Telegram allows at most 100 entries with restricted command names; supported commands that do not fit can still be typed manually.
 
-At startup, one temporary OMP RPC process discovers built-in commands before chat menus are published. It sends no prompt and saves no session; workspace-specific commands appear after their sessions connect. If discovery fails, the bridge menu remains available.
+Workspace-specific commands appear after their session connects. Names and descriptions come from OMP. Native command output is delivered separately from task replies.
 
-Native commands and aliases use descriptions advertised by OMP; commands without usable descriptions keep a generic label. These descriptions are visible to everyone who can view the chat.
-
-Native text output, including `/shake` summaries, is delivered as separate messages. Local commands do not require a model reply; later background output does not confirm task completion.
-
-Command recognition and source restrictions are documented in [Architecture](doc/architecture.md#native-command-recognition-and-submission).
-
-All commands work in ordinary private chats and topics. Bridge-generated menus, buttons, and service messages default to English. `/lang` shows the global setting; `/lang zh` selects Chinese and `/lang en` selects English. Any authorized user can change it for all chats and topics, and the setting survives daemon restarts. Changes apply to newly generated Bridge text and refreshed command menus; previously rendered messages are not rewritten. OMP replies, native dialog content and command descriptions, model/tool content, user captions, session titles, and paths are not translated. Prompts may use any language.
-
-A task started with the English interface can finish with a Chinese Bridge receipt or reply header if `/lang zh` is used while it runs. This does not translate the OMP reply or rewrite earlier messages.
-
-Telegram command menus update asynchronously. Temporary API failures and rate limits trigger retries with backoff using the latest global language; already acknowledged scopes are not resent. A language-change receipt confirms the saved setting, not that every menu has already updated. Permanent API rejections do not trigger continuous background retries.
+`/lang en` and `/lang zh` set the Bridge interface language globally for all private chats and topics. Any authorized user can change it, and the setting survives restarts. New Bridge messages use the new language; command menus may take longer to update. Existing messages, OMP replies, native dialogs and descriptions, and user content are not translated. Prompts may use any language.
 
 In a group topic, all allowed users share that topic's OMP session and workspace, including its context and command effects. Telegram group membership is not restricted by the bot's user allowlist: other members who can view the topic can also see bot replies and exported files. Use a trusted group topic for sensitive work.
 
@@ -316,7 +294,11 @@ The bridge does not lock or isolate workspaces across conversations. OMP session
 
 ### Delete a saved session
 
-In `/resume`, choose **Delete**, then confirm with the red **Delete** button. The bridge shows this confirmation only after checking that no runtime or in-flight operation is using the session. If work is still active, it explains why deletion is blocked and offers no force-delete option. OMP removes the selected session history and artifacts, and the bridge clears saved bindings and pins that reference it. Workspace files and Telegram topics remain. This action cannot be undone.
+In `/resume`, choose **Delete**, then confirm with the red **Delete** button. Sessions in use cannot be deleted; there is no force-delete option.
+
+In `/bindings`, choose **Binding** to forget only that entry while preserving native history, or **Binding+Session** to delete the native session and its bindings and pins across this bot's conversations. If the session file is already missing, only stale Bridge references are removed.
+
+Native session deletion is irreversible. Workspace files and Telegram topics are preserved.
 
 ### Session export
 
@@ -355,31 +337,27 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 
 Voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
 
-Very large replies may be truncated with an explicit notice. OMP's native session history is not truncated by the bridge.
+Very large output or many replies may be truncated with an explicit notice. OMP's native session history is not truncated.
 
 ## Progress UI
 
 `telegram.progress_mode` controls live task progress:
 
 - `off` disables progress messages and typing actions.
-- `summary` shows assistant output, active tools, and task state.
+- `summary` shows active tools, task state, and the current assistant text preview.
 - `verbose` additionally shows recent observable tool activity. Tool details are unredacted and may contain credentials or private content visible to everyone who can read the conversation.
 
-Progress for a new task appears after about three seconds, so short tasks normally produce only their final reply. Active tasks include a **Stop** button; it stops the current task, while `/stop` also clears waiting tasks.
+Progress appears after about three seconds and includes a **Stop** button for the current task. Its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies.
 
-Stop does not wait for Telegram callback acknowledgment or button removal. Both are best-effort asynchronous UI operations.
+Steer input and completed assistant messages remove the task's older Progress bubbles without restarting OMP. A new preview waits for preceding formal replies to be delivered and appears below the latest input/reply. Remaining temporary Progress bubbles are cleaned up when the task ends; formal replies remain.
 
-Progress is best-effort and may not show every task transition. It does not affect task execution or final replies.
+Completed assistant messages use **💬** and are sent immediately, even with progress off. Confirmed task success changes only the latest formal status bar to **✅**; cancellation, failure, uncertainty and ongoing research rounds do not. Only the first formal message quotes the original request. Bodies stay unchanged for Telegram Reply, with no body resend or separate completion message.
 
-Live assistant output shows a bounded tail, not the full response. Separate assistant messages retain paragraph separators in the live preview. Truncated previews prefer whole lines and retain code-fence context, including inside quotes. A single line longer than the preview budget is shown as literal monospaced text to avoid interpreting cut Markdown markers. Outside fenced code, the unfinished final ordinary paragraph temporarily hides plausible unclosed emphasis markers and closes unfinished inline code for literal display. Complete quoted paragraphs are paired together; table cells are never treated as incomplete inline text. This preview-only projection never rewrites the stored output or the final answer.
+Status bars show available model, configured thinking, fast-mode, context and speed information, for example `46% (500k)` and `3.8 t/s`. Context is omitted before the first status read completes; `ctx ?` means a completed read could not confirm context usage. Use `/status` for details.
 
-Progress and final replies support nested bold/italic text and emphasis around inline code without nesting code inside other formatting entities. Formatting can span soft newlines within an ordinary paragraph, and backslash-escaped Markdown punctuation stays literal. Long ordinary paragraphs preserve matched inline formatting across message splits. If a message boundary cannot safely represent an inline entity in Markdown, the affected entity boundary is split into another message rather than exposing markers or exceeding Telegram's limit. Blank lines between list items remain paragraph breaks. Long code fragments use non-colliding fences so splitting cannot consume literal backticks. Normal tables repeat their headers across messages; if a complete header or single row cannot fit, the table becomes labelled monospaced text and is split within Telegram's rendered UTF-16 limit. If Telegram rejects HTML entities, readable plain text is retried; Markdown source that would exceed the limit falls back to the same visible text without formatting, rather than being truncated.
+Replies support Markdown and split long text automatically. Large tables may use a plain-text layout; formatting unsupported by Telegram falls back to readable text.
 
-Live Progress and final text replies use the same compact status-header formatter: context uses `46%/500k`, and speed uses `3.8t/s`. Progress uses native sampled values; final replies use output-inclusive context and whole-task average speed, so the values may differ while the format stays consistent. Provider usage appears only in the final header when enabled. Detailed `/status` formatting is unchanged. Thinking symbols in live progress and reply headers, and the `Thinking` field in `/status`, reflect the configured level rather than its per-turn resolution. Configured `auto` remains `auto` in `/status` and uses `⟳` in compact headers.
-
-Set `telegram.provider_usage = true` to add native provider usage to the final **Result** header, for example `5h30% 7d65%`. For Claude and OpenAI Codex, this uses only the account marked as current in the native `/usage` report for the reply's provider. Each final reply makes at most one best-effort query through the existing OMP session, with a three-second timeout and no retries or cross-reply cache. Unavailable or busy scopes and topics with queued prompts skip the query; timeout or failure leaves the answer deliverable without usage. Ordinary new input cancels a pending query without retiring an otherwise healthy runtime if its private prompt has not begun sending. Missing or unrecognized windows are omitted, including the token/cost-only fallback report. This does not poll usage in the five-second Progress refresh, expose account emails, authentication details or raw reports, launch a sidecar CLI, or read authentication databases.
-
-Native progress-bar styling is ignored; only validated account percentages reach the header. If an unconfirmed query stops the runtime, pending prompts remain queued and resume through a fresh process in the same session.
+Set `telegram.provider_usage = true` to show native Claude or OpenAI Codex account usage in the final status bar, for example `5h30% 7d65%`. This is independent of progress mode. Unavailable usage is omitted without blocking the answer; account identities and raw reports are not shown.
 
 ## Attachments
 
@@ -405,7 +383,7 @@ Replied photos and documents are described, not downloaded again. Reply chains a
 
 Saved OMP sessions survive service restarts. The first prompt or OMP command after restart may take longer while the session reconnects.
 
-Normal session resumes keep a usable saved model. If OMP exits before RPC readiness with an explicit `SessionModelRestoreError`, the bridge reaps that process and retries the same session once with `--model @default`. The retry replaces existing `--model <value>` and `--model=<value>` options in a private argument copy, preserving other option/value pairs even when values resemble model flags and leaving the configured preset unchanged. OMP resolves the default role from the selected argument preset and its own configuration; no model ID is hardcoded or configuration file rewritten. Both ordinary and research-control restores report the fallback once per runtime after identity validation. Other startup failures, RPC byte-budget errors and a failed fallback remain failures, and no prompt is submitted or replayed by this retry. Migration recovery and session deletion retain their stricter model policy.
+Normal resumes keep the saved model. If OMP explicitly reports that it cannot restore that model, the bridge retries once with the selected configuration's `default` model role and reports the fallback. This does not change saved presets or OMP configuration. Other startup failures are not automatically retried.
 
 Interrupted and uncertain work is not automatically replayed. Waiting tasks are cancelled at shutdown or crash; check the conversation and workspace before resending.
 
@@ -415,9 +393,7 @@ Each conversation has its own session, but sessions using the same workspace sha
 
 ### Migrate a large session
 
-`/migrate` generates a handoff, initializes a fresh small session without another model turn, verifies its context and settings, then switches this conversation. The old session and workspace remain available. Handoff itself uses the model and can take up to 180 seconds. Model, configured thinking (including `auto`), and fast-mode settings must match before switching. The selected model is saved in native session history so it also survives process restart and resume.
-
-Short conversations are supported without changing OMP's retention configuration.
+`/migrate` uses a model-generated handoff summary to start a smaller session in the same workspace, preserving model, thinking and fast-mode settings. The old session remains available. Handoff can take up to 180 seconds. Migration also works for short conversations.
 
 Enable the bundled migration Extension in the existing `[omp]` table, then restart the bridge:
 
@@ -426,13 +402,17 @@ Enable the bundled migration Extension in the existing `[omp]` table, then resta
 migration_extension = true
 ```
 
-The default is `false`. When enabled, all OMP argument presets load the embedded Extension without a separate `.ts` installation. Existing `omp.args` remain unchanged; if you previously added `-e` for this migration Extension manually, remove that entry to avoid loading two copies. Migration requires an idle session and empty queue. Other Extension commands and aliases remain blocked.
+Migration requires an idle session and empty queue. The bundled Extension needs no separate installation. If you previously loaded it manually with `-e`, remove that argument to avoid duplicate loading. Other Extension commands and aliases remain blocked.
 
-If migration fails, times out, or is interrupted, ordinary input stays locked; it is not queued or replayed. `/status` shows the operation and any known candidate. `/stop` and `/close` stop the runtime but do not clear the migration lock. Explicitly use `/migrate recover old` to restore the source, or `/migrate recover <full-session-id>` / `/migrate recover <absolute-session-file>` to verify a candidate. Recovery never reruns handoff or creates another session. Unknown candidates are never guessed from the newest file.
+After failure, timeout or interruption, ordinary input stays locked. `/stop` and `/close` stop the runtime but do not unlock migration. Check `/status`, then explicitly recover the source or a known candidate:
 
-A missing candidate in `/status` means its identity is unknown, not that no session was created. Ordinary logs cannot reconstruct an unrecorded candidate. If you do not independently know its full ID or absolute file path, use `/migrate recover old`.
+```text
+/migrate recover old
+/migrate recover <full-session-id>
+/migrate recover <absolute-session-file>
+```
 
-This transfers summarized text, not live tools, eval state, or all session-specific artifacts. The bridge reads only bounded newly appended handoff records; OMP may still need to load the old history when restoring it.
+Recovery does not rerun handoff or create another session. If the candidate is unknown, use `/migrate recover old` rather than guessing the newest file. Migration transfers summarized text, not live tools, eval state or all session artifacts.
 
 ## Data and Retention
 
@@ -452,32 +432,21 @@ Logs are written to stderr; use your process manager for storage and rotation. P
 
 ## Roadmap
 
-- [ ] **Undo/rewind and redo.** Waiting for upstream OMP to provide both:
-  - Authoritative, durable `submissionId -> entryId` receipts linking Telegram inputs to persisted OMP entries, including queued input and reconnects. Track [#12991](https://github.com/can1357/oh-my-pi/issues/12991).
-  - An RPC operation for native rewind/redo, or at least in-place `navigateTree` for conversation-only undo. [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) proposes read-only tree access and cannot move the session leaf; [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663) adds native TUI file-and-conversation rewind/redo but still needs RPC access for the bridge. Tree navigation alone does not restore files; the bridge will not implement its own file rollback engine.
-- [ ] **Reuse the OMP process after Stop.** Waiting for an upstream cancellation barrier that prevents stale callbacks from dispatching more work and old task events from affecting subsequent tasks. An idle `get_state` snapshot, including `isSettled=true`, is not that barrier. Until then, stopping an active task retires the process while preserving the session.
-- [ ] **Precise cancellation of native queued prompts.** Waiting for truthful, request-ID-correlated cancellation results for each removed prompt. In OMP 18.10.4, `remove_queued_message` can return `removed:true` while the removed prompt later receives `prompt_result(status="completed")`. `abort_and_restore_queue` already exists; another atomic queue-clearing RPC is not the missing capability. For now, `/queue` cancels only bridge-pending tasks; stopping unresolved native steering retires the process and leaves its execution status uncertain.
-- [ ] **Sub2API upstream account quota.** Defer gateway integration until the deployed server includes [PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476), which fixes [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473), and the scoped admin key has explicit quota-read permission. Display upstream account 5h/7d windows when available, not gateway API-key or subscription limits. Rotating account pools also require reliable request-to-account correlation before labeling an account as the one used by the current reply; do not infer it from the latest global usage log.
+- [ ] **Undo/rewind and redo.** Requires reliable input-to-session tracking and remote rewind support from OMP. Track [#12991](https://github.com/can1357/oh-my-pi/issues/12991), [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026), and [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663).
+- [ ] **Reuse the OMP process after Stop.** Requires reliable upstream cancellation. For now, Stop retires the process while preserving its session.
+- [ ] **Cancel individual native queued prompts.** Requires reliable upstream cancellation results. `/queue` currently cancels only bridge-pending tasks.
+- [ ] **Sub2API account quota.** Requires the deployed fix for [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473) ([PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476)), quota-read permission, and reliable attribution to the account serving each reply.
 
 ## Development
 
-```sh
-just build
-just fmt
-just test
-just check
-just install
-just deploy
-```
-
-- `just build` builds the binary.
-- `just fmt` formats all Go source and test files with the Go version declared in `go.mod`, matching CI even when the default local Go version is newer.
-- `just test` runs unit tests without starting or restarting a service.
-- `just check` runs tests, race checks, and `go vet` without starting Telegram polling.
-- `just install` installs only the binary; configuration and data remain user-managed.
-- `just deploy` installs the binary, then schedules a background restart of the existing `supervisord` service after five seconds. Returning from the recipe does not confirm that the restart succeeded.
-
-`just test` and `just check` use a recipe-local `umask 0077` so test data directories are private even when the invoking shell uses a group-writable mask such as `0002`. This does not change your terminal's umask or relax production data-directory permission checks.
+| Command | Purpose |
+| --- | --- |
+| `just build` | Build the binary. |
+| `just fmt` | Format Go code with the version declared in `go.mod`, matching CI. |
+| `just test` | Run unit tests without starting or restarting the service. |
+| `just check` | Run tests, race checks and `go vet` without starting Telegram polling. |
+| `just install` | Install only the binary; configuration and data remain user-managed. |
+| `just deploy` | Install and schedule a restart of the existing `supervisord` service after five seconds. Returning does not confirm restart success. |
 
 To check an explicitly selected OMP binary without installing or deploying it:
 
@@ -485,8 +454,8 @@ To check an explicitly selected OMP binary without installing or deploying it:
 just smoke-omp /absolute/path/to/omp
 ```
 
-This opt-in check runs real OMP against isolated sessions and a deterministic local provider: streaming fast controls, queued reply ownership, attachment host-tool enqueueing, Stop/resume, and the existing migration compatibility check. It does not contact a production provider or Telegram. The separate [OMP compatibility workflow](.github/workflows/omp-compatibility.yaml) runs manually and weekly, with a fixed 18.12.2 baseline and an independently reported candidate version (`latest` by default). It never upgrades the deployed OMP.
+This runs real OMP with isolated sessions and a local test provider, without contacting Telegram or a production provider. The [OMP compatibility workflow](.github/workflows/omp-compatibility.yaml) also runs manually and weekly; neither check upgrades the deployed OMP.
 
 ## Architecture
 
-Implementation and maintenance details belong in [Architecture](doc/architecture.md), also available in [Chinese](doc/architecture.zh.md): command routing, RPC completion, persistence, failure semantics, restart recovery, retention, and logging contracts.
+See [Architecture](doc/architecture.md) ([中文](doc/architecture.zh.md)) for implementation, failure handling and verification details.

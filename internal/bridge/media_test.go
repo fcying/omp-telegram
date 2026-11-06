@@ -322,8 +322,9 @@ func TestPhotoAlbumAggregatesIntoOneTask(t *testing.T) {
 	f.mu.Lock()
 	var answers []string
 	for _, message := range f.messages {
-		if text, ok := message["text"].(string); ok && strings.HasPrefix(replyBody(text), "answer: ") {
-			answers = append(answers, replyBody(text))
+		if text, ok := message["text"].(string); ok && strings.Contains(text, "\n\nanswer: ") {
+			_, body, _ := strings.Cut(text, "\n")
+			answers = append(answers, strings.TrimLeft(body, "\n"))
 		}
 	}
 	f.mu.Unlock()
@@ -1170,7 +1171,8 @@ func TestHostResultWriteFailureMarksTaskUncertainAndReleasesRuntime(t *testing.T
 	if err := w.b.db.Mark(taskID, "submitted"); err != nil {
 		t.Fatal(err)
 	}
-	w.active, w.busy, w.preview = taskID, true, "partial answer"
+	w.active, w.busy = taskID, true
+	w.stream.WriteString("partial answer")
 	cancelled := false
 	w.hostRequests = map[string]context.CancelFunc{"pending": func() { cancelled = true }}
 	_ = client.Close()
@@ -1901,6 +1903,7 @@ func pendingSteerAttachment(t *testing.T, downloadErr error) (*worker, mediaResu
 	case <-time.After(5 * time.Second):
 		t.Fatal("attachment preparation did not finish")
 	}
+	deliverReplies(t, w)
 	allowInitialProgress(w)
 	w.flushPreview()
 	var preview previewResult

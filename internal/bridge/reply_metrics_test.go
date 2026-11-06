@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"html"
 	"math"
-	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -36,23 +35,23 @@ func TestReplyMetricsWeightsCallsAndResetsBetweenReplies(t *testing.T) {
 	var metrics replyMetrics
 	metrics.observe(replyMetricsMessage(100, 1000))
 	metrics.observe(replyMetricsMessage(100, 3000))
-	if got := metrics.speedText(); got != "50t/s" {
-		t.Fatalf("weighted speed = %q, want 50t/s", got)
+	if got := metrics.speedText(); got != "50 t/s" {
+		t.Fatalf("weighted speed = %q, want 50 t/s", got)
 	}
 	tool := replyMetricsMessage(math.MaxInt64, math.NaN())
 	tool.Role, tool.ModelID = "toolResult", "tool-model"
 	metrics.observe(tool)
 	metrics.observe(message{Role: "user"})
-	if got := compactHeader("en", statusState{}, &metrics); !strings.Contains(got, "answer-model") || strings.Contains(got, "tool-model") || !strings.Contains(got, "50t/s") {
+	if got := compactHeader("en", statusState{}, &metrics); !strings.Contains(got, "answer-model") || strings.Contains(got, "tool-model") || !strings.Contains(got, "50 t/s") {
 		t.Fatalf("non-assistant changed reply metadata: %s", got)
 	}
 	metrics = replyMetrics{}
-	if got := compactHeader("en", statusState{}, &metrics); got != "" {
+	if got := compactMessageHeader("en", statusState{}, &metrics, false); got != "" {
 		t.Fatalf("new reply inherited metadata: %q", got)
 	}
 	metrics.observe(replyMetricsMessage(30, 2000))
-	if got := metrics.speedText(); got != "15t/s" {
-		t.Fatalf("new reply speed = %q, want 15t/s", got)
+	if got := metrics.speedText(); got != "15 t/s" {
+		t.Fatalf("new reply speed = %q, want 15 t/s", got)
 	}
 }
 
@@ -85,7 +84,7 @@ func TestReplyMetricsRejectsIncompleteAndInvalidCalls(t *testing.T) {
 			}
 			metrics.observe(bad)
 			header := compactHeader("en", statusState{}, &metrics)
-			if !strings.Contains(header, "last-model") || strings.Contains(header, "t/s") || strings.Contains(header, "%/") {
+			if !strings.Contains(header, "last-model") || strings.Contains(header, "t/s") || strings.Contains(header, "% (") {
 				t.Fatalf("invalid metrics lost model fallback or invented fields: %s", header)
 			}
 		})
@@ -99,7 +98,7 @@ func TestReplyMetricsThresholdZeroOutputAndOverflow(t *testing.T) {
 		t.Fatalf("zero-output call displayed speed: %q", got)
 	}
 	metrics.observe(replyMetricsMessage(200, 1000))
-	if got := metrics.speedText(); got != "100t/s" {
+	if got := metrics.speedText(); got != "100 t/s" {
 		t.Fatalf("valid zero-output duration was excluded: %q", got)
 	}
 	metrics = replyMetrics{}
@@ -108,7 +107,7 @@ func TestReplyMetricsThresholdZeroOutputAndOverflow(t *testing.T) {
 		t.Fatalf("sub-100ms aggregate displayed speed: %q", got)
 	}
 	metrics.observe(replyMetricsMessage(50, 50))
-	if got := metrics.speedText(); got != "1000t/s" {
+	if got := metrics.speedText(); got != "1000 t/s" {
 		t.Fatalf("100ms aggregate speed = %q", got)
 	}
 	metrics = replyMetrics{}
@@ -146,7 +145,7 @@ func TestReplyHeaderShowsLiteralModelAndConfiguredSettings(t *testing.T) {
 	for _, want := range []string{
 		"<code>" + html.EscapeString(state.Model.ID) + "</code>",
 		"<code>" + html.EscapeString(state.ConfiguredThinking) + "</code>",
-		"fast off (setting: on)", "50%/128k", "120t/s",
+		"fast off (setting: on)", "50% (128k)", "120 t/s",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("header missing %q: %s", want, rendered)
@@ -168,7 +167,7 @@ func TestReplyHeaderDoesNotAttachOtherModelSettings(t *testing.T) {
 		state := replyMetricsState(t, raw)
 		state.ConfiguredThinking = "high"
 		header := compactHeader("en", state, &metrics)
-		if !strings.Contains(header, "answer-model") || !strings.Contains(header, "10t/s") || strings.Contains(header, "◒") || strings.Contains(header, "⚡") || strings.Contains(header, "other-") {
+		if !strings.Contains(header, "answer-model") || !strings.Contains(header, "10 t/s") || strings.Contains(header, "◒") || strings.Contains(header, "⚡") || strings.Contains(header, "other-") {
 			t.Fatalf("queried model settings crossed model identity: %s", header)
 		}
 	}
@@ -179,7 +178,7 @@ func TestReplyHeaderDoesNotAttachOtherModelSettings(t *testing.T) {
 	var metrics replyMetrics
 	metrics.observe(replyMetricsMessage(10, 1000))
 	metrics.observe(message{Role: "assistant"})
-	if header := compactHeader("en", statusState{}, &metrics); header != "" {
+	if header := compactHeader("en", statusState{}, &metrics); strings.Contains(header, "answer-model") || strings.Contains(header, "t/s") || strings.Contains(header, "% (") {
 		t.Fatalf("missing latest identity reused earlier assistant: %s", header)
 	}
 }
@@ -192,7 +191,7 @@ func TestReplyHeaderUsesLastAfterOutputContextAndQueriedCapacity(t *testing.T) {
 		msg.Usage.TotalTokens = &total
 		var metrics replyMetrics
 		metrics.observe(msg)
-		if got := compactHeader("en", state, &metrics); !strings.Contains(got, "92%/10k") {
+		if got := compactHeader("en", state, &metrics); !strings.Contains(got, "92% (10k)") {
 			t.Fatalf("after-output usage was omitted or counted twice (state tokens %s): %s", stateTokens, got)
 		}
 	}
@@ -205,16 +204,16 @@ func TestReplyHeaderAccountsForContextUsageAndOrchestration(t *testing.T) {
 		usage string
 		want  string
 	}{
-		{"explicit context first", `{"contextTokens":9233,"totalTokens":9000,"output":233,"orchestration":{"input":100}}`, "92%/10k"},
-		{"explicit zero", `{"contextTokens":0,"totalTokens":9233}`, "0%/10k"},
-		{"total without components", `{"totalTokens":9233}`, "92%/10k"},
-		{"complete components", `{"input":8000,"output":233,"cacheRead":500,"cacheWrite":500}`, "92%/10k"},
-		{"zero total uses components", `{"totalTokens":0,"input":8000,"output":233,"cacheRead":500,"cacheWrite":500}`, "92%/10k"},
-		{"empty orchestration", `{"totalTokens":9233,"orchestration":{}}`, "92%/10k"},
-		{"orchestration partial defaults", `{"totalTokens":9233,"orchestration":{"output":233}}`, "90%/10k"},
-		{"orchestration all components", `{"totalTokens":9233,"orchestration":{"input":100,"output":20,"cacheRead":30}}`, "91%/10k"},
-		{"orchestration clamps at zero", `{"totalTokens":9233,"orchestration":{"input":10000}}`, "0%/10k"},
-		{"all components zero", `{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}`, "0%/10k"},
+		{"explicit context first", `{"contextTokens":9233,"totalTokens":9000,"output":233,"orchestration":{"input":100}}`, "92% (10k)"},
+		{"explicit zero", `{"contextTokens":0,"totalTokens":9233}`, "0% (10k)"},
+		{"total without components", `{"totalTokens":9233}`, "92% (10k)"},
+		{"complete components", `{"input":8000,"output":233,"cacheRead":500,"cacheWrite":500}`, "92% (10k)"},
+		{"zero total uses components", `{"totalTokens":0,"input":8000,"output":233,"cacheRead":500,"cacheWrite":500}`, "92% (10k)"},
+		{"empty orchestration", `{"totalTokens":9233,"orchestration":{}}`, "92% (10k)"},
+		{"orchestration partial defaults", `{"totalTokens":9233,"orchestration":{"output":233}}`, "90% (10k)"},
+		{"orchestration all components", `{"totalTokens":9233,"orchestration":{"input":100,"output":20,"cacheRead":30}}`, "91% (10k)"},
+		{"orchestration clamps at zero", `{"totalTokens":9233,"orchestration":{"input":10000}}`, "0% (10k)"},
+		{"all components zero", `{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}`, "0% (10k)"},
 		{"missing usage", `null`, ""},
 		{"missing input", `{"output":233,"cacheRead":0,"cacheWrite":0}`, ""},
 		{"missing output", `{"input":9000,"cacheRead":0,"cacheWrite":0}`, ""},
@@ -238,7 +237,7 @@ func TestReplyHeaderAccountsForContextUsageAndOrchestration(t *testing.T) {
 			metrics.observe(msg)
 			header := compactHeader("en", state, &metrics)
 			if tc.want == "" {
-				if strings.Contains(header, "%/") {
+				if strings.Contains(header, "% (") {
 					t.Fatalf("incomplete context fabricated: %s", header)
 				}
 			} else if !strings.Contains(header, tc.want) {
@@ -260,23 +259,23 @@ func TestReplyHeaderRequiresConfirmedIdleAndMatchingContextIdentity(t *testing.T
 		`"isStreaming":false,"isCompacting":true,`,
 	} {
 		state := replyMetricsState(t, `{`+flags+`"model":{"id":"answer-model","provider":"private-provider"},"contextUsage":{"tokens":9000,"contextWindow":10000}}`)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "%/") {
+		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
 			t.Fatalf("unconfirmed final context displayed: %s", got)
 		}
 	}
 	for _, model := range []string{`{}`, `{"id":"other-model","provider":"private-provider"}`, `{"id":"answer-model","provider":"other-provider"}`, `{"id":"answer-model"}`} {
 		state := replyMetricsState(t, `{"model":`+model+`,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":9000,"contextWindow":10000}}`)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "%/") {
+		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
 			t.Fatalf("context crossed model identity: %s", got)
 		}
 	}
 	for _, usage := range []string{`null`, `{}`, `{"tokens":9233}`, `{"contextWindow":0}`, `{"contextWindow":-1}`} {
 		state := replyMetricsState(t, `{"model":{"id":"answer-model","provider":"private-provider"},"isStreaming":false,"isCompacting":false,"contextUsage":`+usage+`}`)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "%/") {
+		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
 			t.Fatalf("missing context capacity fabricated: %s", got)
 		}
 	}
-	if got := compactHeader("en", statusState{}, &metrics); strings.Contains(got, "%/") || !strings.Contains(got, "233t/s") || !strings.Contains(got, "answer-model") {
+	if got := compactHeader("en", statusState{}, &metrics); strings.Contains(got, "% (") || !strings.Contains(got, "233 t/s") || !strings.Contains(got, "answer-model") {
 		t.Fatalf("failed state query lost confirmed metrics or fabricated context: %s", got)
 	}
 }
@@ -289,15 +288,15 @@ func TestReplyHeaderContextIsIndependentOfSpeedAndDoesNotCarryForward(t *testing
 	msg.Duration = nil
 	var metrics replyMetrics
 	metrics.observe(msg)
-	if got := compactHeader("en", state, &metrics); !strings.Contains(got, "92%/10k") || strings.Contains(got, "t/s") {
+	if got := compactHeader("en", state, &metrics); !strings.Contains(got, "92% (10k)") || strings.Contains(got, "t/s") {
 		t.Fatalf("valid context was coupled to unknown speed: %s", got)
 	}
 	metrics.observe(message{Role: "toolResult"})
-	if got := compactHeader("en", state, &metrics); !strings.Contains(got, "%/") {
+	if got := compactHeader("en", state, &metrics); !strings.Contains(got, "% (") {
 		t.Fatalf("non-assistant discarded last assistant context: %s", got)
 	}
 	metrics.observe(replyMetricsMessage(233, 1000))
-	if got := compactHeader("en", state, &metrics); strings.Contains(got, "%/") {
+	if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
 		t.Fatalf("missing latest usage inherited earlier context: %s", got)
 	}
 	for _, missingIdentity := range []message{
@@ -306,12 +305,12 @@ func TestReplyHeaderContextIsIndependentOfSpeedAndDoesNotCarryForward(t *testing
 		{Role: "assistant", Provider: msg.Provider, Usage: msg.Usage},
 	} {
 		metrics.observe(missingIdentity)
-		if got := compactHeader("en", state, &metrics); strings.Contains(got, "%/") {
+		if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
 			t.Fatalf("missing assistant identity fabricated matching context: %s", got)
 		}
 	}
 	metrics = replyMetrics{}
-	if got := compactHeader("en", state, &metrics); strings.Contains(got, "%/") {
+	if got := compactHeader("en", state, &metrics); strings.Contains(got, "% (") {
 		t.Fatalf("new reply reused state prompt usage: %s", got)
 	}
 }
@@ -322,7 +321,7 @@ func replyMetricsPlain(text string) string {
 	return html.UnescapeString(replyMetricsHTMLTags.ReplaceAllString(telegram.ConvertMarkdown(text), ""))
 }
 
-func assertReplyMetricsBudget(t *testing.T, parts []string, header string) {
+func assertReplyMetricsBudget(t *testing.T, parts []string) {
 	t.Helper()
 	if len(parts) == 0 || len(parts) > maxFinalReplyMessages {
 		t.Fatalf("reply message count = %d", len(parts))
@@ -333,96 +332,129 @@ func assertReplyMetricsBudget(t *testing.T, parts []string, header string) {
 		if !utf8.ValidString(part) || utf16Length(replyMetricsPlain(part)) > telegram.MaxMessageUTF16 {
 			t.Fatalf("invalid Unicode or oversized Telegram page %d", i)
 		}
-		if i > 0 && strings.Contains(part, header) {
-			t.Fatalf("header repeated on page %d", i)
-		}
 	}
-	if !strings.HasPrefix(parts[0], header) || bytes > maxFinalReplyBytes {
-		t.Fatalf("missing first-page header or byte overflow: bytes=%d", bytes)
+	if bytes > maxFinalReplyBytes {
+		t.Fatalf("reply byte overflow: bytes=%d", bytes)
 	}
 }
 
-func TestReplyTaskRepliesPreservesMarkdownAndUnicode(t *testing.T) {
-	header := "◒ `answer-model` | 50t/s"
+func TestSequentialReplyPreservesMarkdownAndUnicode(t *testing.T) {
+	w, _, _, _ := replyStatusWorker(t)
 	body := "## 中文 😀\n\n**bold** and `literal <&>`\n\n```go\nfmt.Println(\"😀\")\n```\n\n| A | B |\n|---|---|\n| 一 | 二 |"
-	parts := replyTaskReplies("en", body, header, false)
-	assertReplyMetricsBudget(t, parts, header)
-	if len(parts) != 1 || telegram.ConvertMarkdown(parts[0]) != telegram.ConvertMarkdown(header+"\n\n"+body) {
-		t.Fatalf("small Markdown reply changed: %q", parts)
+	assistantMessage(t, w, body)
+	stoppedAssistantMessage(t, w, strings.Repeat("😀", 5000))
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messageCount":2,"messages":[]}`))
+	awaitReplyStatus(t, w)
+	parts := researchReplies(t, w, 2)
+	assertReplyMetricsBudget(t, parts)
+	if len(parts) < 4 || replyBody(t, parts[0]) != body || !strings.Contains(parts[1], "`safe`") {
+		t.Fatalf("Markdown intermediate body or attached final status changed: %q", parts)
 	}
-	body = strings.Repeat("😀", 5000)
-	parts = replyTaskReplies("en", body, header, false)
-	assertReplyMetricsBudget(t, parts, header)
-	visible := strings.Join(parts, "")
-	if strings.Count(visible, "😀") != 5000 || strings.Contains(visible, replyTruncatedNotice) {
+	visible := replyBody(t, parts[1]) + strings.Join(parts[2:], "")
+	if strings.Count(visible, "😀") != 5000 || strings.Contains(visible, replyTruncatedNotice) || strings.Count(strings.Join(parts[1:], ""), "`safe`") != 1 {
 		t.Fatal("Unicode pagination lost or duplicated body text")
 	}
-	if got := replyTaskReplies("en", "", header, false); !reflect.DeepEqual(got, []string{header}) {
-		t.Fatalf("empty body reply = %q", got)
-	}
 }
 
-func TestReplyTaskRepliesReservesFirstPageForBody(t *testing.T) {
-	header := "◒ `answer-model` | 50t/s"
-	body := strings.Repeat("body line\n", 600)
-	parts := replyTaskReplies("en", body, header, false)
-	assertReplyMetricsBudget(t, parts, header)
-	if !strings.Contains(parts[0], "body line") {
-		t.Fatal("long reply sent its metadata as a separate empty-body message")
+func TestSequentialRepliesShareDisplayBudgetWithoutOrphanStatus(t *testing.T) {
+	w, _, _, _ := replyStatusWorker(t)
+	for range maxFinalReplyMessages {
+		assistantMessage(t, w, strings.Repeat("x", telegram.MaxMessageUTF16))
 	}
-	if strings.Count(strings.Join(parts, "\n"), "body line") != 600 {
-		t.Fatal("reserving header space lost or duplicated body lines")
+	before := researchReplies(t, w, 2)
+	if queueState(t, w, 2) != "submitted" || strings.Count(strings.Join(before, "\n"), replyTruncatedNotice) != 1 {
+		t.Fatalf("display overflow settled task or omitted single notice: %d parts", len(before))
 	}
-}
-
-func TestReplyTaskRepliesAccountsForHeaderInPageBudget(t *testing.T) {
-	header := "◒ `answer-model` | 50t/s"
-	body := strings.Repeat("x", telegram.MaxMessageUTF16*maxFinalReplyMessages)
-	parts := replyTaskReplies("en", body, header, false)
-	assertReplyMetricsBudget(t, parts, header)
-	if parts[len(parts)-1] != replyTruncatedNotice || strings.Count(strings.Join(parts, "\n"), replyTruncatedNotice) != 1 {
-		t.Fatal("header-induced overflow lost or duplicated truncation notice")
+	assistantMessage(t, w, "suppressed after overflow")
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[]}`))
+	awaitReplyStatus(t, w)
+	parts := researchReplies(t, w, 2)
+	assertReplyMetricsBudget(t, parts)
+	if queueState(t, w, 2) != "done" || len(parts) != len(before) || strings.Contains(strings.Join(parts, "\n"), "suppressed after overflow") {
+		t.Fatalf("overflow appended an orphan status or excess bodies: %d parts", len(parts))
 	}
-	if strings.Count(strings.Join(parts, ""), "x") >= len(body) {
-		t.Fatal("header did not consume the existing message budget")
-	}
-}
-
-func TestReplyTaskRepliesPreservesExplicitTruncation(t *testing.T) {
-	header := "◒ `answer-model`"
-	for _, body := range []string{"answer 😀", strings.Repeat("answer 😀 ", maxFinalReplyBytes/8)} {
-		parts := replyTaskReplies("en", body, header, true)
-		assertReplyMetricsBudget(t, parts, header)
-		if parts[len(parts)-1] != replyTruncatedNotice || strings.Count(strings.Join(parts, "\n"), replyTruncatedNotice) != 1 {
-			t.Fatal("explicit truncation notice lost or repeated")
+	for i := range before {
+		if parts[i] == before[i] {
+			continue
+		}
+		_, oldBody, oldHeader := strings.Cut(before[i], "\n\n")
+		_, newBody, newHeader := strings.Cut(parts[i], "\n\n")
+		if !oldHeader || !newHeader || oldBody != newBody {
+			t.Fatalf("final status rewrote immutable body part %d", i)
 		}
 	}
-	parts := replyTaskReplies("en", "answer 😀", header, true)
-	if !strings.Contains(parts[0], "answer 😀") {
-		t.Fatal("small explicitly truncated body disappeared")
+}
+
+func TestSequentialReplyCountsMarkdownBytesAndFenceRepair(t *testing.T) {
+	for _, markerSize := range []int{maxFinalReplyBytes / 4, maxFinalReplyBytes/2 + 1} {
+		w, _, _, _ := replyStatusWorker(t)
+		marker := strings.Repeat("`", markerSize)
+		body := marker + "\nbody\n" + marker + "\n\n" + marker + "\n" + strings.Repeat("x", telegram.MaxMessageUTF16+1) + "\n" + marker
+		stoppedAssistantMessage(t, w, body)
+		w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[]}`))
+		awaitReplyStatus(t, w)
+		parts := researchReplies(t, w, 2)
+		assertReplyMetricsBudget(t, parts)
+		if strings.Count(strings.Join(parts, "\n"), replyTruncatedNotice) != 1 {
+			t.Fatal("Markdown byte/fence overflow lost its single truncation notice")
+		}
+		if len(parts) == 1 {
+			if parts[0] != replyTruncatedNotice {
+				t.Fatal("fully truncated body produced an orphan status")
+			}
+		} else if !strings.Contains(parts[0], "`safe`") {
+			t.Fatal("retained Markdown body lost its attached status")
+		}
 	}
 }
 
-func TestReplyTaskRepliesCountsMarkdownBytes(t *testing.T) {
-	header := "◒ `answer-model`"
-	// Long code delimiters consume bytes without consuming rendered UTF-16.
-	// This reaches the byte budget before the Telegram message count budget.
-	marker := strings.Repeat("`", maxFinalReplyBytes/4)
-	body := marker + "\nbody\n" + marker + "\n\n" + marker + "\ntail\n" + marker
-	parts := replyTaskReplies("en", body, header, false)
-	assertReplyMetricsBudget(t, parts, header)
-	if parts[len(parts)-1] != replyTruncatedNotice || !strings.Contains(strings.Join(parts, ""), "body") {
-		t.Fatal("Markdown byte overflow silently lost body or truncation notice")
+func TestFinalHeaderBoundaryPreservesMarkdownAndUTF16(t *testing.T) {
+	w, f, _, _ := replyStatusWorker(t)
+	code := strings.Repeat("😀", 1900)
+	body := "```text\n" + code + "\n```\n\n**End** [link](https://example.com/a?b=c&d=e)\n\n" + strings.Repeat("尾", 600)
+	stoppedAssistantMessage(t, w, body)
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messageCount":1,"messages":[]}`))
+	awaitReplyStatus(t, w)
+	parts := researchReplies(t, w, 2)
+	assertReplyMetricsBudget(t, parts)
+	if len(parts) < 2 || strings.Count(strings.Join(parts, ""), "`safe`") != 1 || !strings.Contains(parts[0], "`safe`") {
+		t.Fatalf("boundary header repeated, orphaned, or absent: %q", parts)
 	}
-}
-
-func TestReplyTaskRepliesKeepsHeaderWhenFenceRepairExceedsByteBudget(t *testing.T) {
-	header := "◒ `answer-model`"
-	marker := strings.Repeat("`", maxFinalReplyBytes/2+1)
-	body := marker + "\n" + strings.Repeat("x", telegram.MaxMessageUTF16+1)
-	parts := replyTaskReplies("en", body, header, false)
-	assertReplyMetricsBudget(t, parts, header)
-	if parts[len(parts)-1] != replyTruncatedNotice {
-		t.Fatal("oversized repaired fence lost its explicit truncation notice")
+	deliverReplies(t, w)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var visible strings.Builder
+	for i, request := range f.messages {
+		text, _ := request["text"].(string)
+		plain := html.UnescapeString(replyMetricsHTMLTags.ReplaceAllString(text, ""))
+		var replyTo any
+		if i == 0 {
+			replyTo = float64(2)
+		}
+		if utf16Length(plain) > telegram.MaxMessageUTF16 || request["message_id"] != nil || sentReplyTarget(request) != replyTo || request["parse_mode"] != "HTML" {
+			t.Fatalf("invalid rendered boundary page: %+v", request)
+		}
+		header, _, _ := strings.Cut(text, "\n")
+		if (i == 0) != strings.Contains(header, "<code>safe</code>") {
+			t.Fatalf("header must appear on first body page only: %q", text)
+		}
+		visible.WriteString(plain)
+	}
+	joined := visible.String()
+	if strings.Count(joined, "😀") != 1900 || strings.Count(joined, "尾") != 600 || strings.Count(joined, "End") != 1 || strings.Count(joined, "link") != 1 {
+		t.Fatalf("header pagination lost or duplicated Markdown/Unicode body: %q", joined)
+	}
+	if first, _ := f.messages[0]["text"].(string); !strings.Contains(first, "<pre>") || !strings.Contains(first, "</pre>") {
+		t.Fatal("header detached from fitting code block or lost code semantics")
+	}
+	var linkPage string
+	for _, request := range f.messages {
+		text, _ := request["text"].(string)
+		if strings.Contains(text, ">link</a>") {
+			linkPage = text
+		}
+	}
+	if !strings.Contains(linkPage, `<a href="https://example.com/a?b=c&amp;d=e">link</a>`) || !strings.Contains(linkPage, "<b>End</b>") {
+		t.Fatal("header pagination damaged bold/link semantics")
 	}
 }

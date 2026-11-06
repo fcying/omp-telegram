@@ -81,7 +81,7 @@ func TestAutoresearchOffPreservesActiveOrdinaryOwnerAndQueue(t *testing.T) {
 			}
 			nativeRPC(t, w, "fixture_finish_root", nil)
 			nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" })
-			if queueState(t, w, 100) != "done" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "root completed" || w.client != client ||
+			if queueState(t, w, 100) != "done" || researchBody(t, w, 100) != "root completed" || w.client != client ||
 				researchTraceCount(trace, "prompt", "wait") != 1 || researchTraceCount(trace, "prompt", "ordinary queued work") != 1 {
 				t.Fatal("ordinary task and queued work did not finish exactly once on their original client")
 			}
@@ -167,7 +167,7 @@ func TestAutoresearchReadOnlyOffPreservesQueuedCompletionAcrossCatalogUpdate(t *
 			}
 			researchEventBarrier(t, w)
 			awaitReplyStatus(t, w)
-			if queueState(t, w, 100) != "done" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "ordinary root final reply" || w.taskActive() {
+			if queueState(t, w, 100) != "done" || researchBody(t, w, 100) != "ordinary root final reply" || w.taskActive() {
 				t.Fatal("read-only off lost the ordinary root completion or final reply")
 			}
 			if w.client != client || !sameBindingIdentity(w.binding, binding) || queueState(t, w, 101) != "pending" {
@@ -208,7 +208,7 @@ func TestAutoresearchRouteScopeFailurePreservesOrdinaryCompletion(t *testing.T) 
 	nativeRPC(t, w, "fixture_catalog_update", map[string]any{"addName": "updated_command"})
 	researchEventBarrier(t, w)
 	awaitReplyStatus(t, w)
-	if queueState(t, w, 100) != "done" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "ordinary root final reply" || w.taskActive() {
+	if queueState(t, w, 100) != "done" || researchBody(t, w, 100) != "ordinary root final reply" || w.taskActive() {
 		t.Fatal("route scope failure lost the ordinary task completion or final reply")
 	}
 	if w.client != client || !sameBindingIdentity(w.binding, binding) || queueState(t, w, 102) != "cancelled" ||
@@ -369,7 +369,7 @@ func TestAutoresearchOverlappingReadOnlyOffPreservesOrdinaryTask(t *testing.T) {
 				nativeRPC(t, w, "fixture_finish_root", nil)
 			}
 			nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" })
-			if queueState(t, w, 100) != "done" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "root completed" ||
+			if queueState(t, w, 100) != "done" || researchBody(t, w, 100) != "root completed" ||
 				w.client != client || researchTraceCount(trace, "prompt", "wait") != 1 ||
 				researchTraceCount(trace, "prompt", "ordinary queued work after overlapping off") != 1 {
 				t.Fatal("overlapping off lost the ordinary reply or replayed work")
@@ -430,7 +430,7 @@ func TestAutoresearchOffReplacingRoutePreservesOrdinaryTask(t *testing.T) {
 				nativeRPC(t, w, "fixture_finish_root", nil)
 			}
 			nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" })
-			if queueState(t, w, 100) != "done" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "root completed" ||
+			if queueState(t, w, 100) != "done" || researchBody(t, w, 100) != "root completed" ||
 				w.client != client || researchTraceCount(trace, "prompt", "wait") != 1 ||
 				researchTraceCount(trace, "prompt", "preserved work after route") != 1 {
 				t.Fatal("off replacing a route lost the ordinary reply or replayed preserved work")
@@ -680,7 +680,7 @@ func TestAutoresearchOffModeFailurePreservesOrdinaryTask(t *testing.T) {
 	}
 	nativeRPC(t, w, "fixture_finish_root", nil)
 	nativeUntil(t, w, func() bool { return queueState(t, w, 100) == "done" })
-	if replyBody(strings.Join(researchReplies(t, w, 100), "")) != "root completed" || queueState(t, w, 101) != "pending" ||
+	if researchBody(t, w, 100) != "root completed" || queueState(t, w, 101) != "pending" ||
 		researchTraceCount(trace, "prompt", "work held after failed mode lookup") != 0 {
 		t.Fatal("failed off lost the ordinary result or dispatched paused work")
 	}
@@ -713,7 +713,7 @@ func TestAutoresearchOffRetryPreservesOrdinaryTaskAndUnpausesQueue(t *testing.T)
 	}
 	nativeRPC(t, w, "fixture_finish_root", nil)
 	nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" })
-	if queueState(t, w, 100) != "done" || replyBody(strings.Join(researchReplies(t, w, 100), "")) != "root completed" ||
+	if queueState(t, w, 100) != "done" || researchBody(t, w, 100) != "root completed" ||
 		w.client != client || researchTraceCount(trace, "prompt", "wait") != 1 ||
 		researchTraceCount(trace, "prompt", "ordinary work after retry") != 1 {
 		t.Fatal("off retry lost the ordinary reply or replayed submitted work")
@@ -787,7 +787,7 @@ func TestAutoresearchLocalCompletionKeepsQueuedResearchGoal(t *testing.T) {
 			}
 			researchRound(t, w, "reply from the queued research goal")
 			awaitReplyStatus(t, w)
-			if replyBody(strings.Join(researchReplies(t, w, 101), "")) != "reply from the queued research goal" {
+			if researchBody(t, w, 101) != "reply from the queued research goal" {
 				t.Fatal("the queued research goal did not retain its durable reply ownership")
 			}
 		})

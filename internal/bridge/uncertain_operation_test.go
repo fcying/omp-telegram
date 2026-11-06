@@ -333,11 +333,8 @@ func TestSuccessfulAbortRetiresRuntimeBeforeFollowingPrompts(t *testing.T) {
 				if queueState(t, w, 100) != "done" {
 					t.Fatalf("message after Stop state = %s, want done", queueState(t, w, 100))
 				}
-				var replies int
-				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=100").Scan(&replies))
-				var finalText string
-				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=100").Scan(&finalText))
-				if replies != 1 || replyBody(finalText) != "answer: fresh message after stop" || queueState(t, w, 2) != "cancelled" {
+				finalReplyStatus(t, w, 100, "answer: fresh message after stop")
+				if queueState(t, w, 2) != "cancelled" {
 					t.Fatal("Stop consumed the fresh message as steering or failed to cancel the old root")
 				}
 				if w.client == nil || w.client == client || !sameBindingIdentity(w.binding, before) {

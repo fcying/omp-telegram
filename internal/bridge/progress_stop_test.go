@@ -24,184 +24,26 @@ func allowInitialProgress(w *worker) {
 	w.progress.StartedAt = time.Now().Add(-progressInitialDelay)
 }
 
-func TestProgressPreviewPreservesFormattingAtTailBoundary(t *testing.T) {
-	for _, test := range []struct {
-		name, text, want, absent string
-	}{
-		{"paragraphs", "First paragraph.\n\nSecond paragraph.\nThird line.", "First paragraph.\n\nSecond paragraph.\nThird line.", ""},
-		{"list paragraphs", "- first\n\n- second", "Output:\n- first\n\n- second", "- first\n- second"},
-		{"nested emphasis", "***current***", "<b>", "*"},
-		{"bold around code", "**a `b` c**", "<code>b</code>", "**"},
-		{"pending bold", "**current", "Output:\ncurrent", "*"},
-		{"pending bold closer", "**current*", "Output:\ncurrent", "*"},
-		{"complete bold", "**current**", "<b>current</b>", "**"},
-		{"pending code", "`**current**", "<code>**current**</code>", "<b>current"},
-		{"literal fenced markers", "```\n**current", "<pre>**current</pre>", "<b>current"},
-		{"clipped emphasis", strings.Repeat("x", 80) + "**important** " + strings.Repeat("y", 2187), "<pre>nt** ", "<i>important</i>"},
-		{"clipped fence", strings.Repeat("intro\n", 30) + "```go\n" + strings.Repeat("value := 1\n", 230) + "```\nFinal paragraph.", "</pre>\nFinal paragraph.", "<pre>Final paragraph."},
-		{"closing fence boundary", "```go\ncode\n```\n" + strings.Repeat("y", 2196), strings.Repeat("y", 2196), "<pre>"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			w, f, _ := setupWorkspaceWorker(t)
-			w.b.cfg.ProgressMode = "summary"
-			w.active, w.busy, w.previewID = 1, true, 777
-			w.previewResult = make(chan previewResult, 1)
-			event, err := json.Marshal(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": test.text}})
-			requireStoreOK(t, err)
-			w.event(event)
-			w.flushPreview()
-			select {
-			case result := <-w.previewResult:
-				requireStoreOK(t, result.err)
-				w.previewFinished(result)
-			case <-time.After(5 * time.Second):
-				t.Fatal("progress edit did not finish")
-			}
-			f.mu.Lock()
-			request := f.messages[len(f.messages)-1]
-			f.mu.Unlock()
-			text, _ := request["text"].(string)
-			if request["parse_mode"] != "HTML" || request["message_id"] != float64(777) || !strings.Contains(text, test.want) {
-				t.Fatalf("progress edit lost formatting: %+v", request)
-			}
-			if test.absent != "" && strings.Contains(text, test.absent) {
-				t.Fatalf("progress edit reinterpreted clipped markup: %q", text)
-			}
-		})
+func waitProgressDeleted(t *testing.T, w *worker, f *fakeHTTP, inboxID, messageID int64) {
+	t.Helper()
+	// Completion and delivery can both request cleanup; verify convergence.
+	waitFor(t, func() bool {
+		var progressID int64
+		err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM progress_messages WHERE inbox_id=?", inboxID).Scan(&progressID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return progressID == 0
+	})
+	deleted := false
+	for _, id := range f.deletedMessageIDs() {
+		if id != messageID {
+			t.Fatalf("deleted progress message %d, want %d", id, messageID)
+		}
+		deleted = true
 	}
-}
-
-func TestSummaryPreviewPreservesAssistantMessageBoundaries(t *testing.T) {
-	const first = `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"First step."}}`
-	const firstEnd = `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"First step."}]}}`
-	const second = `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Second step."}}`
-	const secondEnd = `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Second step."}]}}`
-	const empty = `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":""}}`
-	for _, test := range []struct {
-		name   string
-		events []string
-		want   string
-	}{
-		{"independent messages", []string{first, firstEnd, second, secondEnd}, "First step.\n\nSecond step."},
-		{"same message chunks", []string{first, `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"\n"}}`, second, `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"First step.\nSecond step."}]}}`}, "First step.\nSecond step."},
-		{"empty deltas and messages", []string{empty, first, empty, firstEnd, empty, `{"type":"message_end","message":{"role":"assistant","content":[]}}`, empty, second, empty, secondEnd, empty}, "First step.\n\nSecond step."},
-		{"tool between messages", []string{first, firstEnd, `{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`, `{"type":"message_end","message":{"role":"toolResult","content":[{"type":"text","text":"PRIVATE"}]}}`, `{"type":"tool_execution_end","toolCallId":"read-1"}`, second, secondEnd}, "First step.\n\nSecond step."},
-		{"continuation run", []string{`{"type":"agent_start"}`, first, firstEnd, `{"type":"agent_end","isTerminal":false,"messages":[{"role":"assistant","content":[{"type":"text","text":"First step."}]}]}`, `{"type":"agent_start"}`, empty, second, secondEnd}, "First step.\n\nSecond step."},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			w, f, _ := setupWorkspaceWorker(t)
-			w.b.cfg.ProgressMode = "summary"
-			w.active, w.busy, w.previewID = 1, true, 777
-			w.previewResult = make(chan previewResult, 1)
-			for _, event := range test.events {
-				w.event([]byte(event))
-			}
-			final, found, truncated := boundedAssistantTexts(nil, nil, w.finalAssistantTexts, maxAssistantOutputBytes)
-			if !found || truncated || final != test.want || w.preview != final {
-				t.Fatalf("preview/final paragraph mismatch: preview=%q final=%q want=%q", w.preview, final, test.want)
-			}
-			w.flushPreview()
-			select {
-			case result := <-w.previewResult:
-				requireStoreOK(t, result.err)
-				w.previewFinished(result)
-			case <-time.After(5 * time.Second):
-				t.Fatal("summary progress edit did not finish")
-			}
-			f.mu.Lock()
-			request := f.messages[len(f.messages)-1]
-			f.mu.Unlock()
-			text, _ := request["text"].(string)
-			if request["parse_mode"] != "HTML" || request["message_id"] != float64(777) || !strings.HasSuffix(text, "Output:\n"+test.want) || strings.Contains(text, "PRIVATE") {
-				t.Fatalf("summary edit lost assistant message boundaries: %+v", request)
-			}
-		})
-	}
-}
-
-func TestAssistantMessageSeparatorsRespectOutputBudgets(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		priorSize int
-		cached    bool
-		fits      bool
-	}{
-		{"stream exact", maxAssistantOutputBytes - 3, false, true},
-		{"stream overflow", maxAssistantOutputBytes - 2, false, false},
-		{"cached assistant exact", maxAssistantOutputBytes - 6, true, true},
-		{"cached assistant overflow", maxAssistantOutputBytes - 5, true, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			w, _, _ := setupWorkspaceWorker(t)
-			prior := strings.Repeat("x", test.priorSize)
-			w.finalAssistantTexts = []string{prior}
-			w.finalAssistantBytes = len(prior)
-			if test.cached {
-				// The first message had no deltas, so only the second is in the stream.
-				w.finalAssistantTexts = append(w.finalAssistantTexts, "a")
-				w.finalAssistantBytes++
-				w.stream.WriteString("a")
-			} else {
-				w.stream.WriteString(prior)
-			}
-			w.finalizedStreamBytes = w.stream.Len()
-			w.preview = w.stream.String()
-			before := w.stream.Len()
-			w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"b"}}`))
-			if !test.fits {
-				if w.stream.Len() != before {
-					t.Fatal("over-budget paragraph was appended")
-				}
-			} else {
-				if w.stream.Len() != before+3 || !strings.HasSuffix(w.preview, "\n\nb") {
-					t.Fatal("exact-budget paragraph was rejected")
-				}
-				w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}`))
-				if w.finalizedStreamBytes != w.stream.Len() {
-					t.Fatal("finalized offset excluded the paragraph separator")
-				}
-				before = w.stream.Len()
-				w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":""}}`))
-				if w.stream.Len() != before {
-					t.Fatal("empty delta added a separator at the budget boundary")
-				}
-				if _, err := w.b.db.NextOutput(); err == nil {
-					t.Fatal("exact-budget output was reported as overflow")
-				}
-				w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"c"}}`))
-				if w.stream.Len() != before {
-					t.Fatal("next paragraph exceeded the output budget")
-				}
-			}
-			output, err := w.b.db.NextOutput()
-			requireStoreOK(t, err)
-			if !strings.Contains(output.Text, "budget") {
-				t.Fatalf("missing user-visible output budget notice: %q", output.Text)
-			}
-		})
-	}
-}
-
-func TestAssistantMessageEndCountsUnstreamedParagraphSeparators(t *testing.T) {
-	w, _, _ := setupWorkspaceWorker(t)
-	prior := strings.Repeat("x", maxAssistantOutputBytes-4)
-	w.finalAssistantTexts = []string{prior}
-	w.finalAssistantBytes = len(prior)
-	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"bc"}]}}`))
-	if len(w.finalAssistantTexts) != 2 || w.finalAssistantBytes != maxAssistantOutputBytes-2 {
-		t.Fatal("exact-budget unstreamed message was rejected or cached bytes changed meaning")
-	}
-	if _, err := w.b.db.NextOutput(); err == nil {
-		t.Fatal("exact-budget unstreamed message reported an overflow")
-	}
-	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"d"}]}}`))
-	if len(w.finalAssistantTexts) != 2 {
-		t.Fatal("over-budget unstreamed paragraph was cached")
-	}
-	output, err := w.b.db.NextOutput()
-	requireStoreOK(t, err)
-	if !strings.Contains(output.Text, "budget") {
-		t.Fatalf("missing user-visible output budget notice: %q", output.Text)
+	if !deleted {
+		t.Fatalf("progress message %d was not deleted", messageID)
 	}
 }
 
@@ -245,7 +87,7 @@ func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"short answer"}]}]}`))
 	awaitReplyStatus(t, w)
 	output, err := w.b.db.NextOutput()
-	if err != nil || replyBody(output.Text) != "short answer" {
+	if err != nil || replyBody(t, output.Text) != "short answer" || !strings.Contains(output.Text, "`safe`") {
 		t.Fatalf("final reply = %+v, err=%v", output, err)
 	}
 	if got := f.deletedMessageIDs(); len(got) != 0 {
@@ -258,10 +100,7 @@ func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.b.cleanupDeliveredProgress(context.Background(), output.InboxID)
-	waitFor(t, func() bool { return len(f.deletedMessageIDs()) == 1 })
-	if got := f.deletedMessageIDs(); len(got) != 1 || got[0] != result.id {
-		t.Fatalf("deleted progress messages = %v, want [%d]", got, result.id)
-	}
+	waitProgressDeleted(t, w, f, output.InboxID, result.id)
 }
 
 func TestShortTaskCompletesWithoutProgressMessage(t *testing.T) {
@@ -288,7 +127,7 @@ func TestShortTaskCompletesWithoutProgressMessage(t *testing.T) {
 		t.Fatalf("short task sent progress: %+v", result)
 	default:
 	}
-	w.preview = "short answer"
+	w.stream.WriteString("short answer")
 	w.finish()
 	f.mu.Lock()
 	messages := len(f.messages)
@@ -304,6 +143,7 @@ func TestInitialProgressSurvivesNativeActivity(t *testing.T) {
 	w.b.cfg.QueueCapacity = 1
 	w.previewResult = make(chan previewResult, 1)
 	command("/new " + t.TempDir())
+	deliverReplies(t, w)
 	command("missing-terminal")
 	w.dispatch()
 	drainWatchdogEvents(t, w)
@@ -320,7 +160,7 @@ func TestInitialProgressSurvivesNativeActivity(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("native activity postponed initial progress")
 	}
-	if f.button(0) == "" {
+	if f.button(f.messageCount()-1) == "" {
 		t.Fatal("long task progress omitted Stop button")
 	}
 }
@@ -331,6 +171,7 @@ func TestToolHistoryEditsProgressWithSameStopButton(t *testing.T) {
 	w.b.cfg.QueueCapacity = 1
 	w.previewResult = make(chan previewResult, 1)
 	command("/new " + t.TempDir())
+	deliverReplies(t, w)
 	command("missing-terminal")
 	w.dispatch()
 	drainWatchdogEvents(t, w)
@@ -397,7 +238,7 @@ func TestToolHistoryEditsProgressWithSameStopButton(t *testing.T) {
 	text, _ := edit["text"].(string)
 	messageID := edit["message_id"]
 	f.mu.Unlock()
-	if messageID != float64(initial.id) || !strings.Contains(text, "Status: Running") || !strings.Contains(text, "Recent tools:\n- read: completed (") || !strings.Contains(text, `Args: <code>{"path":"SECRET path"}</code>`) || !strings.Contains(text, "Result: <code>") || !strings.Contains(text, "SECRET result") || strings.Contains(text, "SECRET partial") || !strings.Contains(text, "Output:\nChecking source") {
+	if messageID != float64(initial.id) || !strings.Contains(text, "Status: Running") || !strings.Contains(text, "Recent tools:\n- read: completed (") || !strings.Contains(text, `Args: <code>{"path":"SECRET path"}</code>`) || !strings.Contains(text, "Result: <code>") || !strings.Contains(text, "SECRET result") || strings.Contains(text, "SECRET partial") {
 		t.Fatalf("edited verbose progress is missing tool results: id=%v, text=%q", messageID, text)
 	}
 	if got := f.button(before + 2); got != stop {
@@ -426,10 +267,13 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	if w.active == 0 || !w.busy {
 		t.Fatal("root task did not become active")
 	}
+	assistantMessage(t, w, "Completed question before Stop?")
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"**Pending whole body"}}`))
 	command("/followup queued")
 	if len(w.queue) != 1 {
 		t.Fatal("queued root task missing before stop")
 	}
+	deliverReplies(t, w)
 	allowInitialProgress(w)
 	w.flushPreview()
 	result := <-w.previewResult
@@ -437,12 +281,12 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 		t.Fatalf("progress send failed: %+v", result)
 	}
 	w.previewFinished(result)
-	data := f.button(0)
+	data := f.button(f.messageCount() - 1)
 	if !strings.HasPrefix(data, "stop-7-") {
 		t.Fatalf("progress stop callback = %q", data)
 	}
 	f.mu.Lock()
-	replyTo := sentReplyTarget(f.messages[0])
+	replyTo := sentReplyTarget(f.messages[len(f.messages)-1])
 	f.mu.Unlock()
 	if replyTo != float64(2) {
 		t.Fatalf("progress reply target = %v, want original root message 2", replyTo)
@@ -470,15 +314,13 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&state); err != nil || state != "cancelled" {
 		t.Fatalf("stopped root state = %q, error %v; want cancelled", state, err)
 	}
+	stoppedReplies := researchReplies(t, w, 2)
+	if len(stoppedReplies) != 3 || replyBody(t, stoppedReplies[0]) != "Completed question before Stop?" || stoppedReplies[1] != "**Pending whole body" {
+		t.Fatalf("Stop duplicated/dropped completed or interrupted body: %q", stoppedReplies)
+	}
 	w.dispatch()
 	nativeUntil(t, w, func() bool { return queueState(t, w, 3) == "done" })
-	var replies int
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=3").Scan(&replies))
-	var finalText string
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=3").Scan(&finalText))
-	if replies != 1 || replyBody(finalText) != "answer: queued" {
-		t.Fatal("queued task did not produce its own confirmed reply after Stop")
-	}
+	finalReplyStatus(t, w, 3, "answer: queued")
 }
 
 func TestTerminalCompletionDeletesProgressMessage(t *testing.T) {
@@ -506,7 +348,7 @@ func TestTerminalCompletionDeletesProgressMessage(t *testing.T) {
 		t.Fatal(result.err)
 	}
 	w.previewFinished(result)
-	w.preview = "final"
+	w.stream.WriteString("final")
 	w.finish()
 	out, err := w.b.db.NextOutput()
 	if err != nil {
@@ -526,10 +368,7 @@ func TestTerminalCompletionDeletesProgressMessage(t *testing.T) {
 	if len(w.confirms) != 0 || w.previewStopToken != "" {
 		t.Fatal("terminal completion retained progress stop state")
 	}
-	waitFor(t, func() bool { return len(f.deletedMessageIDs()) == 1 })
-	if got := f.deletedMessageIDs(); len(got) != 1 || got[0] != result.id {
-		t.Fatalf("deleted progress messages = %v, want [%d]", got, result.id)
-	}
+	waitProgressDeleted(t, w, f, out.InboxID, result.id)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, message := range f.messages {
@@ -580,10 +419,10 @@ func TestRootCompletionPersistsReplyToOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.dispatch()
-	w.preview = "final"
+	w.stream.WriteString("final")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || out.Text != "final" || out.ReplyTo != 2 {
+	if err != nil || replyBody(t, out.Text) != "final" || out.ReplyTo != 2 {
 		t.Fatalf("root final output = %+v, error %v", out, err)
 	}
 }
@@ -605,18 +444,22 @@ func TestQueuedRootRepliesRetainTheirOwnOrigins(t *testing.T) {
 	command("first")
 	command("second")
 	w.dispatch()
-	w.preview = "first answer"
+	w.stream.WriteString("first answer")
 	w.finish()
 	w.dispatch()
-	w.preview = "second answer"
+	w.stream.WriteString("second answer")
 	w.finish()
 	for _, want := range []struct {
 		text    string
 		replyTo int64
 	}{{"first answer", 2}, {"second answer", 3}} {
 		out, err := w.b.db.NextOutput()
-		if err != nil || out.Text != want.text || out.ReplyTo != want.replyTo {
-			t.Fatalf("queued root output = %+v, error %v", out, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := replyBody(t, out.Text)
+		if body != want.text || out.ReplyTo != want.replyTo {
+			t.Fatalf("queued root output = %+v", out)
 		}
 		if err = w.b.db.MarkOutput(out.ID, "sending"); err != nil {
 			t.Fatal(err)
@@ -823,7 +666,7 @@ func TestProgressStopAdvancesWithoutTelegram(t *testing.T) {
 				if outcome == "blocked" && uiContext.Err() != nil {
 					t.Fatal("Stop waited for the Telegram request to expire")
 				}
-				if got := replyBody(strings.Join(researchReplies(t, w, 1000), "")); got != "answer: queued" {
+				if got := researchBody(t, w, 1000); got != "answer: queued" {
 					t.Fatalf("preserved followup reply = %q", got)
 				}
 			})
@@ -864,10 +707,10 @@ func TestReviewFinalReplyRetainsCommandOrigin(t *testing.T) {
 	}
 	command("/review staged changes")
 	w.dispatch()
-	w.preview = "review complete"
+	w.stream.WriteString("review complete")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || out.Text != "review complete" || out.ReplyTo != 2 {
+	if err != nil || replyBody(t, out.Text) != "review complete" || out.ReplyTo != 2 {
 		t.Fatalf("review final output = %+v, error %v", out, err)
 	}
 }
@@ -891,10 +734,10 @@ func TestAttachmentFinalReplyRetainsAttachmentOrigin(t *testing.T) {
 	}
 	w.queue = append(w.queue, queued{id: 2, user: 7, replyTo: 42, text: "attachment prompt"})
 	w.dispatch()
-	w.preview = "attachment complete"
+	w.stream.WriteString("attachment complete")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || out.Text != "attachment complete" || out.ReplyTo != 42 {
+	if err != nil || replyBody(t, out.Text) != "attachment complete" || out.ReplyTo != 42 {
 		t.Fatalf("attachment final output = %+v, error %v", out, err)
 	}
 }
@@ -907,10 +750,10 @@ func TestProgressAndFinalReplyShareRootOrigin(t *testing.T) {
 	if progressReplyTo != float64(2) {
 		t.Fatalf("progress reply target = %v, want 2", progressReplyTo)
 	}
-	w.preview = "final"
+	w.stream.WriteString("final")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || out.Text != "final" || out.ReplyTo != 2 {
+	if err != nil || replyBody(t, out.Text) != "final" || out.ReplyTo != 2 {
 		t.Fatalf("final reply target = %+v, error %v", out, err)
 	}
 	waitKeyboardClears(t, f, messageID)

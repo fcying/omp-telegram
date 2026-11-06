@@ -785,7 +785,8 @@ func TestMain(m *testing.M) {
 				}
 				streaming.Store(false)
 				emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text}})
-				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
+				emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []any{map[string]any{"type": "text", "text": text}}}})
+				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "stopReason": "stop", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				if autoresearchRootID != "" {
 					emit(map[string]any{"type": "prompt_result", "id": autoresearchRootID, "status": "completed", "agentInvoked": true, "sessionSettled": true})
 					autoresearchRootID = ""
@@ -1373,10 +1374,11 @@ func TestMain(m *testing.M) {
 				if text == "cwd" {
 					text, _ = os.Getwd()
 				}
-				emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text}})
-				emit(map[string]any{"type": "agent_end", "isTerminal": false})
+				emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "user", "content": text}})
+				emit(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "answer: " + text}})
+				emit(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}})
 				streaming.Store(false)
-				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}}})
+				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "user", "content": text}, map[string]any{"role": "assistant", "stopReason": "stop", "content": []any{map[string]any{"type": "thinking", "text": "PRIVATE"}, map[string]any{"type": "text", "text": "answer: " + text}}}}})
 				continue
 			}
 			emit(resp)
@@ -2642,7 +2644,7 @@ func TestProgressOffKeepsInternalTextWithoutLiveDelivery(t *testing.T) {
 	w.event([]byte(`{"type":"tool_execution_update","toolCallId":"read-1","partialResult":"private output"}`))
 	w.flushPreview()
 	w.typing()
-	if w.preview != "checking bridge" || len(w.progress.ActiveTools) != 1 || w.progress.ActiveTools["read-1"].Args != "" || w.progress.ActiveTools["read-1"].Detail != "" {
+	if w.stream.String() != "checking bridge" || len(w.progress.ActiveTools) != 1 || w.progress.ActiveTools["read-1"].Args != "" || w.progress.ActiveTools["read-1"].Detail != "" {
 		t.Fatal("off mode stopped internal progress tracking")
 	}
 	if w.previewBusy || w.previewID != 0 || w.lastPreview != "" {
@@ -2668,7 +2670,7 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 		t.Fatal("ending one tool removed a concurrent tool")
 	}
 	progress := w.renderProgress()
-	for _, want := range []string{"Status: Running tool...", "Tools:\n- bash: running", "Output:\nchecking bridge"} {
+	for _, want := range []string{"Status: Running tool...", "Tools:\n- bash: running"} {
 		if !strings.Contains(progress, want) {
 			t.Fatalf("summary progress missing %q: %q", want, progress)
 		}
@@ -2684,7 +2686,7 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 	w.b.cfg.ProgressMode = "verbose"
 	w.event([]byte(`{"type":"tool_execution_end","toolCallId":"bash-1","isError":true,"result":"SECRET result"}`))
 	verbose := w.renderProgress()
-	for _, want := range []string{"Status: Running\n\nRecent tools:\n- bash: failed (", "Result: `\"SECRET result\"`", "Output:\nchecking bridge"} {
+	for _, want := range []string{"Status: Running\n\nRecent tools:\n- bash: failed (", "Result: `\"SECRET result\"`"} {
 		if !strings.Contains(verbose, want) {
 			t.Fatalf("verbose progress missing %q: %q", want, verbose)
 		}
@@ -2695,7 +2697,7 @@ func TestProgressRenderingTracksConcurrentToolsAndLifecycle(t *testing.T) {
 		}
 	}
 	w.b.cfg.ProgressMode = "summary"
-	if got := w.renderProgress(); strings.Contains(got, "Recent tools:") || strings.Contains(got, "bash: failed") || !strings.Contains(got, "Status: Running\n\nOutput:") {
+	if got := w.renderProgress(); strings.Contains(got, "Recent tools:") || strings.Contains(got, "bash: failed") || !strings.Contains(got, "Status: Running") {
 		t.Fatalf("summary showed verbose tool history: %q", got)
 	}
 }
@@ -2744,7 +2746,7 @@ func TestVerboseToolPayloadRendersLiterally(t *testing.T) {
 	}
 }
 
-func TestVerboseProgressShowsInterimOutputWithoutDuplicateActivity(t *testing.T) {
+func TestVerboseProgressKeepsAssistantBodyOutOfToolActivity(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	requireStoreOK(t, err)
 	defer db.Close()
@@ -2770,6 +2772,7 @@ func TestVerboseProgressShowsInterimOutputWithoutDuplicateActivity(t *testing.T)
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Inspecting source"}}`))
 	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Inspecting source"}]}}`))
 	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"read-1","toolName":"read"}`))
+	deliverReplies(t, w)
 	done := make(chan struct{})
 	go func() {
 		w.run()
@@ -2783,20 +2786,16 @@ func TestVerboseProgressShowsInterimOutputWithoutDuplicateActivity(t *testing.T)
 			t.Error("worker did not stop")
 		}
 	}()
-	waitFor(t, func() bool { return fake.messageCount() == 1 })
-	select {
-	case <-time.After(2 * time.Second):
-	case <-done:
-		t.Fatal("worker stopped during progress display")
-	}
+	waitFor(t, func() bool { return fake.messageCount() == 2 })
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.messages) != 1 {
-		t.Fatalf("interim text generated duplicate Telegram messages: %+v", fake.messages)
+	formal, _ := fake.messages[0]["text"].(string)
+	preview, _ := fake.messages[1]["text"].(string)
+	if !strings.Contains(formal, "Inspecting source") || strings.Contains(formal, "read: running") {
+		t.Fatalf("formal body was lost or mixed with later tool state: %q", formal)
 	}
-	text, _ := fake.messages[0]["text"].(string)
-	if !strings.Contains(text, "Output:\nInspecting source") || !strings.Contains(text, "read: running") || strings.Contains(text, "Activity:") {
-		t.Fatalf("interim progress lost output or tool state: %q", text)
+	if strings.Contains(preview, "Inspecting source") || !strings.Contains(preview, "read: running") {
+		t.Fatalf("new preview did not follow the separate formal body: %q", preview)
 	}
 }
 
@@ -2845,7 +2844,7 @@ func TestHostToolCompletionWaitsForToolExecutionEnd(t *testing.T) {
 }
 
 func TestProgressStatusPriorityAndBounds(t *testing.T) {
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), taskState: taskState{active: 10, busy: true}, preview: strings.Repeat("😀", maxProgressUnits)})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "verbose"}}), taskState: taskState{active: 10, busy: true}})
 	w.startProgressTool("tool-1", "bash")
 	w.compacting = true
 	if !strings.Contains(w.renderProgress(), "Status: Compacting context...") {
@@ -2880,8 +2879,8 @@ func TestProgressStatusPriorityAndBounds(t *testing.T) {
 		w.event([]byte(fmt.Sprintf(`{"type":"tool_execution_update","toolCallId":%q,"partialResult":%q}`, id, strings.Repeat("`", 120))))
 	}
 	progress = w.renderProgress()
-	if utf16Length(progress) > maxProgressUnits || !strings.Contains(progress, "Output:") {
-		t.Fatalf("literal tool payloads displaced assistant output or exceeded Telegram budget: %d UTF-16 units", utf16Length(progress))
+	if utf16Length(progress) > maxProgressUnits || strings.Contains(progress, "Output:") {
+		t.Fatalf("tool/status progress exceeded Telegram budget or included body: %d UTF-16 units", utf16Length(progress))
 	}
 }
 
@@ -2912,7 +2911,7 @@ func TestProgressEditCannotRestoreClearedAssociation(t *testing.T) {
 	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, db.Mark(10, "submitted"))
 	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	requireStoreOK(t, db.SetProgressMessage(10, 7, 77))
 	requireStoreOK(t, db.ClearProgressMessage(10, 77))
 	fake := &fakeHTTP{}
 	previous := http.DefaultTransport
@@ -2927,7 +2926,6 @@ func TestProgressEditCannotRestoreClearedAssociation(t *testing.T) {
 		ctx:               ctx,
 		cancel:            cancel,
 		taskState:         taskState{active: 10, busy: true},
-		preview:           "late edit",
 		progressTransport: progressTransport{previewID: 77, lastPreview: "current"},
 		previewResult:     make(chan previewResult, 1),
 		confirms:          make(map[string]confirmation),
@@ -2939,7 +2937,7 @@ func TestProgressEditCannotRestoreClearedAssociation(t *testing.T) {
 	}
 	w.previewFinished(result)
 	var progressID int64
-	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	requireStoreOK(t, db.DB.QueryRow("SELECT COUNT(*) FROM progress_messages WHERE inbox_id=10").Scan(&progressID))
 	if progressID != 0 {
 		t.Fatalf("late edit restored progress association: %d", progressID)
 	}
@@ -2958,7 +2956,7 @@ func TestProgressAssociationFailureDeletesSentMessage(t *testing.T) {
 	defer db.Close()
 	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, db.Mark(10, "submitted"))
-	_, err = db.DB.Exec(`CREATE TRIGGER reject_progress_association BEFORE UPDATE OF progress_message_id ON inbox BEGIN SELECT RAISE(FAIL,'injected progress association failure'); END`)
+	_, err = db.DB.Exec(`CREATE TRIGGER reject_progress_association BEFORE INSERT ON progress_messages BEGIN SELECT RAISE(FAIL,'injected progress association failure'); END`)
 	requireStoreOK(t, err)
 	fake := &fakeHTTP{}
 	previous := http.DefaultTransport
@@ -2973,7 +2971,6 @@ func TestProgressAssociationFailureDeletesSentMessage(t *testing.T) {
 		cancel:        cancel,
 		taskState:     taskState{active: 10, owner: 7, busy: true},
 		turn:          1,
-		preview:       "working",
 		previewResult: make(chan previewResult, 1),
 		confirms:      make(map[string]confirmation),
 	})
@@ -3013,10 +3010,11 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, preview: "answer", confirms: map[string]confirmation{}})
+			w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: mode}, db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
+			w.stream.WriteString("answer")
 			w.finish()
 			output, err := db.NextOutput()
-			if err != nil || output.Text != "answer" {
+			if err != nil || replyBody(t, output.Text) != "answer" {
 				t.Fatalf("durable output = %#v, err = %v", output, err)
 			}
 			var state string
@@ -3027,7 +3025,7 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 	}
 }
 
-func TestReplyCommitFailurePreservesOutputCache(t *testing.T) {
+func TestReplyCommitFailurePreservesUncommittedBody(t *testing.T) {
 	for _, kind := range []string{"done", "cancelled", "uncertain", "research"} {
 		t.Run(kind, func(t *testing.T) {
 			db, err := store.Open(t.TempDir())
@@ -3043,9 +3041,7 @@ func TestReplyCommitFailurePreservesOutputCache(t *testing.T) {
 			w := testWorker(t, &worker{
 				b:   testBridge(t, &Bridge{db: db, fatal: make(chan error, 1)}),
 				ctx: ctx, cancel: cancel, taskState: taskState{active: 10, owner: 7, busy: true},
-				preview: "confirmed reply", lastAssistant: last,
-				finalAssistantTexts: []string{"previous message", "current message"}, assistantRunStart: 1,
-				finalAssistantBytes: 31, finalizedStreamBytes: 14, finalOutputTruncated: true,
+				lastAssistant: last,
 			})
 			w.stream.WriteString("streamed reply")
 			switch kind {
@@ -3067,9 +3063,7 @@ func TestReplyCommitFailurePreservesOutputCache(t *testing.T) {
 			if outputs != 0 {
 				t.Fatal("failed reply transaction left partial output")
 			}
-			if w.preview != "confirmed reply" || w.stream.String() != "streamed reply" || w.lastAssistant != last ||
-				strings.Join(w.finalAssistantTexts, "\n") != "previous message\ncurrent message" || w.assistantRunStart != 1 ||
-				w.finalAssistantBytes != 31 || w.finalizedStreamBytes != 14 || !w.finalOutputTruncated {
+			if w.stream.String() != "streamed reply" || w.lastAssistant != last {
 				t.Fatal("output cache was cleared before the reply transaction committed")
 			}
 			if kind == "research" && (!w.research.root || !w.research.roundOpen) {
@@ -3088,7 +3082,7 @@ func TestDeliveryCleansDoneProgressAfterAllReplies(t *testing.T) {
 	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, db.Mark(10, "submitted"))
 	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"first", "second"}))
-	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	requireStoreOK(t, db.SetProgressMessage(10, 7, 77))
 	fake := &fakeHTTP{}
 	previous := http.DefaultTransport
 	http.DefaultTransport = fake
@@ -3108,7 +3102,7 @@ func TestDeliveryCleansDoneProgressAfterAllReplies(t *testing.T) {
 		t.Fatalf("inbox state = %q, want done", state)
 	}
 	var progressID int64
-	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	requireStoreOK(t, db.DB.QueryRow("SELECT COUNT(*) FROM progress_messages WHERE inbox_id=10").Scan(&progressID))
 	if progressID != 0 {
 		t.Fatalf("progress association remained after delivery: %d", progressID)
 	}
@@ -3127,7 +3121,7 @@ func TestDeliveryFailureCleansTerminalProgress(t *testing.T) {
 	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, db.Submit(10, 42))
 	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	requireStoreOK(t, db.SetProgressMessage(10, 7, 77))
 	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
 		7: {{status: http.StatusBadRequest, body: `{"ok":false,"error_code":400,"description":"reply rejected"}`}},
 	}}
@@ -3147,7 +3141,7 @@ func TestDeliveryFailureCleansTerminalProgress(t *testing.T) {
 	waitFor(t, func() bool {
 		var state string
 		var progressID int64
-		err := db.DB.QueryRow("SELECT outbox.state,inbox.progress_message_id FROM outbox JOIN inbox ON inbox.id=outbox.inbox_id WHERE inbox.id=10").Scan(&state, &progressID)
+		err := db.DB.QueryRow("SELECT outbox.state,(SELECT COUNT(*) FROM progress_messages WHERE inbox_id=10) FROM outbox WHERE inbox_id=10").Scan(&state, &progressID)
 		return err == nil && state == "failed" && progressID == 0 && len(fake.deletedMessageIDs()) == 1
 	})
 	if got := fake.deletedMessageIDs(); len(got) != 1 || got[0] != 77 {
@@ -3163,7 +3157,7 @@ func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
 	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, db.Mark(10, "submitted"))
 	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	requireStoreOK(t, db.SetProgressMessage(10, 7, 77))
 	out, err := db.NextOutput()
 	requireStoreOK(t, err)
 	requireStoreOK(t, db.MarkOutput(out.ID, "sending"))
@@ -3175,7 +3169,7 @@ func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
 	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
 	b.cleanupDeliveredProgress(context.Background(), 10)
 	var progressID int64
-	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	requireStoreOK(t, db.DB.QueryRow("SELECT COALESCE(MAX(message_id),0) FROM progress_messages WHERE inbox_id=10").Scan(&progressID))
 	if progressID != 77 {
 		t.Fatalf("failed deletion cleared progress association: %d", progressID)
 	}
@@ -3191,7 +3185,7 @@ func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
 		<-done
 	}()
 	waitFor(t, func() bool {
-		return db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID) == nil && progressID == 0
+		return db.DB.QueryRow("SELECT COUNT(*) FROM progress_messages WHERE inbox_id=10").Scan(&progressID) == nil && progressID == 0
 	})
 }
 
@@ -3204,7 +3198,7 @@ func TestProgressDeletionPermanentFailureClearsAssociation(t *testing.T) {
 	requireStoreOK(t, db.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, db.Mark(10, "submitted"))
 	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, db.SetProgressMessage(10, 77))
+	requireStoreOK(t, db.SetProgressMessage(10, 7, 77))
 	out, err := db.NextOutput()
 	requireStoreOK(t, err)
 	requireStoreOK(t, db.MarkOutput(out.ID, "sending"))
@@ -3216,26 +3210,30 @@ func TestProgressDeletionPermanentFailureClearsAssociation(t *testing.T) {
 	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
 	b.cleanupDeliveredProgress(context.Background(), 10)
 	var progressID int64
-	requireStoreOK(t, db.DB.QueryRow("SELECT progress_message_id FROM inbox WHERE id=10").Scan(&progressID))
+	requireStoreOK(t, db.DB.QueryRow("SELECT COUNT(*) FROM progress_messages WHERE inbox_id=10").Scan(&progressID))
 	if progressID != 0 {
 		t.Fatalf("permanent deletion failure retained progress association: %d", progressID)
 	}
 }
 
 func TestProgressDeliveryFailureDoesNotAffectWorker(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, db.Submit(10, 42))
 	fake := &fakeHTTP{failProgress: true}
 	old := http.DefaultTransport
 	http.DefaultTransport = fake
 	defer func() { http.DefaultTransport = old }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{ProgressMode: "summary"}, db: db, tg: newTestTelegram(t), fatal: make(chan error, 1)}),
 		binding:       store.Binding{Generation: 1},
 		ctx:           ctx,
 		cancel:        cancel,
 		taskState:     taskState{active: 10, owner: 7, busy: true},
 		turn:          1,
-		preview:       "working",
 		previewResult: make(chan previewResult, 1),
 		confirms:      make(map[string]confirmation)})
 	w.flushPreview()
@@ -3275,10 +3273,11 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, progressTransport: progressTransport{previewBusy: true}, preview: "answer", confirms: map[string]confirmation{}})
+	w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, progressTransport: progressTransport{previewBusy: true}, confirms: map[string]confirmation{}})
+	w.stream.WriteString("answer")
 	w.finish()
 	o, e := db.NextOutput()
-	if e != nil || o.Text != "answer" {
+	if e != nil || replyBody(t, o.Text) != "answer" {
 		t.Fatalf("final was not persisted before preview completion: %v", e)
 	}
 	if !w.finishing {
@@ -3307,12 +3306,9 @@ func TestTerminalRPCFailureIsUncertainAndSanitized(t *testing.T) {
 	if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "uncertain" {
 		t.Fatalf("terminal failure state = %q, error %v", state, err)
 	}
-	o, err := db.NextOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(o.Text, "omp reported that the task failed") || !strings.Contains(o.Text, "partial answer") || strings.Contains(o.Text, "SECRET") {
-		t.Fatalf("terminal failure output = %q", o.Text)
+	output := strings.Join(researchReplies(t, w, 10), "\n")
+	if !strings.Contains(output, "omp reported that the task failed") || strings.Count(output, "partial answer") != 1 || strings.Contains(output, "SECRET") {
+		t.Fatalf("terminal failure output = %q", output)
 	}
 }
 
@@ -3323,16 +3319,14 @@ func TestAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 	requireStoreOK(t, w.b.db.Accept(10, []byte(`{"update_id":10}`)))
 	requireStoreOK(t, w.b.db.Mark(10, "submitted"))
 	w.active, w.busy = 10, true
-	w.stream.WriteString(strings.Repeat("x", maxAssistantOutputBytes-2))
-	w.preview = "partial answer"
+	w.stream.WriteString("partial answer" + strings.Repeat("x", maxAssistantOutputBytes-len("partial answer")-2))
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"more"}}`))
 	var state string
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
 	if state != "uncertain" || w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
 		t.Fatalf("preterminal overflow state=%s runtime=%v binding=%+v", state, w.client, w.binding)
 	}
-	var reply string
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=10").Scan(&reply))
+	reply := strings.Join(researchReplies(t, w, 10), "\n")
 	if !strings.Contains(reply, "resource budget") || !strings.Contains(reply, "partial answer") {
 		t.Fatalf("missing partial answer and overflow notice: %q", reply)
 	}
@@ -3350,8 +3344,8 @@ func TestFinalizedAssistantOverflowBeforeTerminalIsUncertain(t *testing.T) {
 	w.event(message)
 	var state string
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
-	if state != "uncertain" || w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) || len(w.finalAssistantTexts) != 0 {
-		t.Fatalf("finalized preterminal overflow state=%s runtime=%v cached=%d", state, w.client, len(w.finalAssistantTexts))
+	if state != "uncertain" || w.client != nil || !w.binding.Running || !sameBindingIdentity(w.binding, before) {
+		t.Fatalf("finalized preterminal overflow state=%s runtime=%v", state, w.client)
 	}
 }
 
@@ -3479,7 +3473,7 @@ func TestNormalTerminalCompletionIsDone(t *testing.T) {
 		t.Fatalf("normal terminal state = %q, error %v", state, err)
 	}
 	o, err := db.NextOutput()
-	if err != nil || o.Text != "final answer" {
+	if err != nil || replyBody(t, o.Text) != "final answer" {
 		t.Fatalf("normal terminal output = %q, error %v", o.Text, err)
 	}
 }
@@ -3490,8 +3484,8 @@ func TestContinuationRepliesPreserveEarlierRounds(t *testing.T) {
 	}{
 		{"compacted", "complete result", `[]`, "follow-up", `[]`},
 		{"terminal messages", "complete result", `[]`, "follow-up", `[{"role":"assistant","content":[{"type":"text","text":"follow-up"}]}]`},
-		{"rewritten earlier round", "obsolete draft", `[{"role":"assistant","content":[{"type":"text","text":"complete result"}]}]`, "follow-up", `[]`},
-		{"rewritten current round", "complete result", `[]`, "obsolete follow-up", `[{"role":"assistant","content":[{"type":"text","text":"follow-up"}]}]`},
+		{"changed earlier snapshot ignored", "original question", `[{"role":"assistant","content":[{"type":"text","text":"changed snapshot"}]}]`, "follow-up", `[]`},
+		{"changed current snapshot ignored", "complete result", `[]`, "original follow-up", `[{"role":"assistant","content":[{"type":"text","text":"changed follow-up"}]}]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, err := store.Open(t.TempDir())
@@ -3507,28 +3501,24 @@ func TestContinuationRepliesPreserveEarlierRounds(t *testing.T) {
 			w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":` + tc.firstEnd + `}`))
 			var count int
 			requireStoreOK(t, db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=10").Scan(&count))
-			if count != 0 {
-				t.Fatal("nonterminal round settled the root early")
+			if count != 1 || queueState(t, w, 10) != "submitted" {
+				t.Fatal("nonterminal round did not queue its body while preserving the root")
 			}
 			w.event([]byte(`{"type":"agent_start"}`))
 			w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"` + tc.lastText + `"}]}}`))
 			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":` + tc.lastEnd + `}`))
-			output, err := db.NextOutput()
-			requireStoreOK(t, err)
-			if body := replyBody(output.Text); body != "complete result\n\nfollow-up" {
-				t.Fatalf("continued task reply = %q", body)
+			parts := researchReplies(t, w, 10)
+			if len(parts) != 2 || replyBody(t, parts[0]) != tc.firstText || replyBody(t, parts[1]) != tc.lastText {
+				t.Fatalf("continued task rewrote or merged completed messages: %q", parts)
 			}
-			requireStoreOK(t, db.MarkOutput(output.ID, "sending"))
-			requireStoreOK(t, db.MarkOutput(output.ID, "done"))
 			requireStoreOK(t, db.Accept(11, []byte(`{"update_id":11}`)))
 			requireStoreOK(t, db.Mark(11, "submitted"))
 			w.beginTask(queued{id: 11})
 			w.event([]byte(`{"type":"agent_start"}`))
 			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"next task"}]}]}`))
-			output, err = db.NextOutput()
-			requireStoreOK(t, err)
-			if body := replyBody(output.Text); body != "next task" {
-				t.Fatalf("previous task output leaked into next root: %q", body)
+			parts = researchReplies(t, w, 11)
+			if len(parts) != 1 || replyBody(t, parts[0]) != "next task" {
+				t.Fatalf("previous task output leaked into next root: %q", parts)
 			}
 		})
 	}
@@ -3630,9 +3620,12 @@ func TestCompactedTerminalEventsUseMessageEndMetadata(t *testing.T) {
 			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != tc.state {
 				t.Fatalf("compacted terminal state = %q, error %v; want %q", state, err, tc.state)
 			}
-			o, err := db.NextOutput()
-			if err != nil || !strings.Contains(o.Text, tc.want) || tc.hidden != "" && strings.Contains(o.Text, tc.hidden) {
-				t.Fatalf("compacted terminal output = %q, error %v", o.Text, err)
+			output := strings.Join(researchReplies(t, w, 10), "\n")
+			if !strings.Contains(output, tc.want) || tc.hidden != "" && strings.Contains(output, tc.hidden) {
+				t.Fatalf("compacted terminal output = %q", output)
+			}
+			if tc.preview == "partial answer" && strings.Count(output, "partial answer") != 1 {
+				t.Fatalf("interrupted snapshot dropped or duplicated its truthful partial body: %q", output)
 			}
 		})
 	}
@@ -3715,18 +3708,17 @@ func TestAgentStartClearsTerminalMetadata(t *testing.T) {
 
 func TestTerminalAbortIsCancelled(t *testing.T) {
 	for _, tc := range []struct {
-		name, event, want, hidden string
+		name, event, body, hidden string
 	}{
 		{
 			name:   "partial output",
 			event:  `{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"partial answer"}],"stopReason":"aborted","errorMessage":"Request was aborted"}]}`,
-			want:   "partial answer",
+			body:   "partial answer",
 			hidden: "Request was aborted",
 		},
 		{
 			name:   "empty output",
 			event:  `{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","stopReason":"aborted","errorMessage":"Stopped by user"}]}`,
-			want:   "Task was cancelled before completion.",
 			hidden: "Stopped by user",
 		},
 	} {
@@ -3750,9 +3742,19 @@ func TestTerminalAbortIsCancelled(t *testing.T) {
 			if err = db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil || state != "cancelled" {
 				t.Fatalf("terminal abort state = %q, error %v", state, err)
 			}
-			o, err := db.NextOutput()
-			if err != nil || !strings.Contains(o.Text, tc.want) || !strings.Contains(o.Text, "Task was cancelled before completion.") || strings.Contains(o.Text, tc.hidden) {
-				t.Fatalf("terminal abort output = %q, error %v", o.Text, err)
+			replies := researchReplies(t, w, 10)
+			wantParts := 1
+			if tc.body != "" {
+				wantParts++
+			}
+			if len(replies) != wantParts {
+				t.Fatalf("terminal abort lost its body or cancellation notice: %q", replies)
+			}
+			if tc.body != "" && replyBody(t, replies[0]) != tc.body {
+				t.Fatalf("terminal abort changed partial body: %q", replies)
+			}
+			if strings.TrimSpace(replies[len(replies)-1]) == "" || strings.Contains(strings.Join(replies, "\n"), tc.hidden) {
+				t.Fatalf("terminal abort omitted its notice or exposed native error: %q", replies)
 			}
 		})
 	}
@@ -3909,12 +3911,12 @@ func TestFinalReplyWriteFailureDoesNotCompleteInput(t *testing.T) {
 	if err := w.b.db.Mark(10, "submitted"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := w.b.db.DB.Exec(`CREATE TRIGGER reject_final_part BEFORE INSERT ON outbox WHEN NEW.text='second' BEGIN SELECT RAISE(FAIL,'injected final failure'); END`)
+	_, err := w.b.db.DB.Exec(`CREATE TRIGGER reject_final_part BEFORE INSERT ON outbox WHEN INSTR(NEW.text,'second')>0 BEGIN SELECT RAISE(FAIL,'injected final failure'); END`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w.active, w.busy = 10, true
-	w.preview = strings.Repeat("x", telegram.MaxMessageUTF16) + "\n\nsecond"
+	w.stream.WriteString(strings.Repeat("x", telegram.MaxMessageUTF16) + "\n\nsecond")
 	w.finish()
 	var state string
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil {

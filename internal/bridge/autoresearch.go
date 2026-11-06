@@ -197,33 +197,41 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 	if !w.research.root || !w.taskActive() || !w.research.roundOpen {
 		return
 	}
-	text, found, truncated := boundedAssistantTexts(e.Messages, nil, w.finalAssistantTexts, maxFinalReplyBytes)
-	if found {
-		w.preview, w.finalOutputTruncated = text, truncated
-	}
-	if w.preview != "" && w.terminalState(e) == terminalDone {
+	if w.hasAssistantBody() && w.terminalState(e) == terminalDone {
 		w.finishReplyWithStatus(true)
 		return
 	}
 	w.commitResearchRound()
 }
 
-func (w *worker) commitResearchRound() {
-	if w.preview != "" {
-		if err := w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, replyTaskReplies(w.b.language(), w.preview, w.replyStatus.header, w.finalOutputTruncated)); err != nil {
+func (w *worker) commitResearchRound() bool {
+	metadata := w.replyStatus.header
+	if metadata == "" {
+		metadata = w.intermediateAssistantHeader()
+	}
+	target := w.assistantDelivery.statusOutboxID
+	if w.stream.Len() != 0 {
+		if !w.queueAssistantTextWithHeader(w.stream.String(), false, metadata) {
+			return false
+		}
+		target = w.assistantDelivery.statusOutboxID
+	} else if target != 0 && metadata != "" {
+		if err := w.b.db.SetAssistantHeader(w.ctx, target, w.assistantHeader(metadata, false)); err != nil {
 			w.b.fail(err)
 			w.cancel()
-			return
+			return false
 		}
 	}
+	if target != 0 {
+		w.replyStatus.roundStatusOutboxID = target
+		w.replyStatus.roundStatusHeader = metadata
+	}
 	w.research.roundOpen = false
-	w.preview = ""
-	w.stream.Reset()
-	w.finalizedStreamBytes = 0
 	w.resetAssistantResult()
 	w.replyStatus.header = ""
 	w.replyStatus.metrics = replyMetrics{}
 	w.awaitTaskContinuation()
+	return true
 }
 
 func (w *worker) researchLocalResult(e rpcEvent) bool {

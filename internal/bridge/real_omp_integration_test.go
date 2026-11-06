@@ -115,10 +115,30 @@ func TestRealOMPBridgeCompatibility(t *testing.T) {
 	close(provider.root)
 	until(func() bool { return queueState(t, w, 101) == "done" })
 	for id, want := range map[int64]string{100: "root-complete", 101: "followup-complete"} {
-		if queueState(t, w, id) != "done" || replyBody(strings.Join(researchReplies(t, w, id), "")) != want {
+		if queueState(t, w, id) != "done" || researchBody(t, w, id) != want {
 			t.Fatal("native control polluted or misattributed a final reply")
 		}
 	}
+	deliverReplies(t, w)
+	fake.mu.Lock()
+	for id, body := range map[int64]string{100: "root-complete", 101: "followup-complete"} {
+		count := 0
+		for _, request := range fake.messages {
+			if sentReplyTarget(request) != float64(id) {
+				continue
+			}
+			count++
+			text, _ := request["text"].(string)
+			header, renderedBody, _ := strings.Cut(text, "\n")
+			if request["message_id"] != nil || request["parse_mode"] != "HTML" || !strings.Contains(header, "<code>gpt-5</code>") || strings.TrimLeft(renderedBody, "\n") != body {
+				t.Errorf("native final status/body did not share an immutable Telegram Send: %+v", request)
+			}
+		}
+		if count != 1 {
+			t.Errorf("native task %d sent %d bubbles, want one body with status and no orphan", id, count)
+		}
+	}
+	fake.mu.Unlock()
 	if provider.count() != 2 || provider.followupTier() != "priority" {
 		t.Fatal("native fast was not reflected in the next real provider request")
 	}
@@ -142,7 +162,7 @@ func TestRealOMPBridgeCompatibility(t *testing.T) {
 	}
 	close(provider.tool)
 	until(func() bool { return queueState(t, w, 200) == "done" })
-	if replyBody(strings.Join(researchReplies(t, w, 200), "")) != "attachment-complete" {
+	if researchBody(t, w, 200) != "attachment-complete" {
 		t.Fatal("native host tool result did not complete the original task")
 	}
 	t.Log("host tool: real OMP call/result round trip, immutable attachment pending for original topic, no delivery claim")
@@ -161,7 +181,7 @@ func TestRealOMPBridgeCompatibility(t *testing.T) {
 	if w.client == stoppedClient || !sameBindingIdentity(binding, w.binding) || provider.count() != 6 {
 		t.Fatal("stop/resume changed session identity or replayed old work")
 	}
-	if replyBody(strings.Join(researchReplies(t, w, 303), "")) != "resumed-complete" {
+	if researchBody(t, w, 303) != "resumed-complete" {
 		t.Fatal("resumed session did not produce its own final reply")
 	}
 	t.Log("stop/resume: old runtime retired, queued work cancelled, saved native context resumed without replay")

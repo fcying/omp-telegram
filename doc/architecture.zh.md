@@ -168,7 +168,7 @@ Root 请求发送前, inbox 必须已持久标记为 `submitted`. Steer 先验�
 | Assistant error stop reason, 非空 `errorMessage`/`errorClassificationMessage`, 或非零 `errorStatus` | `uncertain`, 保留已有部分文本和安全通知. |
 | terminal 事件没有确认文本 | `uncertain`, 明确完成的本地原生命令除外. |
 
-Terminal 消息优先于当前 agent run 的 `message_end` 缓存, 不覆盖同一普通 root 中此前已完成轮次的输出. RPC v2 可从压缩后的 terminal 帧中省略已发出的消息, 因此 worker 保留 finalized assistant 文本, 必要时回退到当前轮缓存. Continuation 的 `agent_start` 开启新轮, 不丢弃此前已确认的输出; 每轮只重置最新终结 metadata. 任务结算和 teardown 才清空任务输出缓存. 没有活动桥接 owner 的迟到/主动 `agent_start` 不能重启 typing 或卡住队列. 托管研究仍使用独立的逐轮交付生命周期.
+Terminal metadata 优先于当前 agent run 的 `message_end` metadata 缓存. 已完成正文已属于持久 outbox, 不被 terminal 快照替换. RPC v2 可能省略不变的前缀, 因此 worker 按所有 role 的位置及原始 `messageCount` 对账, 仅保留当前未提交文字和最新终结 metadata. Continuation 的 `agent_start` 开启新轮, 不丢弃此前已排入输出或任务级资源计数. 任务结算和 teardown 清空临时投递状态. 没有活动桥接 owner 的迟到/主动 `agent_start` 不能重启 typing 或卡住队列. 托管研究仍使用独立的逐轮交付生命周期.
 
 [`steerFence`](../internal/bridge/steer.go) 要求 root terminal 事件, 所有 steer 的 terminal 结果以及当前 session settlement 全部成立后才最终结算. Steer 状态 `completed` 映射为 `done`, `aborted` 为 `cancelled`, `error` 为 `failed`; 未知状态为 uncertain. 明确拒绝只使该 steer 失败, 不声称其指令已生效; 未确认传输结果会退役 runtime. 仅本地的 `agentInvoked:false` acknowledgment 可完成该 steer, 但 root 仍须有静止证据.
 
@@ -256,6 +256,8 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 原生 cancel 使匹配 token 失效. Teardown 先移除失效 token, 再进行有界键盘清理. 菜单 receipt 记录用户选择, 不是操作成功; confirm/select 写入失败按保守策略退役 runtime.
 
+连续的原生 `select` 仅在相同活动 root, turn, client 和 generation 内复用前一个已完成菜单, 中间不能跨模型 run/消息或 session 变化. 后续选择处于 pending, 翻页, 取消或失效状态时, 之前的选择仍在菜单文字预算内保持可见. 被复用的 Telegram 消息已不存在时, 重新发送可用菜单; 其他编辑失败不重发交付状态不明的菜单. Pending 菜单保留创建时的 scope, 包括 root/turn 为零的情况, 完成时不能借用后来的 root. 并发待处理的对话不合并. 取消, 任务结算和 runtime teardown 清除可复用回执缓存, 不移除已显示的历史选择; 原有单次 token, 消息绑定和原生 response 处理保持不变.
+
 手动 `/compact` 要求逻辑 session 空闲, 不要求进程已连接; 恢复已释放 runtime 后直接开始, 无需确认. 它尝试用五秒超时发送无按钮 `Compacting...`, 再以 180 秒 deadline 在 operation 通道执行原生 `compact`. 成功后 `get_state` 在剩余 deadline 内最多再用三秒. 缺失/非法 usage 或采样失败显示 `n/a`, 不把确认完成的 compaction 改为失败. 不同且非空的原生 session ID 还会退役 runtime, 保留原绑定/claim. 完成后替换状态消息; 状态消息不存在或 edit 失败则经持久 outbox 发送结果.
 
 `/handoff` 要求 session 控制空闲且队列为空, 将可选 `customInstructions` 传给原生 RPC, 并阻止后续队列在结果返回前派发. Operation deadline 为 180 秒. Compact/handoff 明确拒绝保留可复用 runtime; 错误, 超时, 取消及未确认结果释放 runtime 供 lazy resume. 两者都不创建模型 root, 不借用其 progress/Stop 键盘. Session/model/argument 选择及原生 export/path resolution 是独立生命周期接口; [`render.go`](../internal/omp/render.go) 通过 `omp render` 解析原生历史路径, 不负责 Telegram 最终答案格式化.
@@ -264,11 +266,13 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ### 尽力而为的 progress
 
-[`worker.renderProgress`](../internal/bridge/bridge.go) 使用单条可编辑内存 preview. 每 1.5 秒 worker tick 在三秒初始延迟后判断是否创建. `off` 关闭 progress Send/Edit 和 typing, 但继续累积文本供最终回复. `summary` 显示输出, 状态和活动工具; `verbose` 增加有界原始参数, 最新 partial/final result 和最近五个工具结果, 另计省略的更早调用数. Retry/compaction 有明确状态. 只有匹配 `tool_execution_end` 才完成工具; host callback 可修正名称/参数但不能虚构完成. 不显示 reasoning 或整帧.
+[`worker.renderProgress`](../internal/bridge/bridge.go) 使用可编辑的工具/状态内存 preview, 包含当前 assistant 正文的有界尾部. 每 1.5 秒 worker tick 在三秒初始延迟后判断是否创建. `off` 关闭 progress Send/Edit 和 typing, 不关闭已完成的 assistant 消息. `summary` 显示状态, 活动工具及正文预览; `verbose` 增加有界原始参数, 最新 partial/final result 和最多 `telegram.progress_recent_tools` 条近期工具结果 (默认 5, 范围 1..100), 另计省略的更早调用数. 渲染超出 preview 预算时丢弃最旧行, 保留最新可见后缀. Retry/compaction 有明确状态. 只有匹配 `tool_execution_end` 才完成工具; host callback 可修正名称/参数但不能虚构完成. 不向此气泡追加 reasoning 或整帧.
 
-最多显示六个活动工具, 名称最多 64 单位, payload 字段最多 100 UTF-16 单位, detail 总预算 1600 单位, output tail 最多 2200 单位, preview 总预算 3500 单位. 有界 JSON payload decoder 扫描事件但只复制有限前缀. Verbose payload 不脱敏, 可向所有能读此会话的人暴露凭据或私有文件; 截断不是隐私过滤.
+Assistant 预览保留当前文字尾部最多 2200 UTF-16 单位, 不修改正式正文. 最多显示六个活动工具, 名称最多 64 单位, payload 字段最多 100 单位, detail 总预算 1600 单位, preview 总预算 3500 单位. 有界 JSON payload decoder 扫描事件但只复制有限前缀. Verbose payload 不脱敏, 可向所有能读此会话的人暴露凭据或私有文件; 截断不是隐私过滤.
 
-Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 初始 Send 失败抑制该 turn 后续 progress, 避免重复消息; Edit 失败仍可重试. Preview 和最终回复尽可能回复 root 的原 Telegram 消息; 回复目标被拒绝时可退回普通消息, 不改变执行状态. Progress 清理由持久完成/输出投递驱动, 不证明 preview 曾可见. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
+Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 接受 Steer 和正文成功持久入队共用 `supersedePreview`: 推进 preview epoch, 对 root 较早的持久预览取快照并异步删除. discard-epoch 边界也会在任一替换前迟到的成功 Send 返回身份后清理它们. 删除沿用既有尽力而为策略, 不改变任务状态. 轮换取消过时 Edit, 但让初次 Send 返回消息身份以供清理. 新 preview 等待当前对话没有 pending/sending outbox 行后才创建, 不抢在正式回复前; 此 UI 屏障不延迟 RPC 消费或任务执行. Steer preview 回复该用户消息, 不改变 root 所有权, 不重启 OMP. 初始 Send 失败抑制该 epoch 后续 progress, 避免重复消息; Edit 失败仍可重试. 只有首条正式文本分片引用原 root 请求. 回复目标被拒绝时可退回普通消息, 不改变执行状态. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
+
+已完成的 assistant 正文是独立持久消息, 不属于临时 Progress. 每条 preview 身份持久保存在 `progress_messages`, 包括旧 epoch 迟到但成功的 Send. 即使正文已在 inbox 完成前全部投递且没有新增终结行, 终结清理仍检查全部关联. 迟到的 Progress 结果按原 task/generation/turn/epoch fencing, 不能重新绑定当前 preview, 改写 assistant 问题或让替换任务接管旧消息.
 
 Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 worker 取消控制, 单次请求的 deadline 为五秒. Owner, 过期时间, generation, active inbox 和 turn 检查仍由 actor 执行, 中断前的 token 消费也留在 actor 内. 通道只接收 UI 目标和回执文本; 迟到结果不能改变任务所有权, 结算或重放任务. 背压可以丢弃 UI 操作, 不丢弃停止请求. 其他 callback 类型保留原行为.
 
@@ -276,27 +280,35 @@ Stop callback 确认和键盘清理在 actor 外的有界 UI 通道执行, 受 w
 
 [`status.go`](../internal/bridge/status.go) 只解码可安全展示字段, 不解码原始模型配置. 详细 `/status` 显示 workspace, session/name, provider/model, configured thinking, fast 设置/实际活动, 原生 context usage, streaming/compaction, 桥接队列长度, 原生速度, runtime 连接状态和空闲时长. 缺失/非法数据为 `n/a`, 不估算. `Running` 是原生 streaming, 不是桥接 active-root 判定. 检查已释放的 running binding 可临时恢复再释放已持久且空闲的 runtime; 新输入, pending work/UI 或缓冲输出会阻止过早释放.
 
-[`progress_status.go`](../internal/bridge/progress_status.go) 独立于变更通道采样已连接的运行 root: 初始 progress 延迟后至多每五秒一次 `get_state`, 仅一条在途, 三秒 deadline. 它不启动进程, 不改变 idle-watchdog 证据. 结果须匹配 request/client/generation/root/turn/catalog epoch 和绑定/原生 session. 失败只清空 UI block, 不结算或重放任务. Task/session/runtime 变化取消旧采样.
+[`progress_status.go`](../internal/bridge/progress_status.go) 独立于变更通道采样已连接的运行 root: 初始 progress 延迟后至多每五秒一次 `get_state`, 仅一条在途, 三秒 deadline. 它不启动进程, 不改变 idle-watchdog 证据. 结果须匹配 request/client/generation/root/turn/catalog epoch 和绑定/原生 session. 当前 scope 的读取完成后立即触发 preview 刷新, 仍受投递屏障限制. 同 session 的标题/metadata 更新保留在途及已完成样本; 真正的 scope 变化使其失效. 读取失败以未知 context 替换陈旧 UI 值, 不结算或重放任务. 采样不受等待中的正式投递影响.
 
-Progress assistant 文本使用 [`markdown.go`](../internal/telegram/markdown.go) 的 `TailForTelegram`, 包括生成围栏的完整 Markdown 片段最多占 2200 个 UTF-16 单元或 progress 剩余容量. 不同 assistant 消息在首个非空 delta 前加入段落分隔; 分隔符计入 stream 和组装文本预算, 不改变缓存原始文本的字节计数语义. 转换与预览共享同一个 block collector. 截断时前移到整行, 按原始作用域恢复 quote/fence 或表头上下文, 不把孤立 closing fence 当作 opener. 末尾普通段落在实际引用作用域内投影; 表格, 围栏正文和列表 continuation 不并入该段落. 裁剪到 continuation 时, 单次扫描到下一个完整列表项; 没有后续完整项时才跳到已收集的块边界, 不逐行从源文开头重复扫描. 隐藏有明确依据的未匹配 emphasis 开头及部分闭合标记, 临时补齐未完成的 inline code. 完整跨行配对保持不变. 投影变化必须保持递归块类型和范围, 不让合成 closer 成为新围栏. 作用域, 源码或渲染预算无法保持时, 在任何合成包装或闭合标记产生之前提取有界原始块正文, 再按字面回退. 大表格预览保留有界原始末行, 不将被丢弃的表头逐行展开或渲染整个源文. 已保存输出和最终转换不使用此投影. 完整预览交付 Telegram 前仍经过 `ClipConvertible`.
+采样独立于 Progress 的可见性服务 assistant 状态栏, 包括 `off` 和已抑制的预览. 已完成中间消息可用已确认且包含输出的 usage, 配合同 scope/model/provider 的正窗口容量计算 context, 即使样本仍处于 streaming 或 compacting. 这不声明 idle; 最终 context 仍要求下文的明确 idle 证据. 当前 scope 首次读取完成前省略 context, 包括首次请求在途期间. 读取完成后 context 不可用才显示 `ctx ?`, 不延迟正文投递, 不增加查询. 最终 metadata 可以更新最新正式消息的状态栏, 不修改正文.
+
+正式 assistant 消息以 **💬** 开头, `message_end` 时仍立即入队投递; 一条消息完成不代表 root 已结束. 整个任务确认成功后, 原子地将最新正式消息首片状态栏改为 **✅**, 并附上已确认的最终 metadata 和可选 provider 用量, 不修改正文. 取消, 结果不确定的任务和仍在继续的研究轮次不标成功. 研究轮次重置时仅保留最新状态栏 outbox ID 和有界显示 metadata; 仅 terminal snapshot 提供的轮次正文也分开存储状态栏, 使 root 自然结束时可更新最后一条回复, 不复制或重发历史. 状态栏预留 512 UTF-16 单位预算, 正文分片保留此空间供后续状态更新.
+
+[`assistant_delivery.go`](../internal/bridge/assistant_delivery.go) 在 root 仍为 submitted 时, 通过 `AppendAssistantReplies` 立即排入每条完成的 assistant `message_end`, 包括模型 stop 正文. Outbox 将首片状态栏与不可变正文分开保存, 保留 bot 消息顺序. 只有该 inbox 首条持久文本回复引用原始请求; 后续消息及分片不设置回复目标. 投递不等待最终 metadata. 只有缺少 `message_end` 的 terminal-only 文字可继续 staged 并等待最终采样. 内存仅保留当前未提交文字, 最多一条 staged 正文及位置/资源计数, 不保存另一份已完成正文历史. `message_end` 不结束 root, 不派发下一个 prompt. 不增加问题检测器, 自动审批, RPC 模式变化或原生 Ask 支持.
+
+位置去重区分 staged 文字与不可变的已排入历史. `agent_end` 快照包括 `isTerminal:false` 时只能修正未提交正文; 重复位置可更新终结 metadata, 但不能改写已提交文字或重复累计指标. 只有 metadata 的快照保留未提交文字. 非终结修正在排入输出前仍受任务剩余输入预算限制. UI 请求仅 `confirm`, `select`, `input` 和 `editor` 属于交互式 continuation. 被动 UI metadata 不冲刷 staged 文字, 也不中断正在等待的最终状态/provider usage 采样.
+
+原生 `agent_end` 可能重复已流送消息, 也可能只包含压缩后的后缀. 对账按所有 role 的位置计数, 包括 user 和 tool-result, 存在原始 `messageCount` 时使用它定位后缀; 不同位置的相同 assistant 正文仍是独立消息. 缺少最终 `message_end` 或原生 continuation/中断时保留未提交正文, 不重发此前内容. 原有每 root 或研究 round 的字节/消息预算跨所有正文消息累计, 预留终结状态及单次明确截断提示. 普通输入, steer, 所有权, session 围栏及交付不确定时不重放的策略不变.
 
 [`markdown_inline.go`](../internal/telegram/markdown_inline.go) 在 HTML 转义前对源码分词, 在普通段落内跨 soft newline 配对 delimiter run, 将 code 和链接目标排除在 delimiter 配对之外, 不使用可被原文伪造的占位符. ASCII 标点转义保留原始源码以重建预览, 同时解码可见正文; code 正文和 URL 目标中的反斜线保持字面含义. 包括重叠标签在内的链接候选通过一次线性扫描建立索引, URL 和 title 使用有限后缀状态; 消费转义 opener 或 code span 后不重新搜索整段后缀. Delimiter 搜索按 marker 和 closer 规则类别缓存搜索下界, 不能继续匹配的删除线残余移出匹配栈. 相邻字符缺失通过源码偏移识别, 不使用 NUL rune 哨兵, 原始 NUL 字形不会被误当成消息边缘. 输出 code 前关闭活动的 emphasis/link 实体, 后续普通文本按需恢复, heading 也遵循同一规则. Inline code padding 支持在字面反引号外围选择安全标记. 列表空行保留为 block 层的段落间隔. Telegram 拒绝 entity 解析时, 原文能容纳则重试原文; 否则客户端仅移除自己生成的 HTML 标签并解码转义, 重试相同的有界可见正文, 不截断内容. 这些渲染修复不证明所有 Telegram iOS 展示报告的根因已确定.
 
 最终分片按完整表头和行转换后的长度计算预算, 包括 compact table 的标签. 普通表格重复表头; 表头或单行过长时, 整表降级为未转义的带标签文本, 再按字面围栏分片, 仅在最终转换时转义. Code 和字面表格片段保留正文字符及换行顺序, 不拆可容纳的完整行, 硬切后选择不冲突的围栏. 超长普通段落复用已配对的 inline token, 按可见正文切分并重建可独立转换的 Markdown. 常数种 delimiter 编码均与原始 span 语义, 实际渲染 UTF-16 长度及块解释核对. 当前上下文没有合法编码时, 由生成 delimiter 的事件定位必要的实体边界分片; 未决的单字形实体使用结构上有效的终端编码, 不依赖源文触发 panic, 不丢弃正文. 实体上下文可表达时保留完整短行; 超长行硬切, 不可表达的实体边界可能需要额外消息. 段落可见正文和非空白字形的格式保持不变. 边缘空白可置于 emphasis 外, 纯空白正文按字面代码保护. 块外围既有的空行规范化及总字节/消息数截断预算保持不变.
 
-[`compact_status.go`](../internal/bridge/compact_status.go) 中的 `compactHeader` 是实时 Progress 和最终回复共用的格式化接口, 在一个逻辑行显示有界字面 model ID (不带 provider), 原生 thinking 符号, fast 活动, context 百分比/窗口容量和已校验速度. Reply metrics 为 nil 时使用原生采样值; 已确认回复的 metrics 提供整轮速度和包含输出的 context, 同时校验 model 专属设置的归属. 未知字段省略, 不从 text delta 估算 tokens/s. Thinking 来源是由本地 `/effort` 元数据查询和 `thinking_level_changed` 填充的 runtime configured-selector 缓存, 而非有效 `get_state.thinkingLevel`. 未知/model-default/不可调 selector 不显示 compact 符号, 详细 status 为 `n/a`. Runtime 停止清空缓存. 可选 configured-selector 读取失败不推翻已验证设置变更; 已 stopping client 仍不能复用.
+[`compact_status.go`](../internal/bridge/compact_status.go) 中的 `compactHeader` 是实时 Progress 和最终回复共用的格式化接口, 在一个逻辑行显示有界字面 model ID (不带 provider), 原生 thinking 符号, fast 活动, context 百分比/窗口容量和已校验速度. Reply metrics 为 nil 时使用原生采样值; 已确认回复的 metrics 提供整轮速度和包含输出的 context, 同时校验 model 专属设置的归属. 读取完成后未知的 context 显示静态 `ctx ?`, 不表示正在刷新; 未读取的 context 和其他未知字段省略. 不从 text delta 估算 tokens/s. Thinking 来源是由本地 `/effort` 元数据查询和 `thinking_level_changed` 填充的 runtime configured-selector 缓存, 而非有效 `get_state.thinkingLevel`. 未知/model-default/不可调 selector 不显示 compact 符号, 详细 status 为 `n/a`. Runtime 停止清空缓存. 可选 configured-selector 读取失败不推翻已验证设置变更; 已 stopping client 仍不能复用.
 
 ### 已确认最终渲染与指标
 
-[`reply_metrics.go`](../internal/bridge/reply_metrics.go) 独立于 progress 模式, 只在成功文本回复首条消息添加 header. 主 agent assistant `message_end` 提供 model/provider 身份与安全数字 usage/duration; terminal summary 不重复计数. 平均生成速度为 `sum(output tokens) * 1000 / sum(duration_ms)`, 不包含 queue/tool 时间, 要求正输出且总 duration 至少 100 ms. 任一贡献调用指标缺失/非法就省略平均值, 不显示部分聚合. 每个 root 或成功托管研究 round 重置计数.
+[`reply_metrics.go`](../internal/bridge/reply_metrics.go) 独立于 progress 模式记录 model/provider 及安全 usage/duration. 中间状态栏使用已确认数据. 最终完成原子记录任务结算与最新正式消息首片的状态栏, 或将 terminal-only 正文和最终状态栏一起排入队列. 现有投递循环发送待发正文时使用最新状态栏; 已投递正文则使用保存的 Telegram 消息 ID 及不变正文尽力 Edit. 状态栏完成按快照 fencing, 不丢失更新后的 pending 状态. 编辑失败不重发答案, 不另发孤立状态气泡. 状态栏字节及分片计入累计输出预算. 主 agent assistant `message_end` 只贡献一次指标, 重复 terminal summary 不再计数. 平均生成速度为 `sum(output tokens) * 1000 / sum(duration_ms)`, 不包含 queue/tool 时间, 要求正输出且总 duration 至少 100 ms. 缺失/非法贡献指标时省略聚合. 每个 root 或成功托管研究 round 重置计数.
 
-Progress 和最终 header 共用 model/thinking/fast 格式, 精简 context (`46%/500k`), 速度单位 (`3.8t/s`) 和字段分隔符. 实时数值仍使用原生采样; 最终数值仍使用包含输出的 context 和整轮平均速度. 可选 provider usage 仅在最终 header 合并为空格分隔的一组 (`5h1% 7d0%`), Progress 不查询或展示它. 详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
+Progress 和中间/最终回复 header 共用 model/thinking/fast 格式, 精简 context (`46% (500k)`), 速度单位 (`3.8 t/s`) 和字段分隔符. 实时数值仍使用原生采样; 最终数值仍使用包含输出的 context 和整轮平均速度. 可选 provider usage 仅在最终 header 合并为空格分隔的一组 (`5h1% 7d0%`), Progress 不查询或展示它. 详细 `/status` 渲染不变. 换行由 Telegram 客户端决定, 一个逻辑 header 行不保证只占一个视觉行.
 
 最终 context 使用最后一次调用包含输出的 usage: 优先显式 `contextTokens`, 否则用正 `totalTokens` 或完整 input/output/cache 总和, 再减 orchestration input/output/cache-read usage, 最低为零. 缺失, 负值或溢出不估算. 这不同于可能仍指向最终 input anchor 的 `get_state.contextUsage.tokens`.
 
 确认文本完成后, [`reply_status.go`](../internal/bridge/reply_status.go) 独立发出一秒 deadline 的 `get_state`, 获取当前窗口/model 和 idle 证据. 只有 model/provider/native session 匹配, 且明确非 streaming/非 compacting 时才显示 context; 百分比由含输出 usage 与采样窗口重新计算. Thinking/fast 也须匹配 model 身份. 该 query 不能释放变更通道. Client/generation/root/turn/catalog epoch/session 围栏拒绝迟到结果; 新输入, 原生活动, retirement 或查询失败时, 使用已知 model/average 字段提交确认答案. 无害元数据/完成尾事件可继续消费而不替换答案.
 
-`telegram.provider_usage` 为 TOML 布尔值, 默认 `false`. 启用后, 已确认最终 Result 的生命周期对每次回复至多尝试一次原生 `prompt("/usage")`, 使用三秒 context deadline, 不重试, 不跨回复缓存, 不属于五秒 Progress 采样. 最终 `get_state` 必须有效, 且匹配最新 assistant 的 model/provider 与原生 session. Provider 不受支持, Bridge prompt 队列非空, 变更/control 通道正忙, 或自主研究 round 仍在运行时跳过查询. 私有 `Client.Usage` 路径要求目录中存在 builtin `/usage` 且返回明确的 `agentInvoked:false`, 在 RPC reader 中有界捕获输出, 不将捕获的原始报告发布为普通事件或 payload 日志. 调用方占用 `reply_usage` operation 通道, 在捕获期间排除竞争的 prompt 和变更操作; `replyStatus.pending` 保留已确认答案, 使现有输入/runtime flush 路径可立即省略用量并发布答案. 超时, 失败或 owner 已过期时省略用量; 提交未确认可能退役 runtime, 但先提交已确认答案. 不增加独立 CLI, 鉴权数据库访问或上游修改.
+`telegram.provider_usage` 为 TOML 布尔值, 默认 `false`. 启用后, 已确认的最终状态生命周期对每次回复至多尝试一次原生 `prompt("/usage")`, 使用三秒 context deadline, 不重试, 不跨回复缓存, 不属于五秒 Progress 采样. 最终 `get_state` 必须有效, 且匹配最新 assistant 的 model/provider 与原生 session. Provider 不受支持, Bridge prompt 队列非空, 变更/control 通道正忙, 或自主研究 round 仍在运行时跳过查询. 私有 `Client.Usage` 路径要求目录中存在 builtin `/usage` 且返回明确的 `agentInvoked:false`, 在 RPC reader 中有界捕获输出, 不将捕获的原始报告发布为普通事件或 payload 日志. 调用方占用 `reply_usage` operation 通道, 在捕获期间排除竞争的 prompt 和变更操作; `replyStatus.pending` 保留最终状态生命周期, 使现有输入/runtime flush 路径可立即省略用量并完成终结. 不为此查询延迟或重发已排入的 assistant 正文. 超时, 失败或 owner 已过期时省略用量; 提交未确认可能退役 runtime, 但先提交已确认的终结结果. 不增加独立 CLI, 鉴权数据库访问或上游修改.
 
 状态头 parser 只接受回复对应 Claude 或 OpenAI Codex provider 下, 原生报告明确标记为当前账号的已识别 5h/7d **已用**百分比, 仅生成 `5h30% 7d65%` 等精简字段. 缺失或无法识别的数据, 以及只有 token/cost 的回退报告都会省略. 状态头不包含账号身份, 邮箱, 鉴权详情或原始报告; 原生当前账号标记不独立证明轮转上游实际由哪个账号处理了请求.
 
@@ -308,7 +320,7 @@ Progress 和最终 header 共用 model/thinking/fast 格式, 精简 context (`46
 
 原生事件触发等待中最终回复的 flush 时, 若 flush 退役或替换了事件所属 client, 就消费并丢弃当前事件, 不再在 teardown 后更新 compaction, progress 或 tool 状态. 若保留同一 client, 则继续正常处理该事件, 包括原生 compaction start/end 状态转换.
 
-被接受的 header 与答案进入同一 inbox-completion/outbox 持久事务; commit 前失败保留 uncertain/不重放恢复语义. Header 空间, Markdown-aware 分割/fence repair 与明确截断共享 1 MiB/32 消息显示预算. Error/cancellation 通知及 local command receipt 不加成功 header. 附件/输出传输仍由 media 和持久投递接口负责.
+被接受的最终 metadata 与任务结算进入同一 inbox-completion/outbox 持久事务; 正式 `message_end` 正文此前已独立提交. 结算 commit 前失败保留 uncertain/不重放恢复语义. 状态栏空间, Markdown-aware 分割/fence repair 与明确截断共享 1 MiB/32 消息显示预算. Error/cancellation 通知及 local command receipt 不加成功状态栏. 附件/输出传输仍由 media 和持久投递接口负责.
 
 Terminal 错误通过 [`ClassifyError`](../internal/omp/errors.go) 暴露固定 RPC 失败类别, 而非原始 rejection. Assistant 失败可附最多 512 单位的 `errorMessage` 摘要, 先过滤 credential, request/trace/correlation ID, URL 和文件路径; 歧义的无键 secret 标记会抑制整个 detail. HTTP 429 或已识别 rate-limit 分类只生成通用 provider 限流通知. `errorClassificationMessage`/`errorStatus` 用于分类但不直接复制为原始 detail. 此过滤不脱敏普通 assistant 答案或 verbose tool payload.
 
@@ -672,7 +684,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 ### Schema 与迁移边界
 
-`PRAGMA user_version` 当前为 **21**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-20 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
+`PRAGMA user_version` 当前为 **22**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-21 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
 
 | 表 | 身份与保留内容 | 职责 |
 | --- | --- | --- |
@@ -686,10 +698,13 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 | `interface_language` | 单行 `id=1`, 语言为 `en` 或 `zh` | 全局 Bridge 界面语言; 没有记录时使用英文 |
 | `topic_names` | `(bot,chat,thread)`; 已知标题和单调递增 revision | 持久化已观察标题并分配预留 token; 空标题 tombstone 防止 revision 复用 |
 | `topic_name_reservations` | `(bot,chat,thread,revision)`; 预留标题和在途/保留状态 | 逐请求名称占用; 标题事件保留在途请求, 匹配的结果仅结算自身占用 |
-| `inbox` | Update ID; typed update JSON, 状态, reply target, progress message ID, 创建/更新时间 | 去重和输入的持久化结算 |
-| `outbox` | 递增 ID; 可选 inbox ID, chat/thread/reply target, 文本或附件类型/路径/名称, 状态, 重试时间/计数, 时间戳 | 有序的持久化交付; 附件字节保存在私有文件 spool |
+| `inbox` | Update ID; typed update JSON, 状态, reply target, 创建/更新时间 | 去重和输入的持久化结算 |
+| `progress_messages` | `(inbox_id,message_id)`, chat | 每条临时 preview 身份保留到完成清理 |
+| `outbox` | 递增 ID; 可选 inbox ID, chat/thread/reply target, 不可变正文或附件类型/路径/名称, 独立状态栏, Telegram 消息 ID, 待更新状态标记, 投递状态, 重试计数/时间 | 有序持久正文交付及尽力状态更新; 附件字节保存在私有文件 spool |
 
 迁移范围仅限 bridge. 早期版本补充启动 metadata, 输入/输出时间戳及 reply/progress 关联, 原生 session ID, 最近使用时间, 收藏和重试调度. 旧 `last_used_at` 保持为零; 独立的服务端拒绝计数从零开始, 不根据总尝试次数猜测. 版本 11/12 的迁移路径会移除 `activity_messages`, 当前 schema 不包含该表. 旧 intent 的创建时间记为迁移时间. 版本 14/15 直接推进, 不重建已废弃的 workspace 表; 版本 17 增加预设 singleton, 版本 18 删除存在的 `workspace_users` 和 `workspace_leases`. 不会把原生 session 文件, 已选择的 workspace 路径或已提交 binding 迁入另一套存储模型.
+
+Schema 版本 22 将原 inbox 单条 progress 关联迁入 `progress_messages`, 并为 outbox 增加独立状态栏/交付字段. 保留现有正文, 投递状态及原生 session; 不重新解析历史正文来推断可编辑状态栏.
 
 ### 输入接收与结算
 
@@ -697,9 +712,9 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 | 输入路径 | 持久化契约 |
 | --- | --- |
-| 普通 root, 附件, review 或受支持的原生提交 | RPC 提交前由 `Submit` 记录 `submitted` 和来源 Telegram message ID. 完成时原子地将 submitted inbox 改为 `done`, `uncertain` 或 `cancelled`, 并插入全部最终文本分段, 使用同一 inbox ID 和持久化 reply target. 事务失败时两者都不变, worker 停止而不宣称完成. |
+| 普通 root, 附件, review 或受支持的原生提交 | RPC 提交前由 `Submit` 记录 `submitted` 和来源 Telegram message ID. `message_end` 正文独立追加时, inbox 仍为 `submitted`. 最终结算在一个事务中记录 `done`, `uncertain` 或 `cancelled` 及尚未提交的文本; 成功完成时还更新捕获的最终状态栏. 只有首条持久文本回复引用记录的来源消息. 追加或结算失败仅回滚当前事务并停止 worker, 不撤销此前已提交的正文. |
 | 已跟踪的 steer | 同样在写入 RPC 前调用 `Submit`; `FinishSubmitted` 将一条 submitted 行结算为 `done`, `cancelled`, `failed` 或 `uncertain`. 不创建独立最终回复 outbox, 最终回复仍由 root 拥有. |
-| 受管理的研究轮次 | `AppendInboxReplies` 原子地追加本轮文本及原始 reply target, owner 保持 `submitted`. 已显示一轮结果不等于研究 owner 完成; 已提交输出在 owner 中断后仍然保留. |
+| 受管理的研究轮次 | `AppendAssistantReplies` 追加已完成的轮次正文并分开存储状态栏, owner 保持 `submitted`. 轮次结束的 metadata 可更新捕获的状态栏, 只有整个 root 结算才完成 owner. 已提交输出在 owner 中断后仍然保留. |
 | Bridge 控制命令和 callback | 使用各自的 inbox 标记和通知路径. 控制 inbox 到达 `done` 不是所有异步原生操作均已完成的通用回执, 仍以关联的 operation 处理为准. `say()` 单独将通知入队, 不属于 root 完成事务. |
 | Host tool 附件或 export | 创建快照后单独插入附件 outbox 行. 不追溯纳入 root 最终文本事务, 也不关联 root progress. |
 
@@ -715,7 +730,9 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 `storage.database_retention_days` 默认 90; `0` 关闭自动消息/附件保留期清理. 尽力而为的 janitor 在启动时及之后每 24 小时运行, 使用最近状态转换时间 `updated_at`, 每批 1000 行提交删除事务, 不自动执行 `VACUUM`.
 
-只有终态 inbox (`done`, `cancelled`, `ignored`, `failed`, `uncertain`) 和终态 outbox (`done`, `failed`, `uncertain`, `cancelled`, 旧 `sent`) 会过期. Pending/submitted 输入和 pending/sending 输出不会过期. 保留中的 progress 关联会保护其 inbox 和相关 outbox 记录; 超过截止时间且没有关联 pending/sending 输出后, retention 可以只清除本地关联并删除过期记录, 不调用 Telegram Delete. 不删除 binding, binding history, favorites, workspace 或原生 session 数据. Startup intent 使用自己的 `created_at` 和 generation fence 退役, 其生命周期和恢复规则由 session 管理章节说明.
+只有终态 inbox (`done`, `cancelled`, `ignored`, `failed`, `uncertain`) 和终态 outbox (`done`, `failed`, `uncertain`, `cancelled`, 旧 `sent`) 会过期. Pending/submitted 输入和 pending/sending 输出不会过期. 保留中的 progress 关联即使超过截止时间, 仍会保护其 inbox 和相关 outbox 记录. Retention 本身不删除 `progress_messages` 关联, 也不调用 Telegram Delete; 只有进度清理流程移除关联且满足其他保留期条件后, 这些记录才可被过期清理. 不删除 binding, binding history, favorites, workspace 或原生 session 数据. Startup intent 使用自己的 `created_at` 和 generation fence 退役, 其生命周期和恢复规则由 session 管理章节说明.
+
+待更新状态栏只有在可执行时才保护终态正文不被过期清理: 状态为 `done`, 且有已知 Telegram 消息 ID 和非空状态栏. Failed, uncertain 及其他无法投递的终态正文即使残留待更新标记也照常过期, 清理不会重放它们.
 
 附件清理还必须通过下文的文件所有权检查. 周期清理失败只记录日志并稍后重试, 不作为任务失败.
 
@@ -739,13 +756,13 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 `server_retry_count` 只记录上述明确服务端拒绝; 429 和总认领次数不消耗该预算. 重试调度跨重启保留并遵守对话内顺序. Client 不自行重试含糊的 send 或文件 upload. SQLite 无法与 Telegram 副作用原子提交, 因此持久化交付和完成事务都不承诺网络 exactly-once. Claim, retry 或终态写入失败属于致命持久化错误, 不静默丢弃状态.
 
-保存的目标是 `(chat,thread,reply_to)`: 每个最终文本分段都回复 root 的来源 Telegram message, 不是最新 steer. 明确的 reply target 不可用拒绝允许文本或附件去掉 reply binding 再尝试一次. Topic 不存在不代表可以改投其他 thread. 这种 fallback 只改变展示, 不改变所有权或结算.
+保存的目标是 `(chat,thread,reply_to)`: 每个 inbox 只有首条持久文本回复引用 root 来源 Telegram message, 不是最新 steer. 后续消息及分片使用零值, inbox/root 所有权不变. 明确的 reply target 不可用拒绝允许文本或附件去掉 reply binding 再尝试一次. Topic 不存在不代表可以改投其他 thread. 这种 fallback 只改变展示, 不改变所有权或结算.
 
 ### 消息渲染与进度关联
 
 [`internal/telegram/markdown.go`](../internal/telegram/markdown.go) 将已转义的 Markdown 转成 Telegram HTML 子集. 分段按渲染后 UTF-16 单位计算, 遵守每条 4096 单位限制, 尽可能保持 block 结构, 为超长表格重复表头, 将超长 code fence 拆成有效 fence. 宽表降级为带标签的行. HTML entity 解析被拒绝时回退纯文本; 转换后渲染长度超限时直接使用纯文本, 不发送已知超限的转换结果.
 
-Progress 初次发送成功后将 Telegram message ID 记录到 root inbox; 后续 edit 不会重建已清除关联. Generation/turn fence 阻止旧 preview 修改新任务, 迟到的首次发送成功仍可登记供清理. Progress 仍是尽力而为的 UI 通道, 不是可重放的 outbox 工作. 实时渲染, Stop 控制和隐私限制见前文执行与 status 章节.
+每次 Progress 初次发送成功后将 Telegram message ID 追加到 root 的 `progress_messages` 关联; 后续 edit 不会重建已清除关联. Generation/turn/epoch fence 阻止旧结果重新绑定当前 preview, 迟到的首次发送成功仍可登记供清理. Progress 仍是尽力而为的 UI 通道, 不是可重放的 outbox 工作. 实时渲染, Stop 控制和隐私限制见前文执行与 status 章节.
 
 ### 进度消息删除
 

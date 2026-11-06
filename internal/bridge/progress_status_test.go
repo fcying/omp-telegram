@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,11 +31,91 @@ func TestCompactHeaderKeepsLiveAndReplyMetricSources(t *testing.T) {
 	contextTokens := int64(210000)
 	msg.Usage.ContextTokens = &contextTokens
 	metrics.observe(msg)
-	if got := compactHeader("en", state, nil); got != "⟳ `answer-model` ⚡ | 35%/500k | 25.8t/s" {
+	if got := compactHeader("en", state, nil); got != "⟳ `answer-model` ⚡ | 35% (500k) | 25.8 t/s" {
 		t.Fatalf("live header changed sampled values or compact format: %s", got)
 	}
-	if got := compactHeader("en", state, &metrics); got != "⟳ `answer-model` ⚡ | 42%/500k | 10t/s" {
+	if got := compactHeader("en", state, &metrics); got != "⟳ `answer-model` ⚡ | 42% (500k) | 10 t/s" {
 		t.Fatalf("reply header reused live metrics or changed compact format: %s", got)
+	}
+}
+
+func TestContextPlaceholderUpdatesProgressButNotDeliveredReplies(t *testing.T) {
+	w, f, _, _ := replyStatusWorker(t)
+	w.b.cfg.ProgressMode = "summary"
+	w.previewResult = make(chan previewResult, 1)
+	allowInitialProgress(w)
+	preview := func() previewResult {
+		t.Helper()
+		w.flushPreview()
+		select {
+		case result := <-w.previewResult:
+			requireStoreOK(t, result.err)
+			w.previewFinished(result)
+			return result
+		case <-time.After(5 * time.Second):
+			t.Fatal("context transition did not reach progress")
+			return previewResult{}
+		}
+	}
+	initial := preview()
+	if strings.Contains(initial.text, "ctx ?") || strings.Contains(initial.text, "% (") {
+		t.Fatalf("pending first read displayed context: %q", initial.text)
+	}
+	w.progressNativeFinished(receiveProgressNative(t, w))
+	message := func(text string) {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{
+			"role": "assistant", "stopReason": "toolUse", "model": "safe", "provider": "fixture", "duration": 1000,
+			"usage":   map[string]any{"output": 100, "totalTokens": 1100},
+			"content": []any{map[string]any{"type": "text", "text": text}},
+		}})
+		requireStoreOK(t, err)
+		w.event(raw)
+		deliverReplies(t, w)
+	}
+	message("Earlier question?")
+	before := researchReplies(t, w, 2)
+	if len(before) != 1 || !strings.Contains(before[0], "ctx ?") {
+		t.Fatalf("early reply omitted unknown context: %q", before)
+	}
+	nativeRPC(t, w, "fixture_get_state_update", map[string]any{
+		"contextUsage": map[string]any{"tokens": 1100, "contextWindow": 10000, "percent": 11},
+	})
+	w.refreshProgressNative(w.progressNative.next)
+	w.progressNativeFinished(receiveProgressNative(t, w))
+	known := preview()
+	knownHeader, _, _ := strings.Cut(known.text, "\n")
+	if !known.created || known.id <= initial.id || !strings.HasPrefix(knownHeader, w.tr(i18n.Msg.Processing)+compactHeaderSeparator) || !strings.Contains(knownHeader, "11% (10k)") || strings.Contains(known.text, "ctx ?") {
+		t.Fatalf("known context did not replace its progress placeholder: %+v", known)
+	}
+	message("Later answer.")
+	w.refreshProgressNative(w.progressNative.next)
+	failed := receiveProgressNative(t, w)
+	failed.valid = false
+	w.progressNativeFinished(failed)
+	unknown := preview()
+	unknownHeader, _, _ := strings.Cut(unknown.text, "\n")
+	if !unknown.created || unknown.id <= known.id || !strings.HasPrefix(unknownHeader, w.tr(i18n.Msg.Processing)+compactHeaderSeparator) || !strings.Contains(unknownHeader, "ctx ?") || strings.Contains(unknown.text, "11% (10k)") {
+		t.Fatalf("failed sample retained stale context: %+v", unknown)
+	}
+	after := researchReplies(t, w, 2)
+	if len(after) != 2 || after[0] != before[0] || !strings.Contains(after[1], "11% (10k)") || strings.Contains(after[1], "ctx ?") {
+		t.Fatalf("sampling rewrote delivered context or failed to update subsequent replies: %q", after)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	earlier := 0
+	for _, request := range f.messages {
+		text, _ := request["text"].(string)
+		if strings.Contains(text, "Earlier question?") {
+			earlier++
+			if request["message_id"] != nil || !strings.Contains(text, "ctx ?") {
+				t.Fatalf("sampling edited an existing assistant reply: %+v", request)
+			}
+		}
+	}
+	if earlier != 1 {
+		t.Fatalf("earlier question was sent %d times", earlier)
 	}
 }
 
@@ -44,6 +125,7 @@ func TestProgressNativeStatusDistinguishesFastSettingAndUnknownMetrics(t *testin
 	w.b.cfg.QueueCapacity = 1
 	w.previewResult = make(chan previewResult, 1)
 	command("/new " + t.TempDir())
+	deliverReplies(t, w)
 	nativeRPC(t, w, "set_model", map[string]any{"provider": "**fixture**", "modelId": "fast-fallback"})
 	nativeRPC(t, w, "set_fast_mode", map[string]any{"enabled": true})
 	command("missing-terminal")
@@ -89,6 +171,7 @@ func TestProgressNativeRefreshUsesLatestGlobalLanguage(t *testing.T) {
 	w.b.cfg.QueueCapacity = 1
 	w.previewResult = make(chan previewResult, 1)
 	command("/new " + t.TempDir())
+	deliverReplies(t, w)
 	nativeRPC(t, w, "set_model", map[string]any{"provider": "**fixture**", "modelId": "fast-fallback"})
 	nativeRPC(t, w, "set_fast_mode", map[string]any{"enabled": true})
 	command("missing-terminal")
@@ -190,7 +273,6 @@ func TestProgressNativeRejectsStaleAndUnconfirmedSnapshots(t *testing.T) {
 		{"binding_session", func(w *worker, _ *progressNativeResult) { w.binding.SessionID = "other-session" }},
 		{"native_session", func(_ *worker, r *progressNativeResult) { r.state.SessionID = "other-session" }},
 		{"epoch", func(_ *worker, r *progressNativeResult) { r.request.epoch++ }},
-		{"query_failure", func(_ *worker, r *progressNativeResult) { r.valid = false }},
 		{"cancelled_request", func(w *worker, _ *progressNativeResult) { w.cancelProgressNative() }},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
@@ -216,15 +298,13 @@ func TestProgressNativeRejectsStaleAndUnconfirmedSnapshots(t *testing.T) {
 	}
 }
 
-func TestProgressNativeSkipsInactiveAndDisabledUI(t *testing.T) {
+func TestProgressNativeSkipsInactiveAndDelayedSampling(t *testing.T) {
 	for _, scenario := range []struct {
 		name   string
 		change func(*worker)
 	}{
 		{"idle", func(w *worker) { w.clearTask() }},
-		{"off", func(w *worker) { w.b.cfg.ProgressMode = "off" }},
 		{"initial_delay", func(w *worker) { w.progress.StartedAt = time.Now() }},
-		{"suppressed", func(w *worker) { w.progressSuppressed = true }},
 		{"finishing", func(w *worker) { w.finishing = true }},
 		{"released", func(w *worker) { w.runtime = runtimeReleased }},
 	} {
@@ -238,7 +318,7 @@ func TestProgressNativeSkipsInactiveAndDisabledUI(t *testing.T) {
 			scenario.change(w)
 			w.refreshProgressNative(time.Now())
 			if w.progressNative.pending != nil {
-				t.Fatal("inactive or disabled progress started a native query")
+				t.Fatal("inactive or delayed sampling started a native query")
 			}
 		})
 	}
@@ -290,5 +370,200 @@ func TestProgressNativePendingQueryDoesNotBlockStop(t *testing.T) {
 	w.progressNativeFinished(receiveProgressNative(t, w))
 	if got := telegram.ConvertMarkdown(w.renderProgress()); got != "" {
 		t.Fatalf("late status query revived stopped progress: %s", got)
+	}
+}
+
+func TestProgressNativeKeepsLatestStatusThroughMetadataAndActivity(t *testing.T) {
+	for _, mode := range []string{"summary", "verbose", "off"} {
+		t.Run(mode, func(t *testing.T) {
+			w, f, _, _ := replyStatusWorker(t)
+			w.b.cfg.ProgressMode = mode
+			w.previewResult = make(chan previewResult, 1)
+			allowInitialProgress(w)
+			metadata, err := json.Marshal(map[string]any{
+				"type": "session_info_update", "sessionId": w.binding.SessionID, "title": "Updated title",
+			})
+			requireStoreOK(t, err)
+			var previous previewResult
+			for i, sample := range []struct {
+				model, thinking string
+				context         int64
+				speed           float64
+				fast            bool
+				want            string
+			}{
+				{"safe", "auto", 1100, 12.5, false, "⟳ `safe` | 11% (10k) | 12.5 t/s"},
+				{"answer-model", "max", 2500, 25.8, true, "◉ `answer-model` ⚡ | 25% (10k) | 25.8 t/s"},
+			} {
+				nativeRPC(t, w, "set_model", map[string]any{"provider": "fixture", "modelId": sample.model})
+				nativeRPC(t, w, "set_fast_mode", map[string]any{"enabled": sample.fast})
+				nativeRPC(t, w, "fixture_get_state_update", map[string]any{
+					"contextUsage": map[string]any{"tokens": sample.context, "contextWindow": 10000},
+				})
+				now := time.Now()
+				if w.progressNative.next.After(now) {
+					now = w.progressNative.next
+				}
+				w.refreshProgressNative(now)
+				result := receiveProgressNative(t, w)
+				// The fixture has no speed field; inject only that native response
+				// field to exercise its projection into the consumer-visible preview.
+				result.state.TokensPerSecond = &sample.speed
+				next := w.progressNative.next
+				w.event(metadata)
+				w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Working"}}`))
+				w.event([]byte(`{"type":"tool_execution_start","toolCallId":"live-tool","toolName":"read"}`))
+				w.event([]byte(`{"type":"tool_execution_update","toolCallId":"live-tool"}`))
+				w.event([]byte(`{"type":"tool_execution_end","toolCallId":"live-tool"}`))
+				thinking, err := json.Marshal(map[string]any{
+					"type": "thinking_level_changed", "thinkingLevel": "low", "configured": sample.thinking,
+				})
+				requireStoreOK(t, err)
+				w.event(thinking)
+				if w.progressNative.pending != result.request || !w.progressNative.next.Equal(next) {
+					t.Fatal("same-session metadata or ordinary activity cancelled or rescheduled the sample")
+				}
+				if !w.progressNativeFinished(result) || w.progress.NativeStatus != sample.want {
+					t.Fatalf("latest native status was not accepted: %q", w.progress.NativeStatus)
+				}
+				w.event(metadata)
+				if w.progress.NativeStatus != sample.want || w.replyStatus.liveScope != result.request {
+					t.Fatal("same-session metadata erased accepted native status")
+				}
+				w.flushPreview()
+				if mode == "off" {
+					if f.messageCount() != 0 || w.previewBusy || w.progressNative.pending != nil {
+						t.Fatal("disabled progress sent a preview or started an extra status query")
+					}
+					continue
+				}
+				select {
+				case preview := <-w.previewResult:
+					requireStoreOK(t, preview.err)
+					w.previewFinished(preview)
+					header, _, _ := strings.Cut(preview.text, "\n")
+					if !strings.Contains(header, sample.want) {
+						t.Fatalf("latest status did not reach the live preview: %q", preview.text)
+					}
+					if i > 0 && (preview.created || preview.id != previous.id) {
+						t.Fatal("ordinary activity replaced rather than updated the live preview")
+					}
+					previous = preview
+				case <-time.After(5 * time.Second):
+					t.Fatal("latest status did not reach Telegram")
+				}
+			}
+		})
+	}
+}
+
+func TestProgressNativeSessionMetadataClearsChangedScopes(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		change func(*worker)
+	}{
+		{"generation", func(w *worker) { w.binding.Generation++ }},
+		{"turn", func(w *worker) { w.turn++ }},
+		{"root", func(w *worker) { w.active++ }},
+		{"client", func(w *worker) { w.client = &omp.Client{} }},
+		{"binding_session", func(w *worker) { w.binding.SessionID = "other-session" }},
+		{"epoch_unknown_session", func(w *worker) { w.client.InvalidateCommandCatalog() }},
+		{"native_session", func(w *worker) {
+			nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": map[string]any{
+				"type": "session_info_update", "sessionId": "other-session",
+			}})
+		}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, _, _, _ := replyStatusWorker(t)
+			client := w.client
+			defer func() { w.client = client }()
+			allowInitialProgress(w)
+			w.refreshProgressNative(time.Now())
+			if !w.progressNativeFinished(receiveProgressNative(t, w)) {
+				t.Fatal("fixture did not establish live native status")
+			}
+			w.refreshProgressNative(w.progressNative.next)
+			late := receiveProgressNative(t, w)
+			scenario.change(w)
+			w.progressNativeSessionChanged()
+			if w.progressNative.pending != nil || w.progressNative.completed != nil || w.replyStatus.liveScope != nil || w.progress.NativeStatus != "" || !w.progressNative.next.IsZero() {
+				t.Fatal("session metadata retained native status from a changed or unknown scope")
+			}
+			if w.progressNativeFinished(late) || w.progress.NativeStatus != "" {
+				t.Fatal("late native status revived a cleared scope")
+			}
+		})
+	}
+}
+
+func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
+	for _, scenario := range []struct {
+		name  string
+		usage any
+		valid bool
+		want  string
+	}{
+		{"known", map[string]any{"tokens": 1100, "contextWindow": 10000}, true, "11% (10k)"},
+		{"missing", nil, true, compactUnknownContext},
+		{"invalid", map[string]any{"tokens": 1100, "contextWindow": 0}, true, compactUnknownContext},
+		{"query_failure", nil, false, compactUnknownContext},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, _, _, _ := replyStatusWorker(t)
+			allowInitialProgress(w)
+			nativeRPC(t, w, "fixture_get_state_update", map[string]any{"contextUsage": scenario.usage})
+			messageHeader := func(text string) string {
+				t.Helper()
+				raw, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{
+					"role": "assistant", "stopReason": "toolUse", "model": "safe", "provider": "fixture", "duration": 1000,
+					"usage":   map[string]any{"output": 100, "totalTokens": 1100},
+					"content": []any{map[string]any{"type": "text", "text": text}},
+				}})
+				requireStoreOK(t, err)
+				w.event(raw)
+				rows := researchReplies(t, w, w.active)
+				header, body := attachedReplyBody(t, rows[len(rows)-1])
+				if body != text {
+					t.Fatalf("context state changed assistant body: %q", body)
+				}
+				return header
+			}
+			assertUnread := func(header string) {
+				t.Helper()
+				if w.progressContextReadCompleted() || w.progressNativeStatus() != "" || strings.Contains(w.renderProgress(), "ctx ?") || strings.Contains(w.renderProgress(), "% (") ||
+					strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(w.unconfirmedAssistantHeader(), "ctx ?") {
+					t.Fatalf("unread context appeared in progress or assistant header: %q", header)
+				}
+			}
+			assertUnread(messageHeader("Before read"))
+			w.refreshProgressNative(time.Now())
+			assertUnread(messageHeader("While read is pending"))
+			result := receiveProgressNative(t, w)
+			result.valid = scenario.valid
+			if !w.progressNativeFinished(result) || !w.progressContextReadCompleted() {
+				t.Fatal("current-scope completed read was not recorded")
+			}
+			if !strings.Contains(w.renderProgress(), scenario.want) || !strings.Contains(messageHeader("After read"), scenario.want) {
+				t.Fatalf("completed context did not reach progress and formal message: progress=%q", w.renderProgress())
+			}
+			if !strings.Contains(w.unconfirmedAssistantHeader(), compactUnknownContext) {
+				t.Fatal("completed read was lost for an unconfirmed streamed message")
+			}
+			rows := researchReplies(t, w, w.active)
+			for _, row := range rows[:2] {
+				header, _ := attachedReplyBody(t, row)
+				if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") {
+					t.Fatal("completed read rewrote an already queued preread header")
+				}
+			}
+			w.binding.Generation++
+			assertUnread(w.intermediateAssistantHeader())
+			w.cancelProgressNative()
+			if w.progressNative.completed != nil {
+				t.Fatal("scope reset retained completed-read evidence")
+			}
+			assertUnread(messageHeader("After scope reset"))
+		})
 	}
 }

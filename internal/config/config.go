@@ -37,6 +37,7 @@ type Config struct {
 	QueueCapacity         int
 	DatabaseRetentionDays int
 	ProgressMode          string
+	ProgressRecentTools   int
 	ProviderUsage         bool
 	IdleTimeout           time.Duration
 	LogLevel              string
@@ -45,8 +46,9 @@ type Config struct {
 }
 
 const (
-	MaxWorkersLimit       = 64
-	MaxQueueCapacityLimit = 1024
+	MaxWorkersLimit            = 64
+	MaxQueueCapacityLimit      = 1024
+	DefaultProgressRecentTools = 5
 )
 
 // fileConfig accepts quoted environment references in otherwise numeric fields.
@@ -59,11 +61,12 @@ type fileConfig struct {
 }
 
 type telegramFileConfig struct {
-	Token         string `toml:"token"`
-	AllowedUsers  []any  `toml:"allowed_users"`
-	AllowedChats  []any  `toml:"allowed_chats"`
-	ProgressMode  string `toml:"progress_mode"`
-	ProviderUsage bool   `toml:"provider_usage"`
+	Token               string `toml:"token"`
+	AllowedUsers        []any  `toml:"allowed_users"`
+	AllowedChats        []any  `toml:"allowed_chats"`
+	ProgressMode        string `toml:"progress_mode"`
+	ProgressRecentTools any    `toml:"progress_recent_tools"`
+	ProviderUsage       bool   `toml:"provider_usage"`
 }
 
 type ompFileConfig struct {
@@ -118,7 +121,8 @@ func load(path, baseDir string) (Config, error) {
 	var c Config
 	raw := fileConfig{
 		Telegram: telegramFileConfig{
-			Token: "${OMP_TELEGRAM_BOT_TOKEN}",
+			Token:               "${OMP_TELEGRAM_BOT_TOKEN}",
+			ProgressRecentTools: int64(DefaultProgressRecentTools),
 		},
 		OMP: ompFileConfig{
 			Binary:      "omp",
@@ -289,6 +293,14 @@ func load(path, baseDir string) (Config, error) {
 		return c, errors.New("worker.max_workers or worker.queue_capacity exceeds the configured safety limit")
 	}
 	c.MaxWorkers, c.QueueCapacity, c.DatabaseRetentionDays = int(workers), int(capacity), int(retentionDays)
+	recentTools, err := integer(raw.Telegram.ProgressRecentTools, "telegram.progress_recent_tools")
+	if err != nil {
+		return c, err
+	}
+	if recentTools < 1 || recentTools > 100 {
+		return c, errors.New("telegram.progress_recent_tools must be between 1 and 100")
+	}
+	c.ProgressRecentTools = int(recentTools)
 	c.ProviderUsage = raw.Telegram.ProviderUsage
 	switch progressMode {
 	case "off", "summary", "verbose":

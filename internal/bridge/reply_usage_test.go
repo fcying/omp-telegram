@@ -20,12 +20,15 @@ func fixtureReplyUsage(command, response map[string]any, emit func(any)) bool {
 	recordFixtureRPCTrace("prompt", "/usage")
 	response["data"] = map[string]any{"agentInvoked": false}
 	switch mode {
-	case "hold":
+	case "hold", "hold-report":
 		recordFixtureRPCTrace("usage_waiting", "")
 		if gate := os.Getenv("OMP_TELEGRAM_FIXTURE_USAGE_RELEASE"); gate != "" {
 			waitForFixtureFile(gate)
 		}
-		return true
+		if mode == "hold" {
+			return true
+		}
+		emit(map[string]any{"type": "command_output", "text": fixtureReplyUsageReport})
 	case "reject":
 		response["success"], response["error"] = false, "PRIVATE_USAGE_REJECTION"
 	case "missing":
@@ -51,8 +54,8 @@ func replyUsageWorker(t *testing.T, mode string) (*worker, func(string), string)
 }
 
 func endUsageReply(w *worker) {
-	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","model":"safe","provider":"openai-codex","duration":1000,"usage":{"output":100,"totalTokens":1100},"content":[{"type":"text","text":"answer"}]}}`))
-	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","model":"safe","provider":"openai-codex","duration":1000,"usage":{"output":100,"totalTokens":1100},"content":[{"type":"text","text":"answer"}]}]}`))
+	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"stop","model":"safe","provider":"openai-codex","duration":1000,"usage":{"output":100,"totalTokens":1100},"content":[{"type":"text","text":"answer"}]}}`))
+	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","model":"safe","provider":"openai-codex","duration":1000,"usage":{"output":100,"totalTokens":1100},"content":[{"type":"text","text":"answer"}]}]}`))
 }
 
 func TestFinalReplyProviderUsage(t *testing.T) {
@@ -66,13 +69,12 @@ func TestFinalReplyProviderUsage(t *testing.T) {
 			}
 			endUsageReply(w)
 			awaitReplyStatus(t, w)
-			output, err := w.b.db.NextOutput()
-			requireStoreOK(t, err)
-			if queueState(t, w, 2) != "done" || replyBody(output.Text) != "answer" || !strings.Contains(output.Text, "100t/s") {
-				t.Fatalf("quota changed the confirmed answer: %q", output.Text)
+			metadata := finalReplyStatus(t, w, 2, "answer")
+			if queueState(t, w, 2) != "done" || !strings.Contains(metadata, "100 t/s") {
+				t.Fatalf("quota changed the confirmed answer metadata: %q", metadata)
 			}
-			if strings.Contains(output.Text, "5h30% 7d65%") != enabled {
-				t.Fatalf("final quota opt-in mismatch: %q", output.Text)
+			if strings.Contains(metadata, "5h30% 7d65%") != enabled {
+				t.Fatalf("final quota opt-in mismatch: %q", metadata)
 			}
 			wantQueries := 0
 			if enabled {
@@ -82,7 +84,7 @@ func TestFinalReplyProviderUsage(t *testing.T) {
 				t.Fatal("quota did not execute exactly once at final reply")
 			}
 			var leaked int
-			requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE text LIKE '%PRIVATE_USAGE%' OR text LIKE '%in use by this session%'").Scan(&leaked))
+			requireStoreOK(t, w.b.db.DB.QueryRow("SELECT count(*) FROM outbox WHERE text LIKE '%PRIVATE_USAGE%' OR text LIKE '%in use by this session%' OR header LIKE '%PRIVATE_USAGE%' OR header LIKE '%in use by this session%'").Scan(&leaked))
 			if leaked != 0 {
 				t.Fatal("private quota report escaped to outbox")
 			}
@@ -96,10 +98,9 @@ func TestFinalReplyUsageSkipsQueuedPrompt(t *testing.T) {
 	nativeInput(t, w, 100, "/followup queued next task", false)
 	endUsageReply(w)
 	awaitReplyStatus(t, w)
-	output, err := w.b.db.NextOutput()
-	requireStoreOK(t, err)
-	if queueState(t, w, 2) != "done" || replyBody(output.Text) != "answer" || strings.Contains(output.Text, "5h") {
-		t.Fatalf("queued work changed the confirmed answer: %q", output.Text)
+	metadata := finalReplyStatus(t, w, 2, "answer")
+	if queueState(t, w, 2) != "done" || strings.Contains(metadata, "5h") {
+		t.Fatalf("queued work changed the confirmed answer metadata: %q", metadata)
 	}
 	if researchTraceCount(trace, "prompt", "/usage") != 0 || w.client != client || client.Stopping() || queueState(t, w, 100) != "pending" {
 		t.Fatal("queued prompt triggered optional usage or runtime retirement")
@@ -147,10 +148,9 @@ func TestFinalReplyUsageFailuresPreserveConfirmedAnswer(t *testing.T) {
 			w, _, trace := replyUsageWorker(t, mode)
 			endUsageReply(w)
 			awaitReplyStatus(t, w)
-			output, err := w.b.db.NextOutput()
-			requireStoreOK(t, err)
-			if queueState(t, w, 2) != "done" || replyBody(output.Text) != "answer" || !strings.Contains(output.Text, "100t/s") || strings.Contains(output.Text, "5h") {
-				t.Fatalf("optional quota failure changed confirmed reply: %q", output.Text)
+			metadata := finalReplyStatus(t, w, 2, "answer")
+			if queueState(t, w, 2) != "done" || !strings.Contains(metadata, "100 t/s") || strings.Contains(metadata, "5h") {
+				t.Fatalf("optional quota failure changed confirmed reply: %q", metadata)
 			}
 			wantQueries := 1
 			if mode == "unavailable" {
@@ -193,9 +193,8 @@ func TestFinalReplyUsageStoppingBeforeDonePreservesQueue(t *testing.T) {
 	if !sameBindingIdentity(w.binding, binding) || w.claimedSession != claim {
 		t.Fatal("optional query retirement changed the session binding or claim")
 	}
-	output, err := w.b.db.NextOutput()
-	requireStoreOK(t, err)
-	if queueState(t, w, 2) != "done" || replyBody(output.Text) != "answer" || queueState(t, w, 101) != "pending" {
+	finalReplyStatus(t, w, 2, "answer")
+	if queueState(t, w, 2) != "done" || queueState(t, w, 101) != "pending" {
 		t.Fatal("optional query failure lost the answer or queued work")
 	}
 	w.dispatch()
@@ -229,10 +228,9 @@ func TestFinalReplyUsageInterruptionFencesLateResult(t *testing.T) {
 			if w.active != before || w.replyStatus.header != "" {
 				t.Fatal("late quota result changed replacement task")
 			}
-			var final string
-			requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=2").Scan(&final))
-			if replyBody(final) != "answer" || strings.Contains(final, "5h ") {
-				t.Fatalf("interrupted quota contaminated old answer: %q", final)
+			metadata := finalReplyStatus(t, w, 2, "answer")
+			if strings.Contains(metadata, "5h ") {
+				t.Fatalf("interrupted quota contaminated old answer: %q", metadata)
 			}
 		})
 	}
@@ -290,7 +288,7 @@ func TestFinalReplyUsageCompactionEventFollowsClientLifetime(t *testing.T) {
 				t.Fatal("native activity changed session identity, replayed work, or blocked dispatch")
 			}
 			for id, want := range map[int64]string{2: "answer", 100: "answer: after native activity"} {
-				if queueState(t, w, id) != "done" || replyBody(strings.Join(researchReplies(t, w, id), "")) != want {
+				if queueState(t, w, id) != "done" || researchBody(t, w, id) != want {
 					t.Fatalf("native activity lost or contaminated the answer for task %d", id)
 				}
 			}
@@ -307,10 +305,11 @@ func TestFinalReplyUsagePreservesOtherNativeOutput(t *testing.T) {
 	if w.replyStatus.pending == nil || w.client == nil {
 		t.Fatal("unrelated native output interrupted private quota query")
 	}
-	output, err := w.b.db.NextOutput()
+	var receipts int
+	err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE text=? AND inbox_id=0", "other command receipt").Scan(&receipts)
 	requireStoreOK(t, err)
-	if output.Text != "other command receipt" {
-		t.Fatalf("unrelated native output was intercepted: %q", output.Text)
+	if receipts != 1 {
+		t.Fatalf("unrelated native output was lost or assigned to the answer: %d receipts", receipts)
 	}
 	w.flushReplyStatus()
 	w.operationReturned(waitOperation(t, w))
@@ -330,9 +329,8 @@ func TestFinalReplyUsageRuntimeReleaseOwnsOneSlot(t *testing.T) {
 		t.Fatal("usage teardown released another runtime's slot")
 	}
 	w.operationReturned(waitOperation(t, w))
-	var final string
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=2").Scan(&final))
-	if queueState(t, w, 2) != "done" || replyBody(final) != "answer" {
+	finalReplyStatus(t, w, 2, "answer")
+	if queueState(t, w, 2) != "done" {
 		t.Fatal("runtime teardown lost the confirmed answer")
 	}
 }

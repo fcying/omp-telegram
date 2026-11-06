@@ -180,6 +180,72 @@ func TestProgressModeEnvironmentExpansion(t *testing.T) {
 	}
 }
 
+func TestProgressRecentTools(t *testing.T) {
+	path, source := configFixture(t)
+	c, err := loadSource(t, path, source)
+	if err != nil || c.ProgressRecentTools != 5 {
+		t.Fatalf("default recent tools = %d, err = %v", c.ProgressRecentTools, err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{
+		{"1", 1},
+		{"3", 3},
+		{"100", 100},
+		{`"12"`, 12},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			c, err := loadSource(t, path, setTOMLField(source, "telegram", "progress_recent_tools", tc.value))
+			if err != nil || c.ProgressRecentTools != tc.want {
+				t.Fatalf("recent tools = %d, want %d, err = %v", c.ProgressRecentTools, tc.want, err)
+			}
+		})
+	}
+	for _, value := range []string{"0", "-7", "101", "9223372036854775807", "true", "1.5", `[]`, `{secret = "private-value"}`, `"private-value"`, `""`} {
+		t.Run(value, func(t *testing.T) {
+			_, err := loadSource(t, path, setTOMLField(source, "telegram", "progress_recent_tools", value))
+			if err == nil || !strings.Contains(err.Error(), "telegram.progress_recent_tools") {
+				t.Fatalf("invalid recent tools did not produce a field error: %v", err)
+			}
+			if strings.Contains(err.Error(), "private-value") || strings.Contains(err.Error(), "9223372036854775807") {
+				t.Fatalf("recent tools validation leaked a value: %v", err)
+			}
+		})
+	}
+}
+
+func TestProgressRecentToolsEnvironment(t *testing.T) {
+	path, source := configFixture(t)
+	for _, reference := range []string{`"$BRIDGE_TEST_RECENT_TOOLS"`, `"${BRIDGE_TEST_RECENT_TOOLS}"`} {
+		t.Run(reference, func(t *testing.T) {
+			configured := setTOMLField(source, "telegram", "progress_recent_tools", reference)
+			t.Setenv("BRIDGE_TEST_RECENT_TOOLS", "17")
+			c, err := loadSource(t, path, configured)
+			if err != nil || c.ProgressRecentTools != 17 {
+				t.Fatalf("expanded recent tools = %d, err = %v", c.ProgressRecentTools, err)
+			}
+			for _, invalid := range []string{"", "0", "101", "4.5", "9223372036854775808", "private-value", "${BRIDGE_TEST_SECOND_RECENT_TOOLS}"} {
+				t.Setenv("BRIDGE_TEST_RECENT_TOOLS", invalid)
+				t.Setenv("BRIDGE_TEST_SECOND_RECENT_TOOLS", "3")
+				_, err := loadSource(t, path, configured)
+				if err == nil || !strings.Contains(err.Error(), "telegram.progress_recent_tools") {
+					t.Fatalf("invalid expanded recent tools did not produce a field error: %v", err)
+				}
+				if strings.Contains(err.Error(), "private-value") || strings.Contains(err.Error(), "9223372036854775808") || strings.Contains(err.Error(), "SECOND_RECENT") {
+					t.Fatalf("expanded recent tools leaked a value: %v", err)
+				}
+			}
+			if err := os.Unsetenv("BRIDGE_TEST_RECENT_TOOLS"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSource(t, path, configured); err == nil || !strings.Contains(err.Error(), "telegram.progress_recent_tools") {
+				t.Fatalf("unset recent tools environment reference was accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestIdleTimeout(t *testing.T) {
 	path, source := configFixture(t)
 	c, err := loadSource(t, path, source)

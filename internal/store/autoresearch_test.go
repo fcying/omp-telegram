@@ -24,10 +24,14 @@ func TestResearchRoundRepliesSurviveRestartWithUncertainOwner(t *testing.T) {
 	if state != "uncertain" {
 		t.Fatalf("restart did not retire in-flight research: %s", state)
 	}
-	for _, want := range []string{"round one", "round two"} {
+	for i, want := range []string{"round one", "round two"} {
 		output, err := s.NextOutput()
 		requireStoreOK(t, err)
-		if output.Text != want || output.InboxID != 10 || output.ReplyTo != 42 || output.Chat != 7 || output.Thread != 8 {
+		var replyTo int64
+		if i == 0 {
+			replyTo = 42
+		}
+		if output.Text != want || output.InboxID != 10 || output.ReplyTo != replyTo || output.Chat != 7 || output.Thread != 8 {
 			t.Fatalf("durable research output = %+v, want %q associated with original input", output, want)
 		}
 		requireStoreOK(t, s.MarkOutput(output.ID, "sending"))

@@ -69,6 +69,7 @@ func (w *worker) steer(in incoming, text string) {
 		w.cancel()
 		return
 	}
+	w.supersedePreview(in.msg.MessageID)
 	w.steerFence.active = true
 	w.steerFence.settled = false
 	w.steerFence.revision++
@@ -206,7 +207,7 @@ func (w *worker) maybeFinishSteeredRoot() {
 	}
 	switch fence.terminal {
 	case terminalDone:
-		if w.preview == "" {
+		if !w.hasAssistantBody() {
 			w.finishUncertain(w.tr(i18n.Msg.OmpEndedWithoutConfirmedTextResultTaskOutcomeUncertain))
 		} else {
 			w.finishReplyWithStatus(false)

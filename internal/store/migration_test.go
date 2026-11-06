@@ -69,6 +69,7 @@ func TestMigrationSchema18Upgrade(t *testing.T) {
 	s := openTestStore(t, dir)
 	m := migrationFixture(t, s)
 	// Remove later additions to construct a populated schema-18 database.
+	restoreLegacyProgressSchema(t, s)
 	_, err := s.DB.Exec("DROP TABLE topic_name_reservations; DROP TABLE topic_names; DROP TABLE interface_language; DROP TABLE migrations; PRAGMA user_version=18")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())

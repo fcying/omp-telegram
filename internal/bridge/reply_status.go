@@ -11,9 +11,13 @@ import (
 const replyStatusTimeout = time.Second
 
 type replyStatusState struct {
-	metrics replyMetrics
-	pending *replyStatusRequest
-	header  string
+	metrics             replyMetrics
+	pending             *replyStatusRequest
+	header              string
+	roundStatusOutboxID int64
+	roundStatusHeader   string
+	liveState           statusState
+	liveScope           *progressNativeRequest
 }
 
 type replyStatusRequest struct {
@@ -41,13 +45,39 @@ func (w *worker) resetReplyStatus() {
 	w.replyStatus = replyStatusState{}
 }
 
+// Streamed text without a completed message has no confirmed model or usage.
+func (w *worker) unconfirmedAssistantHeader() string {
+	if w.progressContextReadCompleted() {
+		return compactUnknownContext
+	}
+	return ""
+}
+
+// Reuse only a validated, same-run status projection. No formatted status is
+// parsed, and intermediate delivery never starts another native/quota query.
+func (w *worker) intermediateAssistantHeader() string {
+	metrics := &w.replyStatus.metrics
+	if metrics.modelID == "" {
+		return w.unconfirmedAssistantHeader()
+	}
+	state := statusState{}
+	if w.progressNativeMatches(w.replyStatus.liveScope) {
+		state = w.replyStatus.liveState
+	}
+	if state.Model.ID == "" {
+		state = statusState{Model: omp.Model{ID: metrics.modelID, Provider: metrics.provider}}
+	}
+	state.ConfiguredThinking = w.configuredThinking
+	return compactMessageHeader(w.b.language(), state, metrics, w.progressContextReadCompleted())
+}
+
 func (w *worker) finishReplyWithStatus(round bool) {
 	if w.replyStatus.pending != nil {
 		return
 	}
-	w.replyStatus.header = compactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics)
+	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, w.progressContextReadCompleted())
 	client, connected := w.runtimeClient()
-	if !connected || !w.taskActive() || w.preview == "" || w.ctx.Err() != nil {
+	if !connected || !w.taskActive() || !w.hasAssistantBody() || w.ctx.Err() != nil {
 		w.commitReplyStatus(round)
 		return
 	}
@@ -93,11 +123,17 @@ func (w *worker) replyStatusFinished(result operationResult) {
 		return
 	}
 	catalog := request.client.CommandCatalog()
-	if sample.valid && request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID && sample.state.SessionID == request.sessionID {
-		sample.state.ConfiguredThinking = w.configuredThinking
-		w.replyStatus.header = compactHeader(w.b.language(), sample.state, &w.replyStatus.metrics)
-		if w.beginReplyUsage(request, sample.state) {
-			return
+	// A stale response is not evidence that this scope's context was read.
+	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, false)
+	if request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID {
+		if !sample.valid {
+			w.replyStatus.header = compactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics)
+		} else if sample.state.SessionID == request.sessionID {
+			sample.state.ConfiguredThinking = w.configuredThinking
+			w.replyStatus.header = compactHeader(w.b.language(), sample.state, &w.replyStatus.metrics)
+			if w.beginReplyUsage(request, sample.state) {
+				return
+			}
 		}
 	}
 	w.commitReplyStatus(request.round)
@@ -126,8 +162,9 @@ func (w *worker) commitPendingReplyStatus() *replyStatusRequest {
 
 func (w *worker) commitReplyStatus(round bool) {
 	if round {
-		w.commitResearchRound()
-		w.probeResearchSettlement()
+		if w.commitResearchRound() {
+			w.probeResearchSettlement()
+		}
 		return
 	}
 	w.finish()
@@ -151,6 +188,10 @@ func (w *worker) replyStatusEvent(e rpcEvent) bool {
 		}
 	case "prompt_result":
 		if e.Status == "completed" {
+			return false
+		}
+	case "extension_ui_request":
+		if !assistantContinuationEvent(e) {
 			return false
 		}
 	case "session_settled", "available_commands_update", "advisor_cost_changed", "thinking_level_changed":
