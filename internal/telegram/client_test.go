@@ -405,6 +405,56 @@ func TestUnchangedEditIsSuccess(t *testing.T) {
 	}
 }
 
+func TestEntityRejectionKeepsLongRenderedTextWithinLimit(t *testing.T) {
+	for _, text := range []struct {
+		name, visible string
+	}{
+		{"ASCII boundary", strings.Repeat("x", MaxMessageUTF16)},
+		{"emoji boundary", strings.Repeat("😀", MaxMessageUTF16/2)},
+		{"escaped literal tags", strings.Repeat("&<b>😀", 682) + "tail"},
+	} {
+		for _, method := range []string{"send", "edit"} {
+			t.Run(text.name+"/"+method, func(t *testing.T) {
+				attempts := 0
+				client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+					var fields map[string]any
+					err := json.NewDecoder(r.Body).Decode(&fields)
+					if err != nil {
+						t.Error(err)
+					}
+					attempts++
+					if attempts == 1 {
+						if fields["parse_mode"] != "HTML" {
+							t.Error("first request must attempt formatted delivery")
+						}
+						w.WriteHeader(http.StatusBadRequest)
+						fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}`)
+						return
+					}
+					plain, _ := fields["text"].(string)
+					if plain != text.visible || literalUTF16Len(plain) > MaxMessageUTF16 {
+						t.Errorf("plain fallback changed visible text or exceeded the limit: units=%d", literalUTF16Len(plain))
+					}
+					if _, exists := fields["parse_mode"]; exists {
+						t.Error("plain fallback must not interpret literal tags")
+					}
+					fmt.Fprint(w, `{"ok":true,"result":{"message_id":8}}`)
+				})
+				source := "**" + text.visible + "**"
+				var err error
+				if method == "send" {
+					_, err = client.Send(t.Context(), 1, 0, source, SendOptions{})
+				} else {
+					err = client.Edit(t.Context(), 1, 8, source, nil)
+				}
+				if err != nil || attempts != 2 {
+					t.Fatalf("entity rejection did not complete plain delivery: attempts=%d error=%v", attempts, err)
+				}
+			})
+		}
+	}
+}
+
 func TestRedirectDoesNotForwardCredentials(t *testing.T) {
 	var forwarded atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { forwarded.Add(1) }))

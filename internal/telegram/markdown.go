@@ -17,36 +17,26 @@ func ConvertMarkdown(md string) string {
 	lines := strings.Split(md, "\n")
 	var out []string
 	for i := 0; i < len(lines); {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == "":
+		block := collectMarkdownBlock(lines, i)
+		switch block.kind {
+		case markdownBlank:
 			out = append(out, "")
-			i++
-		case isFence(trimmed):
-			body, next := collectFence(lines, i)
-			out = append(out, "<pre>"+escapeHTML(strings.Join(body, "\n"))+"</pre>")
-			i = next
-		case isTableStart(lines, i):
-			body, next := collectTable(lines, i)
-			out = append(out, renderTable(body))
-			i = next
-		case headingRe.MatchString(line):
-			out = append(out, "<b>"+convertInline(strings.TrimSpace(headingRe.FindStringSubmatch(line)[2]))+"</b>")
-			i++
-		case strings.HasPrefix(trimmed, ">"):
-			body, next := collectQuote(lines, i)
-			out = append(out, "<blockquote>"+ConvertMarkdown(strings.Join(body, "\n"))+"</blockquote>")
-			i = next
-		case ruleRe.MatchString(line):
+		case markdownFence:
+			out = append(out, "<pre>"+escapeHTML(strings.Join(block.body, "\n"))+"</pre>")
+		case markdownTable:
+			out = append(out, renderTable(block.body))
+		case markdownHeading:
+			out = append(out, convertHeadingInline(strings.TrimSpace(headingRe.FindStringSubmatch(lines[i])[2])))
+		case markdownQuote:
+			out = append(out, "<blockquote>"+ConvertMarkdown(strings.Join(block.body, "\n"))+"</blockquote>")
+		case markdownRule:
 			out = append(out, "──────────")
-			i++
-		case listItemRe.MatchString(line):
-			out = append(out, convertList(lines, &i))
-		default:
-			out = append(out, convertInline(line))
-			i++
+		case markdownList:
+			out = append(out, convertList(lines[i:block.end]))
+		case markdownParagraph:
+			out = append(out, convertInline(strings.Join(lines[i:block.end], "\n")))
 		}
+		i = block.end
 	}
 	return strings.Join(out, "\n")
 }
@@ -57,6 +47,81 @@ var (
 	listItemRe = regexp.MustCompile(`^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$`)
 	tableDelim = regexp.MustCompile(`^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$`)
 )
+
+type markdownBlockKind uint8
+
+const (
+	markdownBlank markdownBlockKind = iota
+	markdownFence
+	markdownTable
+	markdownHeading
+	markdownQuote
+	markdownRule
+	markdownList
+	markdownParagraph
+)
+
+type markdownBlock struct {
+	kind markdownBlockKind
+	end  int
+	body []string
+}
+
+// collectMarkdownBlock is the converter's block dispatch, also used when a
+// preview is projected or clipped. Collectors preserve recursive line boundaries.
+func collectMarkdownBlock(lines []string, start int) markdownBlock {
+	line := lines[start]
+	trimmed := strings.TrimSpace(line)
+	block := markdownBlock{end: start + 1}
+	switch {
+	case trimmed == "":
+		block.kind = markdownBlank
+	case isFence(trimmed):
+		block.kind = markdownFence
+		block.body, block.end = collectFence(lines, start)
+	case isTableStart(lines, start):
+		block.kind = markdownTable
+		block.body, block.end = collectTable(lines, start)
+	case headingRe.MatchString(line):
+		block.kind = markdownHeading
+	case strings.HasPrefix(trimmed, ">"):
+		block.kind = markdownQuote
+		block.body, block.end = collectQuote(lines, start)
+	case ruleRe.MatchString(line):
+		block.kind = markdownRule
+	case listItemRe.MatchString(line):
+		block.kind = markdownList
+		for block.end < len(lines) {
+			next := lines[block.end]
+			if strings.TrimSpace(next) == "" || !(listItemRe.MatchString(next) || strings.HasPrefix(next, " ") || strings.HasPrefix(next, "\t")) {
+				break
+			}
+			block.end++
+		}
+	default:
+		block.kind = markdownParagraph
+		block.end = paragraphEnd(lines, start)
+	}
+	return block
+}
+
+// paragraphEnd shares the converter's block boundaries with inline splitting
+// and preview projection. A soft newline belongs to the current paragraph.
+func paragraphEnd(lines []string, start int) int {
+	i := start + 1
+	for i < len(lines) && !paragraphBoundary(lines, i) {
+		i++
+	}
+	return i
+}
+
+func paragraphBoundary(lines []string, i int) bool {
+	line := lines[i]
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "" || isFence(trimmed) || isTableStart(lines, i) ||
+		headingRe.MatchString(line) || strings.HasPrefix(trimmed, ">") ||
+		ruleRe.MatchString(line) || listItemRe.MatchString(line)
+}
 
 func isFence(trimmed string) bool {
 	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
@@ -223,19 +288,10 @@ func collectQuote(lines []string, start int) ([]string, int) {
 // convertList renders consecutive list items, keeping ordering markers and
 // indenting nested items. Continuation lines (no marker, indented) join the
 // open item with matching padding.
-func convertList(lines []string, i *int) string {
+func convertList(lines []string) string {
 	var b strings.Builder
 	openLen := 0
-	for *i < len(lines) {
-		line := lines[*i]
-		if strings.TrimSpace(line) == "" {
-			// A blank line ends the list unless the next line continues an item.
-			if *i+1 < len(lines) && listItemRe.MatchString(lines[*i+1]) {
-				*i++
-				continue
-			}
-			break
-		}
+	for _, line := range lines {
 		if m := listItemRe.FindStringSubmatch(line); m != nil {
 			indent := strings.ReplaceAll(m[1], "\t", "    ")
 			ordered := m[2][0] >= '0' && m[2][0] <= '9'
@@ -250,177 +306,15 @@ func convertList(lines []string, i *int) string {
 				b.WriteString("\n")
 			}
 			b.WriteString(prefix + body)
-		} else if openLen > 0 && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) {
+		} else {
 			continuation := convertInline(strings.TrimSpace(line))
 			b.WriteString("\n" + strings.Repeat(" ", openLen) + continuation)
-		} else {
-			break
-		}
-		*i++
-	}
-	return b.String()
-}
-
-var (
-	codeRe = regexp.MustCompile("`+")
-	linkRe = regexp.MustCompile(`!?\[([^\]]*)\]\(\s*([^\s)]+)(?:\s+("[^"]*"|'[^']*'))?\s*\)`)
-)
-
-func convertInline(s string) string {
-	if s == "" {
-		return s
-	}
-	var b strings.Builder
-	for len(s) > 0 {
-		loc := codeRe.FindStringIndex(s)
-		if loc == nil {
-			b.WriteString(convertRichText(s))
-			break
-		}
-		b.WriteString(convertRichText(s[:loc[0]]))
-		marker := s[loc[0]:loc[1]]
-		rest := s[loc[1]:]
-		end := strings.Index(rest, marker)
-		if end < 0 {
-			b.WriteString(escapeHTML(marker))
-			s = rest
-			continue
-		}
-		b.WriteString("<code>" + escapeHTML(rest[:end]) + "</code>")
-		s = rest[end+len(marker):]
-	}
-	return b.String()
-}
-
-// convertRichText applies links and text emphasis to one non-code segment.
-// Escaping runs first so markdown markers survive it; tags are injected only
-// afterwards, which keeps the emitted HTML valid no matter what the source
-// contained. Links are parked behind placeholders first so emphasis scanning
-// never rewrites a URL, and vice versa.
-func convertRichText(s string) string {
-	if !strings.ContainsAny(s, "[*_~<>&`") {
-		return escapeHTML(s)
-	}
-	s = escapeHTML(s)
-	var links []string
-	s = linkRe.ReplaceAllStringFunc(s, func(m string) string {
-		groups := linkRe.FindStringSubmatch(m)
-		title := applyEmphasis(groups[1])
-		if strings.HasPrefix(m, "!") { // images have no entity: keep a labeled link
-			if title != "" {
-				title = "🖼 " + title
-			} else {
-				title = "🖼"
-			}
-		}
-		// groups[2] is already HTML-escaped; only the quote can still break the
-		// attribute here (ampersands must not be escaped twice).
-		links = append(links, `<a href="`+strings.ReplaceAll(groups[2], `"`, "&quot;")+`">`+title+`</a>`)
-		return "\x01" + itoa(len(links)-1) + "\x02"
-	})
-	s = applyEmphasis(s)
-	for i, tag := range links {
-		s = strings.ReplaceAll(s, "\x01"+itoa(i)+"\x02", tag)
-	}
-	return s
-}
-
-func itoa(n int) string { return strconv.Itoa(n) }
-
-// applyEmphasis rewrites **, __, *, _ and ~~ delimiters into tags. It is a
-// left-to-right scanner because RE2 lacks backreferences: the scanner pairs
-// runs of identical markers and validates their content.
-func applyEmphasis(s string) string {
-	if !strings.ContainsAny(s, "*_~") {
-		return s
-	}
-	var b strings.Builder
-	i := 0
-	for i < len(s) {
-		c := s[i]
-		switch c {
-		case '~':
-			if i+1 < len(s) && s[i+1] == '~' {
-				if end := strings.Index(s[i+2:], "~~"); end >= 0 {
-					inner := s[i+2 : i+2+end]
-					if validEmphasis(inner) {
-						b.WriteString("<s>")
-						b.WriteString(applyEmphasis(inner))
-						b.WriteString("</s>")
-						i += 2 + end + 2
-						continue
-					}
-				}
-			}
-			b.WriteByte(c)
-			i++
-		case '*', '_':
-			run := 1
-			for i+run < len(s) && s[i+run] == c {
-				run++
-			}
-			if run > 2 {
-				run = 2
-			}
-			if run == 2 {
-				closer := strings.Repeat(string(c), 2)
-				if end := strings.Index(s[i+2:], closer); end >= 0 {
-					inner := s[i+2 : i+2+end]
-					if validEmphasis(inner) {
-						b.WriteString("<b>")
-						b.WriteString(applyEmphasis(inner))
-						b.WriteString("</b>")
-						i += 2 + end + 2
-						continue
-					}
-				}
-			} else if c == '*' {
-				if end := strings.IndexByte(s[i+1:], '*'); end >= 0 {
-					inner := s[i+1 : i+1+end]
-					if validEmphasis(inner) {
-						b.WriteString("<i>")
-						b.WriteString(applyEmphasis(inner))
-						b.WriteString("</i>")
-						i += 2 + end
-						continue
-					}
-				}
-			} else if !wordByteAt(s, i-1) {
-				if end := strings.IndexByte(s[i+1:], '_'); end >= 0 && !wordByteAt(s, i+end+2) {
-					inner := s[i+1 : i+1+end]
-					if validEmphasis(inner) {
-						b.WriteString("<i>")
-						b.WriteString(applyEmphasis(inner))
-						b.WriteString("</i>")
-						i += 2 + end
-						continue
-					}
-				}
-			}
-			b.WriteString(strings.Repeat(string(c), run))
-			i += run
-		default:
-			b.WriteByte(c)
-			i++
 		}
 	}
 	return b.String()
 }
 
-func validEmphasis(inner string) bool {
-	return inner != "" && inner == strings.TrimSpace(inner)
-}
-
-// wordByteAt reports whether the byte at index i continues a word. Underscore
-// emphasis must not fire inside identifiers like snake_case (Byte-level check:
-// any UTF-8 continuation byte counts as part of a word.)
-func wordByteAt(s string, i int) bool {
-	if i < 0 || i >= len(s) {
-		return false
-	}
-	c := s[i]
-	return c == '_' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= 0x80
-}
+var linkRe = regexp.MustCompile(`!?\[((?:\\.|[^\]\\])*)\]\(\s*([^\s)]+)(?:\s+("[^"]*"|'[^']*'))?\s*\)`)
 
 // stripInlineMarks removes inline markup from table cells: links keep their
 // label (every label, matched one by one), emphasis and code markers vanish.
@@ -545,12 +439,10 @@ func compactTable(rows [][]string, header []string, columns int) string {
 	return strings.Join(lines, "\n")
 }
 
-// SplitForTelegram splits markdown into parts whose rendered text each fits
-// within limit UTF-16 units. Blocks stay whole: paragraphs, lists, tables and
-// code fences are never cut apart, and an oversized table repeats its header
-// and delimiter rows in every part. Only a single line with no break point is
-// hard-split, so a reply never degrades to raw markdown just because markup
-// pushed it past the message cap.
+// SplitForTelegram splits Markdown into independently convertible messages
+// within limit UTF-16 units. Fitting blocks stay whole, oversized tables repeat
+// their headers, and oversized ordinary paragraphs reopen matched inline styles
+// around each payload cut instead of exposing their original delimiters.
 func SplitForTelegram(md string, limit int) []string {
 	if strings.TrimSpace(md) == "" {
 		return nil
@@ -561,8 +453,13 @@ func SplitForTelegram(md string, limit int) []string {
 	var parts []string
 	current := ""
 	for _, block := range markdownBlocks(md) {
-		for _, piece := range oversizeBlock(block, limit) {
+		for index, piece := range oversizeBlock(block, limit) {
 			if current == "" {
+				current = piece
+				continue
+			}
+			if index > 0 {
+				parts = append(parts, current)
 				current = piece
 				continue
 			}
@@ -640,110 +537,210 @@ func oversizeBlock(block string, limit int) []string {
 	return packLines(lines, limit)
 }
 
-// splitTableBlock packs table body rows into parts, repeating the header and
-// delimiter row so every part renders as a table on its own.
+// splitTableBlock repeats the header for ordinary tables. If even one complete
+// row cannot fit with its header, the entire table becomes labelled literal text
+// so splitting never changes cell boundaries or interprets cell contents again.
 func splitTableBlock(lines []string, limit int) []string {
 	head := strings.Join(lines[:2], "\n")
+	if convertLen(head) > limit {
+		return splitLiteralBlock(literalTableText(lines), "```", limit)
+	}
+
 	var out []string
-	var chunk []string
-	for _, row := range fitRows(lines[2:], limit) {
-		candidate := append(append([]string{}, chunk...), row)
-		if len(chunk) > 0 && convertLen(head+"\n"+strings.Join(candidate, "\n")) > limit {
-			out = append(out, head+"\n"+strings.Join(chunk, "\n"))
-			chunk = nil
+	chunk := head
+	hasRows := false
+	for _, row := range lines[2:] {
+		single := head + "\n" + row
+		if convertLen(single) > limit {
+			return splitLiteralBlock(literalTableText(lines), "```", limit)
 		}
-		chunk = append(chunk, row)
-	}
-	if len(chunk) > 0 {
-		out = append(out, head+"\n"+strings.Join(chunk, "\n"))
-	}
-	if len(out) == 0 {
-		out = []string{strings.Join(lines, "\n")}
-	}
-	return out
-}
-
-// splitFenceBlock packs code lines into several fences of the same marker.
-func splitFenceBlock(body []string, marker string, limit int) []string {
-	var out []string
-	var chunk []string
-	fence := func(lines []string) string {
-		return marker + "\n" + strings.Join(lines, "\n") + "\n" + marker
-	}
-	for _, line := range fitCodeRows(body, limit) {
-		candidate := append(append([]string{}, chunk...), line)
-		if len(chunk) > 0 && convertLen(fence(candidate)) > limit {
-			out = append(out, fence(chunk))
-			chunk = nil
-		}
-		chunk = append(chunk, line)
-	}
-	if len(chunk) > 0 {
-		out = append(out, fence(chunk))
-	}
-	if len(out) == 0 {
-		out = []string{fence(nil)}
-	}
-	return out
-}
-
-// packLines groups lines so each group converts within limit units.
-func packLines(lines []string, limit int) []string {
-	var out []string
-	var chunk []string
-	for _, line := range lines {
-		for _, piece := range fitPiece(line, limit) {
-			candidate := append(append([]string{}, chunk...), piece)
-			if len(chunk) > 0 && convertLen(strings.Join(candidate, "\n")) > limit {
-				out = append(out, strings.Join(chunk, "\n"))
-				chunk = nil
-			}
-			chunk = append(chunk, piece)
-		}
-	}
-	if len(chunk) > 0 {
-		out = append(out, strings.Join(chunk, "\n"))
-	}
-	return out
-}
-
-// fitRows normalises rows whose own markup would not fit, so the packers never
-// have to measure a single overflowing entry.
-func fitRows(rows []string, limit int) []string {
-	out := make([]string, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, fitPiece(row, limit)...)
-	}
-	return out
-}
-
-// fitCodeRows normalises fenced lines by their literal length. Inside a code
-// block Telegram shows every character as-is, so a fence row must fit on its
-// own before the packer assembles blocks; inline markdown measurement would
-// undercount it (*a pairs render shorter than they occupy in a fence).
-func fitCodeRows(rows []string, limit int) []string {
-	out := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if utf16Len(row) <= limit {
-			out = append(out, row)
+		if !hasRows {
+			chunk = single
+			hasRows = true
 			continue
 		}
-		out = append(out, hardSplitUnits(row, limit)...)
+		candidate := chunk + "\n" + row
+		if convertLen(candidate) > limit {
+			out = append(out, chunk)
+			chunk = single
+		} else {
+			chunk = candidate
+		}
+	}
+	return append(out, chunk)
+}
+
+// literalTableText uses the same visible cell text and labels as compactTable,
+// but leaves HTML escaping to the final fenced conversion.
+func literalTableText(lines []string) string {
+	header := tableCells(lines[0])
+	rows := make([][]string, 0, len(lines)-2)
+	columns := len(header)
+	for _, line := range lines[2:] {
+		row := tableCells(line)
+		rows = append(rows, row)
+		columns = max(columns, len(row))
+	}
+	labels := make([]string, columns)
+	for c := range labels {
+		if c < len(header) {
+			labels[c] = header[c]
+		}
+		if labels[c] == "" {
+			labels[c] = "col" + strconv.Itoa(c+1)
+		}
+	}
+	if len(rows) == 0 {
+		return strings.Join(labels, " · ")
+	}
+	var text strings.Builder
+	for i, row := range rows {
+		if i > 0 {
+			text.WriteByte('\n')
+		}
+		for c, label := range labels {
+			if c > 0 {
+				text.WriteString(" · ")
+			}
+			text.WriteString(label)
+			text.WriteString(": ")
+			if c < len(row) {
+				text.WriteString(row[c])
+			}
+		}
+	}
+	return text.String()
+}
+
+// splitFenceBlock preserves the literal body, including newline boundaries,
+// while choosing a non-colliding marker for every newly wrapped chunk.
+func splitFenceBlock(body []string, marker string, limit int) []string {
+	return splitLiteralBlock(strings.Join(body, "\n"), marker, limit)
+}
+
+// splitLiteralBlock keeps fitting lines whole and only hard-splits oversized
+// lines. Newlines remain part of the payload, not synthetic chunk separators.
+func splitLiteralBlock(text, marker string, limit int) []string {
+	var out []string
+	var chunk strings.Builder
+	units := 0
+	flush := func() {
+		if chunk.Len() > 0 {
+			out = append(out, literalFence(chunk.String(), marker))
+			chunk.Reset()
+			units = 0
+		}
+	}
+	appendPiece := func(piece string, size int) {
+		if units+size > limit {
+			flush()
+		}
+		chunk.WriteString(piece)
+		units += size
+	}
+	for {
+		line, rest, newline := strings.Cut(text, "\n")
+		size := literalUTF16Len(line)
+		if size <= limit {
+			appendPiece(line, size)
+		} else {
+			flush()
+			for _, piece := range hardSplitUnits(line, limit) {
+				appendPiece(piece, literalUTF16Len(piece))
+			}
+		}
+		if !newline {
+			break
+		}
+		appendPiece("\n", 1)
+		text = rest
+	}
+	flush()
+	if len(out) == 0 {
+		out = append(out, literalFence("", marker))
 	}
 	return out
 }
 
-// fitPiece breaks a run of text until every piece renders within limit units.
-// The rendered form can still exceed the piece budget (a --- rule widens to a
-// dash run, compact tables add labels), so the budget is halved until
-// measurement passes; at an 8-unit cut it always does.
-func fitPiece(s string, limit int) []string {
-	if limit < 64 {
-		limit = 64
+// literalFence cannot close early, even when a hard cut exposes a marker-only
+// line that did not exist in the original code block.
+func literalFence(text, marker string) string {
+	longest := len(marker) - 1
+	for rest := text; ; {
+		line, next, newline := strings.Cut(rest, "\n")
+		line = strings.TrimSpace(line)
+		if len(line) >= len(marker) && strings.Trim(line, marker[:1]) == "" {
+			longest = max(longest, len(line))
+		}
+		if !newline {
+			break
+		}
+		rest = next
 	}
-	if convertLen(s) <= limit {
-		return []string{s}
+	if longest >= len(marker) {
+		marker = strings.Repeat(marker[:1], longest+1)
 	}
+	return marker + "\n" + text + "\n" + marker
+}
+
+func literalUTF16Len(text string) int {
+	units := 0
+	for _, r := range text {
+		if r > 0xffff {
+			units += 2
+		} else {
+			units++
+		}
+	}
+	return units
+}
+
+// packLines preserves ordinary paragraph scopes while leaving the converter's
+// structured lines separate. A split paragraph already carries its newlines.
+func packLines(lines []string, limit int) []string {
+	var out []string
+	current := ""
+	flush := func() {
+		if current != "" {
+			out = append(out, current)
+			current = ""
+		}
+	}
+	for i := 0; i < len(lines); {
+		next := i + 1
+		ordinary := !paragraphBoundary(lines, i)
+		if ordinary {
+			next = paragraphEnd(lines, i)
+		}
+		text := strings.Join(lines[i:next], "\n")
+		i = next
+		if convertLen(text) > limit {
+			flush()
+			if ordinary {
+				out = append(out, splitInlineParagraph(text, limit)...)
+			} else {
+				out = append(out, splitStructuredLine(text, limit)...)
+			}
+			continue
+		}
+		candidate := text
+		if current != "" {
+			candidate = current + "\n" + text
+		}
+		if current != "" && convertLen(candidate) > limit {
+			flush()
+			candidate = text
+		}
+		current = candidate
+	}
+	flush()
+	return out
+}
+
+// splitStructuredLine retains the existing source-cut fallback for oversized
+// headings, list items and quote lines; paragraph splitting must not reinterpret
+// those blocks as ordinary inline text.
+func splitStructuredLine(s string, limit int) []string {
 	cut := utf16Len(s) / 2
 	for {
 		pieces := hardSplitUnits(s, cut)
@@ -754,12 +751,10 @@ func fitPiece(s string, limit int) []string {
 				break
 			}
 		}
-		if fits || cut <= 8 {
+		if fits || cut <= 1 {
 			return pieces
 		}
-		if cut /= 2; cut < 8 {
-			cut = 8
-		}
+		cut = max(1, cut/2)
 	}
 }
 
@@ -785,63 +780,253 @@ func hardSplitUnits(s string, limit int) []string {
 	return out
 }
 
-// TailForTelegram retains recent source text without starting inside inline
-// markup. A clipped code block keeps its opening fence; an oversized single
-// line is displayed literally rather than interpreted as broken Markdown.
+// TailForTelegram preserves recent lines and their real block context, then
+// stabilizes only the final inline scope. Stored source remains untouched.
 func TailForTelegram(md string, limit int) string {
 	if limit <= 0 {
 		return ""
 	}
+	lines := strings.Split(md, "\n")
+	// Extract only a bounded original payload, before any synthetic opener or
+	// closer exists. In particular, never expand a whole compact table to HTML.
+	literal := func() string {
+		return literalPreview(previewLiteralTail(lines, limit), limit)
+	}
 	start := previewTailStart(md, limit)
-	if start == 0 {
-		return md
+	line := strings.Count(md[:start], "\n")
+	if start > 0 && md[start-1] != '\n' {
+		next := strings.IndexByte(md[start:], '\n')
+		if next < 0 || strings.TrimSpace(md[start+next+1:]) == "" {
+			return literal()
+		}
+		start += next + 1
+		line++
 	}
-	tail := md[start:]
-	if md[start-1] != '\n' {
-		nextLine := strings.IndexByte(tail, '\n')
-		if nextLine < 0 || strings.TrimSpace(tail[nextLine+1:]) == "" {
-			return literalPreview(tail, limit)
+	for {
+		prefix, skipTo := previewBlockPrefix(lines, line, limit)
+		if skipTo > 0 {
+			if skipTo >= len(lines) {
+				return literal()
+			}
+			for line < skipTo {
+				start += len(lines[line]) + 1
+				line++
+			}
+			if strings.TrimSpace(md[start:]) == "" {
+				return literal()
+			}
+			continue
 		}
-		start += nextLine + 1
+		if prefix != "" && previewTailStart(prefix, limit-1) != 0 {
+			return literal()
+		}
+		tail := md[start:]
+		if prefix != "" {
+			tail = prefix + tail
+		}
+		if previewTailStart(tail, limit) == 0 {
+			projected := strings.Split(tail, "\n")
+			if projectPreviewLines(projected) {
+				if !previewScopesMatch(strings.Split(tail, "\n"), projected) {
+					return literal()
+				}
+				tail = strings.Join(projected, "\n")
+			}
+			// Only this source-bounded candidate may be rendered. Restored
+			// table context can expand even when its Markdown source fits.
+			if previewTailStart(tail, limit) != 0 || convertLen(tail) > limit {
+				return literal()
+			}
+			return tail
+		}
+		next := strings.IndexByte(md[start:], '\n')
+		if next < 0 || strings.TrimSpace(md[start+next+1:]) == "" {
+			return literal()
+		}
+		start += next + 1
+		line++
 	}
-	var fence string
-	for prefix := md[:start]; prefix != ""; {
-		line, rest, _ := strings.Cut(prefix, "\n")
-		trimmed := strings.TrimSpace(line)
-		if fence == "" {
-			if isFence(trimmed) {
-				fence = fenceMarker(trimmed)
-			}
-		} else if trimmed == fence {
-			fence = ""
+}
+
+// previewBlockPrefix restores only the enclosing block syntax removed by a
+// source cut. It follows the original converter scopes, never reparsing a
+// quoted code payload as nested quotes or treating a closing fence as an opener.
+// A nonzero second result jumps directly to the next safe source line.
+func previewBlockPrefix(lines []string, line, limit int) (string, int) {
+	for start := 0; start < len(lines); {
+		block := collectMarkdownBlock(lines, start)
+		if line >= block.end {
+			start = block.end
+			continue
 		}
-		prefix = rest
+		switch block.kind {
+		case markdownFence:
+			if line > start {
+				if line == start+len(block.body)+1 {
+					return "", line + 1
+				}
+				return fenceMarker(strings.TrimSpace(lines[start])) + "\n", 0
+			}
+		case markdownTable:
+			if line > start && previewTailStart(block.body[0], limit-1) != 0 {
+				return block.body[0], 0
+			}
+			if line == start+1 {
+				return block.body[0] + "\n", 0
+			}
+			if line > start+1 {
+				return block.body[0] + "\n" + block.body[1] + "\n", 0
+			}
+		case markdownList:
+			if line > start && !listItemRe.MatchString(lines[line]) {
+				// Scan the discarded continuation once, stopping at the next
+				// complete item rather than discarding the rest of the list.
+				next := line + 1
+				for next < block.end && !listItemRe.MatchString(lines[next]) {
+					next++
+				}
+				return "", next
+			}
+		case markdownQuote:
+			prefix, next := previewBlockPrefix(block.body, line-start, limit)
+			if next > 0 {
+				return "", start + next
+			}
+			if prefix != "" && previewTailStart(prefix, limit-1) != 0 {
+				return prefix, 0
+			}
+			if prefix != "" {
+				quote := lines[line][:len(lines[line])-len(block.body[line-start])]
+				prefix = quote + strings.ReplaceAll(strings.TrimSuffix(prefix, "\n"), "\n", "\n"+quote) + "\n"
+			}
+			return prefix, 0
+		}
+		return "", 0
 	}
-	if fence != "" {
-		if len(fence)+1 >= limit {
-			return literalPreview(tail, limit)
-		}
-		body := md[start:]
-		units := 0
-		for _, r := range body {
-			units += utf16.RuneLen(r)
-		}
-		for units+len(fence)+1 > limit {
-			nextLine := strings.IndexByte(body, '\n')
-			if nextLine < 0 {
-				return literalPreview(body, limit)
-			}
-			if strings.TrimSpace(body[:nextLine]) == fence {
-				return body[nextLine+1:]
-			}
-			for _, r := range body[:nextLine+1] {
-				units -= utf16.RuneLen(r)
-			}
-			body = body[nextLine+1:]
-		}
-		return fence + "\n" + body
+	return "", 0
+}
+
+// previewScopesMatch rejects projections that expose new block syntax. Inline
+// closers are harmless only while the converter sees the same recursive scopes.
+func previewScopesMatch(before, after []string) bool {
+	if len(before) != len(after) {
+		return false
 	}
-	return md[start:]
+	for i := 0; i < len(before); {
+		original := collectMarkdownBlock(before, i)
+		projected := collectMarkdownBlock(after, i)
+		if original.kind != projected.kind || original.end != projected.end {
+			return false
+		}
+		if original.kind == markdownQuote && !previewScopesMatch(original.body, projected.body) {
+			return false
+		}
+		i = original.end
+	}
+	return true
+}
+
+// previewLiteralTail follows the original block scopes without materializing
+// rendered HTML. Tables deliberately keep bounded raw rows: compact rendering
+// could repeat an arbitrarily long header for every discarded row.
+func previewLiteralTail(lines []string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	start := -1
+	var last markdownBlock
+	for i := 0; i < len(lines); {
+		block := collectMarkdownBlock(lines, i)
+		if block.kind != markdownBlank {
+			start, last = i, block
+		}
+		i = block.end
+	}
+	if start < 0 {
+		return strings.Repeat("\n", min(len(lines)-1, limit))
+	}
+	trailing := len(lines) - last.end
+	if trailing >= limit {
+		return strings.Repeat("\n", limit)
+	}
+	available := limit - trailing
+	var payload string
+	switch last.kind {
+	case markdownQuote:
+		payload = previewLiteralTail(last.body, available)
+	case markdownFence, markdownTable:
+		payload = previewSourceTail(last.body, available)
+	default:
+		payload = previewSourceTail(lines[start:last.end], available)
+	}
+	return payload + strings.Repeat("\n", trailing)
+}
+
+// previewSourceTail joins no more than limit UTF-16 units of original lines.
+func previewSourceTail(lines []string, limit int) string {
+	if len(lines) == 0 || limit <= 0 {
+		return ""
+	}
+	start, cut, remaining := len(lines)-1, 0, limit
+	for i := len(lines) - 1; i >= 0; i-- {
+		if i < len(lines)-1 {
+			remaining--
+			if remaining < 0 {
+				break
+			}
+		}
+		start, cut = i, previewTailStart(lines[i], remaining)
+		if cut > 0 {
+			break
+		}
+		remaining -= utf16Len(lines[i])
+	}
+	tail := lines[start][cut:]
+	if start+1 < len(lines) {
+		tail += "\n" + strings.Join(lines[start+1:], "\n")
+	}
+	return tail
+}
+
+// projectPreviewLines uses complete paragraphs at every quote depth. Tables,
+// fences and list continuations keep the same scopes as final conversion.
+func projectPreviewLines(lines []string) bool {
+	start := 0
+	block := collectMarkdownBlock(lines, start)
+	for block.end < len(lines) {
+		start = block.end
+		block = collectMarkdownBlock(lines, start)
+	}
+	switch block.kind {
+	case markdownQuote:
+		if !projectPreviewLines(block.body) {
+			return false
+		}
+		for i, body := range block.body {
+			line := lines[start+i]
+			trimmed := strings.TrimLeft(line, " \t")
+			content := strings.TrimLeft(trimmed[1:], " \t")
+			if content != body {
+				lines[start+i] = line[:len(line)-len(content)] + body
+			}
+		}
+		return true
+	case markdownParagraph:
+		paragraph := strings.Join(lines[start:block.end], "\n")
+		stable := previewInline(paragraph)
+		if stable != paragraph {
+			copy(lines[start:block.end], strings.Split(stable, "\n"))
+			return true
+		}
+	case markdownHeading, markdownList:
+		last := block.end - 1
+		stable := previewInline(lines[last])
+		if stable != lines[last] {
+			lines[last] = stable
+			return true
+		}
+	}
+	return false
 }
 
 func previewTailStart(text string, limit int) int {
