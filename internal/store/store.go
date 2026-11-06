@@ -1480,71 +1480,93 @@ func (s *Store) SetAssistantHeader(ctx context.Context, id int64, header string)
 // CompleteInboxWithReplies commits the complete final result and input completion together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, 0, "")
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, 0, "")
+	return err
 }
 
-// CompleteInboxWithAssistantHeader atomically settles the owner, replies, and captured status header.
-func (s *Store) CompleteInboxWithAssistantHeader(ctx context.Context, id, chat, thread, targetID int64, header string, replies []string) error {
+// CompleteInboxWithAssistantHeader atomically settles the owner, replies, and final status header.
+// An existing target must belong to the owner; new replies remain headerless.
+// Without a target, a nonempty header is attached only to the first new reply.
+// It returns the final header target after commit, or zero when no target exists or any step failed.
+func (s *Store) CompleteInboxWithAssistantHeader(ctx context.Context, id, chat, thread, targetID int64, header string, replies []string) (int64, error) {
 	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header)
 }
 
 // CompleteInboxUncertainWithReplies commits a terminal result that cannot be confirmed.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxUncertainWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies, 0, "")
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies, 0, "")
+	return err
 }
 
 // CompleteInboxCancelledWithReplies commits an aborted terminal result and its replies together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxCancelledWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies, 0, "")
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies, 0, "")
+	return err
 }
 
-func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string, targetID int64, header string) error {
+func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string, targetID int64, header string) (int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	now := time.Now().Unix()
 	var replyTo int64
 	if err := tx.QueryRowContext(ctx, "SELECT CASE WHEN EXISTS (SELECT 1 FROM outbox WHERE inbox_id=inbox.id AND kind='text') THEN 0 ELSE reply_to END FROM inbox WHERE id=? AND state='submitted'", id).Scan(&replyTo); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("input is not submitted")
+			return 0, fmt.Errorf("input is not submitted")
 		}
-		return err
+		return 0, err
 	}
 	result, err := tx.ExecContext(ctx, "UPDATE inbox SET state=?,updated_at=? WHERE id=? AND state='submitted'", string(state), now, id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if changed != 1 {
-		return fmt.Errorf("input is not submitted")
+		return 0, fmt.Errorf("input is not submitted")
 	}
+	var replyHeader string
+	if targetID == 0 {
+		replyHeader = header
+	}
+	finalTargetID := targetID
 	for _, reply := range replies {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, replyTo, now, now, now); err != nil {
-			return err
+		result, err := tx.ExecContext(ctx, "INSERT INTO outbox(inbox_id,chat,thread,text,header,state,reply_to,created_at,updated_at,next_attempt_at,attempt_count) VALUES(?,?,?,?,?,'pending',?,?,?,?,0)", id, chat, thread, reply, replyHeader, replyTo, now, now, now)
+		if err != nil {
+			return 0, err
+		}
+		if replyHeader != "" {
+			finalTargetID, err = result.LastInsertId()
+			if err != nil {
+				return 0, err
+			}
+			replyHeader = ""
 		}
 		replyTo = 0
 	}
 	if targetID != 0 {
 		result, err := tx.ExecContext(ctx, "UPDATE outbox SET header=?,header_pending=1,updated_at=? WHERE id=? AND inbox_id=? AND kind='text' AND header<>''", header, now, targetID, id)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		changed, err := result.RowsAffected()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if changed != 1 {
-			return sql.ErrNoRows
+			return 0, sql.ErrNoRows
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return finalTargetID, nil
 }
 
 func (s *Store) EnqueueAttachment(chat, thread int64, kind, path, name, caption string) error {

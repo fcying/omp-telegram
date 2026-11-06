@@ -129,7 +129,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists. Values may be literal integers or comma-separated environment values. |
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `telegram.progress_recent_tools` | Maximum completed tools retained in verbose Recent history. Default: `5`; range: `1..100`. Display may show fewer to fit Telegram's message limit. |
-| `telegram.provider_usage` | Opt in to native `/usage` 5h/7d used percentages in final reply headers. TOML boolean; default `false`. Independent of progress mode. |
+| `telegram.provider_usage` | Opt in to native `/usage` 5h/7d used percentages from a shared last-good cache in Progress and intermediate/final reply status bars. TOML boolean; default `false`. Independent of progress mode; refresh is idle-only. |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
 | `omp.args_labels` | Optional Telegram picker labels, one per preset; invalid labels fall back to `Preset N`. Labels are visible in the conversation, so never put credentials in them. |
@@ -242,6 +242,8 @@ A named workspace is created when it does not exist. Existing files are not copi
 On a topic's first session, the bridge attempts to use the workspace name as its title, adding `[thread ID]` for a known duplicate in the same chat. Telegram cannot provide a complete topic list, so unobserved or manually renamed titles may cause missed collisions or unnecessary suffixes. Other topics are not renamed.
 
 A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
+
+Selections from `/model`, `/thinking` and `/args` update the original menu with the result instead of sending a duplicate completion message. If there is no menu or it cannot be updated, the result is sent once as a separate notification.
 
 `/fast` runs immediately, including during a task. OMP determines supported arguments and models. Changes affect subsequent model requests, not one already in flight; its receipt is separate from the task's answer.
 
@@ -357,7 +359,13 @@ Status bars show available model, configured thinking, fast-mode, context and sp
 
 Replies support Markdown and split long text automatically. Large tables may use a plain-text layout; formatting unsupported by Telegram falls back to readable text.
 
-Set `telegram.provider_usage = true` to show native Claude or OpenAI Codex account usage in the final status bar, for example `5h30% 7d65%`. This is independent of progress mode. Unavailable usage is omitted without blocking the answer; account identities and raw reports are not shown.
+Set `telegram.provider_usage = true` to show native Claude (`anthropic`) or OpenAI Codex (`openai-codex`) account quota in Progress and intermediate/final reply status bars, independently of progress mode. Like context, the quota field is omitted until the first status read in the current scope completes. It then shows the same last-good cache, for example `5h30% 7d65%`, or `quota ?` when no usable value exists. Only 5h/7d used percentages are shown, without a reading timestamp; account identities, emails, credential IDs and raw reports are not sent to Telegram or written to logs or the database.
+
+Cache visibility does not trigger or wait for refresh. Refresh uses the existing native builtin `/usage` only while idle, with at least five minutes between attempts for the same account scope and a three-second deadline; queued prompts and controls take priority. Busy or long-running tasks show the cache or unavailable, and failed, skipped or empty reads do not clear a last-good value. A successful refresh may update the latest matching final status bar through its editable header, never its body. No direct provider API request is made.
+
+Final answers supplied only by `agent_end.messages` also keep an editable header. Later quota refreshes update that final answer, not an earlier intermediate reply.
+
+The cache lives only in the Bridge process and is not persisted across daemon restarts. It can be shared across messages and native sessions only for the same startup argv namespace and the same uniquely active OAuth credential reported by `get_logout_accounts`. Account scope must match before and after the quota query. Ambiguous or unknown scope never displays another account's cached value; the stored value is retained. These separate RPC reads are not an atomic account-and-quota snapshot and cannot attribute each rotating request to its actual billed account.
 
 ## Attachments
 
@@ -436,6 +444,7 @@ Logs are written to stderr; use your process manager for storage and rotation. P
 - [ ] **Reuse the OMP process after Stop.** Requires reliable upstream cancellation. For now, Stop retires the process while preserving its session.
 - [ ] **Cancel individual native queued prompts.** Requires reliable upstream cancellation results. `/queue` currently cancels only bridge-pending tasks.
 - [ ] **Sub2API account quota.** Requires the deployed fix for [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473) ([PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476)), quota-read permission, and reliable attribution to the account serving each reply.
+- [ ] **Structured native account-and-quota snapshots.** Wait for an upstream interface with a reliable opaque account scope, per-account report timestamps and refresh without a prompt, replacing the identity displayed in native reports and the before/after scope checks. Existing RPC reads are not atomic and cannot identify the account actually billed for each rotating request.
 
 ## Development
 

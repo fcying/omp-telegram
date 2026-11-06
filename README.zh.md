@@ -129,7 +129,7 @@ format = "text"
 | `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单. 可直接填写整数, 或引用逗号分隔的环境变量值. |
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见[进度界面](#进度界面). |
 | `telegram.progress_recent_tools` | verbose Recent 历史保留的已完成工具上限. 默认 `5`, 范围 `1..100`; 受 Telegram 消息长度限制, 实际显示可能更少. |
-| `telegram.provider_usage` | 显式启用最终回复状态头中的原生 `/usage` 5h/7d 已用百分比. TOML 布尔值, 默认 `false`, 独立于 progress 模式. |
+| `telegram.provider_usage` | 显式启用 Progress 和中间/最终回复状态栏共享 last-good 缓存中的原生 `/usage` 5h/7d 已用百分比. TOML 布尔值, 默认 `false`, 独立于 progress 模式; 仅 idle 时刷新. |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram 预设标签, 每个预设一个; 无效标签回退为 `Preset N`. 标签对能查看对话的人可见, 不要填写凭据. |
@@ -242,6 +242,8 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 Topic 的首次 session 会尝试使用 workspace 名称作为标题, 与同一 chat 中已知名称重复时添加 `[thread ID]`. Telegram 不提供完整 Topic 列表, 未观察到或手动改名的标题可能导致漏判冲突或保留不必要的后缀. 不会重命名其他 Topic.
 
 Model 或 thinking 修改成功后, 仍可能因无法读取配置等级而显示 `Thinking: n/a`. 这不会撤销修改; 如果必须关闭进程, 回执会说明 session 已保留.
+
+通过 `/model`, `/thinking` 和 `/args` 菜单选择后, 结果原位更新菜单, 不再另发重复的完成通知. 没有菜单或无法更新菜单时, 才单独发送一次结果通知.
 
 `/fast` 立即执行, 任务运行中也可使用. 支持的参数和模型由 OMP 决定. 修改影响后续模型请求, 不改变已经发出的请求; 回执独立于任务答案.
 
@@ -357,7 +359,13 @@ Steer 输入和已完成的 assistant 消息都会删除该任务较早的 Progr
 
 回复支持 Markdown, 长文本自动分片. 大表格可能改用纯文本布局; Telegram 不支持的格式回退为可读文本.
 
-设置 `telegram.provider_usage = true` 后, 最终状态栏可显示原生 Claude 或 OpenAI Codex 账号用量, 例如 `5h30% 7d65%`, 独立于 progress 模式. 用量不可用时省略, 不阻止答案发送; 不展示账号身份或原始报告.
+设置 `telegram.provider_usage = true` 后, Progress 和中间/最终回复状态栏可显示原生 Claude (`anthropic`) 或 OpenAI Codex (`openai-codex`) 账号额度, 独立于 progress 模式. 与 context 一样, 当前 scope 的首次状态读取完成前省略额度字段. 读取完成后, 各处显示同一份 last-good 缓存, 例如 `5h30% 7d65%`; 没有可用值时显示 `quota ?`. 只展示 5h/7d 已用百分比, 不附加读取时间; 账号身份, 邮箱, credential ID 和原始报告不发送到 Telegram, 不写入日志或数据库.
+
+显示缓存不会触发或等待刷新. 刷新仅在 idle 时通过现有原生 builtin `/usage` 尝试, 同一账号 scope 的尝试间隔至少五分钟, deadline 为三秒; 排队 prompt 和控制操作优先. 忙碌或长任务显示缓存或不可用, 查询失败, 跳过或结果为空都不清除 last-good 值. 刷新成功后可通过可编辑 header 更新最近匹配的最终状态栏, 不修改正文. 不直接请求供应商 API.
+
+仅由 `agent_end.messages` 提供的最终答案也保留可编辑 header. 后续额度刷新更新该最终答案, 不更新之前的中间回复.
+
+缓存仅存于 Bridge 进程内, 不跨 daemon restart 持久化. 只有启动 argv namespace 相同, 且 `get_logout_accounts` 返回的唯一 active OAuth credential 相同时, 才能跨消息及原生 session 复用. 查询额度前后的账号 scope 必须一致. Scope 不明确或未知时不展示其他账号的缓存, 已存值仍保留. 这些分开的 RPC 读取不是原子的账号与额度快照, 不能归因每次轮换请求实际结算的账号.
 
 ## 附件
 
@@ -436,6 +444,7 @@ Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 
 - [ ] **Stop 后复用 OMP 进程.** 等待上游提供可靠的取消机制. 目前 Stop 会退役进程, 保留 session.
 - [ ] **取消单条原生排队 prompt.** 等待上游提供可靠的取消结果. 目前 `/queue` 只取消 bridge 中等待的任务.
 - [ ] **Sub2API 账号额度.** 等待服务端部署 [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473) 的修复 ([PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476)), 授予额度读取权限, 并能可靠识别每次回复使用的账号.
+- [ ] **原生结构化账号与额度快照.** 等待上游接口提供可靠的不透明账号 scope, 对应账号报告的时间戳和无需 prompt 的刷新, 替代当前报告中的展示身份及前后 scope 检查. 现有 RPC 读取并非原子操作, 不能识别每次轮换请求实际结算的账号.
 
 ## 开发
 

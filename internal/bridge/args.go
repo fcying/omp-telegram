@@ -197,46 +197,26 @@ func (w *worker) cancelArgsApply(notify bool) {
 		w.endControlOperation()
 	}
 	if notify {
-		w.finishArgsApply(menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
+		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
 	}
-}
-
-func (w *worker) finishArgsApply(menuID int64, message string) {
-	if menuID != 0 {
-		w.finishMenu(menuID, message)
-	}
-	w.say(message)
 }
 
 func (w *worker) applyArgsPreset(index int, menuID int64) {
 	if !w.argsSelectionIdle() {
-		if menuID != 0 {
-			w.finishMenu(menuID, w.tr(i18n.Msg.SelectionNotChanged))
-		}
-		w.say(w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
+		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
 		return
 	}
 	if !w.binding.Running && w.client == nil {
 		if err := w.b.selectArgsPreset(index); err != nil {
-			if menuID != 0 {
-				w.finishMenu(menuID, w.tr(i18n.Msg.SelectionNotChanged))
-			}
-			w.say(w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
+			w.finishMenuOrSay(menuID, w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
 			return
 		}
 		message := w.b.argsPresetSelectionMessage(w.b.language(), index)
-		if menuID == 0 {
-			w.say(message)
-		} else {
-			w.finishMenu(menuID, message)
-		}
+		w.finishMenuOrSay(menuID, message)
 		return
 	}
 	if !w.binding.Running || !w.sessionDurable() || !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
-		if menuID != 0 {
-			w.finishMenu(menuID, w.tr(i18n.Msg.SelectionNotChanged))
-		}
-		w.say(w.tr(i18n.Msg.ArgumentPresetSessionNotDurable))
+		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ArgumentPresetSessionNotDurable))
 		return
 	}
 	// Capture the chosen argv before any asynchronous work or another conversation's selection.
@@ -291,16 +271,16 @@ func (w *worker) argsStateFinished(result operationResult) {
 	if result.err != nil || result.cancelled || json.Unmarshal(result.data, &state) != nil ||
 		state.Streaming == nil || state.Compacting == nil || state.Settled == nil ||
 		state.Async == nil || state.Queued == nil || *state.Queued < 0 {
-		w.finishArgsApply(request.menuID, w.tr(i18n.Msg.ArgumentPresetIdleCheckFailed))
+		w.finishMenuOrSay(request.menuID, w.tr(i18n.Msg.ArgumentPresetIdleCheckFailed))
 		return
 	}
 	if !w.argsSelectionIdle() || client.Stopping() || len(client.Events()) != 0 ||
 		*state.Streaming || *state.Compacting || !*state.Settled || *state.Async || *state.Queued != 0 {
-		w.finishArgsApply(request.menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
+		w.finishMenuOrSay(request.menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
 		return
 	}
 	if !w.sessionDurable() || !savedSessionAvailable(w.binding.Session, w.binding.Workspace) {
-		w.finishArgsApply(request.menuID, w.tr(i18n.Msg.ArgumentPresetSessionNotDurable))
+		w.finishMenuOrSay(request.menuID, w.tr(i18n.Msg.ArgumentPresetSessionNotDurable))
 		return
 	}
 	w.commitArgsPreset(request.index, request.args, request.menuID)
@@ -308,11 +288,11 @@ func (w *worker) argsStateFinished(result operationResult) {
 
 func (w *worker) commitArgsPreset(index int, args []string, menuID int64) {
 	if err := w.b.selectArgsPreset(index); err != nil {
-		w.finishArgsApply(menuID, w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
+		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
 		return
 	}
 	if _, connected := w.runtimeClient(); connected && slices.Equal(w.launchArgs, args) {
-		w.finishArgsApply(menuID, w.tr(i18n.Msg.ArgumentPresetApplied, index))
+		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ArgumentPresetApplied, index))
 		return
 	}
 	w.releaseRuntimeWithReason(true, "args")
@@ -322,10 +302,10 @@ func (w *worker) commitArgsPreset(index int, args []string, menuID int64) {
 	w.argsResuming = false
 	w.endRuntimeResume()
 	if failure != "" {
-		w.finishArgsApply(menuID, w.tr(i18n.Msg.ArgumentPresetApplyFailed, index)+"\n"+failure)
+		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ArgumentPresetApplyFailed, index)+"\n"+failure)
 		return
 	}
-	w.finishArgsApply(menuID, w.tr(i18n.Msg.ArgumentPresetApplied, index))
+	w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ArgumentPresetApplied, index))
 }
 
 func (w *worker) handleArgsCommand(arg string, user int64) {

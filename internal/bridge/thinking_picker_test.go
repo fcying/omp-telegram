@@ -47,10 +47,6 @@ func TestThinkingPickerOwnerAdjustmentAndReplay(t *testing.T) {
 		t.Fatalf("thinking menu reported the requested rather than verified level: %q", completed)
 	}
 	assertThinkingLevel(t, w, "high")
-	var actualReply bool
-	if err := w.b.db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM outbox WHERE text LIKE 'Thinking level: high%')").Scan(&actualReply); err != nil || !actualReply {
-		t.Fatalf("adjusted thinking level was not reported: %v", err)
-	}
 	if !sameBindingIdentity(w.binding, before) {
 		t.Fatal("thinking change replaced the session")
 	}

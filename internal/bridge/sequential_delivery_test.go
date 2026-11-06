@@ -740,6 +740,10 @@ func TestCommittedBodyIgnoresNoninteractiveUIMetadata(t *testing.T) {
 	}
 	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messageCount":1,"messages":[]}`))
 	awaitReplyStatus(t, w)
+	if queueState(t, w, 2) != "done" {
+		t.Fatal("quota refresh blocked settlement after harmless UI metadata")
+	}
+	awaitProviderUsage(t, w)
 	header := finalReplyStatus(t, w, 2, "Only final body.")
 	for _, metric := range []string{"`safe`", "100 t/s", "46% (500k)", "5h30% 7d65%"} {
 		if !strings.Contains(header, metric) {

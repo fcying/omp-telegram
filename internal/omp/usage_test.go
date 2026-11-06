@@ -19,6 +19,9 @@ const fixtureUsageFallback = "Usage\nInput tokens: 10\nOutput tokens: 20\nCache 
 var fixtureUsagePrompts int
 
 func fixtureUsageCommand(command map[string]any) bool {
+	if fixtureAccountScopeCommand(command) {
+		return true
+	}
 	mode := os.Getenv("OMP_TEST_USAGE_MODE")
 	if mode == "" {
 		return false

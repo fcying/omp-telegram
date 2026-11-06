@@ -10,10 +10,8 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-func thinkingQueryFailureReceipt(t *testing.T, w *worker, stopped bool) string {
+func thinkingQueryFailureReceipt(t *testing.T, w *worker, text string, stopped bool) string {
 	t.Helper()
-	var text string
-	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE text LIKE 'Thinking level: %' ORDER BY id DESC LIMIT 1").Scan(&text))
 	if !strings.Contains(text, "Thinking level: high") || !strings.Contains(text, "adjusted the requested max") || !strings.Contains(text, "Thinking: n/a") || !strings.Contains(text, "change succeeded") || !strings.Contains(text, "follow-up thinking query failed") {
 		t.Fatalf("optional query failure lost the verified, adjusted thinking outcome: %q", text)
 	}
@@ -23,7 +21,7 @@ func thinkingQueryFailureReceipt(t *testing.T, w *worker, stopped bool) string {
 	var receipts, failures int
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE text LIKE 'Thinking level: %'").Scan(&receipts))
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE text LIKE '%could not be confirmed%' OR text LIKE '%PRIVATE_%' OR text LIKE '%task outcome is uncertain%'").Scan(&failures))
-	if receipts != 1 || failures != 0 {
+	if receipts != 0 || failures != 0 || strings.Contains(text, "PRIVATE_") {
 		t.Fatalf("thinking operation emitted duplicate or misleading receipts: successes=%d failures=%d", receipts, failures)
 	}
 	return text
@@ -70,10 +68,7 @@ func TestThinkingChangeOptionalConfiguredQueryFailure(t *testing.T) {
 				t.Fatalf("fixture mode %s stopped=%t, want %t", mode, client.Stopping(), stopped)
 			}
 			w.operationReturned(result)
-			receipt := thinkingQueryFailureReceipt(t, w, stopped)
-			if menu := settingsMenuResult(t, f, messageID); menu != receipt {
-				t.Fatalf("thinking menu lost the confirmed outcome: %q", menu)
-			}
+			receipt := thinkingQueryFailureReceipt(t, w, settingsMenuResult(t, f, messageID), stopped)
 			assertSettingsMenuNeverInterrupted(t, f, messageID)
 			if w.configuredThinking != "" {
 				t.Fatal("optional query failure retained the previous configured thinking cache")
@@ -173,10 +168,7 @@ func TestThinkingQueryFailureDoneBeforeOperationReturn(t *testing.T) {
 	}
 	w.operationReturned(result)
 	assertRetiredOperationClient(t, w, client, before)
-	receipt := thinkingQueryFailureReceipt(t, w, true)
-	if settingsMenuResult(t, f, messageID) != receipt {
-		t.Fatal("early Done lost the confirmed thinking menu outcome")
-	}
+	thinkingQueryFailureReceipt(t, w, settingsMenuResult(t, f, messageID), true)
 	assertSettingsMenuNeverInterrupted(t, f, messageID)
 	if w.rpcExitPendingClientID != 0 || len(w.b.slots) != 0 || len(w.rpcOperations) != 0 || w.claimedSession != claim || !w.b.sessionInUse(w.sessionID) || len(w.queue) != 1 {
 		t.Fatal("early Done lost the session claim, runtime slot, queued request, or exit fence")

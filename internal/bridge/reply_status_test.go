@@ -181,32 +181,36 @@ func TestFinalReplyMetadataPreservesPendingStatusAndUsage(t *testing.T) {
 	client := w.client
 	metadata := func() {
 		t.Helper()
-		pending := w.replyStatus.pending
-		if pending == nil {
-			t.Fatal("final metadata query was not pending")
+		pending, usage := w.replyStatus.pending, w.providerUsage.pending
+		state := "submitted"
+		if usage != nil {
+			state = "done"
+		}
+		if pending == nil && usage == nil {
+			t.Fatal("neither status sampling nor idle quota refresh was pending")
 		}
 		for _, method := range []string{"setStatus", "setWidget", "notify"} {
 			raw, err := json.Marshal(map[string]any{"type": "extension_ui_request", "method": method, "message": "metadata"})
 			requireStoreOK(t, err)
 			w.event(raw)
 			rows := researchReplies(t, w, 2)
-			if w.replyStatus.pending != pending || w.client != client || client.Stopping() || queueState(t, w, 2) != "submitted" || len(rows) != 1 || replyBody(t, rows[0]) != "answer" {
-				t.Fatalf("%s interrupted final sampling or changed the already committed body", method)
+			if w.replyStatus.pending != pending || w.providerUsage.pending != usage || w.client != client || client.Stopping() || queueState(t, w, 2) != state || len(rows) != 1 || replyBody(t, rows[0]) != "answer" {
+				t.Fatalf("%s interrupted status or quota sampling or changed the committed body", method)
 			}
 		}
 	}
 	metadata()
 	w.operationReturned(sample)
 	waitFixtureRPCTrace(t, trace, "usage_waiting", "")
-	if w.replyStatus.pending == nil || !w.replyStatus.pending.usage {
-		t.Fatal("confirmed final state did not start the private usage query")
+	if w.providerUsage.pending == nil || w.replyStatus.pending != nil || queueState(t, w, 2) != "done" {
+		t.Fatal("idle quota refresh blocked final settlement")
 	}
 	if !client.UsageNeedsRetirement() {
 		t.Fatal("private usage was not submitted and awaiting its report")
 	}
 	metadata()
 	requireStoreOK(t, os.WriteFile(gate, nil, 0600))
-	awaitReplyStatus(t, w)
+	awaitProviderUsage(t, w)
 	header := finalReplyStatus(t, w, 2, "answer")
 	for _, want := range []string{"11% (10k)", "100 t/s", "5h30% 7d65%"} {
 		if !strings.Contains(header, want) {
@@ -413,12 +417,13 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, _, _, _ := replyStatusWorker(t)
+			w.b.cfg.ProviderUsage = true
 			nativeRPC(t, w, "fixture_get_state_update", map[string]any{"contextUsage": scenario.usage})
 			replyStatusMessage(t, w, 100, 1000, 1100)
 			endReplyStatus(w)
 			assertPending := func() {
 				t.Helper()
-				if w.replyStatus.pending == nil || strings.Contains(w.replyStatus.header, "ctx ?") || strings.Contains(w.replyStatus.header, "% (") {
+				if w.replyStatus.pending == nil || strings.Contains(w.replyStatus.header, "ctx ?") || strings.Contains(w.replyStatus.header, "% (") || strings.Contains(w.replyStatus.header, "quota ?") {
 					t.Fatalf("pending final read displayed context: %q", w.replyStatus.header)
 				}
 				rows := researchReplies(t, w, w.active)
@@ -426,7 +431,7 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 					t.Fatalf("pending final metadata changed formal body count: %q", rows)
 				}
 				header, body := attachedReplyBody(t, rows[0])
-				if body != "answer" || strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") {
+				if body != "answer" || strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(header, "quota ?") {
 					t.Fatalf("initial formal header displayed unread context or changed body: %q", rows[0])
 				}
 			}
@@ -441,10 +446,10 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 			w.operationReturned(result)
 			header := finalReplyStatus(t, w, 2, "answer")
 			if scenario.want == "" {
-				if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") {
+				if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(header, "quota ?") {
 					t.Fatalf("stale final read marked current context as read: %q", header)
 				}
-			} else if !strings.Contains(header, scenario.want) {
+			} else if !strings.Contains(header, scenario.want) || !strings.Contains(header, "quota ?") {
 				t.Fatalf("completed final read omitted context state %q: %q", scenario.want, header)
 			}
 		})
@@ -453,12 +458,13 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 
 func TestInterruptedFirstFinalReadDoesNotDisplayUnknownContext(t *testing.T) {
 	w, _, _, _ := replyStatusWorker(t)
+	w.b.cfg.ProviderUsage = true
 	replyStatusMessage(t, w, 100, 1000, 1100)
 	endReplyStatus(w)
 	late := receiveReplyStatus(t, w)
 	w.flushReplyStatus()
 	header := finalReplyStatus(t, w, 2, "answer")
-	if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") {
+	if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(header, "quota ?") {
 		t.Fatalf("interrupted unconsumed first read displayed context: %q", header)
 	}
 	w.operationReturned(late)

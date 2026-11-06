@@ -279,6 +279,7 @@ var Msg = struct {
 	Assistant                                                                 Message
 	PromptExceedsOmpRPCFrameLimitNoTaskSubmitted                              Message
 	ProvideOldFullSessionIDAbsolutePathNewJSONL                               Message
+	ProviderUsageUnavailable                                                  Message
 	QueueRunningPending                                                       Message
 	QueuePromptAfterCurrentTask                                               Message
 	QueuedAlbum                                                               Message
@@ -321,7 +322,6 @@ var Msg = struct {
 	ArgumentPresetSessionNotDurable                                           Message
 	Selected                                                                  Message
 	SelectedID                                                                Message
-	SelectionNotChanged                                                       Message
 	SendAutoresearchDirectlyUsingCurrentNativeExtensionCommandNot             Message
 	SessionHTMLExportFailed                                                   Message
 	SessionHTMLExportTimedOut                                                 Message
@@ -775,6 +775,7 @@ var Msg = struct {
 	Assistant:           message("💬", "💬"),
 	PromptExceedsOmpRPCFrameLimitNoTaskSubmitted: message("Prompt exceeds the omp RPC frame limit. No task was submitted.", "提示词超过 omp RPC 帧大小限制. 未提交任务."),
 	ProvideOldFullSessionIDAbsolutePathNewJSONL:  message("Provide old, a full session ID, or the absolute path to the new JSONL file.", "请提供 old, 完整会话 ID, 或新 JSONL 的绝对路径."),
+	ProviderUsageUnavailable:                     message("quota ?", "quota ?"),
 	QueueRunningPending:                          message("Queue\nRunning: %s\nPending: %d", "队列\n运行中: %s\n待处理: %d"),
 	QueuePromptAfterCurrentTask:                  message("Queue a prompt after the current task", "将消息加入当前任务之后的队列"),
 	QueuedAlbum:                                  message("Queued album", "排队中的相册"),
@@ -817,7 +818,6 @@ var Msg = struct {
 	ArgumentPresetSessionNotDurable:        message("The current session cannot be safely restored from disk. The argument preset was not changed and the instance was not stopped.", "当前 Session 无法从磁盘安全恢复. 参数预设未更改, 实例未停止."),
 	Selected:                               message("Selected: %s", "已选择: %s"),
 	SelectedID:                             message("Selected: %s\nID: %s", "已选择: %s\nID: %s"),
-	SelectionNotChanged:                    message("Selection was not changed.", "选择未更改."),
 	SendAutoresearchDirectlyUsingCurrentNativeExtensionCommandNot: message("Send /autoresearch directly using the current native extension command, not through a followup or attachment. No command was submitted.", "请直接使用当前原生扩展命令发送 /autoresearch, 不要通过后续消息或附件发送. 未提交命令."),
 	SessionHTMLExportFailed:                                               message("Session HTML export failed.", "会话 HTML 导出失败."),
 	SessionHTMLExportTimedOut:                                             message("Session HTML export timed out.", "会话 HTML 导出超时."),

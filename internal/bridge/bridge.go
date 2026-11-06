@@ -64,6 +64,7 @@ type Bridge struct {
 	commandMenus      commandMenuState
 	languageMu        sync.Mutex
 	interfaceLanguage atomic.Uint32
+	providerUsage     providerUsageCache
 }
 type incoming struct {
 	id       int64
@@ -292,6 +293,7 @@ type worker struct {
 	progress               progressState
 	progressNative         progressNativeState
 	replyStatus            replyStatusState
+	providerUsage          providerUsageState
 	operations             chan operationResult
 	albums                 map[albumKey]*pendingAlbum
 	rpcOperations          []rpcOperation
@@ -1239,6 +1241,8 @@ func (w *worker) beginTask(q queued) {
 	w.rotatePreview(0)
 	w.cancelProgressNative()
 	w.resetReplyStatus()
+	w.providerUsage.key = providerUsageKey{}
+	w.providerUsage.target = 0
 	w.uiSelection = nativeSelectionReceipt{}
 	w.taskState = taskState{active: q.id, activeReplyTo: q.replyTo, owner: q.user, busy: true, activeInputKind: q.kind}
 	w.activeAttachmentDir = q.directory
@@ -1307,7 +1311,7 @@ func (w *worker) canReleaseRuntime() bool {
 	return !w.migrationLocked() && w.runtime == runtimeConnected && w.client != nil &&
 		!w.taskActive() && !w.taskOrSessionBusy() && !w.controlInProgress() &&
 		!w.compacting && !w.finishing && !w.previewBusy &&
-		len(w.queue) == 0 && len(w.hostRequests) == 0 &&
+		len(w.queue) == 0 && len(w.hostRequests) == 0 && w.providerUsage.pending == nil &&
 		w.resumeCancel == nil && w.exportCancel == nil && w.deleteCancel == nil && w.startIntent == nil &&
 		!w.hasRuntimeConfirmation()
 }
@@ -1389,6 +1393,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 	w.b.registerCommandMenuWorker(w)
 	w.client = client
 	w.launchArgs = args
+	w.resetProviderUsage(args)
 	w.configuredThinking = ""
 	w.runtime = runtimeConnected
 	w.resumeFailed = false
@@ -1402,6 +1407,8 @@ func (w *worker) runtimeStopped() {
 	w.uiSelection = nativeSelectionReceipt{}
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
+	w.cancelProviderUsage()
+	w.providerUsage = providerUsageState{}
 	w.commitPendingReplyStatus()
 	w.cancelProgressNative()
 	w.configuredThinking = ""
@@ -1597,6 +1604,7 @@ func (w *worker) run() {
 		w.probeStuckTask(now)
 		w.steeredTick(now)
 		w.researchControlTick(now)
+		w.refreshProviderUsage(now)
 		w.releaseIdleRuntime(now)
 		return w.evictIfIdle(now)
 	}
@@ -1937,9 +1945,7 @@ func (w *worker) operationFinished(result operationResult) {
 			message = w.tr(i18n.Msg.CompactionCompletedContext, state.contextText(w.b.language()))
 		}
 		messageID, _ := result.meta.(int64)
-		if !w.finishMenu(messageID, message) {
-			w.say(message)
-		}
+		w.finishMenuOrSay(messageID, message)
 	case "abort":
 		if result.err != nil || result.cancelled {
 			if uncertainOperationOutcome(result.err, result.cancelled) {
@@ -2314,7 +2320,12 @@ func (w *worker) startOperation(kind string, client *omp.Client, call func(conte
 	if len(metadata) > 0 {
 		request.meta = metadata[0]
 	}
-	w.touchActivity()
+	if kind == "reply_usage" {
+		// Metadata refresh must not keep an otherwise idle runtime alive.
+		w.resetIdleProbe()
+	} else {
+		w.touchActivity()
+	}
 	w.rpcOperations = append(w.rpcOperations, request)
 	w.dispatchRPCOperation()
 }
@@ -3472,13 +3483,27 @@ func (w *worker) finish() {
 		}
 		header := w.assistantHeader(metadata, true)
 		parts, _ := w.boundedAssistantRepliesWithHeader(w.stream.String(), header)
-		if err := w.b.db.CompleteInboxWithAssistantHeader(w.ctx, taskID, w.key.chat, w.key.thread, target, header, parts); err != nil {
+		if len(parts) != 0 {
+			body, attached := strings.CutPrefix(parts[0], header)
+			if attached && strings.HasPrefix(body, "\n\n") && len(body) > 2 {
+				parts[0] = body[2:]
+				target = 0
+			} else if target == 0 {
+				header = ""
+			}
+		}
+		target, err := w.b.db.CompleteInboxWithAssistantHeader(w.ctx, taskID, w.key.chat, w.key.thread, target, header, parts)
+		if err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
 				w.cancel()
 			}
 			return
+		}
+		if !w.research.root {
+			w.providerUsage.target = target
+			w.providerUsage.targetProvider = w.replyStatus.metrics.provider
 		}
 		w.cancelHostRequests()
 		w.logTaskComplete(taskID, "done")
@@ -4723,8 +4748,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	}
 	if c.action == "ui" && w.exportingSession != "" {
 		text := w.tr(i18n.Msg.WaitCurrentSessionExportFinish)
-		w.finishMenu(c.messageID, text)
-		w.say(text)
+		w.finishMenuOrSay(c.messageID, text)
 		return callbackDone
 	}
 	w.finishConfirmation(c, n)
@@ -4846,6 +4870,13 @@ func (w *worker) finishMenu(messageID int64, text string) bool {
 		return false
 	}
 	return true
+}
+
+func (w *worker) finishMenuOrSay(messageID int64, text string) {
+	finished := w.finishMenu(messageID, text)
+	if !finished {
+		w.say(text)
+	}
 }
 
 type stopCallbackReply struct {
