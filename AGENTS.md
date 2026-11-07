@@ -8,6 +8,14 @@ Build a Go Telegram daemon that manages an independent `omp --mode rpc` process 
 
 Use Chinese for conversations and explanations, and English for code comments, this file, and the default README.md. Maintain the Chinese translation in README.zh.md, with links between the two README files. Keep both versions consistent. Use ASCII punctuation. State assumptions and acceptance criteria before making changes.
 
+## Documentation Scope
+
+- `README.md` and `README.zh.md` are user/operator guides. Include purpose, requirements, installation and upgrades, configuration keys and defaults, minimal working examples, Telegram commands and controls, visible output, actionable troubleshooting, and security or permission requirements needed to operate the feature.
+- Keep README additions concise: what the feature does, how to enable/use it, and user-visible limitations. List required permissions and optional permissions tied to a stated capability; do not list unused permissions. Configuration examples should contain only settings needed for the demonstrated use case.
+- `doc/architecture.md` and `doc/architecture.zh.md` are contributor references. Include component responsibilities, data flow, ownership and invariants, state transitions, RPC/API contracts, persistence, concurrency and fencing, timeouts, retries, caching, failure/recovery mechanisms, design tradeoffs, and development/verification/release workflows.
+- Document the observable contract in README and the implementation mechanism in architecture. For example, README explains quota configuration, permissions and displayed values; architecture explains request-ID attribution, endpoint/response validation, cache keys/TTL and stale-result fencing. Do not append these internals to README just because a feature was added.
+- Link to architecture for implementation details instead of duplicating them in README. Neither document is a changelog, work log or transcript of test runs. Keep each English/Chinese pair consistent and update the document whose contract actually changed.
+
 ## Pull Requests
 
 - When asked to create a pull request, use `gh pr create -f` to generate its title and description from commit messages. Do not supply a custom title or body unless the user explicitly requests it.

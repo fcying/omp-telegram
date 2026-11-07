@@ -15,6 +15,14 @@ import (
 // Content-addressed paths keep a new binary or --check from changing code used
 // by an already-running OMP process. Generated files are owned by the bridge.
 func prepareMigrationExtension(dataDir string) (string, error) {
+	return prepareExtension(dataDir, "omp-telegram-migrate", defaults.MigrationExtension)
+}
+
+func prepareSub2apiExtension(dataDir string) (string, error) {
+	return prepareExtension(dataDir, "omp-telegram-sub2api", defaults.Sub2apiExtension)
+}
+
+func prepareExtension(dataDir, name string, content []byte) (string, error) {
 	dir := filepath.Join(dataDir, ".bridge-extensions")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
@@ -26,8 +34,8 @@ func prepareMigrationExtension(dataDir string) (string, error) {
 	if !info.IsDir() {
 		return "", errors.New("invalid extension directory")
 	}
-	digest := sha256.Sum256(defaults.MigrationExtension)
-	path := filepath.Join(dir, "omp-telegram-migrate-"+hex.EncodeToString(digest[:])+".ts")
+	digest := sha256.Sum256(content)
+	path := filepath.Join(dir, name+"-"+hex.EncodeToString(digest[:])+".ts")
 	info, err = os.Lstat(path)
 	if err == nil {
 		if !info.Mode().IsRegular() {
@@ -37,7 +45,7 @@ func prepareMigrationExtension(dataDir string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		cached, readErr := io.ReadAll(io.LimitReader(file, int64(len(defaults.MigrationExtension))+1))
+		cached, readErr := io.ReadAll(io.LimitReader(file, int64(len(content))+1))
 		closeErr := file.Close()
 		if readErr != nil {
 			return "", readErr
@@ -45,18 +53,18 @@ func prepareMigrationExtension(dataDir string) (string, error) {
 		if closeErr != nil {
 			return "", closeErr
 		}
-		if bytes.Equal(cached, defaults.MigrationExtension) {
+		if bytes.Equal(cached, content) {
 			return path, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	file, err := os.CreateTemp(dir, ".migration-*.ts")
+	file, err := os.CreateTemp(dir, "."+name+"-*.ts")
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(file.Name())
-	if _, err := file.Write(defaults.MigrationExtension); err != nil {
+	if _, err := file.Write(content); err != nil {
 		file.Close()
 		return "", err
 	}

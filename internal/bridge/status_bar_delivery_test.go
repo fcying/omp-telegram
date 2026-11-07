@@ -178,7 +178,7 @@ func TestFinalGitAndLateQuotaKeepSameAnswer(t *testing.T) {
 	requireStoreOK(t, os.WriteFile(gate, nil, 0600))
 	awaitProviderUsage(t, w)
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT header,text FROM outbox WHERE id=?", id).Scan(&header, &body))
-	if !strings.HasPrefix(header, "`feature/ui*`") || !strings.Contains(header, "5h30% 7d65%") || body != "answer" {
+	if !strings.HasPrefix(header, "`feature/ui*`") || !strings.Contains(header, "70% 35%") || body != "answer" {
 		t.Fatalf("late quota edit dropped Git state or changed immutable body: %q/%q", header, body)
 	}
 	deliverReplies(t, w)
@@ -202,7 +202,7 @@ func TestTerminalOnlyQuotaHeaderWaitsForRealValue(t *testing.T) {
 	requireStoreOK(t, os.WriteFile(gate, nil, 0600))
 	awaitProviderUsage(t, w)
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT header,text FROM outbox WHERE id=?", id).Scan(&header, &body))
-	if header != "5h30% 7d65%" || body != "answer" {
+	if header != "70% 35%" || body != "answer" {
 		t.Fatalf("real quota failed to attach to the initially headerless answer: %q/%q", header, body)
 	}
 	deliverReplies(t, w)
@@ -257,7 +257,7 @@ func TestIntermediateOnlyQuotaWarmsCacheAfterShortTask(t *testing.T) {
 	}
 	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","model":"safe","provider":"openai-codex","content":[{"type":"text","text":"middle"}]}}`))
 	header, body := attachedReplyBody(t, researchReplies(t, w, 100)[0])
-	if header != "5h30% 7d65%" || body != "middle" || researchTraceCount(trace, "prompt", "/usage") != 1 {
+	if header != "70% 35%" || body != "middle" || researchTraceCount(trace, "prompt", "/usage") != 1 {
 		t.Fatalf("intermediate header missed the idle cache or triggered another query: %q/%q", header, body)
 	}
 }
@@ -393,7 +393,7 @@ func TestTerminalTruncationNoticeBodyReceivesLateQuota(t *testing.T) {
 	awaitProviderUsage(t, w)
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT header,text FROM outbox WHERE id=?", target).Scan(&header, &body))
 	rows := researchReplies(t, w, 2)
-	if header != "5h30% 7d65%" || body != notice || len(rows) != 2 || rows[0] != "earlier" {
+	if header != "70% 35%" || body != notice || len(rows) != 2 || rows[0] != "earlier" {
 		t.Fatalf("late quota edited an earlier reply or duplicated the final body: %q", rows)
 	}
 	deliverReplies(t, w)
