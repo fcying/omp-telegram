@@ -60,53 +60,18 @@ go build -o omp-telegram ./cmd/omp-telegram
 
 ## 配置
 
-将 [config.toml](config.toml) 复制到二进制旁, 或创建包含以下设置的配置文件:
+可将完整带注释示例 [config.toml](config.toml) 复制到二进制旁, 或从以下最小配置开始. 其他设置使用[配置项参考](#配置项)中的默认值.
 
 ```toml
 [telegram]
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
-progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
-progress_recent_tools = 5
-final_actions = []
 
-[telegram.status_bar]
-progress = ["status", "thinking", "model", "fast", "context", "speed"]
-intermediate = ["status", "thinking", "model", "fast", "context", "speed"]
-final = ["status", "thinking", "model", "fast", "context", "speed"]
-
-[omp]
-binary = "omp"
-args = ["${OMP_TELEGRAM_ARGS}"]
-args_labels = ["Default"]
-migration_extension = false
-
+# Keep the bot token out of OMP's inherited environment.
 [omp.environment]
 mode = "denylist"
 deny = ["OMP_TELEGRAM_BOT_TOKEN"]
-
-[storage]
-data_dir = "."
-workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
-database_retention_days = 90
-
-[worker]
-max_workers = 8
-queue_capacity = 16
-idle_timeout = "30m"
-
-[logging]
-level = "info"
-format = "text"
-
-[logging.component_levels]
-# daemon = "debug"
-# bridge = "debug"
-# rpc = "debug"
-# telegram = "warn"
-# store = "debug"
-# media = "debug"
 ```
 
 ### 配置文件和环境变量
@@ -138,10 +103,12 @@ format = "text"
 | `telegram.status_bar.progress`, `.intermediate`, `.final` | 按顺序选择 Progress, 中间 assistant 消息和最终结果的字段. `[]` 关闭对应状态栏. 未配置的数组默认 `["status", "thinking", "model", "fast", "context", "speed"]`. 见[状态栏](#状态栏). |
 | `telegram.status_bar.git_command` | 最终 `git` 字段的可选字面 argv. 未配置或 `[]` 使用内置安全 Git 探针. 自定义命令在当前 session workspace 中执行, 不经过 shell; 安全与副作用由用户负责. |
 | `telegram.status_bar.git_timeout` | 内置和自定义 Git 采样共用的正数字面 Go duration, 默认 `"450ms"`. 大仓库可增至如 `"2s"`. 空串, 零, 负数, 非法, 溢出或非字符串均拒绝; 不展开环境引用, 不允许关闭超时. |
-| `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 不是 shell 命令. |
+| `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 默认 `"omp"`, 不是 shell 命令. |
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram 预设标签, 每个预设一个; 无效标签回退为 `Preset N`. 标签对能查看对话的人可见, 不要填写凭据. |
 | `omp.migration_extension` | 为所有参数预设在每次 OMP 启动时加载内嵌迁移 Extension, 包括 resume. 默认 `false`, 无需单独安装 Extension. |
+| `[sub2api]` | 可选的 bridge 专用上游额度: `base_url`, `api_key` 和精确 OMP `providers`. 全空关闭, 部分配置报错. 见 [sub2api 上游额度](#sub2api-上游额度). |
+| `sub2api.extension` | 为所有参数预设启用内嵌 sub2api 额度 Extension. 默认 `false`; 启用额度源时必须显式设为 `true`. |
 | `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"` 会传递当前及未来新增的服务环境变量, 只排除显式列入 `deny` 的名称. 随附的 `config.toml` 设置了 `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` 只传递列出且已存在的变量. |
 | `storage.data_dir` | 数据库, lock, 输入/输出附件及 bridge 生成的 Extension 缓存目录. 默认是二进制所在目录. |
 | `storage.workspace_root` | `/new <名称>` 使用的根目录. 默认读取可选的 `OMP_TELEGRAM_WORKSPACE_ROOT`, 再回退到二进制旁的 `workspace/`. |
@@ -194,7 +161,7 @@ deny = ["OMP_TELEGRAM_BOT_TOKEN", "SOME_API_KEY"]
 export OMP_TELEGRAM_BOT_TOKEN='your-bot-token'
 export OMP_TELEGRAM_ALLOWED_USERS=123456789
 export OMP_TELEGRAM_ALLOWED_CHATS=123456789
-# 可选: off, summary 或 verbose.
+# Optional: off, summary, or verbose.
 export OMP_TELEGRAM_PROGRESS_MODE=summary
 
 ~/tool/omp-telegram/omp-telegram --check
@@ -221,7 +188,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session 供后续使用. |
-| `/queue` | 查看运行及排队任务. Cancel 按钮只删除选中的等待任务, 不中止当前任务. |
+| `/queue` | 查看运行及排队任务. Cancel 按钮只删除 bridge 中选中的等待任务, 不中止当前任务或取消原生队列中的 prompt. |
 | `/followup <message>` | 明确排队一个独立任务, 不会作为 steer 发送给当前任务. |
 | `/close` | 关闭当前 session, 保留文件和 OMP history. |
 | `/bindings` | 列出并管理当前 chat 已保存的对话/session 绑定. 图标表示逻辑上的开启, 关闭或待处理状态, 不表示进程是否运行. 删除选项见下文. |
@@ -298,7 +265,7 @@ Workspace 专属命令在 session 连接后显示, 名称和简介由 OMP 提供
 优化当前工程的启动时间, 保持对外行为不变.
 ```
 
-研究循环由原生 OMP 管理, 参见[原生模式说明](https://github.com/can1357/oh-my-pi/blob/v18.10.3/packages/coding-agent/src/autoresearch/prompt-setup.md). 它可能创建分支、修改文件、提交保留的实验、回滚丢弃的实验并多次调用模型. 请使用合适的 workspace, 并考虑费用和文件变更.
+研究循环由原生 OMP 管理, 参见[原生模式说明](https://github.com/can1357/oh-my-pi/blob/v18.10.3/packages/coding-agent/src/autoresearch/prompt-setup.md). 它可能创建分支, 修改文件, 提交保留的实验, 回滚丢弃的实验并多次调用模型. 请使用合适的 workspace, 并考虑费用和文件变更.
 
 Bridge 不会在不同对话之间锁定或隔离 workspace. 使用同一 workspace 的 OMP session 可能修改相同文件; 请使用不同 workspace, 或避免同时运行会修改文件的任务. 服务重启后不会自动重放研究任务; 决定是否重发不确定的任务前, 检查 `/status` 和 workspace.
 
@@ -345,7 +312,7 @@ omp --resume /path/to/session.jsonl
 | `/compact` 失败 | 短 session 可能没有可压缩内容. 如果本机 OMP 也失败, 检查其 model 配置. |
 | 数据库结构不支持 | 备份数据, 使用受支持的数据库或新数据目录; 不要手动修改版本号. |
 
-不支持语音/转写, 自动创建 topic, 以及任意终端或编辑器对话框. 部分确认和选择流程可以使用 Telegram 按钮, 但不是所有交互式工具审批都能远程完成. bridge 从不自动批准工具操作.
+不支持 undo/rewind 和 redo, 语音/转写, 自动创建 topic, 以及任意终端或编辑器对话框. 部分确认和选择流程可以使用 Telegram 按钮, 但不是所有交互式工具审批都能远程完成. Bridge 从不自动批准工具操作.
 
 输出过大或回复过多时可能截断, 并明确提示. OMP 原生 session 历史不会被截断.
 
@@ -359,19 +326,15 @@ omp --resume /path/to/session.jsonl
 
 Progress 延迟约三秒显示, 同一行带有 **Stop | Follow-up** 按钮. **Stop** 中止当前任务; **Follow-up (后续输入)** 打开回复提示, 不暂停也不 steer 当前任务. 选择 `status` 字段后, **⚙️** 标记与可用状态字段位于同一首行. `/stop` 还会清空等待任务. 进度更新和清理属于尽力而为, 不延迟正式回复. `progress_mode = "off"` 时两个按钮都不创建.
 
-Steer 输入替换当前 Progress 预览, 不重启 OMP. Assistant 消息完成后冻结旧预览, 仅在对应正式回复的全部分片成功交付后删除. 交付失败或不确定时保留该可见副本, 后续 Steer 不能绕过此保护. 新预览等待前面的正式回复离开投递队列后, 出现在最新输入/回复下方. 清理重试覆盖运行中任务已替代的预览, 正式回复从不作为清理目标.
+Steer 输入更新当前预览, 不重启 OMP. 正式回复送达后通常会删除预览; 交付失败或不确定时可能保留预览. 进度清理不会删除正式回复.
 
-确认不调用模型的原生本地命令, 在完成事务提交后显式退役仅含状态的 Progress, 即使没有正式 assistant 回复也会清理. 迟到的预览回执和暂时删除失败沿用同一清理策略.
-
-已完成的 assistant 消息立即独立发送, 关闭 progress 也不受影响. 选择 `status` 字段后, 中间状态栏显示 **💬**, 整个任务确认成功后仅将最新正式消息的状态栏改为 **✅**; 取消, 失败, 结果不确定或研究轮次仍在继续时不标成功. 仅首条正式消息引用原始请求. 正文保持不变, 方便 Telegram Reply 引用, 不重发正文或额外发送完成消息.
+已完成的 assistant 消息立即发送, 关闭 progress 也不受影响. 选择 `status` 后, 中间状态栏显示 **💬**, 确认任务成功后将最新正式回复标为 **✅**. 取消, 失败, 结果不确定或研究轮次仍在继续时不标成功. 仅首条正式消息引用原始请求; 完成状态更新不重发答案.
 
 ### 后续输入
 
 点击 **Follow-up (后续输入)**, 再以非空文本回复 bot 的 ForceReply 提示. 仅接受点击者本人在同一 chat/topic 中对该提示的回复, 与 `/followup <message>` 一样作为独立任务排队. 打开提示不暂停当前任务. 接受后 bot 会确认后续消息已入队; 队列满或空/非文本回复不会消费请求或谎报成功, 请求有效时可以重试.
 
-请求十分钟后过期. 再次点击会替代你在此对话中的旧请求. 原任务自然完成后, session/binding 未变时请求仍有效; Stop, Close, session 替换及服务重启使未完成请求失效. 已识别的旧提示, 未授权或交付不确定提示的回复一律拒绝, 包括 `/stop`, `/close` 等命令. 只有有效请求中的已知 Bridge 命令才沿用普通控制路径. 来自当前 Bot 的合法 marker 即使缺少数据库记录也会被拒绝. 不回复已识别提示的普通文本维持现有 prompt/steer 行为. ForceReply 的显示由 Telegram 客户端控制; bridge 不提供 inline 文本输入控件.
-
-Marker 回退识别仅匹配非空提示正文末尾独立完整的 `[followup:token]` 行. 正文中的内联片段及后面仍有文字的标记不匹配. 已保存的 prompt ID 仍优先识别, 不依赖引用中是否保留 marker.
+请求十分钟后过期. 再次点击会替代你在此对话中的旧请求. 原任务自然完成且 session 未变时请求仍有效; Stop, Close, session 替换及服务重启使未完成请求失效. 对过期, 未授权或交付不确定提示的回复一律拒绝, 包括命令; 此时请将命令作为新消息发送. 有效提示中的已知 Bridge 命令保持普通命令效果. 其他普通文字保持原有 prompt/steer 行为. ForceReply 的显示由 Telegram 客户端决定, 不提供 inline 文本输入控件.
 
 ### 完成快捷按钮
 
@@ -385,13 +348,39 @@ final_actions = [
 ]
 ```
 
-省略或使用 `final_actions = []` 关闭 (默认关闭). 保留数组顺序, 用户自定义标签不翻译. 标签必须非空, 单行, 最多 64 个 UTF-16 单位 (BMP 外的 emoji 占两个单位). 最多六项. Command 必须以 slash 开头, 包含一个命令名, 可附固定参数, 不能含换行或控制字符. 标签和命令均为字面值: 不展开 `$VAR`, `${VAR}` 或 shell 语法, 不经过 shell 执行. 参数沿用原命令的解析规则, 不增加第二套快捷命令语言. 不要在可见标签或命令参数中填写凭据.
+省略或使用 `final_actions = []` 关闭 (默认关闭). 保留数组顺序, 不翻译标签. 最多六项. 标签必须非空, 单行, 最多 64 个 UTF-16 单位 (BMP 外的 emoji 占两个单位). 命令是一个 slash invocation, 可带固定参数, 不能含换行或控制字符. 标签和命令均为字面值, 不展开环境变量或经过 shell 执行. 不要在可见标签或参数中填写凭据. 每行最多三个按钮, 长标签可能独占一行.
 
-每行最多三个按钮, 合计标签超过 24 个 UTF-16 单位时换行. 单个较长标签独占一行且不截断; 实际按钮宽度由 Telegram 客户端决定.
+按钮只在任务成功完成后出现在最后一条 assistant 回复上, 关闭状态栏也不影响. 中间回复, 错误/截断提示, 已停止/不确定结果及原生命令输出不显示. 每个按钮只能执行一次; 忙碌, 参数错误或命令不可用时可重新点击. 等待确认时不能重叠点击; 取消或确认超时后可重试. 打开命令菜单视为执行. 已提交或结果不确定的动作不重放, 包括被重启打断的动作. Session 变化及快捷按钮配置删除或变更使旧按钮失效; 其他未使用按钮仍可用.
 
-按钮只在 root task 成功完成后出现在最后一个真实 assistant 正文片段上, 关闭状态栏也不影响. 中间回复, 错误/截断提示, 已停止/不确定结果及原生命令输出不显示. 更新按钮不会重发答案. 按钮在命令被接受执行后才是一次性消费, 不是点击即消费: 忙碌, 参数错误或命令不可用等确定性本地拒绝后可重新点击. 资格检查或执行确认期间会预留按钮, 防止重叠点击; 取消或超时的执行确认会释放预留. 成功打开菜单即视为该菜单命令已执行. 接受任务入队, 提交目标 RPC 或开始本地操作后消费按钮, 已提交或结果不确定的动作不重放. 重启打断的预留按不确定保守消费. 其他未使用按钮或后续已完成回复仍可用. Session/binding 变更及配置删除或变更使旧动作失效.
+点击沿用真实点击用户的权限, 以及手动输入命令时的 chat/topic, 参数, 忙碌限制与确认流程. 未知或不可用命令明确报错, 不作为模型 prompt 或替换为其他动作. 原生命令必须在当前 session 可用, 且遵守[原生命令限制](#omp-原生命令). 例如 **Shake** 仅在 OMP 支持时调用 `/shake`, 不提供替代动作.
 
-点击沿用同一 chat/topic, 真实点击用户的权限, 原命令参数, 忙碌限制与确认流程. 未知或不可用命令明确报错, 不作为模型 prompt, 也不静默替换为其他动作. 原生快捷命令必须是**当前 session** 原生命令目录确认可执行的命令, 且仍受来源和生命周期限制; 配置加载不代表当前可用. 本次实现验证的原生 OMP catalog 公布了 builtin `/shake` ("Shake heavy content out of the conversation context"), 因此示例将 **Shake 显式映射为 `/shake`**. 不同 runtime/session 的可用性可能不同: `/shake` 不可用时拒绝执行, 不会自动映射为 Queue 或其他操作.
+### sub2api 上游额度
+
+这是状态栏 `quota` 字段可选的数据源, 不是模型 provider 配置. 保持 OMP 现有 provider URL, model/context 设置及凭据不变. Bridge 不会自动修改模型, provider 或全局 OMP 配置. 将以下 table 合并到 bridge 的 `config.toml`:
+
+```toml
+[sub2api]
+extension = true
+base_url = "https://sub2api.example.com"
+# usage.read (required, global): Read all-site logs to identify the serving account.
+# openai.quota.read (required, resource): Scope to the target OpenAI OAuth groups.
+# accounts.identity.read (optional, resource): Show plan names instead of account IDs.
+api_key = "<management-key>"
+providers = ["my-openai-gateway"]
+
+[telegram.status_bar]
+final = ["status", "model", "context", "speed", "quota"]
+```
+
+`base_url`, `api_key` 及每个 `providers` 元素沿用单次环境变量展开. 三项全空关闭此源; 部分配置, 非法 HTTP(S) URL, 重复/非法 provider ID, 或未显式启用 `sub2api.extension = true` 时启用数据源, 都以脱敏错误拒绝启动. URL 可含路径前缀, 不得含凭据, query, fragment 或点路径段. 远程管理请使用 HTTPS. Provider 按精确字符串区分大小写匹配, 必须是实际 OMP provider ID, 不能用 model 名, URL 或猜测的 alias. 在 `progress`, `intermediate` 和/或 `final` 独立加入 `quota`; 默认状态栏不变.
+
+管理 key 需要全局 `usage.read` 和目标 OpenAI OAuth 分组上的资源权限 `openai.quota.read`. 全局 `usage.read` 可读取全站日志, 不限于所选分组. 可选资源权限 `accounts.identity.read` 用于显示套餐名; 否则以已确认账号 ID 标记额度.
+
+请保护管理 key, 远程管理使用 HTTPS, 不要复用模型凭据. Key 由 bridge 使用, 不加入 OMP 参数. 若通过环境变量引用 key, 请用[子进程环境策略](#配置项)显式禁止 OMP 继承该变量.
+
+配置校验会拒绝启用 sub2api 且任一 OMP 参数预设包含 `--no-ui` 的组合; 请移除该选项后启用额度. RPC 不需要交互终端. `--no-extensions` 仍与此显式启用的 Extension 兼容.
+
+Provider 响应后, 字段显示实际上游 OpenAI OAuth 账号可识别的 5h/7d **剩余**百分比和可用的重置倒计时, 格式见下方[状态栏](#状态栏). 同一任务使用多个账号时可分别显示. 数据缺失或有歧义, OMP hook/header 不受支持, 权限或 HTTP 失败及额度窗口缺失时, 省略不可用额度; 不替换为其他账号或网关凭据额度. 额度查询不延迟任务完成. Key 和原始响应不记日志, 不发送 Telegram. 其他 provider 保留原生额度源; 详细 `/status` 不变. 归因与缓存机制见[架构文档](doc/architecture.zh.md#sub2api-额度).
 
 ### 状态栏
 
@@ -412,14 +401,14 @@ final = ["status", "model", "thinking", "fast", "context", "speed", "quota", "gi
 | `fast` | 已确认的 fast mode 活动/设置. |
 | `context` | 已确认用量与窗口容量, 如 `46% (500k)`. |
 | `speed` | 原生实时速度或已确认回复的平均速度, 如 `3.8 t/s`. |
-| `quota` | 同账号缓存中的原生 5h/7d 已用百分比. |
+| `quota` | 原生或真实上游账号的剩余额度, 附带可用的重置倒计时. |
 | `git` | 仅最终结果: 当前分支和可选的 dirty `*`, 或自定义命令 stdout. |
 
-没有数据或尚未读取的字段直接省略, 读取失败也不显示 `ctx ?`, `quota ?` 或 `n/a` 占位. 已确认的数据可以立即显示. 刷新不回填较早的中间消息. 未选择的字段不启动仅为显示服务的采样; 任务安全和命令所需的查询不变. 详细 `/status` 不变.
+没有数据或尚未读取的字段直接省略, 读取失败也不显示 `ctx ?`, `quota ?` 或 `n/a` 占位. 已确认的数据可以立即显示; 刷新不回填较早的中间回复. 状态栏过长时省略整个字段, 不截断值. 详细 `/status` 不变.
 
-`git` 在完成时采样 session 当前 workspace, 不使用任务启动时的快照. 未配置 `git_command` 或为空时, 内置只读探针在干净时显示 `main`, 存在 staged, unstaged 或未忽略的 untracked 改动时显示 `main*`; 仅 ahead/behind 不算 dirty. Detached HEAD 显示 `HEAD`. 非 Git 仓库, 查询失败或有界探针未能完成时省略字段, 不假装已确认干净. 研究中间轮次不采样 Git, 仅在 root 结算时采样.
+Quota 显示**剩余百分比**, 不是已用比例. 双窗口 `80%(2h) 40%(5d12h)` 固定 5 小时在前, 7 天在后; 单窗口保留标签, 如 `7d 40%(5d12h)`. `~` 标记粗略重置时间, 如 `(~6d)`; 精确倒计时不足一小时显示 `(<1h)`. 重置时间缺失或已过时只省略倒计时, 不假定额度已经恢复. 倒计时在状态栏渲染时更新, 不在历史消息中持续走时. Context 仍是独立的已用百分比指标.
 
-内置探针读取状态前会检查已跟踪文件属性及已初始化的子模块. 内容过滤器使只读结果无法安全确认时, 省略 Git 字段而不执行过滤器; 未使用的全局过滤器定义不影响普通仓库. 即使全局/系统 Git 配置启用了 Trace2, 探测也会显式关闭输出. 有界探测不提供 Git 配置或属性并发变化的原子快照.
+`git` 显示任务完成时当前 workspace 的分支: 干净时为 `main`, 有 staged, unstaged 或未忽略的 untracked 改动时为 `main*`, detached HEAD 为 `HEAD`. 仅 ahead/behind 不算 dirty. 非 Git 仓库, 安全读取失败或超时时省略字段, 包括内容过滤器使安全读取不可用的仓库. 研究持续期间不显示新的 Git 采样, 直到研究结束.
 
 配置非空 `git_command` argv 可覆盖 `git` 字段:
 
@@ -438,25 +427,23 @@ git_timeout = "450ms"
 # git_command = ["/usr/local/bin/my-git-status"]    # dev@a1b2c3d*
 ```
 
-自定义 argv 保持字面值, 不经过 shell, 不展开环境变量引用, 不额外添加 Git 参数. 命令沿用现有 `omp.environment` 子进程策略, 不做内置探针的 Git 专用环境改写或安全预检. 只有 `final` 选择 `git` 才执行. Stdout 直接作为字面显示文本, 不做 Git 格式解析: 去掉末尾 CR/LF, 保留其他空格, 仅接受有效 UTF-8 单行文本, 在字符边界裁剪至 64 字节后进行 Telegram 转义. 命令使用 `git_timeout`, 保留 64 KiB stdout 上限; 命令失败, 超时, 空输出, 内嵌换行/控制字符或非法 UTF-8 时省略字段, 不回退到内置探针. Stderr 丢弃. 研究结算可能重新采样, 不保证恰好调用一次. 后续额度编辑保留已捕获的输出, 不重新执行命令.
+自定义命令只在 `final` 选择 `git` 时执行, 使用当前 workspace 和 `omp.environment` 策略. 参数保持字面值, 不经过 shell 或展开环境变量. 与内置探针不同, 自定义命令没有 Git 专用安全保护; 请使用安全的只读命令, 不要依赖恰好执行一次. Stdout 必须是非空的有效 UTF-8 单行文本, 去掉末尾行结束符后裁剪至 64 字节. 失败, 超时, 非法输出或输出超过 64 KiB 时省略字段, 不回退到内置探针. 后续额度更新不会重新执行命令.
 
-`git_timeout` 覆盖完整的内置安全预检/状态探针或自定义命令, 不增加重试. 默认 `"450ms"`, 大仓库可增至如 `"2s"`. 必须是正数字面 Go duration 字符串: 不展开环境引用, 空串, 零, 负数, 非法, 溢出或非字符串均拒绝, 不允许关闭超时. 增大超时不放宽内置安全检查, 64 KiB 输出上限或 64 字节 label 上限; 大仓库超过输出上限时仍可能省略字段.
-
-Git 预算独立于原生状态/账号 RPC deadline: 普通最终采样的每次 RPC 仍限制为 1 秒, 研究结算的每次 RPC 仍为 5 秒. 普通采样共享取消, Git 使用独立的配置预算. 研究结算保留 operation 取消及所有权/session 围栏, 仅移除通用的 30 秒 operation 上限: 有限次 RPC 和 Git 探针各自执行自己的 deadline.
+`git_timeout` 默认 `"450ms"`, 大仓库可增至如 `"2s"`. 必须是正数字面 Go duration 字符串, 不展开环境引用, 不允许关闭超时. 增大超时不放宽安全或输出限制, 字段仍可能省略. Git 采样细节见[架构文档](doc/architecture.zh.md#git-状态采样).
 
 迁移: 旧 `telegram.provider_usage` 键会被忽略并打印 ERROR 日志, 不再阻止启动. 请删除它, 仅在需要显示额度的数组中加入 `"quota"`; 三处都不选则关闭额度读取. 默认不选择 quota 和 Git.
 
-仅在中间/Progress 状态栏选择 quota 时, 空闲 runtime 仍可在短任务之后识别账号并预热缓存, 完成不等待它. 如果 quota 只选在已关闭的 Progress 中, 不启动读取. 状态栏过长时省略整个字段, 不截断字面值或 dirty 标记.
+额度独立于 progress 模式, 但仅在已关闭的 Progress 中选择 quota 不会启动读取. 短任务结束后仍可能显示可用额度, 不延迟任务完成.
 
 回复支持 Markdown, 长文本自动分片. 大表格可能改用纯文本布局; Telegram 不支持的格式回退为可读文本.
 
-选择 `quota` 后, 对应状态栏可显示原生 Claude (`anthropic`) 或 OpenAI Codex (`openai-codex`) 账号额度, 独立于 progress 模式. 只有当前 scope 的账号读取确认存在可用的同账号缓存时才显示, 例如 `5h30% 7d65%`. 只展示 5h/7d 已用百分比, 不附加读取时间; 账号身份, 邮箱, credential ID 和原始报告不发送到 Telegram, 不写入日志或数据库.
+#### 原生 provider 额度
 
-显示缓存不会触发或等待刷新. 刷新仅在 idle 时通过现有原生 builtin `/usage` 尝试, 同一账号 scope 的尝试间隔至少五分钟, deadline 为三秒; 排队 prompt 和控制操作优先. 忙碌或长任务有缓存就显示, 否则省略字段. 查询失败, 跳过或结果为空都不清除 last-good 值. 刷新成功后仅在 final 数组选择了 `quota` 时更新最近匹配的最终 header, 不修改正文或已捕获的 Git 结果. 不直接请求供应商 API.
+选择 `quota` 后, 对应状态栏可显示原生 Claude (`anthropic`) 或 OpenAI Codex (`openai-codex`) 额度, 独立于 progress 模式. 展示可识别的 5h/7d 剩余百分比及 OMP 提供的粗略重置时间, 不附加读取时间. 账号身份, 邮箱, credential ID 和原始报告不发送到 Telegram, 不写入日志或数据库.
 
-仅由 `agent_end.messages` 提供的最终答案也保留可编辑 header. 后续额度刷新更新该最终答案, 不更新之前的中间回复.
+额度仅在 OMP 空闲时尽力刷新, 排队 prompt 和控制操作优先. 忙碌或长任务有缓存就显示, 否则省略字段. 缓存值可能不是最新值; 查询失败或结果为空时保留最近成功读取的值. 刷新成功后, 若 final 选择了 `quota`, 可以更新最近的最终状态栏, 不修改或重发答案及其 Git 结果. 服务重启会清除缓存.
 
-缓存仅存于 Bridge 进程内, 不跨 daemon restart 持久化. 只有启动 argv namespace 相同, 且 `get_logout_accounts` 返回的唯一 active OAuth credential 相同时, 才能跨消息及原生 session 复用. 查询额度前后的账号 scope 必须一致. Scope 不明确或未知时不展示其他账号的缓存, 已存值仍保留. 这些分开的 RPC 读取不是原子的账号与额度快照, 不能归因每次轮换请求实际结算的账号.
+账号信息未知或有歧义时省略额度, 不展示其他账号的值. 凭据轮换时, 原生额度无法识别每次请求实际计费的账号. 已配置 sub2api 的 provider 改用[上游额度源](#sub2api-上游额度). 原生账号与刷新机制见[架构文档](doc/architecture.zh.md#原生-provider-额度).
 
 ## 附件
 
@@ -517,46 +504,23 @@ migration_extension = true
 
 Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 Telegram 输入内容, 待发送/已发送回复和消息 metadata. 附件以文件形式保存在同一数据目录下. 数据库, 附件缓存及其备份都应按敏感数据保护. `storage.data_dir` 默认是解析符号链接后的真实二进制所在目录; 相对 storage 路径使用该目录, 不使用启动目录.
 
-`storage.database_retention_days` 控制 bridge 终态消息, 符合清理条件的附件缓存及过期 Follow-up metadata 的保留时间. 默认 `90` 天; 设为 `0` 可关闭按保留期执行的自动清理. Follow-up 按到期时间计算保留年龄, 未回复的过期提示也可清理; 关联 pending/submitted inbox 的记录保留至其结算. 不删除 workspace 文件, OMP session 数据或已保存的对话 binding. 保留清理不会删除已送达的 Telegram 回复.
+`storage.database_retention_days` 控制 bridge 终态消息, 符合清理条件的附件缓存及过期 Follow-up 请求 metadata 的保留时间. 默认 `90` 天; `0` 关闭自动保留清理. 待处理工作及交付或进度清理仍需使用的记录可能保留更久. 不删除 workspace 文件, OMP session 数据或已保存的对话 binding. 保留清理不会删除已送达的 Telegram 回复.
 
-升级前先停止服务, 备份数据目录、workspace 及 OMP 自己的 session 存储. 只备份 bridge 数据库不等于完整备份 OMP 对话.
+升级前先停止服务, 备份数据目录, workspace 及 OMP 自己的 session 存储. 只备份 bridge 数据库不等于完整备份 OMP 对话.
 
 只授权可信用户. 服务使用其 OS 用户的文件系统权限和环境运行; 群成员即使无权控制 bot, 也可能看到 prompt 和回复. 请保护 bot token.
 
 ## 日志
 
-日志支持 `text` 和 `json`, 由 `logging.format` 选择. `logging.level` 设置全局级别; `[logging.component_levels]` 可分别覆盖 `daemon`, `bridge`, `rpc`, `telegram`, `store` 或 `media`. 见完整[配置示例](#配置).
+日志支持 `text` 和 `json`, 由 `logging.format` 选择. `logging.level` 设置全局级别; `[logging.component_levels]` 可分别覆盖 `daemon`, `bridge`, `rpc`, `telegram`, `store` 或 `media`. 见带注释的[配置示例](config.toml).
 
 日志输出到 stderr, 保存及轮转由进程管理器负责. 不记录 prompt, 模型回复, 凭据, 工具负载或 workspace/session 路径. Chat 和 thread ID 仍可能识别具体对话, 应限制日志访问权限.
 
-`rpc_queue_overflow` 是默认 info 级别即可看到的 ERROR. `reason=event_slots|byte_budget` 和 `stage=event_enqueue|physical_read|chunk_reassembly` 区分耗尽的资源与检测位置. 对照 `queued_events/queue_capacity`, `rejected_used_bytes/rejected_bytes/buffer_limit_bytes` 及 `forward_wait_ms`; `buffered_bytes` 在清理被拒帧后采样, 不等于拒绝瞬间的占用. 按 `client_id` 关联 `consumer_phase/consumer_phase_ms` 和附近的 `rpc_consumer_slow` WARN. 后者记录至少耗时一秒的 actor 操作, 包含固定 `point`, 耗时及任务身份. 正常快速操作不产生这些告警, 不包含 RPC 帧或工具内容. 这些快照用于定位压力或阻塞, 单靠快照不能证明根因.
-
-## Roadmap
-
-- [ ] **Undo/rewind 和 redo.** 等待 OMP 提供可靠的输入与 session 记录关联及远程 rewind 支持. 跟踪 [#12991](https://github.com/can1357/oh-my-pi/issues/12991), [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) 和 [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663).
-- [ ] **Stop 后复用 OMP 进程.** 等待上游提供可靠的取消机制. 目前 Stop 会退役进程, 保留 session.
-- [ ] **取消单条原生排队 prompt.** 等待上游提供可靠的取消结果. 目前 `/queue` 只取消 bridge 中等待的任务.
-- [ ] **Sub2API 账号额度.** 等待服务端部署 [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473) 的修复 ([PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476)), 授予额度读取权限, 并能可靠识别每次回复使用的账号.
-- [ ] **原生结构化账号与额度快照.** 等待上游接口提供可靠的不透明账号 scope, 对应账号报告的时间戳和无需 prompt 的刷新, 替代当前报告中的展示身份及前后 scope 检查. 现有 RPC 读取并非原子操作, 不能识别每次轮换请求实际结算的账号.
+`rpc_queue_overflow` ERROR 和 `rpc_consumer_slow` WARN 表示 RPC 压力或 bridge 操作缓慢. 重发中断或结果不确定的工作前, 请检查 `/status` 和 workspace; 这些工作不会自动重放. 保留附近日志用于诊断, 但仅凭这些告警不能确定原因. 诊断字段解读见[架构日志契约](doc/architecture.zh.md#日志契约).
 
 ## 开发
 
-| 命令 | 用途 |
-| --- | --- |
-| `just build` | 构建二进制. |
-| `just fmt` | 使用 `go.mod` 声明的 Go 版本格式化代码, 与 CI 保持一致. |
-| `just test` | 运行单元测试, 不启动或重启服务. |
-| `just check` | 运行测试, race 检查和 `go vet`, 不启动 Telegram polling. |
-| `just install` | 只安装二进制, 配置和数据由用户管理. |
-| `just deploy` | 安装并安排五秒后重启已有的 `supervisord` 服务. 返回不代表重启成功. |
-
-验证显式选择的 OMP 二进制, 不安装或部署:
-
-```sh
-just smoke-omp /absolute/path/to/omp
-```
-
-使用真实 OMP, 隔离 session 和本地测试 provider, 不连接 Telegram 或生产 provider. [OMP 兼容性工作流](.github/workflows/omp-compatibility.yaml) 也支持手动和每周运行; 两种检查都不会升级已部署的 OMP.
+贡献者工作流, 验证及发布命令见[开发, 验证与发布](doc/architecture.zh.md#开发-验证与发布).
 
 ## 架构
 

@@ -11,3 +11,8 @@ var DefaultConfig string
 //
 //go:embed extensions/omp-telegram-migrate.ts
 var MigrationExtension []byte
+
+// Sub2apiExtension is the bundled opt-in upstream request observer.
+//
+//go:embed extensions/omp-telegram-sub2api.ts
+var Sub2apiExtension []byte

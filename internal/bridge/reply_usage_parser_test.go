@@ -3,7 +3,10 @@ package bridge
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+var replyUsageObservedAt = time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
 
 // Layouts follow upstream usage-report.ts, claude.ts, openai-codex.ts, and
 // active-oauth-account.ts, including the native formatter's provider headings.
@@ -16,10 +19,10 @@ func replyUsageRow(label, account, amount string, active bool) string {
 	if active {
 		marker = "  ← in use by this session"
 	}
-	return "- " + label + "\n  " + account + ": " + amount + marker + "\n  [███████░░░░░░░░░░░░░░░░░] 30%\n  resets in 3h"
+	return "- " + label + "\n  " + account + ": " + amount + marker + "\n  [███████░░░░░░░░░░░░░░░░░] 30%"
 }
 
-func TestReplyUsageHeaderNativeProviderLayouts(t *testing.T) {
+func TestReplyUsageSampleNativeProviderLayouts(t *testing.T) {
 	text := replyUsageReport(`Anthropic
   Models with usage data
     anthropic/claude-sonnet-4-6
@@ -36,22 +39,22 @@ func TestReplyUsageHeaderNativeProviderLayouts(t *testing.T) {
 		provider string
 		want     string
 	}{
-		{"anthropic", "5h30% 7d65%"},
-		{"openai-codex", "5h12.5% 7d43.1%"},
+		{"anthropic", "70% 35%"},
+		{"openai-codex", "87.5% 56.9%"},
 		{"openai", ""},
 		{"claude", ""},
 		{"Anthropic", ""},
 		{"", ""},
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
-			if got := replyUsageHeader(text, tc.provider); got != tc.want {
-				t.Fatalf("header = %q, want %q", got, tc.want)
+			if got := replyUsageSample(text, tc.provider, replyUsageObservedAt).text(replyUsageObservedAt); got != tc.want {
+				t.Fatalf("quota = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestReplyUsageHeaderIgnoresStyledBarsNotStyledFields(t *testing.T) {
+func TestReplyUsageSampleIgnoresStyledBarsNotStyledFields(t *testing.T) {
 	for _, provider := range []struct {
 		id, heading, short, week string
 	}{
@@ -68,25 +71,25 @@ func TestReplyUsageHeaderIgnoresStyledBarsNotStyledFields(t *testing.T) {
 				"  [\x1b[38;2;120;150;180m························\x1b[39m]",
 			} {
 				styled := strings.ReplaceAll(text, "  [███████░░░░░░░░░░░░░░░░░] 30%", bar)
-				if got := replyUsageHeader(styled, provider.id); got != "5h30% 7d65%" {
+				if got := replyUsageSample(styled, provider.id, replyUsageObservedAt).text(replyUsageObservedAt); got != "70% 35%" {
 					t.Fatalf("decorative bar changed account percentages: %q", got)
 				}
 			}
 			for _, field := range []string{provider.heading, "private@example.com", "30.00% used", "← in use by this session"} {
 				styled := strings.ReplaceAll(text, field, "\x1b[32m"+field+"\x1b[39m")
-				if got := replyUsageHeader(styled, provider.id); got != "" {
+				if got := replyUsageSample(styled, provider.id, replyUsageObservedAt).text(replyUsageObservedAt); got != "" {
 					t.Fatalf("styled semantic field produced quota: %q", got)
 				}
 			}
 			intervening := strings.Replace(text, "- "+provider.short+"\n", "- "+provider.short+"\n  [\x1b[39m] 99%\n", 1)
-			if got := replyUsageHeader(intervening, provider.id); got != "" {
+			if got := replyUsageSample(intervening, provider.id, replyUsageObservedAt).text(replyUsageObservedAt); got != "" {
 				t.Fatalf("bar substituted for the required adjacent account row: %q", got)
 			}
 		})
 	}
 }
 
-func TestReplyUsageHeaderRequiresExplicitUnambiguousAccount(t *testing.T) {
+func TestReplyUsageSampleRequiresExplicitUnambiguousAccount(t *testing.T) {
 	row := func(label, account string, active bool) string {
 		return replyUsageRow(label, account, "30.00% used (70.0% left)", active)
 	}
@@ -97,31 +100,31 @@ func TestReplyUsageHeaderRequiresExplicitUnambiguousAccount(t *testing.T) {
 	}{
 		{"single unmarked account", row("Claude 5 Hour", "private@example.com", false), ""},
 		{"unmarked windows", row("Claude 5 Hour", "private@example.com", false) + "\n" + row("Claude 7 Day", "private@example.com", false), ""},
-		{"active second account", row("Claude 5 Hour", "other@example.com", false) + "\n" + row("Claude 5 Hour", "private@example.com", true), "5h30%"},
-		{"only marked window", row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 7 Day", "private@example.com", false), "5h30%"},
-		{"only weekly", row("Claude 7 Day", "private@example.com", true), "7d30%"},
+		{"active second account", row("Claude 5 Hour", "other@example.com", false) + "\n" + row("Claude 5 Hour", "private@example.com", true), "5h 70%"},
+		{"only marked window", row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 7 Day", "private@example.com", false), "5h 70%"},
+		{"only weekly", row("Claude 7 Day", "private@example.com", true), "7d 70%"},
 		{"different accounts", row("Claude 5 Hour", "first@example.com", true) + "\n" + row("Claude 7 Day", "second@example.com", true), ""},
 		{"same email different organizations", row("Claude 5 Hour", "private@example.com (First Team)", true) + "\n" + row("Claude 7 Day", "private@example.com (Other Team)", true), ""},
 		{"two marked accounts same window", row("Claude 5 Hour", "first@example.com", true) + "\n" + row("Claude 5 Hour", "second@example.com", true), ""},
 		{"duplicate active window", row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 5 Hour", "private@example.com", true), ""},
-		{"duplicate omits only affected window", row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 7 Day", "private@example.com", true), "7d30%"},
-		{"conflicting duplicate omits only affected window", row("Claude 5 Hour", "private@example.com", true) + "\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "50.00% used", true) + "\n" + row("Claude 7 Day", "private@example.com", true), "7d30%"},
+		{"duplicate omits only affected window", row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 5 Hour", "private@example.com", true) + "\n" + row("Claude 7 Day", "private@example.com", true), "7d 70%"},
+		{"conflicting duplicate omits only affected window", row("Claude 5 Hour", "private@example.com", true) + "\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "50.00% used", true) + "\n" + row("Claude 7 Day", "private@example.com", true), "7d 70%"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := replyUsageHeader(replyUsageReport("Anthropic\n"+tc.body), "anthropic"); got != tc.want {
-				t.Fatalf("header = %q, want %q", got, tc.want)
+			if got := replyUsageSample(replyUsageReport("Anthropic\n"+tc.body), "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != tc.want {
+				t.Fatalf("quota = %q, want %q", got, tc.want)
 			}
 		})
 	}
 	codex := replyUsageReport("Openai Codex\n" +
 		row("5 hours", "private@example.com (org-first) · plan: team", true) + "\n" +
 		row("7 days", "private@example.com (org-second) · plan: team", true))
-	if got := replyUsageHeader(codex, "openai-codex"); got != "" {
-		t.Fatalf("different Codex workspaces produced header %q", got)
+	if got := replyUsageSample(codex, "openai-codex", replyUsageObservedAt).text(replyUsageObservedAt); got != "" {
+		t.Fatalf("different Codex workspaces produced quota %q", got)
 	}
 }
 
-func TestReplyUsageHeaderExactWindowsExcludeModelTiers(t *testing.T) {
+func TestReplyUsageSampleExactWindowsExcludeModelTiers(t *testing.T) {
 	for _, tc := range []struct {
 		provider string
 		heading  string
@@ -145,28 +148,28 @@ func TestReplyUsageHeaderExactWindowsExcludeModelTiers(t *testing.T) {
 	} {
 		t.Run(tc.provider+"/"+tc.label, func(t *testing.T) {
 			text := replyUsageReport(tc.heading + "\n" + replyUsageRow(tc.label, "private@example.com", "99.00% used (1.0% left)", true))
-			if got := replyUsageHeader(text, tc.provider); got != "" {
-				t.Fatalf("non-general or unknown window produced header %q", got)
+			if got := replyUsageSample(text, tc.provider, replyUsageObservedAt).text(replyUsageObservedAt); got != "" {
+				t.Fatalf("non-general or unknown window produced quota %q", got)
 			}
 		})
 	}
 	text := replyUsageReport("Anthropic\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "30.00% used", true) + "\n" +
 		replyUsageRow("Claude 7 Day (Sonnet)", "private@example.com", "99.00% used", true))
-	if got := replyUsageHeader(text, "anthropic"); got != "5h30%" {
+	if got := replyUsageSample(text, "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != "5h 70%" {
 		t.Fatalf("scoped tier substituted for missing general week: %q", got)
 	}
 }
 
-func TestReplyUsageHeaderValidatesPercentages(t *testing.T) {
+func TestReplyUsageSampleValidatesPercentages(t *testing.T) {
 	for _, tc := range []struct {
 		amount string
 		want   string
 	}{
-		{"0.00% used (100.0% left)", "5h0%"},
-		{"100.00% used (0.0% left)", "5h100%"},
-		{"30.25% used (69.8% left)", "5h30.25%"},
-		{"30.10% used", "5h30.1%"},
-		{"0.01% used", "5h0.01%"},
+		{"0.00% used (100.0% left)", "5h 100%"},
+		{"100.00% used (0.0% left)", "5h 0%"},
+		{"30.25% used (69.8% left)", "5h 69.75%"},
+		{"30.10% used", "5h 69.9%"},
+		{"0.01% used", "5h 99.99%"},
 		{"unknown used", ""},
 		{"NaN% used", ""},
 		{"Inf% used", ""},
@@ -187,19 +190,19 @@ func TestReplyUsageHeaderValidatesPercentages(t *testing.T) {
 	} {
 		t.Run(tc.amount, func(t *testing.T) {
 			text := replyUsageReport("Anthropic\n" + replyUsageRow("Claude 5 Hour", "private@example.com", tc.amount, true))
-			if got := replyUsageHeader(text, "anthropic"); got != tc.want {
-				t.Fatalf("header = %q, want %q", got, tc.want)
+			if got := replyUsageSample(text, "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != tc.want {
+				t.Fatalf("quota = %q, want %q", got, tc.want)
 			}
 		})
 	}
 	text := replyUsageReport("Anthropic\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "NaN% used", true) + "\n" +
 		replyUsageRow("Claude 7 Day", "private@example.com", "65.00% used", true))
-	if got := replyUsageHeader(text, "anthropic"); got != "7d65%" {
+	if got := replyUsageSample(text, "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != "7d 35%" {
 		t.Fatalf("invalid short window hid valid weekly window: %q", got)
 	}
 }
 
-func TestReplyUsageHeaderRejectsMalformedReportsAndBounds(t *testing.T) {
+func TestReplyUsageSampleRejectsMalformedReportsAndBounds(t *testing.T) {
 	valid := replyUsageReport("Anthropic\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "30.00% used", true))
 	for _, tc := range []struct {
 		name string
@@ -229,8 +232,8 @@ func TestReplyUsageHeaderRejectsMalformedReportsAndBounds(t *testing.T) {
 		{"line length bound", strings.Replace(valid, "Anthropic", strings.Repeat("x", replyUsageMaxLine+1)+"\nAnthropic", 1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := replyUsageHeader(tc.text, "anthropic"); got != "" {
-				t.Fatalf("malformed report produced header %q", got)
+			if got := replyUsageSample(tc.text, "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != "" {
+				t.Fatalf("malformed report produced quota %q", got)
 			}
 		})
 	}
@@ -239,13 +242,129 @@ func TestReplyUsageHeaderRejectsMalformedReportsAndBounds(t *testing.T) {
 		strings.Replace(valid, "Usage (2s ago)", "Usage", 1),
 		strings.Replace(valid, "\n```", "\n\n```", 1),
 	} {
-		if got := replyUsageHeader(text, "anthropic"); got != "5h30%" {
-			t.Fatalf("valid native framing produced header %q", got)
+		if got := replyUsageSample(text, "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != "5h 70%" {
+			t.Fatalf("valid native framing produced quota %q", got)
 		}
 	}
 	otherProvider := strings.TrimSuffix(valid, "\n```") + "\n\nOther Provider\n" +
 		replyUsageRow("Claude 5 Hour", "other@example.com", "99.00% used", true) + "\n```"
-	if got := replyUsageHeader(otherProvider, "anthropic"); got != "5h30%" {
+	if got := replyUsageSample(otherProvider, "anthropic", replyUsageObservedAt).text(replyUsageObservedAt); got != "5h 70%" {
 		t.Fatalf("another provider contaminated current provider: %q", got)
+	}
+}
+
+func TestReplyUsageSampleAssociatesResetWithActiveAccountAndWindow(t *testing.T) {
+	for _, provider := range []struct {
+		id, heading, short, week string
+	}{
+		{"anthropic", "Anthropic", "Claude 5 Hour", "Claude 7 Day"},
+		{"openai-codex", "Openai Codex", "5 hours", "7 days"},
+	} {
+		t.Run(provider.id, func(t *testing.T) {
+			text := replyUsageReport(provider.heading + "\n" +
+				replyUsageRow(provider.short, "other@example.com", "99% used", false) + "\n  resets in 9h\n" +
+				replyUsageRow(provider.week, "private@example.com", "60% used", true) + "\n  resets in 5d\n" +
+				replyUsageRow(provider.short, "private@example.com", "20% used", true) + "\n  resets in 2h\n" +
+				"  other@example.com: 99% used\n  [████] 99%\n  resets in 9h")
+			sample := replyUsageSample(text, provider.id, replyUsageObservedAt)
+			want := quotaSample{windows: [2]quotaWindow{
+				{present: true, used: 20, resetAt: replyUsageObservedAt.Add(2 * time.Hour), approximate: true, resetPrecision: time.Hour},
+				{present: true, used: 60, resetAt: replyUsageObservedAt.Add(5 * 24 * time.Hour), approximate: true, resetPrecision: 24 * time.Hour},
+			}}
+			if sample != want {
+				t.Fatalf("sample = %#v, want %#v", sample, want)
+			}
+			if got := sample.text(replyUsageObservedAt); got != "80%(~2h) 40%(~5d)" {
+				t.Fatalf("quota = %q", got)
+			}
+		})
+	}
+}
+
+func TestReplyUsageSampleMissingOrInvalidResetPreservesPercentage(t *testing.T) {
+	for _, reset := range []string{
+		"",
+		"  resets in ",
+		"  resets in 0h",
+		"  resets in -1h",
+		"  resets in +1h",
+		"  resets in 1.5h",
+		"  resets in 1h30m",
+		"  resets in 1w",
+		"  resets in 1H",
+		"  resets in 1h ",
+		"  resets in 18446744073709551616s",
+		"  resets in 9223372037s",
+		"  resets in 106752d",
+		"  resets in 2h\n  resets in 2h",
+		"  resets in invalid\n  resets in 2h",
+		"  resets in 2h\n  resets in invalid",
+	} {
+		t.Run(reset, func(t *testing.T) {
+			text := replyUsageReport("Anthropic\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "20% used", true) + "\n" + reset)
+			sample := replyUsageSample(text, "anthropic", replyUsageObservedAt)
+			want := quotaSample{windows: [2]quotaWindow{{present: true, used: 20}}}
+			if sample != want {
+				t.Fatalf("sample = %#v, want percentage without reset %#v", sample, want)
+			}
+			if got := sample.text(replyUsageObservedAt); got != "5h 80%" {
+				t.Fatalf("quota = %q", got)
+			}
+		})
+	}
+}
+
+func TestReplyUsageSampleResetDoesNotCrossReportBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, intervening string
+	}{
+		{"account", "  other@example.com: 99% used\n  [████] 99%"},
+		{"window", replyUsageRow("Claude 7 Day", "other@example.com", "99% used", false)},
+		{"model tier", replyUsageRow("Claude 7 Day (Opus)", "private@example.com", "99% used", true)},
+		{"section", "Openai Codex"},
+		{"saved resets", "- private@example.com: 2 saved rate-limit resets — available — /usage reset to spend\n  soonest expires in 2d (2026-11-09)"},
+		{"blank line", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := replyUsageReport("Anthropic\n" + replyUsageRow("Claude 5 Hour", "private@example.com", "20% used", true) +
+				"\n" + tc.intervening + "\n  resets in 9h")
+			sample := replyUsageSample(text, "anthropic", replyUsageObservedAt)
+			want := quotaSample{windows: [2]quotaWindow{{present: true, used: 20}}}
+			if sample != want {
+				t.Fatalf("unrelated reset crossed %s: %#v", tc.name, sample)
+			}
+		})
+	}
+}
+
+func TestReplyUsageSampleApproximateResetAgesWithoutRequery(t *testing.T) {
+	for _, tc := range []struct {
+		reset     string
+		precision time.Duration
+		duration  time.Duration
+		aged      string
+	}{
+		{"2d", 24 * time.Hour, 48 * time.Hour, "7d 40%(~1d)"},
+		{"2h", time.Hour, 2 * time.Hour, "7d 40%(~1h)"},
+		{"2m", time.Minute, 2 * time.Minute, "7d 40%(~1m)"},
+		{"2s", time.Second, 2 * time.Second, "7d 40%(~1s)"},
+	} {
+		t.Run(tc.reset, func(t *testing.T) {
+			text := replyUsageReport("Anthropic\n- Claude 7 Day\n  private@example.com: 60% used" + replyUsageMarker + "\n  resets in " + tc.reset)
+			sample := replyUsageSample(text, "anthropic", replyUsageObservedAt)
+			window := sample.windows[1]
+			if !window.present || window.used != 60 || !window.approximate || window.resetPrecision != tc.precision || !window.resetAt.Equal(replyUsageObservedAt.Add(tc.duration)) {
+				t.Fatalf("native reset lost its unit or observation time: %#v", window)
+			}
+			if got := sample.text(replyUsageObservedAt); got != "7d 40%(~"+tc.reset+")" {
+				t.Fatalf("initial quota = %q", got)
+			}
+			if got := sample.text(replyUsageObservedAt.Add(tc.precision)); got != tc.aged {
+				t.Fatalf("aged quota = %q, want %q", got, tc.aged)
+			}
+			if got := sample.text(replyUsageObservedAt.Add(tc.duration)); got != "7d 40%" {
+				t.Fatalf("expired countdown changed remaining quota: %q", got)
+			}
+		})
 	}
 }

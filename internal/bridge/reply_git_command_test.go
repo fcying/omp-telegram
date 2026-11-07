@@ -136,7 +136,7 @@ func TestCustomGitCommandFinalAndLateQuotaKeepSnapshot(t *testing.T) {
 	requireStoreOK(t, os.WriteFile(gate, nil, 0600))
 	awaitProviderUsage(t, w)
 	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT header,text FROM outbox WHERE id=?", id).Scan(&header, &body))
-	if telegram.ConvertMarkdown(header) != "<code>"+label+"</code> | 5h30% 7d65%" || body != "**answer** with `code`" {
+	if telegram.ConvertMarkdown(header) != "<code>"+label+"</code> | 70% 35%" || body != "**answer** with `code`" {
 		t.Fatalf("late quota changed the captured custom label or answer: %q/%q", header, body)
 	}
 	runs, err := os.ReadFile(filepath.Join(w.binding.Workspace, "custom-git-runs"))
