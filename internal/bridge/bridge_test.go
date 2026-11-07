@@ -1438,8 +1438,9 @@ func TestMain(m *testing.M) {
 }
 
 type fakeHTTPResponse struct {
-	status int
-	body   string
+	status  int
+	body    string
+	onClose func()
 }
 
 type fakeHTTPResponseBody struct {
@@ -1559,7 +1560,7 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		f.mu.Unlock()
 		result = map[string]any{"message_id": id}
 		if response != nil {
-			return &http.Response{StatusCode: response.status, Body: io.NopCloser(strings.NewReader(response.body)), Header: make(http.Header), Request: r}, nil
+			return &http.Response{StatusCode: response.status, Body: fakeHTTPResponseBody{Reader: strings.NewReader(response.body), onClose: response.onClose}, Header: make(http.Header), Request: r}, nil
 		}
 	case "editForumTopic":
 		f.mu.Lock()
@@ -1850,9 +1851,11 @@ func testServerRejectionUsesDurableBackoff(t *testing.T, status int) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	ctxFirst, cancelFirst := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFirst()
 	body := fmt.Sprintf(`{"ok":false,"error_code":%d,"description":%q}`, status, http.StatusText(status))
 	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
-		-10: {{status: status, body: body}},
+		-10: {{status: status, body: body, onClose: cancelFirst}},
 	}}
 	oldTransport := http.DefaultTransport
 	http.DefaultTransport = fake
@@ -1864,32 +1867,51 @@ func testServerRejectionUsesDurableBackoff(t *testing.T, status int) {
 		t.Fatal(err)
 	}
 	startedAt := time.Now().Unix()
-	ctx, cancel := context.WithCancel(context.Background())
+	// Stop after the complete rejection so the durable retry cannot race its observer.
+	if err := b.deliver(ctxFirst); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var nextAttempt, updatedAt, attempts, serverRetries int64
+	if err := db.DB.QueryRow("SELECT state,next_attempt_at,updated_at,attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&state, &nextAttempt, &updatedAt, &attempts, &serverRetries); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" || attempts != 1 || serverRetries != 1 {
+		t.Fatalf("first retry state = %q, attempts = %d, server retries = %d", state, attempts, serverRetries)
+	}
+	if nextAttempt < startedAt+1 || nextAttempt-updatedAt < 0 || nextAttempt-updatedAt > 1 {
+		t.Fatalf("first retry deadline = %d, started at %d, updated at %d", nextAttempt, startedAt, updatedAt)
+	}
+	_, err = db.ClaimNextOutput(context.Background(), nextAttempt-1)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("claimed retry before its deadline: %v", err)
+	}
+	// Simulate the persisted retry deadline elapsing without a wall-clock sleep.
+	if _, err := db.DB.Exec("UPDATE outbox SET next_attempt_at=? WHERE id=? AND state='pending'", time.Now().Unix(), outputID); err != nil {
+		t.Fatal(err)
+	}
+	ctxSecond, cancelSecond := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- b.deliver(ctx) }()
+	go func() { done <- b.deliver(ctxSecond) }()
 	defer func() {
-		cancel()
+		cancelSecond()
 		if err := <-done; err != nil {
 			t.Error(err)
 		}
 	}()
 	waitFor(t, func() bool {
 		var state string
-		var nextAttempt, updatedAt int64
-		var attempts int
-		return db.DB.QueryRow("SELECT state,next_attempt_at,updated_at,attempt_count FROM outbox WHERE id=?", outputID).Scan(&state, &nextAttempt, &updatedAt, &attempts) == nil && state == "pending" && attempts == 1 && nextAttempt-updatedAt >= 0 && nextAttempt-updatedAt <= 1
-	})
-	var nextAttempt int64
-	if err := db.DB.QueryRow("SELECT next_attempt_at FROM outbox WHERE id=?", outputID).Scan(&nextAttempt); err != nil {
-		t.Fatal(err)
-	}
-	if nextAttempt < startedAt+1 {
-		t.Fatalf("first server retry deadline = %d, started at %d", nextAttempt, startedAt)
-	}
-	waitFor(t, func() bool {
-		var state string
 		return db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", outputID).Scan(&state) == nil && state == "done"
 	})
+	if err := db.DB.QueryRow("SELECT attempt_count,server_retry_count FROM outbox WHERE id=?", outputID).Scan(&attempts, &serverRetries); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	sends := len(fake.messages)
+	fake.mu.Unlock()
+	if attempts != 2 || serverRetries != 1 || sends != 2 {
+		t.Fatalf("completed retry: attempts = %d, server retries = %d, sends = %d", attempts, serverRetries, sends)
+	}
 }
 
 func TestTransientServerRejectionUsesDurableBackoff(t *testing.T) {
