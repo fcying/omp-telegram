@@ -292,7 +292,7 @@ ForceReply 提示通过 `tg://user?id=...` 链接显式 mention 目标用户. Se
 
 Assistant 预览保留当前文字尾部最多 2200 UTF-16 单位, 不修改正式正文. 最多显示六个活动工具, 名称最多 64 单位, payload 字段最多 100 单位, detail 总预算 1600 单位, preview 总预算 3500 单位. 有界 JSON payload decoder 扫描事件但只复制有限前缀. Verbose payload 不脱敏, 可向所有能读此会话的人暴露凭据或私有文件; 截断不是隐私过滤.
 
-Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 接受 Steer 和正文成功持久入队共用 `supersedePreview`: 推进 preview epoch, 对 root 较早的持久预览取快照并异步删除. discard-epoch 边界也会在任一替换前迟到的成功 Send 返回身份后清理它们. 删除沿用既有尽力而为策略, 不改变任务状态. 轮换取消过时 Edit, 但让初次 Send 返回消息身份以供清理. 新 preview 等待当前对话没有 pending/sending outbox 行后才创建, 不抢在正式回复前; 此 UI 屏障不延迟 RPC 消费或任务执行. Steer preview 回复该用户消息, 不改变 root 所有权, 不重启 OMP. 初始 Send 失败抑制该 epoch 后续 progress, 避免重复消息; Edit 失败仍可重试. 只有首条正式文本分片引用原 root 请求. 回复目标被拒绝时可退回普通消息, 不改变执行状态. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
+Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 接受 Steer 和正文持久入队通过 `retirePreview` 推进 preview epoch. Steer 可立即退役未受保护的实时预览; 已完成正文记录首个 outbox ID 和分片数量, 等待整个替代范围成功交付后才允许删除. 每个预览保留首次退役边界, 后续 Steer 或正文入队不能覆盖交付保护. 同步共享的退役凭据将边界带入迟到的初次 Send 回执, 包括 shutdown 处理. 轮换取消过时 Edit, 但让初次 Send 返回消息身份以供清理. 新 preview 等待当前对话没有 pending/sending outbox 行后才创建, 不抢在正式回复前; 此 UI 屏障不延迟 RPC 消费或任务执行. Steer preview 回复该用户消息, 不改变 root 所有权, 不重启 OMP. 初始 Send 失败抑制该 epoch 后续 progress, 避免重复消息; Edit 失败仍可重试. 只有首条正式文本分片引用原 root 请求. 回复目标被拒绝时可退回普通消息, 不改变执行状态. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
 
 已完成的 assistant 正文是独立持久消息, 不属于临时 Progress. 每条 preview 身份持久保存在 `progress_messages`, 包括旧 epoch 迟到但成功的 Send. 即使正文已在 inbox 完成前全部投递且没有新增终结行, 终结清理仍检查全部关联. 迟到的 Progress 结果按原 task/generation/turn/epoch fencing, 不能重新绑定当前 preview, 改写 assistant 问题或让替换任务接管旧消息.
 
@@ -747,7 +747,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 | `topic_names` | `(bot,chat,thread)`; 已知标题和单调递增 revision | 持久化已观察标题并分配预留 token; 空标题 tombstone 防止 revision 复用 |
 | `topic_name_reservations` | `(bot,chat,thread,revision)`; 预留标题和在途/保留状态 | 逐请求名称占用; 标题事件保留在途请求, 匹配的结果仅结算自身占用 |
 | `inbox` | Update ID; typed update JSON, 状态, reply target, 创建/更新时间 | 去重和输入的持久化结算 |
-| `progress_messages` | `(inbox_id,message_id)`, chat | 每条临时 preview 身份保留到完成清理 |
+| `progress_messages` | `(inbox_id,message_id)`, chat, 退役标记及替代 outbox 范围 | Preview 身份及持久删除资格, 包括运行中任务的清理重试 |
 | `outbox` | 递增 ID; 可选 inbox ID, chat/thread/reply target, 不可变正文或附件类型/路径/名称, 独立状态栏, Telegram 消息 ID, 待更新状态标记, 投递状态, 重试计数/时间 | 有序持久正文交付及尽力状态更新; 附件字节保存在私有文件 spool |
 
 迁移范围仅限 bridge. 早期版本补充启动 metadata, 输入/输出时间戳及 reply/progress 关联, 原生 session ID, 最近使用时间, 收藏和重试调度. 旧 `last_used_at` 保持为零; 独立的服务端拒绝计数从零开始, 不根据总尝试次数猜测. 版本 11/12 的迁移路径会移除 `activity_messages`, 当前 schema 不包含该表. 旧 intent 的创建时间记为迁移时间. 版本 14/15 直接推进, 不重建已废弃的 workspace 表; 版本 17 增加预设 singleton, 版本 18 删除存在的 `workspace_users` 和 `workspace_leases`. 不会把原生 session 文件, 已选择的 workspace 路径或已提交 binding 迁入另一套存储模型.
@@ -755,6 +755,8 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 Schema 版本 22 将原 inbox 单条 progress 关联迁入 `progress_messages`, 并为 outbox 增加独立状态栏/交付字段. 保留现有正文, 投递状态及原生 session; 不重新解析历史正文来推断可编辑状态栏.
 
 Schema 版本 24 将逐按钮一次性 claim 和尾片 reply-markup 状态与首片 header 编辑分别保存. 最小 follow-up 请求/tombstone metadata 记录 prompt 交付确定性, owner 及 session/binding 身份, 过期时间, bridge instance 和接受的 inbox 关联; 不维护第二份模型 transcript 或队列. 上一个 bridge instance 的未完成请求在重启后拒绝, 已消费/不确定工作不能作为普通输入重新执行.
+
+Schema 版本 25 增加 preview 退役和替代范围字段. 保留已有预览身份及 outbox 正文, 不推断缺失的替代边界. 无边界的终态预览必须有关联文本且所有关联输出成功交付才允许清理; 正式交付失败, 不确定或缺失时保留预览.
 
 ### 输入接收与结算
 
@@ -816,9 +818,9 @@ Schema 版本 24 将逐按钮一次性 claim 和尾片 reply-markup 状态与首
 
 ### 进度消息删除
 
-终态 inbox 存在关联 outbox, 且所有关联行均为终态时, progress 才具备删除条件. 最终交付 failed 或 uncertain 不阻止清理, pending/sending 会阻止. 清理在终态交付后, 启动时及每分钟执行, 每次 Delete 超时为五秒.
+已退役预览记录的替代范围内所有 outbox 分片均为 `done` 或旧 `sent` 后, 才具备删除资格. 显式 Steer-only 退役无交付范围, 可立即清理, 但不能覆盖已有受保护边界. 运行中的任务也参与此检查, 删除暂时失败不必等到任务结束才重试. 未退役的终态预览要求有关联文本且所有关联输出成功交付. Failed, uncertain, cancelled 或缺失的交付不授权删除. 清理在交付后, 预览退役或迟到回执时, 启动时及每分钟执行, 每次 Delete 超时为五秒.
 
-成功会清除匹配的本地关联. 明确的永久 4xx (429 除外) 会放弃删除并清除关联. 429, 5xx, 传输失败或不确定响应保留关联, 等待再次清理. 清理不改变任务或 outbox 结果. 即使 Telegram 删除一直失败, retention 最终也会清除超期且无活动交付的本地关联; 无法保证每条 preview 都从远端消失.
+成功会清除匹配的本地关联. 明确的永久 4xx (429 除外) 会放弃删除并清除关联. 429, 5xx, 传输失败或不确定响应保留关联, 等待再次清理. 清理不改变任务或 outbox 结果, 从不以正式回复为目标. 保留中的预览关联保护其 inbox 和 outbox 记录不被 retention 删除; 因此正式交付未成功时保留冻结的可见预览及已存正文, 不静默删除最后一个可见副本. 不重放不确定的交付或模型任务, 尽力而为的删除也无法保证每条旧预览都从远端消失.
 
 ## 附件与 host tool 文件边界
 
