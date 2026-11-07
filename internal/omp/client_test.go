@@ -824,7 +824,7 @@ func TestEventByteBudgetOverflowAndConsumption(t *testing.T) {
 			<-forwarded
 		}()
 		frame := json.RawMessage(make([]byte, 40<<20))
-		if !c.bytes.reserve(cap(frame)) {
+		if _, ok := c.bytes.reserve(cap(frame)); !ok {
 			t.Fatal("first event rejected")
 		}
 		c.queuedEvents <- frame
@@ -1080,5 +1080,222 @@ func TestPeerCorrelationIDIsOmittedFromLifecycleLogs(t *testing.T) {
 	}
 	if strings.Contains(logs, "peer-secret") {
 		t.Fatal("peer correlation ID leaked into lifecycle logs")
+	}
+}
+
+func TestConsumerPhaseRestorationAndRedaction(t *testing.T) {
+	for _, test := range []struct {
+		name, phase, want string
+		nested            bool
+	}{
+		{name: "nested phase retains outer elapsed time", phase: "callback", want: "callback", nested: true},
+		{name: "unknown phase is redacted", phase: rpcSensitiveCanary, want: "other"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			c := &Client{log: slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo})), stop: make(chan struct{})}
+			c.BeginConsumerPhase(test.phase)
+			if test.nested {
+				time.Sleep(10 * time.Millisecond)
+				previous := c.BeginConsumerPhase("telegram")
+				c.EndConsumerPhase(previous)
+			}
+			c.queueOverflow(errQueueOverflow, queueOverflowDetails{reason: "byte_budget", stage: "physical_read"})
+			var record map[string]any
+			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+				t.Fatal(err)
+			}
+			if record["consumer_phase"] != test.want || strings.Contains(output.String(), "SECRET_") {
+				t.Fatalf("unsafe or unrestored consumer phase: %s", output.String())
+			}
+			if test.nested {
+				if elapsed, ok := record["consumer_phase_ms"].(float64); !ok || elapsed < 5 {
+					t.Fatalf("restoration restarted outer phase elapsed time: %v", record["consumer_phase_ms"])
+				}
+			}
+		})
+	}
+
+	c := &Client{}
+	c.BeginConsumerPhase("operation")
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for range 1000 {
+			previous := c.BeginConsumerPhase("callback")
+			c.EndConsumerPhase(previous)
+		}
+	}()
+	for {
+		phase, elapsed := c.consumerPhaseSnapshot()
+		if (phase != "operation" && phase != "callback") || elapsed < 0 {
+			t.Fatalf("incoherent concurrent phase snapshot: %q, %d", phase, elapsed)
+		}
+		select {
+		case <-finished:
+			return
+		default:
+		}
+	}
+}
+
+func TestPhysicalReadBudgetFailureRetainsPreReleaseSnapshot(t *testing.T) {
+	var budget byteBudget
+	initial := int64(maxRPCBufferedBytes - 24)
+	budget.used.Store(initial)
+	var failure byteBudgetFailure
+	reader := bufio.NewReaderSize(strings.NewReader(strings.Repeat("x", 40)+"\n"), 16)
+	if data, err := readLineBudget(reader, 1024, &budget, &failure); data != nil || err != errQueueOverflow {
+		t.Fatalf("physical read did not retain overflow sentinel: data=%v err=%v", data, err)
+	}
+	if failure.used != initial+16 || failure.requested != 16 || budget.used.Load() != initial {
+		t.Fatalf("failure snapshot lost partial-frame credit: failure=%+v current=%d", failure, budget.used.Load())
+	}
+}
+
+func TestReadLoopOverflowDiagnosticsAtInfo(t *testing.T) {
+	makeEvent := func(kind string, padding int) []byte {
+		data, err := json.Marshal(map[string]any{"type": kind, "id": rpcSensitiveCanary, "data": rpcSensitiveCanary + strings.Repeat("x", padding)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(data, '\n')
+	}
+	known := makeEvent("message_update", 0)
+	unknown := makeEvent(rpcSensitiveCanary, 0)
+	large := makeEvent(rpcSensitiveCanary, 2048)
+	chunk := append(chunkFrame(rpcSensitiveCanary, 0, 2, 2<<20, []byte(rpcSensitiveCanary)), '\n')
+	for _, test := range []struct {
+		name, reason, stage, kind string
+		frames                    [][]byte
+		initial, rejectedUsed     int64
+		rejected, queued          int
+		current                   int64
+	}{
+		{name: "event slots known kind", reason: "event_slots", stage: "event_enqueue", kind: "message_update", frames: [][]byte{known, known}, rejectedUsed: int64(2 * len(known)), rejected: len(known), queued: 1, current: int64(len(known))},
+		{name: "event slots private kind", reason: "event_slots", stage: "event_enqueue", kind: "other", frames: [][]byte{known, unknown}, rejectedUsed: int64(len(known) + len(unknown)), rejected: len(unknown), queued: 1, current: int64(len(known))},
+		{name: "physical bytes", reason: "byte_budget", stage: "physical_read", kind: "other", frames: [][]byte{large}, initial: maxRPCBufferedBytes - 1024, rejectedUsed: maxRPCBufferedBytes - 1024, rejected: len(large), current: maxRPCBufferedBytes - 1024},
+		{name: "chunk bytes", reason: "byte_budget", stage: "chunk_reassembly", kind: "rpc_chunk", frames: [][]byte{chunk}, initial: maxRPCBufferedBytes - 2048, rejectedUsed: int64(maxRPCBufferedBytes - 2048 + len(chunk)), rejected: 2 << 20, current: maxRPCBufferedBytes - 2048},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			defer writer.Close()
+			c := &Client{log: logger, stdout: reader, queuedEvents: make(chan json.RawMessage, 1), ready: make(chan struct{}), stop: make(chan struct{}), readDone: make(chan struct{})}
+			c.bytes.used.Store(test.initial)
+			previous := c.BeginConsumerPhase("callback")
+			defer c.EndConsumerPhase(previous)
+			go c.readLoop()
+			input := []byte("{\"type\":\"ready\",\"protocolVersion\":1,\"supportedProtocolVersions\":[1,2],\"maxFrameBytes\":1048576,\"maxReassembledFrameBytes\":67108864}\n")
+			for _, frame := range test.frames {
+				input = append(input, frame...)
+			}
+			if _, err := writer.Write(input); err != nil {
+				t.Fatal(err)
+			}
+			_ = writer.Close()
+			select {
+			case <-c.readDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("overflow reader did not finish")
+			}
+			if err := c.failure(); ClassifyError(err) != "queue_overflow" || !c.protocolFailed.Load() || (test.reason == "byte_budget" && !errors.Is(err, errQueueOverflow)) {
+				t.Fatalf("overflow classification changed: %v", err)
+			}
+			var record map[string]any
+			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+				t.Fatalf("expected one INFO-visible error record: %v: %s", err, output.String())
+			}
+			for key, want := range map[string]string{"event": "rpc_queue_overflow", "level": "ERROR", "reason": test.reason, "stage": test.stage, "rpc_event": test.kind, "consumer_phase": "callback"} {
+				if record[key] != want {
+					t.Errorf("%s = %v, want %q", key, record[key], want)
+				}
+			}
+			for key, want := range map[string]int64{"queued_events": int64(test.queued), "queue_capacity": 1, "buffered_bytes": test.current, "buffer_limit_bytes": maxRPCBufferedBytes, "rejected_bytes": int64(test.rejected), "rejected_used_bytes": test.rejectedUsed, "forward_wait_ms": 0} {
+				if record[key] != float64(want) {
+					t.Errorf("%s = %v, want %d", key, record[key], want)
+				}
+			}
+			if elapsed, ok := record["consumer_phase_ms"].(float64); !ok || elapsed < 0 {
+				t.Errorf("missing phase duration: %v", record["consumer_phase_ms"])
+			}
+			for _, canary := range []string{"SECRET_PROMPT", "SECRET_OUTPUT", "SECRET_TOKEN", "SECRET_HEADER", "https://api.telegram.org", "Authorization"} {
+				if strings.Contains(output.String(), canary) {
+					t.Fatalf("overflow leaked private frame content: %q", canary)
+				}
+			}
+		})
+	}
+}
+
+func TestForwarderBlockedDurationClearsAfterDeliveryAndLogsOverflow(t *testing.T) {
+	var output bytes.Buffer
+	c := &Client{log: slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo})), events: make(chan json.RawMessage), queuedEvents: make(chan json.RawMessage, 1), stop: make(chan struct{})}
+	frame := json.RawMessage(`{"type":"message_update"}`)
+	if _, ok := c.bytes.reserve(cap(frame)); !ok {
+		t.Fatal("cannot reserve small event")
+	}
+	c.queuedEvents <- frame
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		c.forwardEvents()
+	}()
+	defer func() {
+		c.stopOnce.Do(func() { close(c.stop) })
+		<-finished
+	}()
+	deadline := time.Now().Add(time.Second)
+	for c.forwardBlockedAt.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("forwarder did not start waiting")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	started := c.forwardBlockedAt.Load()
+	time.Sleep(5 * time.Millisecond)
+	if elapsed := time.Since(rpcDiagnosticsEpoch).Nanoseconds() - (started - 1); elapsed < int64(time.Millisecond) {
+		t.Fatalf("blocked duration did not advance: %d", elapsed)
+	}
+	select {
+	case <-c.events:
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not deliver event")
+	}
+	for c.forwardBlockedAt.Load() != 0 || c.bytes.used.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("delivery did not clear wait state and release credit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, ok := c.bytes.reserve(cap(frame)); !ok {
+		t.Fatal("cannot reserve second event")
+	}
+	c.queuedEvents <- frame
+	deadline = time.Now().Add(time.Second)
+	for c.forwardBlockedAt.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("forwarder did not start second wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(5 * time.Millisecond)
+	details := queueOverflowDetails{reason: "event_slots", stage: "event_enqueue", eventKind: rpcSensitiveCanary, budget: byteBudgetFailure{used: c.bytes.used.Load(), requested: cap(frame)}}
+	c.queueOverflow(errQueueOverflow, details)
+	c.queueOverflow(errQueueOverflow, details)
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("overflow should log exactly once: %v: %s", err, output.String())
+	}
+	if elapsed, ok := record["forward_wait_ms"].(float64); !ok || elapsed < 1 {
+		t.Fatalf("blocked wait missing from error log: %v", record["forward_wait_ms"])
+	}
+	if record["rpc_event"] != "other" || strings.Contains(output.String(), "SECRET_") {
+		t.Fatal("overflow event kind was not sanitized")
 	}
 }

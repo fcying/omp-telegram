@@ -167,13 +167,14 @@ func argsMenuButtonLabel(language i18n.Language, preset, current int, labels []s
 }
 
 type argsApplyRequest struct {
-	clientID   uint64
-	generation int64
-	session    string
-	index      int
-	menuID     int64
-	args       []string
-	cancel     context.CancelFunc
+	finalAction *finalActionDispatch
+	clientID    uint64
+	generation  int64
+	session     string
+	index       int
+	menuID      int64
+	args        []string
+	cancel      context.CancelFunc
 }
 
 func (w *worker) argsSelectionIdle() bool {
@@ -186,18 +187,27 @@ func (w *worker) argsSelectionIdle() bool {
 		w.startIntent == nil && !w.rpcOperationActive && len(w.rpcOperations) == 0
 }
 
-func (w *worker) cancelArgsApply(notify bool) {
-	if w.argsApply == nil {
-		return
+func (w *worker) endArgsApply() *argsApplyRequest {
+	request := w.argsApply
+	if request == nil {
+		return nil
 	}
-	menuID := w.argsApply.menuID
-	w.argsApply.cancel()
+	request.cancel()
 	w.argsApply = nil
 	if w.controlOp == controlArgs {
 		w.endControlOperation()
 	}
+	return request
+}
+
+func (w *worker) cancelArgsApply(notify bool) {
+	request := w.endArgsApply()
+	if request == nil {
+		return
+	}
+	w.releaseFinalAction(request.finalAction)
 	if notify {
-		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
+		w.finishMenuOrSay(request.menuID, w.tr(i18n.Msg.ConversationBusyUseAgainAfterTaskQueueFinish, "/args"))
 	}
 }
 
@@ -207,6 +217,9 @@ func (w *worker) applyArgsPreset(index int, menuID int64) {
 		return
 	}
 	if !w.binding.Running && w.client == nil {
+		if !w.consumeFinalAction() {
+			return
+		}
 		if err := w.b.selectArgsPreset(index); err != nil {
 			w.finishMenuOrSay(menuID, w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
 			return
@@ -235,7 +248,7 @@ func (w *worker) applyArgsPreset(index int, menuID int64) {
 	}
 	if client, connected := w.runtimeClient(); connected {
 		ctx, cancel := context.WithCancel(w.ctx)
-		request := &argsApplyRequest{clientID: client.ID(), generation: w.binding.Generation,
+		request := &argsApplyRequest{finalAction: w.finalAction, clientID: client.ID(), generation: w.binding.Generation,
 			session: w.binding.Session, index: index, menuID: menuID, args: args, cancel: cancel}
 		w.argsApply = request
 		w.beginControlOperation(controlArgs)
@@ -254,7 +267,7 @@ func (w *worker) argsStateFinished(result operationResult) {
 	if !ok || request != w.argsApply {
 		return
 	}
-	w.cancelArgsApply(false)
+	w.endArgsApply()
 	client, connected := w.runtimeClient()
 	if !connected || client.ID() != request.clientID || result.clientID != request.clientID ||
 		w.binding.Generation != request.generation || result.generation != request.generation ||
@@ -287,6 +300,9 @@ func (w *worker) argsStateFinished(result operationResult) {
 }
 
 func (w *worker) commitArgsPreset(index int, args []string, menuID int64) {
+	if !w.consumeFinalAction() {
+		return
+	}
 	if err := w.b.selectArgsPreset(index); err != nil {
 		w.finishMenuOrSay(menuID, w.tr(i18n.Msg.FailedSaveOMPArgumentPresetSelection))
 		return

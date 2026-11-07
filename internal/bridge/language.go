@@ -72,6 +72,9 @@ func (b *Bridge) changeLanguage(language i18n.Language) error {
 
 func (w *worker) handleLanguageCommand(arg string) {
 	if arg == "" {
+		if !w.consumeFinalAction() {
+			return
+		}
 		name := "English"
 		if w.b.language() == i18n.Chinese {
 			name = "中文"
@@ -82,6 +85,9 @@ func (w *worker) handleLanguageCommand(arg string) {
 	language, ok := i18n.Parse(arg)
 	if !ok {
 		w.say(w.tr(i18n.Msg.Language.Usage))
+		return
+	}
+	if !w.consumeFinalAction() {
 		return
 	}
 	if err := w.b.changeLanguage(language); err != nil {

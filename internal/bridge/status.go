@@ -124,6 +124,7 @@ func (w *worker) releaseStatusRuntime(result operationResult, valid bool) {
 }
 
 func (w *worker) finishPendingStatusRelease() {
+	defer w.beginConsumerPhase("runtime", "finish_pending_status_release").end()
 	if w.statusReleaseClientID == 0 {
 		return
 	}

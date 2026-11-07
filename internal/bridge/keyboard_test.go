@@ -458,7 +458,9 @@ func TestCompactCompletionUsesOneMessageAndFreshUsage(t *testing.T) {
 				nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "get_state"})
 			}
 			messagesBefore := f.messageCount()
+			f.mu.Lock()
 			f.failProgress = scenario.sendFailure
+			f.mu.Unlock()
 			command("/compact")
 			messageID := f.messageCount()
 			if w.sessionOp != sessionOperationCompact || w.taskActive() || !sameBindingIdentity(w.binding, before) || len(w.confirms) != 0 || f.button(messagesBefore) != "" {
@@ -1266,8 +1268,10 @@ func TestNativeUISelectionEditFailurePreservesSession(t *testing.T) {
 	_, rows := pickerView(t, f)
 	data := rows[0][0]["callback_data"].(string)
 	messageID := int64(f.messageCount())
+	f.mu.Lock()
 	f.failProgress, f.failKeyboardClear = true, true
 	f.keyboardClearGate = make(chan struct{})
+	f.mu.Unlock()
 	transport := &failedMenuHTTP{
 		base: f, clearStarted: make(chan struct{}, 1), clearFinished: make(chan struct{}, 1), callbacks: make(chan string, 1),
 	}

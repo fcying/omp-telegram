@@ -124,7 +124,7 @@ Polling 失败采用可取消的指数退避, 从一秒增加到 30 秒. Telegra
 
 支持 `[telegram]`, `[telegram.status_bar]`, `[omp]`, `[omp.environment]`, `[storage]`, `[worker]`, `[logging]` 和 `[logging.component_levels]`. 未知和错位字段直接忽略, 不自动迁移或展开环境变量. 未知日志组件名同样作为未知键处理; 六个已知组件的非法值仍拒绝. 两个白名单都必须非空; user ID 必须为正数, chat ID 不能为零. `max_workers` 范围为 `1..64`, `queue_capacity` 为 `1..1024`, 保留天数不能为负. 正数 Go duration 启用空闲释放; 空值, `0` 或 `disabled` 关闭.
 
-TOML 解析后仅展开一次字符串引用: `$VAR`, `${VAR}`, `$$` 表示字面美元符号. 插入的环境变量内容不会再次展开, 也不能注入 TOML. 数值和白名单字段支持其文档中约定的环境引用字符串. 默认 `OMP_TELEGRAM_ARGS` 和 workspace-root 引用允许未设置; progress mode 无效或未设置时回退为 `summary`. 其他必需引用未设置时报错. Environment 策略的 mode/变量名以及仅展示的 `omp.args_labels` 保持字面值. 不读取 `.env` 文件.
+TOML 解析后仅展开一次字符串引用: `$VAR`, `${VAR}`, `$$` 表示字面美元符号. 插入的环境变量内容不会再次展开, 也不能注入 TOML. 数值和白名单字段支持其文档中约定的环境引用字符串. 默认 `OMP_TELEGRAM_ARGS` 和 workspace-root 引用允许未设置; progress mode 无效或未设置时回退为 `summary`. 其他必需引用未设置时报错. Environment 策略的 mode/变量名, 仅展示的 `omp.args_labels`, `telegram.status_bar` 字段以及 `telegram.final_actions` 标签/命令保持字面值. 不读取 `.env` 文件.
 
 `omp.args` 接受有序预设字符串数组, 或归一化为一个预设的标量字符串. 每项使用支持引号的 tokenizer 解析, 不经过 shell; 启动前校验全部预设. 拒绝覆盖 bridge 管理的 mode/cwd/session 选项及受保护短选项, `--`, NUL 字节. 只持久化归一化预设 fingerprint 与所选 index, 不保存原始参数. 选择语义和每 runtime 快照见运行设置章节.
 
@@ -151,7 +151,7 @@ Linux 上通过 [`startProcess`](../internal/omp/process_linux.go) 启动的原�
 
 `worker.queue_capacity` 限制排队 root 与未解决 steer 的总数. `/queue` 只读取当前 worker 的运行时 queue/active/busy 状态; Cancel 按钮取消选定 pending inbox 及准备资源, 不终止活动 root, 也不管理 OMP 原生 steer 队列. 关闭会取消等待输入. 重启后不自动重放队列输入或 uncertain 提交.
 
-原生命令的 acceptance 若省略 `agentInvoked`, 仍保留 native owner, 新普通文本继续排队. 只有 `agentInvoked:true` 或 `agent_start` 能证明已进入 agent 执行, 从而在原回复 owner 下允许普通 root steering. `controlAbort` 期间收到的文本始终成为新的排队 root, 包括 Stop 期间才完成分类的未知 slash 文本. 托管研究使用特殊长期 owner, 不采用普通 root 的终结/settlement 规则.
+原生命令的 acceptance 若省略 `agentInvoked`, 仍保留 native owner, 新普通文本继续排队. 只有 `agentInvoked:true` 或 `agent_start` 能证明已进入 agent 执行, 从而在原回复 owner 下允许普通 root steering. `controlAbort` 期间收到的普通文本成为新的排队 root; slash invocation 仍须严格 Bridge/native 分类, 未知命令不能变成模型 prompt. 托管研究使用特殊长期 owner, 不采用普通 root 的终结/settlement 规则.
 
 ### 传输与完成边界
 
@@ -264,6 +264,28 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ## Progress, status 与最终回复
 
+### 完成快捷按钮与后续输入 (#99 契约)
+
+`telegram.final_actions` 是按顺序排列的 literal `{label, command}` 列表, 最多六项; 省略或空列表关闭完成按钮. 标签非空, 单行, 最多 64 个 UTF-16 单位. Command 只能是一个 slash invocation, 不允许控制字符, 变量展开或 shell 解释. 加载配置不虚构原生命令目录: 点击时重新检查实际可用性, 来源策略, binding 和 session. 自定义标签与命令永不记入日志. 本次实现的隔离原生 catalog 检查公布 builtin `shake` ("Shake heavy content out of the conversation context"), 示例显式将 Shake 映射为 `/shake`. 执行仍以当前 runtime/session 可用性为准, Queue 不能替代 Shake.
+
+完成按钮只属于成功结算的 root task 的最后一个真实 assistant 正文片段, 不挂在 header, 截断/错误提示或原生命令输出上. 尾片 Telegram ID 与首片 header 目标分别跟踪, header 关闭时也保存. 待发正文携带 keyboard; 已发正文只编辑 reply markup. Markup 失败或不确定不能重发正文, header/quota 编辑须保留当前 markup. 现有 outbox 顺序, claim 和不确定交付策略继续有效. 每个按钮拥有独立持久化一次性 token. 接收时先预留且不移除 markup (`consumed=0, consumed_by>0`); 原命令 handler 保留资格检查, 确定性本地拒绝时原子释放预留并结算该 callback inbox. 接受任务入队, 提交目标 RPC 或开始本地操作前才消费 token. 执行确认携带预留直到接受, 取消或超时; 已成功打开的菜单视为菜单命令已执行. 重复 update 不能重新打开已结算的尝试. 旧 binding/generation/configuration 动作拒绝. 启动恢复保守消费中断的预留, 取消其 pending callback inbox, 不重放. 预留期间保留清理不能删除来源正文.
+
+同一个已交付 outbox 行的 header 和 markup 编辑共享独占 `actions_pending=2` claim, 覆盖远端调用及确认. 按钮变化保留进行中的 claim; 与请求快照不同时, 释放后仍待更新. 其他行仍可并行编辑. 已取消但尚未发起的 markup claim 回到待处理状态; 已尝试或不确定的编辑都不能重发正文.
+
+Progress 同一行显示 `Stop | Follow-up`, `off` 时两者都不发送. Stop 保持原 task-fenced token 及索引 `0`; Follow-up 使用同一 token 的 `followup` 索引且不消费 Stop. 点击 Follow-up 仅异步打开同 topic 的 ForceReply 输入, 不暂停也不提交当前任务. 新请求替代此用户在此对话中的旧请求. 请求在发送前持久化, 带不透明随机 marker, 十分钟到期, 只接受目标用户对已明确交付的 prompt ID 的回复. Send-uncertain prompt, 错误身份, 陈旧/过期/取消/已消费请求及其他 bridge instance 的未完成请求一律拒绝, 不作为普通 prompt 或附件. 最小持久化 metadata 支持重启后识别拒绝, 不重复保存 prompt/model 正文.
+
+自然完成后, binding/session 稳定时已发输入请求仍有效; 提交不绑定旧 active turn. Stop/Close 取消请求, new/resume 改变 binding 后请求失效. 空/非文本输入及现有 worker queue 已满不会消费请求或谎报入队成功. 接受时先按原 inbox ID 原子关联请求, 再追加现有队列; 接受后中断遵循现有 uncertain/cancelled inbox 恢复, 不重放为普通输入. 只有有效请求的已知 Bridge slash 回复才维持普通命令处理, 并只剥离 bridge ForceReply 上下文. 当前 Bot 的合法 marker 识别出的失效或缺记录提示, 连控制命令也拒绝. 其他有效文字独立排队, 不 steer, 不引用 ForceReply prompt. 快捷按钮同样保留原 callback inbox ID 和真实点击者身份; 严格 bridge/native dispatch 不把未知 slash 变成 prompt/steer.
+
+迁移预检期间拦截的 Stop/Close 也取消待处理 Follow-up 请求, 即使尚未建立持久化 migration 记录.
+
+Follow-up 历史与消息清理共用 `storage.database_retention_days`. 每批最多删除 1000 条到期时间同时早于保留 cutoff 且不晚于当前时间的请求, 包括未回复的过期 pending/delivered 提示, 但保留关联 pending/submitted inbox 的记录. 现有 schema 24 数据库也安装 expiry 索引. 删除后仍可通过当前 Bot 的合法 marker 拒绝迟到输入; 若既无保留的 prompt 身份也无可识别 marker, 就无法与普通引用区分.
+
+Marker 回退仅接受非空正文末尾独立完整的 `[followup:token]` 行, 该行不能有额外前后缀. 不再搜索任意正文子串, 也不匹配翻译后的提示文案. 已知 prompt ID 仍独立于文本回退识别回复.
+
+Telegram send options 只能携带 inline keyboard 或 selective ForceReply 之一. `EditKeyboard` 使用 `editMessageReplyMarkup`; 原 reply fallback, 鉴权和 not-modified 处理保持不变.
+
+ForceReply 提示通过 `tg://user?id=...` 链接显式 mention 目标用户. Selective 定向不能依赖原始 reply target: Favorite 可从 bot 消息启动任务, reply fallback 也可能移除该 target.
+
 ### 尽力而为的 progress
 
 [`worker.renderProgress`](../internal/bridge/bridge.go) 使用可编辑的工具/状态内存 preview, 包含当前 assistant 正文的有界尾部. 每 1.5 秒 worker tick 在三秒初始延迟后判断是否创建. `off` 关闭 progress Send/Edit 和 typing, 不关闭已完成的 assistant 消息. `summary` 显示状态, 活动工具及正文预览; `verbose` 增加有界原始参数, 最新 partial/final result 和最多 `telegram.progress_recent_tools` 条近期工具结果 (默认 5, 范围 1..100), 另计省略的更早调用数. 渲染超出 preview 预算时丢弃最旧行, 保留最新可见后缀. Retry/compaction 有明确状态. 只有匹配 `tool_execution_end` 才完成工具; host callback 可修正名称/参数但不能虚构完成. 不向此气泡追加 reasoning 或整帧.
@@ -308,7 +330,7 @@ Progress 和中间/最终回复 header 共用 model/thinking/fast 格式, 精简
 
 通过 splitter 的截断标记及片段数量区分实际 assistant 正文与纯生成提示, 不按正文是否等于本地化截断提示分类. 即使真实正文与提示完全同名, 仍保留其可编辑最终目标, 包括 terminal-only 完成和后续额度编辑; 生成提示不替换此前的真实正文目标.
 
-`[telegram.status_bar]` 包含有序的 `progress`, `intermediate`, `final` 数组. 未配置的数组默认 `status, thinking, model, fast, context, speed`; 显式 `[]` 隐藏对应状态栏及图标, 不隐藏 Progress 正文/Stop 控件. 数组中未知/重复的字段值及非 final 中的 `git` 会报错. 旧 `telegram.provider_usage` 键被忽略并打印 ERROR 日志, 改为选择 `quota` 显式启用. 未选择的字段不启动仅为显示服务的 native/account/quota/Git 采样; 任务安全及显式命令查询不变.
+`[telegram.status_bar]` 包含有序的 `progress`, `intermediate`, `final` 数组. 未配置的数组默认 `status, thinking, model, fast, context, speed`; 显式 `[]` 隐藏对应状态栏及图标, 不隐藏 Progress 正文及 Stop/Follow-up 控件. 数组中未知/重复的字段值及非 final 中的 `git` 会报错. 旧 `telegram.provider_usage` 键被忽略并打印 ERROR 日志, 改为选择 `quota` 显式启用. 未选择的字段不启动仅为显示服务的 native/account/quota/Git 采样; 任务安全及显式命令查询不变.
 
 Schema 23 增加独立于 header 内容的 `outbox.header_editable`, 回填现有 assistant 状态栏. 仅 assistant 正文的首片可编辑. 即使 header 为空也保存 Telegram ID; pending 编辑可添加或删除 header, 使用快照 CAS 确认, 相同内容不产生冗余编辑. 普通输出不可编辑. Intermediate 关闭/final 开启和相反组合均支持发送前, 发送中及发送后切换.
 
@@ -710,7 +732,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 ### Schema 与迁移边界
 
-`PRAGMA user_version` 当前为 **22**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-21 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
+`PRAGMA user_version` 当前为 **24**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-23 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录, 版本 22 增加独立 progress/header 交付, 版本 23 增加 header 可编辑性, 版本 24 增加持久化完成快捷动作和后续输入请求 metadata. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
 
 | 表 | 身份与保留内容 | 职责 |
 | --- | --- | --- |
@@ -731,6 +753,8 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 迁移范围仅限 bridge. 早期版本补充启动 metadata, 输入/输出时间戳及 reply/progress 关联, 原生 session ID, 最近使用时间, 收藏和重试调度. 旧 `last_used_at` 保持为零; 独立的服务端拒绝计数从零开始, 不根据总尝试次数猜测. 版本 11/12 的迁移路径会移除 `activity_messages`, 当前 schema 不包含该表. 旧 intent 的创建时间记为迁移时间. 版本 14/15 直接推进, 不重建已废弃的 workspace 表; 版本 17 增加预设 singleton, 版本 18 删除存在的 `workspace_users` 和 `workspace_leases`. 不会把原生 session 文件, 已选择的 workspace 路径或已提交 binding 迁入另一套存储模型.
 
 Schema 版本 22 将原 inbox 单条 progress 关联迁入 `progress_messages`, 并为 outbox 增加独立状态栏/交付字段. 保留现有正文, 投递状态及原生 session; 不重新解析历史正文来推断可编辑状态栏.
+
+Schema 版本 24 将逐按钮一次性 claim 和尾片 reply-markup 状态与首片 header 编辑分别保存. 最小 follow-up 请求/tombstone metadata 记录 prompt 交付确定性, owner 及 session/binding 身份, 过期时间, bridge instance 和接受的 inbox 关联; 不维护第二份模型 transcript 或队列. 上一个 bridge instance 的未完成请求在重启后拒绝, 已消费/不确定工作不能作为普通输入重新执行.
 
 ### 输入接收与结算
 
@@ -864,6 +888,10 @@ Bridge 不提供日志文件, 轮转, 网络 exporter, 异步队列或运行时�
 
 RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, 包括 `received`, `event_queued`, `response_queued`, `response_ignored`, `rejected` 及 bridge 侧 `handled`. 可选 terminal metadata 分为 `absent|true|false|invalid`. Request ID 只有安全解析为十进制数后才能记录. 同时将 `logging.component_levels.rpc` 和 `logging.component_levels.bridge` 设为 `debug`, 可跟踪 transport 接收到 actor 处理的路径; 这不会开启 frame 日志.
 
+Overflow ERROR 使用 `reason=event_slots|byte_budget` 和 `stage=event_enqueue|physical_read|chunk_reassembly` 区分来源. 记录队列占用/容量, 共享字节上限, 失败申请大小及清理前精确占用 (`rejected_bytes`, `rejected_used_bytes`), 清理后的 `buffered_bytes`, 白名单 `rpc_event` (其他归为 `other`), `forward_wait_ms` 及当前 `consumer_phase/consumer_phase_ms`. Forwarder 仅在不能立即交付时使用单调时钟计时. Consumer phase 快照同步读取; 嵌套 actor span 恢复原 client 及原 phase 起始时间, 不修改 replacement runtime. 各计数/耗时快照不构成全局原子状态转储.
+
+Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时一秒时发出 `rpc_consumer_slow` WARN. 包含固定 `phase/point`, `duration_ms` 及进入时捕获的 client/generation/turn/inbox 身份. 覆盖 input/callback, RPC event/result, dispatch/tick, runtime 生命周期, 常用持久化及菜单/键盘操作. 未单独包裹的专用调用保留外围 phase. 后台 HTTP/清理不修改 actor phase. 不增加监控 goroutine, 不逐帧输出 info 或记录 payload, 不改变 transport 上限, 调度, 失败退役或重放策略.
+
 ### 保密边界
 
 日志调用点必须投影获准 metadata; handler 不是通用 secret scrubber. 不得传入 prompt, 输出, reasoning, token, 认证 header, URL, 完整 frame, 原始 error, 工具 payload, callback token, 文件名, workspace/session 路径, 白名单, 原始 `omp.args` 或未经审查的配置值. Chat/thread ID 可关联用户活动: 限制日志访问, 公开分享前使用一致的替代值.
@@ -891,6 +919,8 @@ RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, �
 本地配置检查先构建, 再运行 `./omp-telegram --check`; 需要时显式指定 `--config`. 该命令会创建目录, 测试配置行为时使用一次性路径.
 
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
+
+共享假 Telegram transport 使用 `fakeHTTP.mu` 保护 `failProgress` 的读写, 包括后台键盘清理运行时由测试切换开关. 故障判定和 `progressCalls` 递增位于同一临界区.
 
 Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 request 和 epoch, 再注入 deadline 错误; 根任务, session 和队列断言仍然适用. RPC 测试单独覆盖真实 context deadline, 合并发现请求和迟到响应. 不为测试提速缩短生产查询 deadline.
 

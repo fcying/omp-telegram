@@ -69,6 +69,7 @@ allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 progress_recent_tools = 5
+final_actions = []
 
 [telegram.status_bar]
 progress = ["status", "thinking", "model", "fast", "context", "speed"]
@@ -121,7 +122,7 @@ An explicitly selected missing file, unreadable file, invalid TOML or invalid kn
 Explicit relative `--config` paths use the launch directory. Relative `storage.data_dir` and `storage.workspace_root` paths always use the real executable directory, not the config file's directory.
 
 Configuration strings support `$VAR` and `${VAR}` except for `[omp.environment]` mode and `allow`/`deny` variable names, which are literal. Use `$$` for a literal dollar sign. Environment references are expanded once after TOML parsing. The default references to `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE`, and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset. An empty or invalid `telegram.progress_mode` falls back to `summary`. The token and allowlists must be provided. `.env` files are not loaded automatically.
-The display-only `omp.args_labels` values are literal and are not environment-expanded.
+The display-only `omp.args_labels`, `telegram.status_bar` fields, and `telegram.final_actions` labels/commands are literal and are not environment-expanded.
 
 Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An update is accepted only when both the sender and chat match their allowlists. Private-chat IDs normally match the user ID; group IDs are usually negative numbers.
 
@@ -133,6 +134,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.allowed_users`, `telegram.allowed_chats` | Required numeric ID allowlists. Values may be literal integers or comma-separated environment values. |
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `telegram.progress_recent_tools` | Maximum completed tools retained in verbose Recent history. Default: `5`; range: `1..100`. Display may show fewer to fit Telegram's message limit. |
+| `telegram.final_actions` | Optional ordered completion shortcuts `{ label, command }`. Omitted or `[]` disables them. At most six buttons; labels are nonempty, single-line and at most 64 UTF-16 units. Commands are one slash invocation with optional literal fixed arguments and no controls or line breaks. See [Completion shortcuts](#completion-shortcuts). |
 | `telegram.status_bar.progress`, `.intermediate`, `.final` | Ordered field arrays for Progress, intermediate assistant messages, and final results. `[]` disables that header. Omitted arrays default to `["status", "thinking", "model", "fast", "context", "speed"]`. See [Status bars](#status-bars). |
 | `telegram.status_bar.git_command` | Optional literal argv for the final `git` field. Omitted or `[]` uses the built-in safe Git probe. Custom commands run without a shell in the current session workspace; users own their safety and side effects. |
 | `telegram.status_bar.git_timeout` | Positive literal Go duration for both built-in and custom Git sampling, default `"450ms"`. Increase to e.g. `"2s"` for large repositories. Empty, zero, negative, invalid, overflowing or non-string values are rejected; environment references are not expanded and the timeout cannot be disabled. |
@@ -355,15 +357,43 @@ Very large output or many replies may be truncated with an explicit notice. OMP'
 - `summary` shows active tools, task state, and the current assistant text preview.
 - `verbose` additionally shows recent observable tool activity. Tool details are unredacted and may contain credentials or private content visible to everyone who can read the conversation.
 
-Progress appears after about three seconds and includes a **Stop** button for the current task. With the `status` field selected, its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies.
+Progress appears after about three seconds and includes **Stop | Follow-up** in one row. **Stop** cancels the current task; **Follow-up** opens a reply prompt without pausing or steering it. With the `status` field selected, its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies. `progress_mode = "off"` creates neither button.
 
 Steer input and completed assistant messages remove the task's older Progress bubbles without restarting OMP. A new preview waits for preceding formal replies to be delivered and appears below the latest input/reply. Remaining temporary Progress bubbles are cleaned up when the task ends; formal replies remain.
 
 Completed assistant messages are sent immediately, even with progress off. With the `status` field selected, intermediate headers show **💬** and confirmed task success changes only the latest formal header to **✅**; cancellation, failure, uncertainty and ongoing research rounds do not gain a success marker. Only the first formal message quotes the original request. Bodies stay unchanged for Telegram Reply, with no body resend or separate completion message.
 
+### Follow-up input
+
+Click **Follow-up**, then reply to the bot's ForceReply prompt with nonempty text. Only the clicking user's reply to that particular prompt in the same chat/topic is accepted, as a separate queued task just like `/followup <message>`. Opening the prompt does not pause the running task. After acceptance, the bot confirms that the follow-up was queued; a full queue or empty/nontext reply does not consume the request or report success, so you can retry while it is valid.
+
+Requests expire after ten minutes. Clicking again replaces your previous request in that conversation. Natural task completion keeps the issued request valid if the session/binding is unchanged; Stop, Close, session replacement and service restart invalidate unfinished requests. Replies to recognized stale, unauthorized or uncertain-delivery prompts are rejected, including `/stop`, `/close` and other commands. Only valid requests allow recognized Bridge commands to use their ordinary control path. A well-formed marker from this bot is rejected even if its database record is missing. Ordinary text not replying to a recognized prompt keeps its existing prompt/steer behavior. Telegram clients control how ForceReply is displayed; the bridge does not provide an inline text-entry widget.
+
+Marker fallback requires a complete `[followup:token]` line at the very end of a nonempty prompt body. Inline fragments and markers followed by more text do not match. Stored prompt IDs remain authoritative even if the quoted marker is omitted.
+
+### Completion shortcuts
+
+To opt in, place this setting in the existing `[telegram]` table, before `[telegram.status_bar]`:
+
+```toml
+final_actions = [
+  { label = "Compact", command = "/compact" },
+  { label = "New", command = "/new" },
+  { label = "Shake", command = "/shake" },
+]
+```
+
+Omit the setting or use `final_actions = []` to disable it (the default). Order is preserved; labels are user-defined and are not translated. Labels must be nonempty and single-line, with at most 64 UTF-16 units (an emoji outside the BMP uses two). Up to six entries are allowed. Each command must start with a slash and contain one command name, optionally followed by fixed arguments; no newlines or control characters are allowed. Labels and commands stay literal: `$VAR`, `${VAR}`, shell syntax and argument text are never expanded or executed by a shell. Arguments retain the existing command's parsing rules, not a second shortcut language. Do not put secrets in visible button labels or command arguments.
+
+Rows contain at most three buttons and use a 24-UTF-16-unit combined-label budget to move longer labels onto additional rows. A single long label remains intact on its own row; Telegram clients determine actual button widths.
+
+Buttons appear only on the last real assistant body part after the root task successfully completes, including when status headers are hidden. They do not appear on intermediate replies, error/truncation notices, stopped/uncertain results or native command output. Updating buttons does not resend the answer. Each button is one-shot after command admission, not after the first click: deterministic local rejection such as busy state, invalid arguments or unavailable commands leaves it retryable with a new click. A reservation prevents overlapping clicks while eligibility or an execution confirmation is pending; cancelling or expiring that confirmation releases it. Successfully opening a command's menu counts as executing that menu command. Accepted queue input, target RPC submission and local execution consume the button; submitted or uncertain operations are never replayed. A reservation interrupted by restart is conservatively consumed. Another unused button or a later completed reply can still be used. Changed sessions/bindings or removed/changed configuration invalidate old actions.
+
+Clicks use the same chat/topic, the real clicking user's permissions, original command arguments, busy-state restrictions and confirmations as typing the command. Unknown or unavailable commands give an error, never become a model prompt or silently run a different action. Native shortcuts require an executable command advertised by the **current session's** native command catalog and remain subject to source/lifecycle restrictions; configuration loading does not prove availability. The native OMP catalog used for this implementation advertised builtin `/shake` ("Shake heavy content out of the conversation context"), so the example maps **Shake explicitly to `/shake`**. Availability can differ by runtime/session: an unavailable `/shake` rejects, and is never automatically mapped to Queue or another operation.
+
 ### Status bars
 
-Configure the three header types independently. Fields appear in array order; unknown or duplicate names are rejected. `[]` removes the entire header, including its icon and separator. Disabling the Progress header does not hide its tool body, text preview or **Stop** button; use `progress_mode = "off"` to disable Progress itself.
+Configure the three header types independently. Fields appear in array order; unknown or duplicate names are rejected. `[]` removes the entire header, including its icon and separator. Disabling the Progress header does not hide its tool body, text preview or **Stop | Follow-up** buttons; use `progress_mode = "off"` to disable Progress itself.
 
 ```toml
 [telegram.status_bar]
@@ -485,7 +515,7 @@ Recovery does not rerun handoff or create another session. If the candidate is u
 
 Bridge data is stored in `<storage.data_dir>/omp-telegram.db`, including accepted Telegram input content, outgoing replies, and message metadata. Attachments are stored as files under the same data directory. Treat the database, attachment caches, and their backups as sensitive. `storage.data_dir` defaults to the real executable directory; relative storage paths use that directory rather than the launch directory.
 
-`storage.database_retention_days` controls retention of terminal bridge messages and eligible attachment caches. Default: `90` days. Set it to `0` to disable automatic retention cleanup. Workspace files, OMP session data, and saved conversation bindings are not removed. Retention does not delete delivered Telegram replies.
+`storage.database_retention_days` controls retention of terminal bridge messages, eligible attachment caches and expired Follow-up request metadata. Default: `90` days. Set it to `0` to disable automatic retention cleanup. Follow-up age uses its expiration time; unread expired prompts are eligible too, while correlations with pending/submitted inbox work are retained until settled. Workspace files, OMP session data, and saved conversation bindings are not removed. Retention does not delete delivered Telegram replies.
 
 Before upgrading, stop the service and back up the data directory, workspaces, and OMP's own session storage. The bridge database alone is not a complete backup of OMP conversations.
 
@@ -496,6 +526,8 @@ Authorize trusted users only. The service runs with the filesystem permissions a
 Logs support `text` and `json`, selected by `logging.format`. `logging.level` sets the global threshold; `[logging.component_levels]` overrides it for `daemon`, `bridge`, `rpc`, `telegram`, `store`, or `media`. See the complete [configuration example](#configuration).
 
 Logs are written to stderr; use your process manager for storage and rotation. Prompts, model replies, credentials, tool payloads, and workspace/session paths are not logged. Chat and thread IDs may still identify conversations, so restrict log access.
+
+`rpc_queue_overflow` is an ERROR visible at the default info level. `reason=event_slots|byte_budget` and `stage=event_enqueue|physical_read|chunk_reassembly` identify the exhausted resource and detection point. Compare `queued_events/queue_capacity`, `rejected_used_bytes/rejected_bytes/buffer_limit_bytes`, and `forward_wait_ms`; `buffered_bytes` is sampled after rejected-frame cleanup, not the occupancy at rejection. Correlate `client_id` with `consumer_phase/consumer_phase_ms` and nearby `rpc_consumer_slow` WARN records. The latter report actor operations taking at least one second, with a fixed `point`, duration and task identity. Normal fast operations do not produce these warnings; RPC frames and tool content are never included. These snapshots help locate pressure or blocking but do not by themselves prove its root cause.
 
 ## Roadmap
 

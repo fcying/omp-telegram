@@ -89,6 +89,9 @@ func (w *worker) routeResearchInput(in incoming, text string, client *omp.Client
 	}
 	// Convert pending discovery in place; the control fences dispatch until lookup finishes.
 	if pendingIndex >= 0 {
+		if !autoresearchClear(args) && !w.consumeFinalAction() {
+			return false
+		}
 		q := &w.queue[pendingIndex]
 		q.kind, q.nativeName, q.text = queuedNativeCommand, "autoresearch", text
 		q.nativeSession = client.CommandCatalog().SessionID
@@ -205,6 +208,7 @@ func (w *worker) flushResearchRound(e rpcEvent) {
 }
 
 func (w *worker) commitResearchRound() bool {
+	defer w.beginConsumerPhase("store", "commit_research_round").end()
 	metadata := w.replyStatus.header
 	if !w.replyStatus.prepared {
 		metadata = w.intermediateAssistantHeader()

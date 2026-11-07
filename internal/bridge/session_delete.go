@@ -179,6 +179,7 @@ func (w *worker) beginBindingSessionDelete(c confirmation, binding store.Binding
 }
 
 func (w *worker) sessionDeleteFinished(result sessionDeleteResult) {
+	defer w.beginConsumerPhase("result", "session_delete_finished").end()
 	if result.request != w.deleteRequest || w.deleteCancel == nil {
 		return
 	}

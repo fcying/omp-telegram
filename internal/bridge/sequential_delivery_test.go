@@ -90,7 +90,7 @@ func deliverReplies(t *testing.T, w *worker) {
 	}()
 	waitFor(t, func() bool {
 		var pending int
-		err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending') OR header_pending=1").Scan(&pending)
+		err := w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending') OR header_pending=1 OR (state='done' AND message_id>0 AND actions_pending<>0)").Scan(&pending)
 		if err != nil || pending != 0 {
 			return false
 		}

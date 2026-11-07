@@ -136,6 +136,7 @@ func (w *worker) refreshProgressNative(now time.Time) {
 
 // The actor can immediately flush a completed current-scope read, including failure.
 func (w *worker) progressNativeFinished(result progressNativeResult) bool {
+	defer w.beginConsumerPhase("result", "progress_native_finished").end()
 	request := result.request
 	if request == nil || w.progressNative.pending != request {
 		return false

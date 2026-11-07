@@ -85,6 +85,7 @@ func savedSessionAvailable(session, workspace string) bool {
 }
 
 func (w *worker) restoreBinding() {
+	defer w.beginConsumerPhase("runtime", "restore_binding").end()
 	if w.migrationLocked() {
 		w.restoring = false
 		return

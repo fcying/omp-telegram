@@ -38,6 +38,7 @@ type Config struct {
 	ProgressMode          string
 	ProgressRecentTools   int
 	StatusBar             StatusBar
+	FinalActions          []FinalAction
 	UnknownFields         []UnknownField
 	IdleTimeout           time.Duration
 	LogLevel              string
@@ -73,6 +74,7 @@ type telegramFileConfig struct {
 	ProgressMode        string              `toml:"progress_mode"`
 	ProgressRecentTools any                 `toml:"progress_recent_tools"`
 	StatusBar           statusBarFileConfig `toml:"status_bar"`
+	FinalActions        []FinalAction       `toml:"final_actions"`
 }
 
 type ompFileConfig struct {
@@ -193,6 +195,10 @@ func load(path, baseDir string) (Config, error) {
 	if err = c.StatusBar.validate(); err != nil {
 		return c, err
 	}
+	if err = validateFinalActions(raw.Telegram.FinalActions); err != nil {
+		return c, err
+	}
+	c.FinalActions = raw.Telegram.FinalActions
 	for _, field := range []struct {
 		name  string
 		value *string

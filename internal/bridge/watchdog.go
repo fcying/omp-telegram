@@ -144,6 +144,7 @@ func (w *worker) probeStuckTask(now time.Time) {
 }
 
 func (w *worker) idleProbeFinished(result idleProbeResult, now time.Time) {
+	defer w.beginConsumerPhase("result", "idle_probe_finished").end()
 	if result.client != w.client || result.generation != w.binding.Generation || result.turn != w.turn || result.active != w.active || result.revision != w.idleProbe.revision {
 		if w.log.Enabled(context.Background(), slog.LevelDebug) {
 			attrs := []slog.Attr{

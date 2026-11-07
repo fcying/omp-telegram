@@ -32,39 +32,41 @@ import (
 )
 
 type Bridge struct {
-	cfg               config.Config
-	version           string
-	db                *store.Store
-	tg                *telegram.Client
-	bot               telegram.User
-	log               *slog.Logger
-	telegramLog       *slog.Logger
-	storeLog          *slog.Logger
-	mediaLog          *slog.Logger
-	rpcLog            *slog.Logger
-	slots             chan struct{}
-	argsMu            sync.Mutex
-	argsPresets       [][]string
-	argsFingerprint   string
-	argsIndex         int
-	wg                sync.WaitGroup
-	fatal             chan error
-	mediaSlots        chan struct{}
-	resumeSlots       chan struct{}
-	sessionMu         sync.Mutex
-	sessionClaims     map[string]sessionClaim
-	exportClaims      map[*worker]string
-	deleteClaims      map[*worker]string
-	bindingsEpoch     atomic.Uint64
-	incomingMu        sync.Mutex
-	incomingInUse     map[string]struct{}
-	ctx               context.Context
-	workerExits       chan workerExit
-	forgetRequests    chan bindingForgetRequest
-	commandMenus      commandMenuState
-	languageMu        sync.Mutex
-	interfaceLanguage atomic.Uint32
-	providerUsage     providerUsageCache
+	cfg                  config.Config
+	version              string
+	db                   *store.Store
+	tg                   *telegram.Client
+	bot                  telegram.User
+	log                  *slog.Logger
+	telegramLog          *slog.Logger
+	storeLog             *slog.Logger
+	mediaLog             *slog.Logger
+	rpcLog               *slog.Logger
+	slots                chan struct{}
+	argsMu               sync.Mutex
+	argsPresets          [][]string
+	argsFingerprint      string
+	argsIndex            int
+	wg                   sync.WaitGroup
+	fatal                chan error
+	mediaSlots           chan struct{}
+	resumeSlots          chan struct{}
+	sessionMu            sync.Mutex
+	sessionClaims        map[string]sessionClaim
+	exportClaims         map[*worker]string
+	deleteClaims         map[*worker]string
+	bindingsEpoch        atomic.Uint64
+	incomingMu           sync.Mutex
+	incomingInUse        map[string]struct{}
+	ctx                  context.Context
+	workerExits          chan workerExit
+	forgetRequests       chan bindingForgetRequest
+	commandMenus         commandMenuState
+	languageMu           sync.Mutex
+	interfaceLanguage    atomic.Uint32
+	providerUsage        providerUsageCache
+	quickActionsOnce     sync.Once
+	quickActionsInstance string
 }
 type incoming struct {
 	id       int64
@@ -121,7 +123,9 @@ type queued struct {
 	nativeName    string
 	nativeSession string
 	bridgeReview  bool // Explicit /review, not raw followup or attachment text.
+	strictCommand bool // Configured shortcuts must never fall back to model input.
 	reply         *telegram.Message
+	finalAction   *finalActionDispatch
 	images        []media.Image
 	albumKey      albumKey
 	album         bool
@@ -152,6 +156,7 @@ type albumEvent struct {
 }
 
 type confirmation struct {
+	finalAction                     *finalActionDispatch
 	action, uiID, method            string
 	uiTitle                         string
 	uiSelected                      string
@@ -320,6 +325,8 @@ type worker struct {
 	lastAssistant       *terminalAssistant
 	previewResult       chan previewResult
 	confirms            map[string]confirmation
+	finalAction         *finalActionDispatch
+	resumeFinalAction   *finalActionDispatch
 	uiSelection         nativeSelectionReceipt
 	keyboardCleanup     chan int64
 	stopCallbackReplies chan stopCallbackReply
@@ -413,16 +420,17 @@ type progressToolResult struct {
 }
 
 type operationResult struct {
-	generation int64
-	active     int64
-	turn       uint64
-	clientID   uint64
-	kind       string
-	data       json.RawMessage
-	message    string
-	meta       any
-	cancelled  bool
-	err        error
+	finalAction *finalActionDispatch
+	generation  int64
+	active      int64
+	turn        uint64
+	clientID    uint64
+	kind        string
+	data        json.RawMessage
+	message     string
+	meta        any
+	cancelled   bool
+	err         error
 }
 
 func uncertainOperationOutcome(err error, cancelled bool) bool {
@@ -433,14 +441,15 @@ func uncertainOperationOutcome(err error, cancelled bool) bool {
 }
 
 type rpcOperation struct {
-	generation int64
-	active     int64
-	turn       uint64
-	clientID   uint64
-	kind       string
-	call       func(context.Context) (json.RawMessage, error)
-	message    string
-	meta       any
+	finalAction *finalActionDispatch
+	generation  int64
+	active      int64
+	turn        uint64
+	clientID    uint64
+	kind        string
+	call        func(context.Context) (json.RawMessage, error)
+	message     string
+	meta        any
 }
 type topicRenameResult struct {
 	generation        int64
@@ -847,8 +856,8 @@ func (b *Bridge) cleanupDatabase(ctx context.Context) {
 			b.storeLog.Warn("incoming attachment cleanup failed", "event", "cleanup_failed", "error_kind", "filesystem")
 		}
 	}
-	if result.Inbox != 0 || result.Outbox != 0 || incomingCount != 0 {
-		b.storeLog.Info("database cleanup completed", "event", "cleanup_completed", "inbox_count", result.Inbox, "outbox_count", result.Outbox, "incoming_count", incomingCount)
+	if result.Inbox != 0 || result.Outbox != 0 || result.Followups != 0 || incomingCount != 0 {
+		b.storeLog.Info("database cleanup completed", "event", "cleanup_completed", "inbox_count", result.Inbox, "outbox_count", result.Outbox, "followup_count", result.Followups, "incoming_count", incomingCount)
 	}
 }
 
@@ -974,6 +983,9 @@ func (b *Bridge) deliver(ctx context.Context) error {
 		if err := b.deliverAssistantHeader(ctx); err != nil {
 			return err
 		}
+		if err := b.deliverFinalActions(ctx); err != nil {
+			return err
+		}
 		o, err := b.db.ClaimNextOutput(ctx, time.Now().Unix())
 		if errors.Is(err, sql.ErrNoRows) {
 			timer := time.NewTimer(200 * time.Millisecond)
@@ -998,7 +1010,7 @@ func (b *Bridge) deliver(ctx context.Context) error {
 		var message telegram.Message
 		switch o.Kind {
 		case "text":
-			message, err = b.tg.Send(ctx, o.Chat, o.Thread, assistantOutputText(o), telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
+			message, err = b.tg.Send(ctx, o.Chat, o.Thread, assistantOutputText(o), telegram.SendOptions{ReplyToMessageID: o.ReplyTo, Keyboard: finalActionKeyboard(o.FinalActions)})
 		case "photo", "document":
 			_, err = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text, telegram.SendOptions{ReplyToMessageID: o.ReplyTo})
 		default:
@@ -1062,8 +1074,8 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			}
 		}
 		if !retryExhausted {
-			if state == store.OutboxDone && o.HeaderEditable {
-				err = b.db.MarkOutputDelivered(o.ID, message.MessageID, o.Header)
+			if state == store.OutboxDone && (o.HeaderEditable || o.AssistantBody || o.FinalActions != "") {
+				err = b.db.MarkOutputDelivered(o.ID, message.MessageID, o.Header, o.FinalActions)
 			} else {
 				err = b.db.MarkOutput(o.ID, state)
 			}
@@ -1158,7 +1170,53 @@ func (b *Bridge) fail(err error) {
 	default:
 	}
 }
+
+// consumerSpan belongs to the actor, including its original client and identity.
+// In particular, ending a span must never restore state onto a replacement client.
+type consumerSpan struct {
+	client     *omp.Client
+	previous   omp.ConsumerPhaseState
+	log        *slog.Logger
+	started    time.Time
+	phase      string
+	point      string
+	clientID   uint64
+	generation int64
+	turn       uint64
+	inboxID    int64
+}
+
+func (w *worker) beginConsumerPhase(phase, point string) consumerSpan {
+	switch phase {
+	case "idle", "input", "callback", "rpc_event", "operation", "dispatch", "tick", "result", "runtime", "store", "telegram":
+	default:
+		phase = "other"
+	}
+	s := consumerSpan{
+		client: w.client, log: w.log, started: time.Now(), phase: phase, point: point,
+		generation: w.binding.Generation, turn: w.turn, inboxID: w.active,
+	}
+	if s.client != nil {
+		s.clientID = s.client.ID()
+		s.previous = s.client.BeginConsumerPhase(phase)
+	}
+	return s
+}
+
+func (s consumerSpan) end() {
+	duration := time.Since(s.started)
+	if s.client != nil {
+		s.client.EndConsumerPhase(s.previous)
+	}
+	if duration >= time.Second && s.log != nil {
+		s.log.Warn("rpc consumer operation slow", "event", "rpc_consumer_slow",
+			"phase", s.phase, "point", s.point, "duration_ms", duration.Milliseconds(),
+			"client_id", s.clientID, "generation", s.generation, "turn", s.turn, "inbox_id", s.inboxID)
+	}
+}
+
 func (w *worker) say(s string) {
+	defer w.beginConsumerPhase("store", "say").end()
 	for _, part := range telegram.SplitForTelegram(s, telegram.MaxMessageUTF16) {
 		if e := w.b.db.Enqueue(w.key.chat, w.key.thread, part); e != nil {
 			w.b.storeLog.Error("outbox write failed", "event", "outbox_write_failed")
@@ -1169,6 +1227,9 @@ func (w *worker) say(s string) {
 	}
 }
 func (w *worker) mark(id int64, state store.InboxState) bool {
+	span := w.beginConsumerPhase("store", "mark")
+	span.inboxID = id
+	defer span.end()
 	if id == 0 {
 		return true
 	}
@@ -1390,6 +1451,7 @@ func (w *worker) beginRuntimeStart() {
 }
 
 func (w *worker) runtimeStarted(client *omp.Client, args []string) {
+	defer w.beginConsumerPhase("runtime", "runtime_started").end()
 	w.b.registerCommandMenuWorker(w)
 	w.client = client
 	w.launchArgs = args
@@ -1404,6 +1466,7 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 }
 
 func (w *worker) runtimeStopped() {
+	defer w.beginConsumerPhase("runtime", "runtime_stopped").end()
 	w.uiSelection = nativeSelectionReceipt{}
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
@@ -1435,6 +1498,7 @@ func (w *worker) endRuntimeResume() {
 }
 
 func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
+	defer w.beginConsumerPhase("runtime", "release_runtime").end()
 	w.interruptModelMenu()
 	w.invalidateResearchAdmission()
 	w.cancelResearchControl()
@@ -1442,6 +1506,12 @@ func (w *worker) releaseRuntimeWithReason(releaseSlot bool, reason string) {
 	w.resetIdleProbe()
 	w.clearAwaitingContinuation()
 	// Drop old-client calls, but keep the active lane fenced until its result returns.
+	for _, request := range w.rpcOperations {
+		if request.finalAction != nil && w.controlOp == controlModel && (request.kind == "model_state" || request.kind == "model_roles") {
+			w.endControlOperation()
+		}
+		w.releaseFinalAction(request.finalAction)
+	}
 	w.rpcOperations = nil
 	sessionID := w.sessionID
 	generation := w.binding.Generation
@@ -1505,6 +1575,11 @@ func (w *worker) closeFailedStart() {
 }
 
 func (w *worker) ensureRuntime() (*omp.Client, error) {
+	defer w.beginConsumerPhase("runtime", "ensure_runtime").end()
+	// Restoring a runtime only prepares command qualification; it is not acceptance.
+	action := w.finalAction
+	w.finalAction = nil
+	defer func() { w.finalAction = action }()
 	if w.migrationLocked() {
 		return nil, newMessageError(i18n.Msg.SessionMigrationUnresolvedUseMigrateRecoverRecoverExplicitly)
 	}
@@ -1534,6 +1609,9 @@ func (w *worker) ensureRuntime() (*omp.Client, error) {
 }
 
 func (w *worker) submit(q queued) bool {
+	span := w.beginConsumerPhase("store", "submit")
+	span.inboxID = q.id
+	defer span.end()
 	if q.id == 0 {
 		return true
 	}
@@ -1597,6 +1675,7 @@ func (w *worker) run() {
 	tick := time.NewTicker(1500 * time.Millisecond)
 	defer tick.Stop()
 	onTick := func() bool {
+		defer w.beginConsumerPhase("tick", "on_tick").end()
 		now := time.Now()
 		w.expireStartIntent(now)
 		w.typing()
@@ -2018,6 +2097,7 @@ func (w *worker) operationFinished(result operationResult) {
 // teardownWorker releases runtime/session resources and settles unconfirmed work.
 // Callers reusing the worker must clear its task fields separately.
 func (w *worker) teardownWorker(releaseSlot bool) {
+	defer w.beginConsumerPhase("runtime", "teardown_worker").end()
 	if w.migrationRun != nil {
 		w.cancelMigration("shutdown", false)
 	}
@@ -2093,6 +2173,10 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 }
 
 func (w *worker) closeLogicalSession() bool {
+	if !w.consumeFinalAction() {
+		return false
+	}
+	w.cancelFollowupInputs()
 	w.cancelArgsApply(true)
 	if w.migrationLocked() {
 		w.cancelMigration("closed", false)
@@ -2126,6 +2210,7 @@ func (w *worker) closeLogicalSession() bool {
 }
 
 func (w *worker) failed() {
+	defer w.beginConsumerPhase("runtime", "failed").end()
 	if w.migrationLocked() {
 		w.cancelMigration("runtime_exit", true)
 		return
@@ -2192,6 +2277,7 @@ func (w *worker) cancelQueuedTask(id int64) bool {
 		w.b.discardIncoming(q.directory, w.mediaTaskLogger(q.id))
 		w.queue = append(w.queue[:i], w.queue[i+1:]...)
 		if w.mark(q.id, "cancelled") {
+			w.releaseFinalAction(q.finalAction)
 			w.logQueuedTaskComplete(q.id, "cancelled")
 		}
 		return true
@@ -2206,6 +2292,10 @@ func (w *worker) clearQueue() {
 }
 
 func (w *worker) stop() {
+	if !w.consumeFinalAction() {
+		return
+	}
+	w.cancelFollowupInputs()
 	w.cancelArgsApply(true)
 	if w.migrationLocked() {
 		w.cancelMigration("cancelled", true)
@@ -2241,6 +2331,7 @@ func (w *worker) stop() {
 }
 
 func (w *worker) stopActiveTask() {
+	w.cancelFollowupInputs()
 	w.cancelArgsApply(true)
 	if w.nativeControl != nil {
 		w.stopNativeControl(w.tr(i18n.Msg.AbortRequestedCurrentTaskQueuedPromptsWillContinue))
@@ -2306,18 +2397,38 @@ func (w *worker) completeAbort(retire bool, notice string) {
 }
 
 func (w *worker) startOperation(kind string, client *omp.Client, call func(context.Context) (json.RawMessage, error), active int64, message string, metadata ...any) {
+	readOnly := kind == "model_state" || kind == "model_roles" || kind == "args_state"
+	var operationMeta any
+	if len(metadata) != 0 {
+		operationMeta = metadata[0]
+	}
+	if c, ok := operationMeta.(*nativeControlRequest); ok && c.phase == "catalog" {
+		readOnly = true
+	}
+	if c, ok := operationMeta.(*researchControl); ok && c.phase != "prompt" {
+		readOnly = true
+	}
+	if readOnly {
+		w.holdFinalAction()
+	} else if !w.consumeFinalAction() {
+		if strings.HasPrefix(kind, "model_set_") {
+			w.endControlOperation()
+		}
+		return
+	}
 	w.statusReleaseClientID = 0
 	if kind == "steer" {
 		w.invalidateResearchSettlement()
 	}
 	request := rpcOperation{
-		generation: w.binding.Generation,
-		active:     active,
-		turn:       w.turn,
-		clientID:   client.ID(),
-		kind:       kind,
-		call:       call,
-		message:    message,
+		generation:  w.binding.Generation,
+		active:      active,
+		turn:        w.turn,
+		clientID:    client.ID(),
+		kind:        kind,
+		call:        call,
+		message:     message,
+		finalAction: w.finalAction,
 	}
 	if len(metadata) > 0 {
 		request.meta = metadata[0]
@@ -2360,15 +2471,16 @@ func (w *worker) dispatchRPCOperation() {
 		}
 		data, err := request.call(ctx)
 		result := operationResult{
-			generation: request.generation,
-			active:     request.active,
-			turn:       request.turn,
-			clientID:   request.clientID,
-			kind:       request.kind,
-			data:       data,
-			message:    request.message,
-			meta:       request.meta,
-			err:        err,
+			generation:  request.generation,
+			active:      request.active,
+			turn:        request.turn,
+			clientID:    request.clientID,
+			kind:        request.kind,
+			data:        data,
+			message:     request.message,
+			meta:        request.meta,
+			finalAction: request.finalAction,
+			err:         err,
 		}
 		select {
 		case w.operations <- result:
@@ -2378,6 +2490,11 @@ func (w *worker) dispatchRPCOperation() {
 }
 
 func (w *worker) operationReturned(result operationResult) {
+	defer w.beginConsumerPhase("operation", "operation_returned").end()
+	defer w.withFinalAction(result.finalAction)()
+	if w.followupPromptFinished(result) {
+		return
+	}
 	if result.kind == "reply_status" {
 		w.replyStatusFinished(result)
 		return
@@ -2409,6 +2526,9 @@ func (w *worker) beginControl(kind string, call func(*omp.Client, context.Contex
 	client, err := w.ensureRuntime()
 	if err != nil {
 		w.say(w.errorText(err))
+		return false
+	}
+	if !w.consumeFinalAction() {
 		return false
 	}
 	switch kind {
@@ -2536,6 +2656,7 @@ func (w *worker) renameNewTopic(workspace string) {
 }
 
 func (w *worker) topicRenameFinished(result topicRenameResult) {
+	defer w.beginConsumerPhase("result", "topic_rename_finished").end()
 	if w.ctx.Err() != nil || result.generation != w.binding.Generation {
 		return
 	}
@@ -2549,6 +2670,7 @@ func (w *worker) topicRenameFinished(result topicRenameResult) {
 }
 
 func (w *worker) startInternal(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64) string {
+	defer w.beginConsumerPhase("runtime", "start_internal").end()
 	return w.startInternalWithArgs(resume, target, expectedCWD, replace, expectedGeneration, fenced, expectedEpoch, nil)
 }
 
@@ -2656,6 +2778,13 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			}
 			return w.tr(i18n.Msg.SessionDeletedTryAgainAfterOperationFinishes)
 		}
+		if !w.consumeFinalAction() {
+			w.b.sessionMu.Unlock()
+			if reserved {
+				<-w.b.slots
+			}
+			return w.tr(i18n.Msg.ActionUnavailable)
+		}
 		e = w.b.db.PrepareStart(previous, intent)
 		w.b.sessionMu.Unlock()
 		if e != nil {
@@ -2715,6 +2844,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		return w.tr(i18n.Msg.FailedStartOmpStartupOutcomeUncertainUseCloseBefore)
 	}
 	w.runtimeStarted(c, launchArgs)
+	defer w.beginConsumerPhase("runtime", "initialize_runtime").end()
 	w.initMedia()
 	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Second)
 	info, e := c.SessionInfo(ctx)
@@ -2832,6 +2962,13 @@ func (w *worker) announceDefaultModelFallback(client *omp.Client) {
 	w.say(w.tr(i18n.Msg.Session.DefaultModelFallback))
 }
 func (w *worker) handle(in incoming) {
+	phase := "input"
+	if in.callback != nil {
+		phase = "callback"
+	}
+	span := w.beginConsumerPhase(phase, "handle")
+	span.inboxID = in.id
+	defer span.end()
 	if in.callback == nil && in.msg != nil && w.key.thread != 0 && (in.msg.ForumTopicCreated != nil || in.msg.ForumTopicEdited != nil) {
 		name := ""
 		if in.msg.ForumTopicCreated != nil {
@@ -2855,10 +2992,16 @@ func (w *worker) handle(in incoming) {
 	w.flushReplyStatus()
 	w.statusReleaseClientID = 0
 	w.touchLogicalActivity()
+	if in.callback == nil && w.routeFollowupInput(&in) {
+		return
+	}
 	if w.handleMigrationIncoming(in) {
 		return
 	}
 	if in.callback != nil {
+		if w.handleFinalAction(in) {
+			return
+		}
 		if !w.mark(in.id, "submitted") {
 			return
 		}
@@ -2914,13 +3057,18 @@ func (w *worker) handle(in incoming) {
 		w.routePrompt(in, text)
 		return
 	}
+	w.handleSlash(in, text)
+}
+
+// handleSlash is shared by authorized messages and claimed command shortcuts.
+func (w *worker) handleSlash(in incoming, text string) {
 	cmd, tail, foreign := parseSlashInvocation(text, w.b.bot.Username)
 	if foreign {
 		w.mark(in.id, "ignored")
 		return
 	}
 	if !knownBridgeCommand(cmd) {
-		w.routeSlashInput(in, text)
+		w.routeSlashInput(in, text, false)
 		return
 	}
 	arg := slashCommandArguments(tail)
@@ -2955,6 +3103,9 @@ func (w *worker) handle(in incoming) {
 	defer w.mark(in.id, "done")
 	switch cmd {
 	case "/help", "/start":
+		if !w.consumeFinalAction() {
+			return
+		}
 		w.say(w.commandHelp())
 	case "/lang":
 		w.handleLanguageCommand(arg)
@@ -2993,6 +3144,9 @@ func (w *worker) handle(in incoming) {
 			w.say(w.tr(i18n.Msg.UsageBindingsOld))
 			return
 		}
+		if !w.consumeFinalAction() {
+			return
+		}
 		w.showBindings(in.msg.From.ID, arg == "old", 0)
 	case "/close":
 		if !w.closeLogicalSession() {
@@ -3004,6 +3158,9 @@ func (w *worker) handle(in incoming) {
 	case "/queue":
 		if arg != "" {
 			w.say(w.tr(i18n.Msg.UsageQueue))
+			return
+		}
+		if !w.consumeFinalAction() {
 			return
 		}
 		w.showQueue(in.msg.From.ID)
@@ -3061,6 +3218,9 @@ func (w *worker) handle(in incoming) {
 			w.say(w.errorText(err))
 			return
 		}
+		if !w.consumeFinalAction() {
+			return
+		}
 		w.beginSessionOperation(sessionOperationCompact)
 		w.touchActivity()
 		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
@@ -3092,6 +3252,9 @@ func (w *worker) handoff(instructions string) {
 	client, err := w.ensureRuntime()
 	if err != nil {
 		w.say(w.errorText(err))
+		return
+	}
+	if !w.consumeFinalAction() {
 		return
 	}
 	var fields map[string]any
@@ -3136,6 +3299,9 @@ func (w *worker) status() {
 	queryResearch := w.researchAvailable(client)
 	if queryResearch || temporary {
 		mode = &statusModeResult{temporary: temporary}
+	}
+	if !w.consumeFinalAction() {
+		return
 	}
 	w.beginControlOperation(controlStatus)
 	w.startOperation("status", client, func(ctx context.Context) (json.RawMessage, error) {
@@ -3184,6 +3350,7 @@ func promptInlineCount(message string, images []media.Image, limit int) (int, bo
 }
 
 func (w *worker) dispatch() {
+	defer w.beginConsumerPhase("dispatch", "dispatch").end()
 	if !w.canDispatch() {
 		return
 	}
@@ -3277,6 +3444,9 @@ func (w *worker) enqueuePreparedPrompt(in incoming, prompt, displayText string) 
 		if w.mark(in.id, "cancelled") {
 			w.log.Warn("task queue rejected", "event", "queue_rejected", "inbox_id", in.id, "reason", "worker_queue_full")
 		}
+		return
+	}
+	if !w.consumeFinalAction() {
 		return
 	}
 	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: prompt, displayText: displayText})
@@ -3474,6 +3644,7 @@ func (w *worker) resetAssistantResult() {
 }
 
 func (w *worker) finish() {
+	defer w.beginConsumerPhase("result", "finish").end()
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.clearAwaitingContinuation()
@@ -3502,7 +3673,7 @@ func (w *worker) finish() {
 		} else if target == 0 {
 			header = ""
 		}
-		target, err := w.b.db.CompleteInboxWithAssistantHeader(w.ctx, taskID, w.key.chat, w.key.thread, target, header, parts)
+		target, err := w.completeAssistantResult(taskID, target, header, parts, truncated, hasBody)
 		if err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
@@ -3536,6 +3707,7 @@ func (w *worker) finishCancelled(notice string) bool {
 }
 
 func (w *worker) finishIncomplete(state, notice string) bool {
+	defer w.beginConsumerPhase("store", "finish_incomplete").end()
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.clearAwaitingContinuation()
@@ -3802,6 +3974,7 @@ func (w *worker) drainPreviewResults() {
 	}
 }
 func (w *worker) event(raw []byte) {
+	defer w.beginConsumerPhase("rpc_event", "event").end()
 	w.cancelArgsApply(true)
 	w.touchActivity()
 	var e rpcEvent
@@ -4319,7 +4492,7 @@ func (w *worker) newProgressStopToken() string {
 
 func (w *worker) progressKeyboard(token string) *telegram.Keyboard {
 	if token != "" && token != w.previewStopToken {
-		return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: w.tr(i18n.Msg.Stop), CallbackData: token + ":0"}}}}
+		return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: w.tr(i18n.Msg.Stop), CallbackData: token + ":0"}, {Text: w.tr(i18n.Msg.FollowupButton), CallbackData: token + ":followup"}}}}
 	}
 	if token == "" {
 		token = w.previewStopToken
@@ -4328,7 +4501,7 @@ func (w *worker) progressKeyboard(token string) *telegram.Keyboard {
 	if !ok || c.action != "stop" || c.generation != w.binding.Generation || c.turn != w.turn || c.active != w.active {
 		return nil
 	}
-	return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: w.tr(i18n.Msg.Stop), CallbackData: token + ":0"}}}}
+	return &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{{{Text: w.tr(i18n.Msg.Stop), CallbackData: token + ":0"}, {Text: w.tr(i18n.Msg.FollowupButton), CallbackData: token + ":followup"}}}}
 }
 
 func progressStopTokenOwner(token string) (int64, bool) {
@@ -4369,7 +4542,11 @@ func (w *worker) recordProgressMessage(result previewResult) {
 }
 
 func (w *worker) previewFinished(result previewResult) {
+	defer w.beginConsumerPhase("result", "preview_finished").end()
+	span := w.beginConsumerPhase("store", "record_progress_message")
+	span.inboxID = result.taskID
 	w.recordProgressMessage(result)
+	span.end()
 	if result.epoch != w.previewEpoch || result.generation != w.binding.Generation || result.turn != w.turn {
 		if result.stopToken != "" {
 			c, exists := w.confirms[result.stopToken]
@@ -4455,7 +4632,9 @@ func (w *worker) flushPreview() {
 		return
 	}
 	if w.previewID == 0 {
+		span := w.beginConsumerPhase("store", "has_pending_outputs")
 		pending, err := w.b.db.HasPendingOutputs(w.key.chat, w.key.thread)
+		span.end()
 		if err != nil {
 			w.b.fail(err)
 			w.cancel()
@@ -4513,6 +4692,10 @@ func (w *worker) flushPreview() {
 }
 
 func (w *worker) confirm(c confirmation, title string, options []string) {
+	defer w.beginConsumerPhase("telegram", "confirm").end()
+	if c.finalAction == nil {
+		c.finalAction = w.finalAction
+	}
 	parts := split(title, 3800)
 	if len(parts) == 0 {
 		title = w.tr(i18n.Msg.ConfirmationRequired)
@@ -4572,6 +4755,10 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	}
 	c.messageID = message.MessageID
 	w.confirms[token] = c
+	if c.action != "new" && c.action != "autoresearch_clear" && !w.consumeFinalAction() {
+		return
+	}
+	w.holdFinalAction()
 }
 func (w *worker) queueCallback(ctx context.Context, q *telegram.CallbackQuery, token, action string, c confirmation) callbackResult {
 	if (!c.expires.IsZero() && time.Now().After(c.expires)) || c.generation != w.conversationGeneration() || q.Message == nil || q.Message.MessageID != c.messageID {
@@ -4622,10 +4809,14 @@ func (w *worker) queueCallback(ctx context.Context, q *telegram.CallbackQuery, t
 }
 
 func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
+	defer w.beginConsumerPhase("callback", "callback").end()
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 	token, index, ok := strings.Cut(q.Data, ":")
 	c, exists := w.confirms[token]
+	if exists && c.user == q.From.ID {
+		defer w.withFinalAction(c.finalAction)()
+	}
 	if !ok || !exists {
 		if owner, isStop := progressStopTokenOwner(token); isStop {
 			var messageID int64
@@ -4645,6 +4836,19 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		}
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
+	}
+	if action := c.finalAction; action != nil && !action.finished {
+		if err := w.b.db.CheckFinalActionReservation(ctx, action.inboxID); err != nil {
+			action.finished = true
+			delete(w.confirms, token)
+			w.queueKeyboardCleanup(c.messageID)
+			if !errors.Is(err, sql.ErrNoRows) {
+				w.b.fail(err)
+				w.cancel()
+			}
+			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionUnavailable))
+			return callbackDone
+		}
 	}
 	if c.uiSelectMenu && (q.Message == nil || q.Message.MessageID != c.messageID) {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
@@ -4708,6 +4912,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 			delete(w.confirms, token)
 			w.clearKeyboard(c.messageID)
 		}
+		return callbackDone
+	}
+	if w.handleProgressFollowup(ctx, q, token, index, c) {
 		return callbackDone
 	}
 	n, err := strconv.Atoi(index)
@@ -4866,6 +5073,7 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 }
 
 func (w *worker) finishMenu(messageID int64, text string) bool {
+	defer w.beginConsumerPhase("telegram", "finish_menu").end()
 	if messageID == 0 {
 		return false
 	}
@@ -4923,6 +5131,12 @@ func (w *worker) queueStopCallbackReply(id string, message i18n.Message, message
 }
 
 func (w *worker) clearKeyboard(messageID int64) {
+	defer w.beginConsumerPhase("telegram", "clear_keyboard").end()
+	w.clearKeyboardRequest(messageID)
+}
+
+// clearKeyboardRequest also runs in background cleanup; it must not touch actor diagnostics.
+func (w *worker) clearKeyboardRequest(messageID int64) {
 	if messageID == 0 {
 		return
 	}
@@ -4945,7 +5159,7 @@ func (w *worker) queueKeyboardCleanup(messageID int64) {
 				case <-w.ctx.Done():
 					return
 				case id := <-w.keyboardCleanup:
-					w.clearKeyboard(id)
+					w.clearKeyboardRequest(id)
 				}
 			}
 		}()
@@ -4958,6 +5172,7 @@ func (w *worker) queueKeyboardCleanup(messageID int64) {
 }
 
 func (w *worker) expireStartIntent(now time.Time) {
+	defer w.beginConsumerPhase("store", "expire_start_intent").end()
 	if w.startIntent == nil || w.b.cfg.DatabaseRetentionDays == 0 || w.client != nil || w.runtime != runtimeReleased || w.restoring || now.Sub(w.lastIntentRetentionCheck) < databaseJanitorInterval {
 		return
 	}
@@ -4993,6 +5208,7 @@ func (w *worker) cancelStart() bool {
 const uiSelectPageSize = 10
 
 func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) bool {
+	defer w.beginConsumerPhase("telegram", "show_ui_select_page").end()
 	pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize
 	if page < 0 || page >= pages {
 		return false
@@ -5115,6 +5331,7 @@ func (w *worker) cancelUI(c confirmation) {
 // teardown may then cancel a current-generation native UI.
 func (w *worker) dropConfirmation(token string, c confirmation) {
 	delete(w.confirms, token)
+	w.releaseFinalAction(c.finalAction)
 	if w.previewStopToken == token {
 		w.previewStopToken = ""
 	}

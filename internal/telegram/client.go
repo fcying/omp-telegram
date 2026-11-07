@@ -110,9 +110,16 @@ type Keyboard struct {
 	InlineKeyboard [][]Button `json:"inline_keyboard"`
 }
 
+type ForceReply struct {
+	ForceReply            bool   `json:"force_reply"`
+	Selective             bool   `json:"selective,omitempty"`
+	InputFieldPlaceholder string `json:"input_field_placeholder,omitempty"`
+}
+
 type SendOptions struct {
 	ReplyToMessageID int64
 	Keyboard         *Keyboard
+	ForceReply       *ForceReply
 }
 
 type BotCommand struct {
@@ -334,6 +341,8 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 		}
 		if options.Keyboard != nil {
 			fields["reply_markup"] = options.Keyboard
+		} else if options.ForceReply != nil {
+			fields["reply_markup"] = options.ForceReply
 		}
 		var message Message
 		err := c.call(ctx, "sendMessage", fields, &message, false)
@@ -404,6 +413,9 @@ func parseEntitiesError(err error) bool {
 }
 
 func sendWithReplyFallback(logger *slog.Logger, chatID, threadID int64, options SendOptions, send func(SendOptions) (Message, error)) (Message, error) {
+	if options.Keyboard != nil && options.ForceReply != nil {
+		return Message{}, deliveryFailure(errors.New("inline keyboard and ForceReply are mutually exclusive"), false)
+	}
 	message, err := send(options)
 	if err == nil || options.ReplyToMessageID == 0 || !replyRejected(err) {
 		return message, err
@@ -431,6 +443,21 @@ func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string,
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Code == 400 && strings.Contains(strings.ToLower(apiErr.Description), "message is not modified") {
+		return nil
+	}
+	return err
+}
+
+// EditKeyboard changes only reply markup; nil removes the inline keyboard.
+func (c *Client) EditKeyboard(ctx context.Context, chatID, messageID int64, keyboard *Keyboard) error {
+	if keyboard == nil {
+		keyboard = &Keyboard{InlineKeyboard: [][]Button{}}
+	}
+	err := c.call(ctx, "editMessageReplyMarkup", map[string]any{
+		"chat_id": chatID, "message_id": messageID, "reply_markup": keyboard,
+	}, nil, false)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(apiErr.Description), "message is not modified") {
 		return nil
 	}
 	return err

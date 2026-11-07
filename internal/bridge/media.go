@@ -305,6 +305,7 @@ func albumReply(messages []telegram.Message) *telegram.Message {
 }
 
 func (w *worker) sealAlbum(result albumEvent) {
+	defer w.beginConsumerPhase("result", "seal_album").end()
 	album, ok := w.albums[result.key]
 	if !ok || album.version != result.version {
 		return
@@ -628,6 +629,7 @@ func mediaPreparationError(language i18n.Language, err error) string {
 }
 
 func (w *worker) preparedMedia(result mediaResult) {
+	defer w.beginConsumerPhase("result", "prepared_media").end()
 	index := -1
 	// Preparation belongs to the logical session's queue, not its current process.
 	if result.generation == w.binding.Generation {
@@ -787,6 +789,7 @@ func (w *worker) hostSend(event rpcEvent) {
 }
 
 func (w *worker) preparedSend(result sendResult) {
+	defer w.beginConsumerPhase("result", "prepared_send").end()
 	cancel, pending := w.hostRequests[result.id]
 	if !pending || w.client != result.client || result.generation != w.binding.Generation {
 		removeMediaSnapshot(result.file.Path, result.logger)
