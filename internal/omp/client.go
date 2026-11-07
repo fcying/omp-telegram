@@ -33,17 +33,19 @@ var errQueueOverflow = errors.New("omp: RPC byte budget exceeded; execution stat
 // held for an event until a receiver accepts it from the public channel.
 type byteBudget struct{ used atomic.Int64 }
 
-func (b *byteBudget) reserve(n int) bool {
+// reserve returns the exact occupancy observed by a failed reservation. The
+// forwarder may release credits immediately afterwards, so callers must retain it.
+func (b *byteBudget) reserve(n int) (int64, bool) {
 	if b == nil || n == 0 {
-		return true
+		return 0, true
 	}
 	for {
 		used := b.used.Load()
 		if int64(n) > maxRPCBufferedBytes-used {
-			return false
+			return used, false
 		}
 		if b.used.CompareAndSwap(used, used+int64(n)) {
-			return true
+			return used, true
 		}
 	}
 }
@@ -53,6 +55,26 @@ func (b *byteBudget) release(n int) {
 		b.used.Add(-int64(n))
 	}
 }
+
+type byteBudgetFailure struct {
+	used      int64
+	requested int
+}
+
+type queueOverflowDetails struct {
+	reason, stage, eventKind string
+	budget                   byteBudgetFailure
+	queued                   int
+}
+
+// ConsumerPhaseState is an opaque, by-value token for restoring a nested
+// consumer phase, including its original start time, on the same Client.
+type ConsumerPhaseState struct {
+	phase   string
+	started time.Time
+}
+
+var rpcDiagnosticsEpoch = time.Now()
 
 var errProtocol = errors.New("omp: invalid RPC frame")
 
@@ -91,6 +113,9 @@ type Client struct {
 	events                    chan json.RawMessage
 	queuedEvents              chan json.RawMessage
 	bytes                     byteBudget
+	consumerMu                sync.Mutex
+	consumerPhase             ConsumerPhaseState
+	forwardBlockedAt          atomic.Int64 // Monotonic nanoseconds since rpcDiagnosticsEpoch, plus one.
 	ready                     chan struct{}
 	readDone, done, stop      chan struct{}
 	stopOnce                  sync.Once
@@ -117,6 +142,38 @@ type Client struct {
 	commandCatalog            CommandCatalog
 	catalogUpdateRevision     uint64
 	catalogQuery              *commandCatalogQuery
+}
+
+// BeginConsumerPhase records a bounded diagnostic phase without changing event
+// consumption. EndConsumerPhase must receive the token on this same client.
+func (c *Client) BeginConsumerPhase(phase string) ConsumerPhaseState {
+	switch phase {
+	case "idle", "input", "callback", "rpc_event", "operation", "dispatch", "tick", "result", "runtime", "store", "telegram":
+	default:
+		phase = "other"
+	}
+	c.consumerMu.Lock()
+	previous := c.consumerPhase
+	c.consumerPhase = ConsumerPhaseState{phase: phase, started: time.Now()}
+	c.consumerMu.Unlock()
+	return previous
+}
+
+// EndConsumerPhase restores an earlier phase without restarting its elapsed time.
+func (c *Client) EndConsumerPhase(previous ConsumerPhaseState) {
+	c.consumerMu.Lock()
+	c.consumerPhase = previous
+	c.consumerMu.Unlock()
+}
+
+func (c *Client) consumerPhaseSnapshot() (string, int64) {
+	c.consumerMu.Lock()
+	state := c.consumerPhase
+	c.consumerMu.Unlock()
+	if state.phase == "" {
+		return "idle", 0
+	}
+	return state.phase, time.Since(state.started).Milliseconds()
 }
 
 // ValidateArgs protects the transport and session lifecycle owned by the bridge.
@@ -218,6 +275,7 @@ func startOnce(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client
 	outWrite.Close()
 	stderr.Close()
 	c := &Client{id: clientID, log: rpcLogger.With("client_id", clientID), cmd: cmd, stdin: inWrite, stdout: outRead, events: make(chan json.RawMessage), queuedEvents: make(chan json.RawMessage, 128), ready: make(chan struct{}), readDone: make(chan struct{}), done: make(chan struct{}), stop: make(chan struct{}), writeGate: make(chan struct{}, 1), pending: make(map[string]request)}
+	c.consumerPhase = ConsumerPhaseState{phase: "idle", started: time.Now()}
 	c.resumeDiagnostics = diagnostics
 	diagnostics = nil // The supervisor now owns the collector.
 	c.frameLimit.Store(maxFrame)
@@ -641,12 +699,43 @@ func (c *Client) protocolFailure(err error) {
 	c.fail(&classifiedError{kind: "protocol", err: err})
 }
 
-func (c *Client) queueOverflow(err error) {
+func (c *Client) queueOverflow(err error, details queueOverflowDetails) {
 	c.protocolFailed.Store(true)
 	c.queueOverflowLogOnce.Do(func() {
-		c.log.LogAttrs(context.Background(), slog.LevelError, "rpc queue overflow", slog.String("event", "rpc_queue_overflow"))
+		phase, phaseMS := c.consumerPhaseSnapshot()
+		var forwardWaitMS int64
+		if started := c.forwardBlockedAt.Load(); started != 0 {
+			forwardWaitMS = max(0, (time.Since(rpcDiagnosticsEpoch).Nanoseconds()-(started-1))/int64(time.Millisecond))
+		}
+		c.log.LogAttrs(context.Background(), slog.LevelError, "rpc queue overflow",
+			slog.String("event", "rpc_queue_overflow"),
+			slog.String("reason", details.reason),
+			slog.String("stage", details.stage),
+			slog.String("rpc_event", overflowEventKind(details.eventKind)),
+			slog.Int("queued_events", details.queued),
+			slog.Int("queue_capacity", cap(c.queuedEvents)),
+			slog.Int64("buffered_bytes", c.bytes.used.Load()),
+			slog.Int("buffer_limit_bytes", maxRPCBufferedBytes),
+			slog.Int("rejected_bytes", details.budget.requested),
+			slog.Int64("rejected_used_bytes", details.budget.used),
+			slog.Int64("forward_wait_ms", forwardWaitMS),
+			slog.String("consumer_phase", phase),
+			slog.Int64("consumer_phase_ms", phaseMS))
 	})
 	c.fail(&classifiedError{kind: "queue_overflow", err: err})
+}
+
+func overflowEventKind(kind string) string {
+	switch kind {
+	case "ready", "rpc_chunk", "response", "agent_start", "agent_end", "prompt_result",
+		"message_start", "message_update", "message_end", "turn_start", "turn_end",
+		"tool_execution_start", "tool_execution_update", "tool_execution_end", "host_tool_call",
+		"auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end",
+		"session_info_update", "available_commands_update", "command_output":
+		return kind
+	default:
+		return "other"
+	}
 }
 
 func decodeObject(data []byte) (envelope, error) {
@@ -673,7 +762,18 @@ func (c *Client) forwardEvents() {
 			select {
 			case c.events <- frame:
 				c.bytes.release(cap(frame))
+				continue
 			case <-c.stop:
+				return
+			default:
+			}
+			c.forwardBlockedAt.Store(time.Since(rpcDiagnosticsEpoch).Nanoseconds() + 1)
+			select {
+			case c.events <- frame:
+				c.forwardBlockedAt.Store(0)
+				c.bytes.release(cap(frame))
+			case <-c.stop:
+				c.forwardBlockedAt.Store(0)
 				return
 			}
 		}
@@ -688,8 +788,9 @@ func (c *Client) readLoop() {
 	reader := bufio.NewReaderSize(c.stdout, 64<<10)
 	decoder := frameDecoder{physical: maxFrame, logical: maxLogical, budget: &c.bytes}
 	ready := false
+	var readFailure byteBudgetFailure
 	for {
-		data, err := readLineBudget(reader, decoder.physical, &c.bytes)
+		data, err := readLineBudget(reader, decoder.physical, &c.bytes, &readFailure)
 		if err != nil {
 			c.bytes.release(cap(decoder.data))
 			if decoder.id != "" && !errors.Is(err, errQueueOverflow) {
@@ -705,7 +806,7 @@ func (c *Client) readLoop() {
 			default:
 			}
 			if errors.Is(err, errQueueOverflow) {
-				c.queueOverflow(err)
+				c.queueOverflow(err, queueOverflowDetails{reason: "byte_budget", stage: "physical_read", budget: readFailure, queued: len(c.queuedEvents)})
 				return
 			}
 			if errors.Is(err, errProtocol) {
@@ -720,7 +821,7 @@ func (c *Client) readLoop() {
 			c.bytes.release(cap(data))
 			c.bytes.release(cap(decoder.data))
 			if errors.Is(err, errQueueOverflow) {
-				c.queueOverflow(err)
+				c.queueOverflow(err, queueOverflowDetails{reason: "byte_budget", stage: "chunk_reassembly", eventKind: "rpc_chunk", budget: decoder.budgetFailure, queued: len(c.queuedEvents)})
 			} else {
 				c.protocolFailure(errProtocol)
 			}
@@ -846,19 +947,21 @@ func (c *Client) readLoop() {
 			// The receiver, not this buffered send, releases byte credit.
 			c.logLifecycle(env, "event_queued")
 		default:
+			details := queueOverflowDetails{reason: "event_slots", stage: "event_enqueue", eventKind: env.Type,
+				budget: byteBudgetFailure{used: c.bytes.used.Load(), requested: cap(frame)}, queued: len(c.queuedEvents)}
 			c.bytes.release(cap(frame))
 			c.logLifecycle(env, "rejected")
-			c.queueOverflow(errors.New("omp: event queue overflow; execution state uncertain"))
+			c.queueOverflow(errors.New("omp: event queue overflow; execution state uncertain"), details)
 			return
 		}
 	}
 }
 
 func readLine(reader *bufio.Reader, limit int) ([]byte, error) {
-	return readLineBudget(reader, limit, nil)
+	return readLineBudget(reader, limit, nil, nil)
 }
 
-func readLineBudget(reader *bufio.Reader, limit int, budget *byteBudget) ([]byte, error) {
+func readLineBudget(reader *bufio.Reader, limit int, budget *byteBudget, failure *byteBudgetFailure) ([]byte, error) {
 	var data []byte
 	for {
 		part, err := reader.ReadSlice('\n')
@@ -872,7 +975,11 @@ func readLineBudget(reader *bufio.Reader, limit int, budget *byteBudget) ([]byte
 			if capacity > limit {
 				capacity = limit
 			}
-			if !budget.reserve(capacity - cap(data)) {
+			requested := capacity - cap(data)
+			if used, ok := budget.reserve(requested); !ok {
+				if failure != nil {
+					*failure = byteBudgetFailure{used: used, requested: requested}
+				}
 				budget.release(cap(data))
 				return nil, errQueueOverflow
 			}
@@ -901,6 +1008,7 @@ type frameDecoder struct {
 	data                []byte
 	budget              *byteBudget
 	reassembled         bool
+	budgetFailure       byteBudgetFailure
 }
 
 func (d *frameDecoder) push(data []byte) ([]byte, error) {
@@ -933,7 +1041,8 @@ func (d *frameDecoder) push(data []byte) ([]byte, error) {
 		if *chunk.Index != 0 {
 			return nil, errProtocol
 		}
-		if !d.budget.reserve(chunk.Length) {
+		if used, ok := d.budget.reserve(chunk.Length); !ok {
+			d.budgetFailure = byteBudgetFailure{used: used, requested: chunk.Length}
 			return nil, errQueueOverflow
 		}
 		d.id, d.count, d.length, d.next = chunk.ID, chunk.Count, chunk.Length, 0

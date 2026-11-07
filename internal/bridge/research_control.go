@@ -135,10 +135,16 @@ func (w *worker) researchControlMode(c *researchControl, phase string) {
 func (w *worker) disableResearch(inbox int64) {
 	researchActive := w.research.root || w.research.enabled
 	if researchActive || w.research.disablePending {
+		if !w.consumeFinalAction() {
+			return
+		}
 		w.cancelQueuedResearchToggles()
 	}
 	replacedReadOnly := false
 	if c := w.research.control; c != nil {
+		if !w.consumeFinalAction() {
+			return
+		}
 		// Read-only mode lookups have not submitted a native control. Replacing
 		// them must not retire the ordinary owner, even if its task just completed.
 		readOnly := c.intent == "route" || c.intent == "off" && c.text == ""
@@ -151,6 +157,9 @@ func (w *worker) disableResearch(inbox int64) {
 	w.invalidateResearchAdmission()
 	client, connected := w.runtimeClient()
 	if connected && w.taskActive() && !researchActive && w.researchOffProof(client) {
+		if !w.consumeFinalAction() {
+			return
+		}
 		w.mark(inbox, store.InboxDone)
 		w.say(w.tr(i18n.Msg.AutoresearchModeAlreadyDisabledCurrentOrdinaryTaskLeftRunning))
 		return
@@ -165,6 +174,9 @@ func (w *worker) disableResearch(inbox int64) {
 
 func (w *worker) beginResearchDisable(inbox int64) {
 	if w.taskActive() || w.research.root || w.steerFence.active || w.rpcOperationActive {
+		if !w.consumeFinalAction() {
+			return
+		}
 		w.retireResearch(w.tr(i18n.Msg.AutoresearchForciblyInterruptedTaskOutcomeUncertainWillNotReplayed))
 	}
 	w.research.disablePending, w.resumeFailed = true, true
@@ -371,6 +383,10 @@ func (w *worker) researchControlFinished(result operationResult) {
 			w.researchControlFailed(c)
 			return
 		}
+		if !w.consumeFinalAction() {
+			w.endResearchControl(c)
+			return
+		}
 		c.requestID = client.ReserveRequestID()
 		w.research.command, w.research.notices = true, 0
 		id, text := c.requestID, c.text
@@ -425,6 +441,7 @@ func (w *worker) finishResearchRoute(c *researchControl, enabled bool) {
 		for i := range w.queue {
 			if w.queue[i].id == c.inbox {
 				w.queue[i].reply = nil
+				w.holdFinalAction()
 				return
 			}
 		}

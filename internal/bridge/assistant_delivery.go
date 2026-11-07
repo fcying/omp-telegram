@@ -174,6 +174,7 @@ func (w *worker) queueAssistantText(text string, enforceInputBudget bool) bool {
 }
 
 func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bool, header string) bool {
+	defer w.beginConsumerPhase("store", "queue_assistant_text").end()
 	if enforceInputBudget && len(text) > maxAssistantOutputBytes-w.assistantDelivery.bytes {
 		w.assistantBudgetExceeded()
 		return false
@@ -190,7 +191,11 @@ func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bo
 				if header != "" {
 					parts[0] = parts[0][len(header)+2:]
 				}
-				w.assistantDelivery.statusOutboxID, err = w.b.db.AppendAssistantReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts, header)
+				bodyParts := len(parts)
+				if truncated {
+					bodyParts--
+				}
+				w.assistantDelivery.statusOutboxID, err = w.b.db.AppendAssistantBodyReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts, header, bodyParts)
 			} else {
 				err = w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts)
 			}
@@ -300,13 +305,13 @@ func (b *Bridge) deliverAssistantHeader(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	err = b.tg.Edit(ctx, output.Chat, output.MessageID, assistantOutputText(output), nil)
+	err = b.tg.Edit(ctx, output.Chat, output.MessageID, assistantOutputText(output), finalActionKeyboard(output.FinalActions))
 	if ctx.Err() != nil {
-		return nil
+		return b.db.FinishFinalActionEdit(output.ID, output.FinalActions)
 	}
 	if err != nil {
 		logTelegramFailure(b.telegramLog, slog.LevelWarn, "assistant_header_update_failed", "assistant status update failed", err,
 			slog.Int64("outbox_id", output.ID), slog.Int64("chat_id", output.Chat))
 	}
-	return b.db.MarkAssistantHeaderDelivered(output.ID, output.Header)
+	return b.db.MarkAssistantHeaderDelivered(output.ID, output.Header, output.FinalActions)
 }

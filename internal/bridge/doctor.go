@@ -91,6 +91,9 @@ func (w *worker) runDoctor() {
 		w.say(w.tr(i18n.Msg.DiagnosticsUnavailableRunDoctorAgain))
 		return
 	}
+	if !w.consumeFinalAction() {
+		return
+	}
 	fence := doctorFence{binding: binding, runtime: w.runtime}
 	if w.client != nil {
 		fence.clientID = w.client.ID()
@@ -510,6 +513,7 @@ func formatDoctorReport(language i18n.Language, checks []doctorCheck) string {
 }
 
 func (w *worker) doctorFinished(result doctorResult) {
+	defer w.beginConsumerPhase("result", "doctor_finished").end()
 	if result.request != w.doctorRequest {
 		return
 	}

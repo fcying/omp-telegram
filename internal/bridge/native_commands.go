@@ -79,6 +79,7 @@ func (w *worker) clearCommandCatalog() {
 }
 
 func (w *worker) commandCatalogFinished(result commandCatalogResult) {
+	defer w.beginConsumerPhase("result", "command_catalog_finished").end()
 	if result.request != w.nativeCatalog.request || w.client != result.client {
 		return
 	}
@@ -117,6 +118,14 @@ func (w *worker) commandCatalogFinished(result commandCatalogResult) {
 		// Scope invalidation or a reader-published update restores command classification.
 		w.nativeCatalog.pausedClientID = result.client.ID()
 		w.nativeCatalog.pausedEpoch = catalog.Epoch
+		for i := 0; i < len(w.queue); {
+			q := w.queue[i]
+			if q.kind == queuedSlashPending && q.finalAction != nil {
+				w.cancelQueuedTask(q.id)
+				continue
+			}
+			i++
+		}
 		if w.ctx.Err() == nil {
 			w.logRuntimeEvent(slog.LevelWarn, "command_catalog_unavailable", omp.ClassifyError(result.err), "native command discovery unavailable", w.sessionID)
 			w.say(w.tr(i18n.Msg.NativeCommandDiscoveryUnavailableWaitingSlashCommandsNotSubmitted))
@@ -266,7 +275,7 @@ func (w *worker) rejectUnsupportedSlash(catalog omp.CommandCatalog, text string,
 	return true
 }
 
-func (w *worker) routeSlashInput(in incoming, text string) {
+func (w *worker) routeSlashInput(in incoming, text string, strict bool) {
 	if command := unsupportedNativeCommand(text, w.b.bot.Username); command != "" {
 		if w.mark(in.id, store.InboxCancelled) {
 			w.unsupportedNativeCommandNotice(command)
@@ -308,21 +317,25 @@ func (w *worker) routeSlashInput(in incoming, text string) {
 				return
 			}
 			w.enqueueNativeCommand(in, normalized, name, catalog.SessionID)
+		} else if strict {
+			w.mark(in.id, store.InboxCancelled)
+			w.say(w.tr(i18n.Msg.ActionUnavailable))
 		} else {
 			w.routePrompt(in, text)
 		}
 		return
 	}
-	w.enqueueSlashInput(in, text, client)
+	w.enqueueSlashInput(in, text, client, strict)
 }
 
-func (w *worker) enqueueSlashInput(in incoming, text string, client *omp.Client) {
+func (w *worker) enqueueSlashInput(in incoming, text string, client *omp.Client, strict bool) {
 	if w.pendingInputFull() {
 		w.say(w.tr(i18n.Msg.Queue.Full))
 		w.mark(in.id, store.InboxCancelled)
 		return
 	}
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text, displayText: text, reply: in.msg, kind: queuedSlashPending})
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text, displayText: text, reply: in.msg, kind: queuedSlashPending, strictCommand: strict, finalAction: w.finalAction})
+	w.holdFinalAction()
 	w.refreshCommandCatalog(client)
 }
 
@@ -332,7 +345,14 @@ func (w *worker) enqueueNativeCommand(in incoming, text, name, sessionID string)
 		w.mark(in.id, store.InboxCancelled)
 		return
 	}
-	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text, displayText: text, kind: queuedNativeCommand, nativeName: name, nativeSession: sessionID})
+	_, args, _ := parseSlashInvocation(text, w.b.bot.Username)
+	waitForConfirmation := name == "autoresearch" && autoresearchClear(slashCommandArguments(args))
+	if waitForConfirmation {
+		w.holdFinalAction()
+	} else if !w.consumeFinalAction() {
+		return
+	}
+	w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, replyTo: in.msg.MessageID, text: text, displayText: text, kind: queuedNativeCommand, nativeName: name, nativeSession: sessionID, finalAction: w.finalAction})
 }
 
 func (w *worker) resolveSlashInputs() {
@@ -365,7 +385,11 @@ func (w *worker) resolveSlashInputs() {
 				w.say(w.tr(i18n.Msg.AutoresearchNotAvailableCurrentNativeExtensionCatalogNoCommand))
 			} else {
 				_, normalized, _ := advertisedCommand(catalog, q.text, w.b.bot.Username)
-				if w.routeResearchInput(in, normalized, client, i) {
+				converted := func() bool {
+					defer w.withFinalAction(q.finalAction)()
+					return w.routeResearchInput(in, normalized, client, i)
+				}()
+				if converted {
 					i++
 				}
 			}
@@ -381,9 +405,21 @@ func (w *worker) resolveSlashInputs() {
 				}
 				continue
 			}
+			accepted := func() bool {
+				defer w.withFinalAction(q.finalAction)()
+				return w.consumeFinalAction()
+			}()
+			if !accepted {
+				return
+			}
 			q.kind, q.nativeName, q.text, q.reply = queuedNativeCommand, name, normalized, nil
 			q.nativeSession = catalog.SessionID
 			i++
+			continue
+		}
+		if q.strictCommand {
+			w.cancelQueuedTask(q.id)
+			w.say(w.tr(i18n.Msg.ActionUnavailable))
 			continue
 		}
 		if w.controlOp != controlAbort && w.taskActive() && w.activeInputKind != queuedNativeCommand {

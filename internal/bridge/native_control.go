@@ -12,6 +12,7 @@ import (
 
 // Native controls own only their submission, never the running task's lifecycle.
 type nativeControlRequest struct {
+	finalAction  *finalActionDispatch
 	client       *omp.Client
 	generation   int64
 	epoch        uint64
@@ -38,7 +39,7 @@ func (w *worker) beginNativeControl(in incoming, text string) {
 	}
 	catalog := client.CommandCatalog()
 	ctx, cancel := context.WithCancel(w.ctx)
-	c := &nativeControlRequest{client: client, generation: w.binding.Generation,
+	c := &nativeControlRequest{finalAction: w.finalAction, client: client, generation: w.binding.Generation,
 		epoch: catalog.Epoch, sessionID: w.sessionID, inbox: in.id, text: text, ctx: ctx, cancel: cancel}
 	w.nativeControl = c
 	w.beginControlOperation(controlNative)
@@ -81,6 +82,9 @@ func (w *worker) cancelNativeControl() {
 		return
 	}
 	w.endNativeControl(c)
+	if c.phase != "prompt" {
+		w.releaseFinalAction(c.finalAction)
+	}
 	state := store.InboxCancelled
 	if c.phase == "prompt" {
 		state = store.InboxUncertain
@@ -93,6 +97,10 @@ func (w *worker) submitNativeControl(c *nativeControlRequest) {
 		w.endNativeControl(c)
 		w.mark(c.inbox, store.InboxCancelled)
 		w.say(w.tr(i18n.Msg.NativeControlUnavailable))
+		return
+	}
+	if !w.consumeFinalAction() {
+		w.endNativeControl(c)
 		return
 	}
 	if !w.mark(c.inbox, store.InboxSubmitted) {

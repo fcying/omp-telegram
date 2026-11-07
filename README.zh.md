@@ -69,6 +69,7 @@ allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
 progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 progress_recent_tools = 5
+final_actions = []
 
 [telegram.status_bar]
 progress = ["status", "thinking", "model", "fast", "context", "speed"]
@@ -121,7 +122,7 @@ format = "text"
 显式相对 `--config` 路径以启动目录为基准. 相对 `storage.data_dir` 和 `storage.workspace_root` 始终以真实可执行文件目录为基准, 不以配置文件目录为基准.
 
 配置字符串支持 `$VAR` 和 `${VAR}`, 但 `[omp.environment]` 的模式与 `allow`/`deny` 变量名为字面值, 不展开引用. `$$` 表示字面美元符号. TOML 解析后其他环境变量引用只展开一次. 默认引用的 `OMP_TELEGRAM_ARGS`, `OMP_TELEGRAM_PROGRESS_MODE` 和 `OMP_TELEGRAM_WORKSPACE_ROOT` 可以未设置. `telegram.progress_mode` 为空或非法时回退到 `summary`. token 和白名单必须提供. 程序不会自动加载 `.env` 文件.
-仅用于显示的 `omp.args_labels` 按字面读取, 不展开环境变量.
+仅用于显示的 `omp.args_labels`, `telegram.status_bar` 字段以及 `telegram.final_actions` 的标签和命令按字面读取, 不展开环境变量.
 
 `telegram.allowed_users` 和 `telegram.allowed_chats` 都是必填项. 只有发送者和 chat 同时命中白名单时才接受 update. 普通私聊的 chat ID 通常等于 user ID; 群组 chat ID 通常是负数.
 
@@ -133,6 +134,7 @@ format = "text"
 | `telegram.allowed_users`, `telegram.allowed_chats` | 必填的数字 ID 白名单. 可直接填写整数, 或引用逗号分隔的环境变量值. |
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见[进度界面](#进度界面). |
 | `telegram.progress_recent_tools` | verbose Recent 历史保留的已完成工具上限. 默认 `5`, 范围 `1..100`; 受 Telegram 消息长度限制, 实际显示可能更少. |
+| `telegram.final_actions` | 可选的有序完成快捷按钮 `{ label, command }`. 省略或 `[]` 关闭. 最多六项; 标签非空, 单行, 最多 64 个 UTF-16 单位. Command 是一个 slash invocation, 可带固定字面参数, 不能含控制字符或换行. 见[完成快捷按钮](#完成快捷按钮). |
 | `telegram.status_bar.progress`, `.intermediate`, `.final` | 按顺序选择 Progress, 中间 assistant 消息和最终结果的字段. `[]` 关闭对应状态栏. 未配置的数组默认 `["status", "thinking", "model", "fast", "context", "speed"]`. 见[状态栏](#状态栏). |
 | `telegram.status_bar.git_command` | 最终 `git` 字段的可选字面 argv. 未配置或 `[]` 使用内置安全 Git 探针. 自定义命令在当前 session workspace 中执行, 不经过 shell; 安全与副作用由用户负责. |
 | `telegram.status_bar.git_timeout` | 内置和自定义 Git 采样共用的正数字面 Go duration, 默认 `"450ms"`. 大仓库可增至如 `"2s"`. 空串, 零, 负数, 非法, 溢出或非字符串均拒绝; 不展开环境引用, 不允许关闭超时. |
@@ -355,15 +357,43 @@ omp --resume /path/to/session.jsonl
 - `summary` - 显示活动工具, 任务状态及当前 assistant 正文预览.
 - `verbose` - 额外显示近期可观察的工具活动. 工具详情不脱敏, 可能含有凭据或私人内容, 能查看对话的人都可见.
 
-Progress 延迟约三秒显示, 带有中止当前任务的 **Stop** 按钮. 选择 `status` 字段后, **⚙️** 标记与可用状态字段位于同一首行. `/stop` 还会清空等待任务. 进度更新和清理属于尽力而为, 不延迟正式回复.
+Progress 延迟约三秒显示, 同一行带有 **Stop | Follow-up** 按钮. **Stop** 中止当前任务; **Follow-up (后续输入)** 打开回复提示, 不暂停也不 steer 当前任务. 选择 `status` 字段后, **⚙️** 标记与可用状态字段位于同一首行. `/stop` 还会清空等待任务. 进度更新和清理属于尽力而为, 不延迟正式回复. `progress_mode = "off"` 时两个按钮都不创建.
 
 Steer 输入和已完成的 assistant 消息都会删除该任务较早的 Progress, 不重启 OMP. 后续预览等待前面的正式回复投递后, 出现在最新输入/回复下方. 任务结束后清理剩余临时 Progress, 保留正式回复.
 
 已完成的 assistant 消息立即独立发送, 关闭 progress 也不受影响. 选择 `status` 字段后, 中间状态栏显示 **💬**, 整个任务确认成功后仅将最新正式消息的状态栏改为 **✅**; 取消, 失败, 结果不确定或研究轮次仍在继续时不标成功. 仅首条正式消息引用原始请求. 正文保持不变, 方便 Telegram Reply 引用, 不重发正文或额外发送完成消息.
 
+### 后续输入
+
+点击 **Follow-up (后续输入)**, 再以非空文本回复 bot 的 ForceReply 提示. 仅接受点击者本人在同一 chat/topic 中对该提示的回复, 与 `/followup <message>` 一样作为独立任务排队. 打开提示不暂停当前任务. 接受后 bot 会确认后续消息已入队; 队列满或空/非文本回复不会消费请求或谎报成功, 请求有效时可以重试.
+
+请求十分钟后过期. 再次点击会替代你在此对话中的旧请求. 原任务自然完成后, session/binding 未变时请求仍有效; Stop, Close, session 替换及服务重启使未完成请求失效. 已识别的旧提示, 未授权或交付不确定提示的回复一律拒绝, 包括 `/stop`, `/close` 等命令. 只有有效请求中的已知 Bridge 命令才沿用普通控制路径. 来自当前 Bot 的合法 marker 即使缺少数据库记录也会被拒绝. 不回复已识别提示的普通文本维持现有 prompt/steer 行为. ForceReply 的显示由 Telegram 客户端控制; bridge 不提供 inline 文本输入控件.
+
+Marker 回退识别仅匹配非空提示正文末尾独立完整的 `[followup:token]` 行. 正文中的内联片段及后面仍有文字的标记不匹配. 已保存的 prompt ID 仍优先识别, 不依赖引用中是否保留 marker.
+
+### 完成快捷按钮
+
+要启用, 在已有 `[telegram]` table 内, `[telegram.status_bar]` 之前加入:
+
+```toml
+final_actions = [
+  { label = "Compact", command = "/compact" },
+  { label = "New", command = "/new" },
+  { label = "Shake", command = "/shake" },
+]
+```
+
+省略或使用 `final_actions = []` 关闭 (默认关闭). 保留数组顺序, 用户自定义标签不翻译. 标签必须非空, 单行, 最多 64 个 UTF-16 单位 (BMP 外的 emoji 占两个单位). 最多六项. Command 必须以 slash 开头, 包含一个命令名, 可附固定参数, 不能含换行或控制字符. 标签和命令均为字面值: 不展开 `$VAR`, `${VAR}` 或 shell 语法, 不经过 shell 执行. 参数沿用原命令的解析规则, 不增加第二套快捷命令语言. 不要在可见标签或命令参数中填写凭据.
+
+每行最多三个按钮, 合计标签超过 24 个 UTF-16 单位时换行. 单个较长标签独占一行且不截断; 实际按钮宽度由 Telegram 客户端决定.
+
+按钮只在 root task 成功完成后出现在最后一个真实 assistant 正文片段上, 关闭状态栏也不影响. 中间回复, 错误/截断提示, 已停止/不确定结果及原生命令输出不显示. 更新按钮不会重发答案. 按钮在命令被接受执行后才是一次性消费, 不是点击即消费: 忙碌, 参数错误或命令不可用等确定性本地拒绝后可重新点击. 资格检查或执行确认期间会预留按钮, 防止重叠点击; 取消或超时的执行确认会释放预留. 成功打开菜单即视为该菜单命令已执行. 接受任务入队, 提交目标 RPC 或开始本地操作后消费按钮, 已提交或结果不确定的动作不重放. 重启打断的预留按不确定保守消费. 其他未使用按钮或后续已完成回复仍可用. Session/binding 变更及配置删除或变更使旧动作失效.
+
+点击沿用同一 chat/topic, 真实点击用户的权限, 原命令参数, 忙碌限制与确认流程. 未知或不可用命令明确报错, 不作为模型 prompt, 也不静默替换为其他动作. 原生快捷命令必须是**当前 session** 原生命令目录确认可执行的命令, 且仍受来源和生命周期限制; 配置加载不代表当前可用. 本次实现验证的原生 OMP catalog 公布了 builtin `/shake` ("Shake heavy content out of the conversation context"), 因此示例将 **Shake 显式映射为 `/shake`**. 不同 runtime/session 的可用性可能不同: `/shake` 不可用时拒绝执行, 不会自动映射为 Queue 或其他操作.
+
 ### 状态栏
 
-三种状态栏独立配置, 按数组顺序显示字段, 未知或重复名称会报错. `[]` 删除整个状态栏, 包括图标和分隔符. 关闭 Progress 状态栏不隐藏工具正文, 文本预览或 **Stop** 按钮; 关闭整个 Progress 仍使用 `progress_mode = "off"`.
+三种状态栏独立配置, 按数组顺序显示字段, 未知或重复名称会报错. `[]` 删除整个状态栏, 包括图标和分隔符. 关闭 Progress 状态栏不隐藏工具正文, 文本预览或 **Stop | Follow-up** 按钮; 关闭整个 Progress 仍使用 `progress_mode = "off"`.
 
 ```toml
 [telegram.status_bar]
@@ -485,7 +515,7 @@ migration_extension = true
 
 Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 Telegram 输入内容, 待发送/已发送回复和消息 metadata. 附件以文件形式保存在同一数据目录下. 数据库, 附件缓存及其备份都应按敏感数据保护. `storage.data_dir` 默认是解析符号链接后的真实二进制所在目录; 相对 storage 路径使用该目录, 不使用启动目录.
 
-`storage.database_retention_days` 控制 bridge 终态消息和符合清理条件的附件缓存保留时间. 默认 `90` 天; 设为 `0` 可关闭按保留期执行的自动清理. 不删除 workspace 文件, OMP session 数据或已保存的对话 binding. 保留清理不会删除已送达的 Telegram 回复.
+`storage.database_retention_days` 控制 bridge 终态消息, 符合清理条件的附件缓存及过期 Follow-up metadata 的保留时间. 默认 `90` 天; 设为 `0` 可关闭按保留期执行的自动清理. Follow-up 按到期时间计算保留年龄, 未回复的过期提示也可清理; 关联 pending/submitted inbox 的记录保留至其结算. 不删除 workspace 文件, OMP session 数据或已保存的对话 binding. 保留清理不会删除已送达的 Telegram 回复.
 
 升级前先停止服务, 备份数据目录、workspace 及 OMP 自己的 session 存储. 只备份 bridge 数据库不等于完整备份 OMP 对话.
 
@@ -496,6 +526,8 @@ Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 
 日志支持 `text` 和 `json`, 由 `logging.format` 选择. `logging.level` 设置全局级别; `[logging.component_levels]` 可分别覆盖 `daemon`, `bridge`, `rpc`, `telegram`, `store` 或 `media`. 见完整[配置示例](#配置).
 
 日志输出到 stderr, 保存及轮转由进程管理器负责. 不记录 prompt, 模型回复, 凭据, 工具负载或 workspace/session 路径. Chat 和 thread ID 仍可能识别具体对话, 应限制日志访问权限.
+
+`rpc_queue_overflow` 是默认 info 级别即可看到的 ERROR. `reason=event_slots|byte_budget` 和 `stage=event_enqueue|physical_read|chunk_reassembly` 区分耗尽的资源与检测位置. 对照 `queued_events/queue_capacity`, `rejected_used_bytes/rejected_bytes/buffer_limit_bytes` 及 `forward_wait_ms`; `buffered_bytes` 在清理被拒帧后采样, 不等于拒绝瞬间的占用. 按 `client_id` 关联 `consumer_phase/consumer_phase_ms` 和附近的 `rpc_consumer_slow` WARN. 后者记录至少耗时一秒的 actor 操作, 包含固定 `point`, 耗时及任务身份. 正常快速操作不产生这些告警, 不包含 RPC 帧或工具内容. 这些快照用于定位压力或阻塞, 单靠快照不能证明根因.
 
 ## Roadmap
 

@@ -42,6 +42,7 @@ func restoreLegacyProgressSchema(t *testing.T, s *Store) {
 UPDATE inbox SET progress_message_id=COALESCE((SELECT MAX(message_id) FROM progress_messages WHERE inbox_id=inbox.id),0);
 DROP TABLE progress_messages;
 DROP INDEX idx_outbox_assistant_header;
+DROP INDEX IF EXISTS idx_outbox_final_actions;
 ALTER TABLE outbox DROP COLUMN header;
 ALTER TABLE outbox DROP COLUMN message_id;
 ALTER TABLE outbox DROP COLUMN header_pending;
@@ -2021,7 +2022,7 @@ func TestOnlyFirstTextReplyQuotesRootAcrossAppendsAndCompletion(t *testing.T) {
 					if out.Text != text || out.ReplyTo != replyTo || out.InboxID != 10 {
 						t.Fatalf("text reply = %+v, want %q replying to %d with original owner", out, text, replyTo)
 					}
-					requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header))
+					requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header, ""))
 				}
 			}
 			first := []string{"first body", "first split part"}
@@ -2077,7 +2078,7 @@ func TestAssistantHeaderUpdatesBeforeDuringAndAfterSend(t *testing.T) {
 				if stage == "during" {
 					requireStoreOK(t, s.SetAssistantHeader(ctx, id, transition.updated))
 				}
-				requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+				requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 				if stage == "after" {
 					requireStoreOK(t, s.SetAssistantHeader(ctx, id, transition.updated))
 				}
@@ -2091,7 +2092,7 @@ func TestAssistantHeaderUpdatesBeforeDuringAndAfterSend(t *testing.T) {
 					if header.ID != id || header.Text != body || header.Header != transition.updated || !header.HeaderEditable || header.MessageID != 100 {
 						t.Fatalf("status-only delivery = %+v", header)
 					}
-					requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header))
+					requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header, ""))
 				}
 				var storedBody, state string
 				requireStoreOK(t, s.DB.QueryRow("SELECT text FROM outbox WHERE id=?", id).Scan(&storedBody))
@@ -2107,14 +2108,14 @@ func TestAssistantHeaderUpdatesBeforeDuringAndAfterSend(t *testing.T) {
 				if err := s.SetAssistantHeader(ctx, second.ID, "not first"); !errors.Is(err, sql.ErrNoRows) {
 					t.Fatalf("split continuation accepted header: %v", err)
 				}
-				requireStoreOK(t, s.MarkOutputDelivered(second.ID, 101, ""))
+				requireStoreOK(t, s.MarkOutputDelivered(second.ID, 101, "", ""))
 				if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
 					t.Fatalf("body was replayed after header update: %v", err)
 				}
 				if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
 					t.Fatalf("settled header remained pending: %v", err)
 				}
-				if err := s.MarkOutputDelivered(id, 102, transition.updated); !errors.Is(err, ErrOutboxStateTransition) {
+				if err := s.MarkOutputDelivered(id, 102, transition.updated, ""); !errors.Is(err, ErrOutboxStateTransition) {
 					t.Fatalf("duplicate body delivery transition = %v", err)
 				}
 			})
@@ -2135,7 +2136,7 @@ func TestAssistantHeaderSnapshotCASAndRestart(t *testing.T) {
 		ids = append(ids, id)
 		out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 		requireStoreOK(t, err)
-		requireStoreOK(t, s.MarkOutputDelivered(out.ID, id+100, out.Header))
+		requireStoreOK(t, s.MarkOutputDelivered(out.ID, id+100, out.Header, ""))
 		requireStoreOK(t, s.SetAssistantHeader(ctx, id, "snapshot one"))
 	}
 	first, err := s.NextAssistantHeader()
@@ -2144,13 +2145,13 @@ func TestAssistantHeaderSnapshotCASAndRestart(t *testing.T) {
 		t.Fatalf("oldest header = %+v, want ID %d", first, ids[0])
 	}
 	requireStoreOK(t, s.SetAssistantHeader(ctx, first.ID, "snapshot two"))
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(first.ID, first.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(first.ID, first.Header, ""))
 	first, err = s.NextAssistantHeader()
 	requireStoreOK(t, err)
 	if first.ID != ids[0] || first.Header != "snapshot two" {
 		t.Fatalf("old snapshot cleared a new update: %+v", first)
 	}
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(first.ID, first.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(first.ID, first.Header, ""))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
 	second, err := s.NextAssistantHeader()
@@ -2158,7 +2159,7 @@ func TestAssistantHeaderSnapshotCASAndRestart(t *testing.T) {
 	if second.ID != ids[1] || second.Text != "second immutable body" || second.Header != "snapshot one" || second.MessageID != second.ID+100 {
 		t.Fatalf("restarted header delivery = %+v", second)
 	}
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(second.ID, second.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(second.ID, second.Header, ""))
 	if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("settled status header remained pending: %v", err)
 	}
@@ -2275,7 +2276,7 @@ func TestCleanupMessagesRetainsActiveAssistantBodies(t *testing.T) {
 					t.Fatalf("retained pending body changed: %+v", out)
 				}
 			} else {
-				requireStoreOK(t, s.MarkOutputDelivered(id, 100, "initial"))
+				requireStoreOK(t, s.MarkOutputDelivered(id, 100, "initial", ""))
 				out, err := s.NextAssistantHeader()
 				requireStoreOK(t, err)
 				if out.ID != id || out.Text != "active immutable body" || out.Header != "final" || out.MessageID != 100 {
@@ -2295,14 +2296,14 @@ func TestAssistantHeaderDoesNotModifyOrdinaryOutputAndSurvivesRetention(t *testi
 	if err := s.SetAssistantHeader(ctx, ordinary.ID, "not assistant"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("ordinary output accepted assistant header: %v", err)
 	}
-	requireStoreOK(t, s.MarkOutputDelivered(ordinary.ID, 90, ""))
+	requireStoreOK(t, s.MarkOutputDelivered(ordinary.ID, 90, "", ""))
 	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
 	requireStoreOK(t, s.Submit(10, 42))
 	id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"retained immutable body"}, "initial")
 	requireStoreOK(t, err)
 	out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 	requireStoreOK(t, err)
-	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, "updated"))
 	requireStoreOK(t, s.FinishSubmitted(10, InboxDone))
 	old := time.Now().AddDate(0, 0, -91).Unix()
@@ -2317,7 +2318,7 @@ func TestAssistantHeaderDoesNotModifyOrdinaryOutputAndSurvivesRetention(t *testi
 	if header.ID != id || header.Text != "retained immutable body" {
 		t.Fatalf("retained header lost body: %+v", header)
 	}
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header.Header, ""))
 	result, err = s.CleanupMessages(ctx, time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)
 	if result.Outbox != 1 {
@@ -2416,7 +2417,7 @@ func TestFinalAssistantHeaderTargetsFirstNewBody(t *testing.T) {
 				priorID = id
 				out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 				requireStoreOK(t, err)
-				requireStoreOK(t, s.MarkOutputDelivered(out.ID, 100, out.Header))
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, 100, out.Header, ""))
 			}
 			targetID, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, 0, "final header", []string{"final body", "final split part"})
 			requireStoreOK(t, err)
@@ -2445,7 +2446,7 @@ func TestFinalAssistantHeaderTargetsFirstNewBody(t *testing.T) {
 				if out.InboxID != 10 || out.Text != text || out.Header != header || out.ReplyTo != replyTo {
 					t.Fatalf("final part = %+v, want %q/%q/%d", out, text, header, replyTo)
 				}
-				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header))
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header, ""))
 			}
 			requireStoreOK(t, s.SetAssistantHeader(ctx, targetID, "updated final header"))
 			out, err := s.NextAssistantHeader()

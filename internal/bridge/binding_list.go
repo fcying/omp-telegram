@@ -38,6 +38,7 @@ func (w *worker) conversationGeneration() int64 {
 }
 
 func (w *worker) touchBinding() {
+	defer w.beginConsumerPhase("store", "touch_binding").end()
 	if w.migrationLocked() || w.b == nil || w.b.db == nil || w.binding.Generation == 0 {
 		return
 	}
@@ -211,6 +212,7 @@ func (w *worker) lookupBindingNames(entries []store.BindingListEntry, generation
 }
 
 func (w *worker) bindingNamesLoaded(result bindingNamesResult) {
+	defer w.beginConsumerPhase("result", "binding_names_loaded").end()
 	if result.request != w.bindingNameRequest || result.generation != w.conversationGeneration() {
 		return
 	}
@@ -251,6 +253,7 @@ func bindingSessionName(language i18n.Language, entry store.BindingListEntry, li
 }
 
 func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
+	defer w.beginConsumerPhase("telegram", "show_bindings_page").end()
 	pages := (len(c.bindings) + bindingPageSize - 1) / bindingPageSize
 	if page < 0 || page >= pages {
 		return
@@ -377,6 +380,7 @@ func queueTaskText(language i18n.Language, q queued) string {
 }
 
 func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
+	defer w.beginConsumerPhase("telegram", "show_queue_page").end()
 	pages := (len(w.queue) + queuePageSize - 1) / queuePageSize
 	if pages == 0 {
 		pages = 1
@@ -554,6 +558,7 @@ func (w *worker) canForgetBinding() bool {
 }
 
 func (w *worker) forgetBinding(request bindingForgetRequest) {
+	defer w.beginConsumerPhase("input", "forget_binding").end()
 	if w.migrationLocked() {
 		request.reply(bindingForgetResult{status: i18n.Msg.MigrationUnresolvedCannotDeleteBinding})
 		return
@@ -611,6 +616,7 @@ func (w *worker) forgetBinding(request bindingForgetRequest) {
 }
 
 func (w *worker) forgetFinished(result bindingForgetResult) {
+	defer w.beginConsumerPhase("result", "forget_finished").end()
 	w.forgetPending = false
 	c := w.forgetConfirmation
 	w.forgetConfirmation = nil

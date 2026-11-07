@@ -261,7 +261,9 @@ func (w *worker) replyUsageFinished(result operationResult) {
 		fields := request.baseFields
 		fields.quota = w.providerUsageText(request.key.provider, true)
 		header := w.renderStatusBar("final", fields)
+		span := w.beginConsumerPhase("store", "set_assistant_header")
 		err := w.b.db.SetAssistantHeader(w.ctx, request.target, header)
+		span.end()
 		if err != nil && w.ctx.Err() == nil {
 			w.b.storeLog.Error("provider usage header update failed", "event", "assistant_header_update_failed", "error_kind", "persistence")
 		}

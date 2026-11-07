@@ -272,6 +272,7 @@ func (w *worker) probeSteeredQuiescence() {
 }
 
 func (w *worker) steeredQuiescenceFinished(result steerProbeResult) {
+	defer w.beginConsumerPhase("result", "steered_quiescence_finished").end()
 	fence := &w.steerFence
 	if w.replyStatus.pending != nil || !fence.active || w.client != result.client || w.binding.Generation != result.generation || w.turn != result.turn || w.active != result.rootID || fence.revision != result.revision {
 		return

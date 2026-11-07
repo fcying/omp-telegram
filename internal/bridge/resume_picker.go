@@ -24,6 +24,7 @@ import (
 const resumePageSize = 10
 
 type resumeListResult struct {
+	finalAction               *finalActionDispatch
 	request                   uint64
 	generation, user          int64
 	epoch                     uint64
@@ -91,6 +92,8 @@ func (w *worker) cancelExport() {
 }
 
 func (w *worker) cancelResumeList() {
+	w.releaseFinalAction(w.resumeFinalAction)
+	w.resumeFinalAction = nil
 	w.resumeRequest++
 	if w.resumeCancel != nil {
 		w.resumeCancel()
@@ -233,6 +236,9 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 	epoch := w.b.bindingsEpoch.Load()
 	argsPresetIndex, argsFingerprint, args := w.b.selectedArgsPresetSnapshot()
 	cfg := omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Args: args, Environment: w.b.cfg.OMPEnvironment}
+	actionReceipt := w.finalAction
+	w.resumeFinalAction = actionReceipt
+	w.holdFinalAction()
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
@@ -245,7 +251,7 @@ func (w *worker) requestSessionList(user int64, action, format string) {
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
-		result := resumeListResult{request: request, generation: generation, epoch: epoch, user: user, cwd: cwd, action: action, exportFormat: format, args: args, argsPresetIndex: argsPresetIndex, argsFingerprint: argsFingerprint, sessions: sessions, err: err}
+		result := resumeListResult{finalAction: actionReceipt, request: request, generation: generation, epoch: epoch, user: user, cwd: cwd, action: action, exportFormat: format, args: args, argsPresetIndex: argsPresetIndex, argsFingerprint: argsFingerprint, sessions: sessions, err: err}
 		select {
 		case w.resumeResults <- result:
 		case <-w.ctx.Done():
@@ -304,6 +310,11 @@ func sessionIsPinned(session omp.SessionSummary, pinned map[string]struct{}) boo
 }
 
 func (w *worker) resumeListed(result resumeListResult) {
+	defer w.beginConsumerPhase("result", "resume_listed").end()
+	defer w.withFinalAction(result.finalAction)()
+	if w.resumeFinalAction == result.finalAction {
+		w.resumeFinalAction = nil
+	}
 	if !w.acceptSessionList(result) {
 		return
 	}
@@ -407,6 +418,10 @@ func (w *worker) beginExportWithArgs(session omp.SessionSummary, format, workspa
 		w.say(w.tr(i18n.Msg.SessionCurrentlyExportedTryAgainAfterExportFinishes))
 		return
 	}
+	if !w.consumeFinalAction() {
+		w.b.releaseExport(w)
+		return
+	}
 	if currentCandidate {
 		w.clearRuntimeConfirmations()
 	}
@@ -501,6 +516,7 @@ func (w *worker) cleanupExportResult(result exportResult) {
 }
 
 func (w *worker) exportFinished(result exportResult) {
+	defer w.beginConsumerPhase("result", "export_finished").end()
 	defer w.b.releaseExport(w)
 	if result.request != w.exportRequest || result.generation != w.binding.Generation || result.epoch != w.b.bindingsEpoch.Load() || w.exportCancel == nil {
 		w.cleanupExportResult(result)
@@ -537,6 +553,9 @@ func (w *worker) exportFinished(result exportResult) {
 }
 
 func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
+	if c.finalAction == nil {
+		c.finalAction = w.finalAction
+	}
 	pages := (len(c.sessions) + resumePageSize - 1) / resumePageSize
 	if page < 0 || page >= pages {
 		return
@@ -643,6 +662,10 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	}
 	c.messageID = messageID
 	w.confirms[token] = c
+	if !w.consumeFinalAction() {
+		return
+	}
+	w.holdFinalAction()
 }
 
 func (w *worker) selectResume(c confirmation, index int, messageID int64) {

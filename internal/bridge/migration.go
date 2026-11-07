@@ -22,13 +22,14 @@ var errMigrationLease = errors.New("migration runtime identity changed")
 
 // A run owns only transient RPC work. The durable migration remains locked after it ends.
 type migrationRun struct {
-	id       string
-	ctx      context.Context
-	inboxID  int64
-	request  omp.MigrationRequest
-	recovery bool
-	old      bool
-	args     []string
+	finalAction *finalActionDispatch
+	id          string
+	ctx         context.Context
+	inboxID     int64
+	request     omp.MigrationRequest
+	recovery    bool
+	old         bool
+	args        []string
 }
 
 // Pending starts must be reaped before another recovery may open the same journal.
@@ -52,15 +53,16 @@ func (s *migrationStartup) run(ctx context.Context, start func(context.Context) 
 }
 
 type migrationResult struct {
-	id       string
-	attempt  uint64
-	clientID uint64
-	stage    string
-	info     omp.SessionInfo
-	settings omp.MigrationSettings
-	request  omp.MigrationRequest
-	client   *omp.Client
-	err      error
+	finalAction *finalActionDispatch
+	id          string
+	attempt     uint64
+	clientID    uint64
+	stage       string
+	info        omp.SessionInfo
+	settings    omp.MigrationSettings
+	request     omp.MigrationRequest
+	client      *omp.Client
+	err         error
 }
 
 func (w *worker) migrationLocked() bool { return w.migration != nil || w.migrationRun != nil }
@@ -127,14 +129,24 @@ func (w *worker) handleMigrationIncoming(in incoming) bool {
 			w.mark(in.id, store.InboxDone)
 			return true
 		case "/status":
+			if !w.consumeFinalAction() {
+				return true
+			}
 			w.say(w.migrationStatus())
 			w.mark(in.id, store.InboxDone)
 			return true
 		case "/help", "/start":
+			if !w.consumeFinalAction() {
+				return true
+			}
 			w.say(w.commandHelp())
 			w.mark(in.id, store.InboxDone)
 			return true
 		case "/stop", "/close":
+			if !w.consumeFinalAction() {
+				return true
+			}
+			w.cancelFollowupInputs()
 			w.cancelMigration("cancelled", true)
 			if command == "/close" && w.migration == nil {
 				w.closeLogicalSession()
@@ -185,7 +197,7 @@ func (w *worker) beginMigration(inboxID int64) {
 	w.migrationCancel = cancel
 	w.migrationClientID = client.ID()
 	w.migrationAttempt++
-	w.migrationRun = &migrationRun{id: id, ctx: ctx, inboxID: inboxID, args: cloneArgv(w.launchArgs)}
+	w.migrationRun = &migrationRun{finalAction: w.finalAction, id: id, ctx: ctx, inboxID: inboxID, args: cloneArgv(w.launchArgs)}
 	source := w.binding
 	w.startMigrationJob("prepare", 30*time.Second, func(ctx context.Context) migrationResult {
 		result := migrationResult{}
@@ -213,6 +225,11 @@ func (w *worker) startMigrationJob(stage string, timeout time.Duration, work fun
 	if run == nil {
 		return
 	}
+	if stage == "prepare" {
+		w.holdFinalAction()
+	} else if !w.consumeFinalAction() {
+		return
+	}
 	if w.migrationResults == nil {
 		w.migrationResults = make(chan migrationResult, 4)
 	}
@@ -226,6 +243,7 @@ func (w *worker) startMigrationJob(stage string, timeout time.Duration, work fun
 		defer cancel()
 		result := work(ctx)
 		result.id, result.clientID, result.stage, result.attempt = run.id, clientID, stage, attempt
+		result.finalAction = run.finalAction
 		if stage == "candidate" && result.info.ID != "" {
 			_, err := w.b.observeMigrationCandidate(w, run.id, result.info.File, result.info.ID)
 			if err != nil {
@@ -262,6 +280,8 @@ func (w *worker) saveMigration(next store.Migration) bool {
 }
 
 func (w *worker) migrationFinished(result migrationResult) {
+	defer w.beginConsumerPhase("result", "migration_finished").end()
+	defer w.withFinalAction(result.finalAction)()
 	run := w.migrationRun
 	if run == nil || result.id != run.id || result.attempt != w.migrationAttempt || result.clientID != w.migrationClientID || run.ctx.Err() != nil {
 		if result.stage == "candidate" && w.migration != nil && result.id == w.migration.ID {
@@ -300,6 +320,10 @@ func (w *worker) migrationFinished(result migrationResult) {
 	case "prepare":
 		settings := result.settings
 		m := store.Migration{ID: run.id, Source: w.binding, InboxID: run.inboxID, Phase: "prepared", Provider: settings.Provider, Model: settings.Model, Thinking: settings.Thinking, Fast: settings.Fast, CreatedAt: time.Now().Unix()}
+		if !w.consumeFinalAction() {
+			w.cancelMigration("unavailable", false)
+			return
+		}
 		if err := w.b.db.PrepareMigration(m); err != nil {
 			w.cancelMigration("prepare_failed", true)
 			return
@@ -490,6 +514,9 @@ func (w *worker) commitMigration(info omp.SessionInfo) {
 
 func (w *worker) cancelMigration(kind string, notify bool) {
 	run := w.migrationRun
+	if run != nil {
+		w.releaseFinalAction(run.finalAction)
+	}
 	if w.migrationCancel != nil {
 		w.migrationCancel()
 		w.migrationCancel = nil
@@ -572,6 +599,9 @@ func (w *worker) recoverMigration(inboxID int64, target string) {
 	if strings.EqualFold(target, w.migration.Source.SessionID) {
 		w.say(w.tr(i18n.Msg.UseMigrateRecoverOldRestoreSourceSession))
 		w.mark(inboxID, store.InboxDone)
+		return
+	}
+	if !w.consumeFinalAction() {
 		return
 	}
 	if w.client != nil {

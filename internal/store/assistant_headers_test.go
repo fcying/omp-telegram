@@ -47,7 +47,7 @@ func TestAssistantCompletionAddsAndRemovesHeaderAroundSend(t *testing.T) {
 				if stage == "during" {
 					complete()
 				}
-				requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+				requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 				if stage == "after" {
 					complete()
 				}
@@ -61,7 +61,7 @@ func TestAssistantCompletionAddsAndRemovesHeaderAroundSend(t *testing.T) {
 					if edit.ID != id || edit.Header != transition.final || edit.Text != "immutable body" || !edit.HeaderEditable || edit.MessageID != 100 {
 						t.Fatalf("final header-only edit = %+v", edit)
 					}
-					requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, edit.Header))
+					requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, edit.Header, ""))
 				}
 				var count int
 				var state string
@@ -92,7 +92,7 @@ func TestHeaderlessFinalAssistantRetainsFirstNewTarget(t *testing.T) {
 				requireStoreOK(t, err)
 				out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 				requireStoreOK(t, err)
-				requireStoreOK(t, s.MarkOutputDelivered(out.ID, 100, out.Header))
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, 100, out.Header, ""))
 			}
 			target, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, 0, "", []string{"final body", "final continuation"})
 			requireStoreOK(t, err)
@@ -109,7 +109,7 @@ func TestHeaderlessFinalAssistantRetainsFirstNewTarget(t *testing.T) {
 				if out.Text != body || out.Header != "" || out.HeaderEditable != (i == 0) || out.ReplyTo != replyTo || (i == 0 && out.ID != target) {
 					t.Fatalf("headerless final part %d = %+v", i, out)
 				}
-				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header))
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, out.Header, ""))
 				if i != 0 {
 					if err := s.SetAssistantHeader(ctx, out.ID, "not first"); !errors.Is(err, sql.ErrNoRows) {
 						t.Fatalf("final continuation accepted header: %v", err)
@@ -170,7 +170,7 @@ func TestPlainReplyAPIsKeepHeadersNoneditable(t *testing.T) {
 						t.Fatalf("rejected ordinary target did not roll back: %q/%d", state, count)
 					}
 				}
-				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, ""))
+				requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, "", ""))
 			}
 			if _, err := s.NextAssistantHeader(); !errors.Is(err, sql.ErrNoRows) {
 				t.Fatalf("plain reply acquired pending header: %v", err)
@@ -189,7 +189,7 @@ func TestEmptyAssistantHeaderSnapshotRecoveryAndRetention(t *testing.T) {
 	requireStoreOK(t, err)
 	out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 	requireStoreOK(t, err)
-	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, ""))
 	removal, err := s.NextAssistantHeader()
 	requireStoreOK(t, err)
@@ -197,14 +197,14 @@ func TestEmptyAssistantHeaderSnapshotRecoveryAndRetention(t *testing.T) {
 		t.Fatalf("removal snapshot = %+v", removal)
 	}
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, "added again"))
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, removal.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, removal.Header, ""))
 	addition, err := s.NextAssistantHeader()
 	requireStoreOK(t, err)
 	if addition.Header != "added again" {
 		t.Fatalf("empty snapshot cleared new addition: %+v", addition)
 	}
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, ""))
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, addition.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, addition.Header, ""))
 	requireStoreOK(t, s.FinishSubmitted(10, InboxDone))
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)
@@ -221,7 +221,7 @@ func TestEmptyAssistantHeaderSnapshotRecoveryAndRetention(t *testing.T) {
 	if result.Outbox != 0 {
 		t.Fatalf("retention discarded empty header edit: %+v", result)
 	}
-	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, removal.Header))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, removal.Header, ""))
 	if _, err := s.NextOutput(); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("recovered header removal replayed body: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestHeaderEditabilityMigrationFromVersion22(t *testing.T) {
 	requireStoreOK(t, err)
 	out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 	requireStoreOK(t, err)
-	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, "pending legacy header"))
 	requireStoreOK(t, s.Enqueue(7, 8, "ordinary legacy text"))
 	_, err = s.DB.Exec(`DROP INDEX idx_outbox_assistant_header;
@@ -264,6 +264,7 @@ PRAGMA user_version=22;`)
 		t.Fatalf("migration lost legacy header target: %+v", edit)
 	}
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, ""))
+	requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, edit.Header, ""))
 	edit, err = s.NextAssistantHeader()
 	requireStoreOK(t, err)
 	if edit.ID != id || edit.Header != "" || edit.Text != "legacy assistant" {
@@ -278,7 +279,7 @@ PRAGMA user_version=22;`)
 		if err := s.SetAssistantHeader(ctx, out.ID, "not assistant"); !errors.Is(err, sql.ErrNoRows) {
 			t.Fatalf("migrated ordinary row accepted header: %v", err)
 		}
-		requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, ""))
+		requireStoreOK(t, s.MarkOutputDelivered(out.ID, out.ID+100, "", ""))
 	}
 }
 
@@ -311,7 +312,7 @@ func TestEmptyAssistantHeaderTransactionsRollBack(t *testing.T) {
 			requireStoreOK(t, err)
 			out, err := s.ClaimNextOutput(ctx, time.Now().Unix())
 			requireStoreOK(t, err)
-			requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header))
+			requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 			_, err = s.DB.Exec(`CREATE TRIGGER reject_empty_assistant_header BEFORE UPDATE OF header ON outbox BEGIN SELECT RAISE(FAIL,'injected header failure'); END`)
 			requireStoreOK(t, err)
 			if target, err := s.CompleteInboxWithAssistantHeader(ctx, 10, 7, 8, id, transition.final, []string{"must roll back"}); err == nil || target != 0 {
@@ -392,7 +393,7 @@ func TestUnchangedAssistantHeaderPreservesPendingWithoutNewEdit(t *testing.T) {
 							requireStoreOK(t, err)
 						}
 						if stage == "after" {
-							requireStoreOK(t, s.MarkOutputDelivered(id, 100, header))
+							requireStoreOK(t, s.MarkOutputDelivered(id, 100, header, ""))
 						}
 						if pending {
 							requireStoreOK(t, s.SetAssistantHeader(ctx, id, "different header"))
@@ -420,7 +421,7 @@ func TestUnchangedAssistantHeaderPreservesPendingWithoutNewEdit(t *testing.T) {
 							}
 						}
 						if stage != "after" {
-							requireStoreOK(t, s.MarkOutputDelivered(id, 100, header))
+							requireStoreOK(t, s.MarkOutputDelivered(id, 100, header, ""))
 						}
 						edit, err := s.NextAssistantHeader()
 						if stage == "after" && pending {
@@ -428,7 +429,7 @@ func TestUnchangedAssistantHeaderPreservesPendingWithoutNewEdit(t *testing.T) {
 							if edit.ID != id || edit.Header != header || edit.Text != "immutable body" {
 								t.Fatalf("unchanged update lost existing pending edit: %+v", edit)
 							}
-							requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header))
+							requireStoreOK(t, s.MarkAssistantHeaderDelivered(id, header, ""))
 						} else if !errors.Is(err, sql.ErrNoRows) {
 							t.Fatalf("unchanged header queued redundant edit: %+v/%v", edit, err)
 						}

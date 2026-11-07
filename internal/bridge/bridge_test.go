@@ -676,6 +676,11 @@ func TestMain(m *testing.M) {
 				continue
 			}
 			switch typ {
+			case "fixture_consumer_overflow":
+				for range 256 {
+					emit(map[string]any{"type": "message_update", "text": "PRIVATE_CONSUMER_RPC_PAYLOAD"})
+				}
+				continue
 			case "fixture_usage_mode":
 				usageMode, _ = cmd["mode"].(string)
 			case "fixture_usage_account":
@@ -886,6 +891,12 @@ func TestMain(m *testing.M) {
 				emit(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}}}}})
 				continue
 			case "get_state":
+				if os.Getenv("OMP_TELEGRAM_FIXTURE_INIT_OVERFLOW") == "1" {
+					for range 256 {
+						emit(map[string]any{"type": "message_update", "text": "PRIVATE_CONSUMER_RPC_PAYLOAD"})
+					}
+					continue
+				}
 				if getStateUpdateRemaining > 0 {
 					getStateUpdateRemaining--
 					if getStateUpdateRemaining == 0 {
@@ -1486,10 +1497,13 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return nil, err
 	}
-	if f.failProgress && (filepath.Base(r.URL.Path) == "sendMessage" || filepath.Base(r.URL.Path) == "editMessageText") {
-		f.mu.Lock()
+	f.mu.Lock()
+	failProgress := f.failProgress && (filepath.Base(r.URL.Path) == "sendMessage" || filepath.Base(r.URL.Path) == "editMessageText")
+	if failProgress {
 		f.progressCalls++
-		f.mu.Unlock()
+	}
+	f.mu.Unlock()
+	if failProgress {
 		return nil, errors.New("progress transport failed")
 	}
 	var result any = true

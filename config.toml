@@ -1,7 +1,7 @@
 # Default test configuration. Keep credentials in environment variables.
 # Use --config config.local.toml or -c config.local.toml for private overrides.
 # Configuration references expand once after TOML parsing, except literal
-# omp.environment settings and telegram.status_bar fields; $$ is a literal dollar sign.
+# omp.environment, telegram.final_actions and telegram.status_bar fields; $$ is a literal dollar sign elsewhere.
 # Unknown settings are ignored and logged at ERROR with their source location.
 # Invalid values for known settings still fail validation.
 
@@ -24,6 +24,19 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 # Accepts an integer or a quoted numeric environment reference. Active Tools stay at 6.
 # Long histories show the newest rows that fit, with an omitted count for older rows.
 progress_recent_tools = 5
+
+# Optional ordered completion shortcuts. Omitted or [] keeps them disabled.
+# At most 6; nonempty single-line labels, at most 64 UTF-16 units each.
+# Each command is one slash invocation with optional literal fixed arguments.
+# No variable expansion, command joining or shell execution is performed.
+# Native commands require current-session catalog availability and source policy.
+# Shake explicitly invokes native /shake; unavailable runtimes reject, never substitute.
+final_actions = []
+# final_actions = [
+#   { label = "Compact", command = "/compact" },
+#   { label = "New", command = "/new" },
+#   { label = "Shake", command = "/shake" },
+# ]
 
 [telegram.status_bar]
 # Fields appear in array order; unavailable values are omitted. [] hides that header.
