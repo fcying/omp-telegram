@@ -187,6 +187,7 @@ func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bo
 		}
 		if len(parts) != 0 {
 			var err error
+			var firstID int64
 			if assistantReplyHasBody(parts, truncated) {
 				if header != "" {
 					parts[0] = parts[0][len(header)+2:]
@@ -196,6 +197,7 @@ func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bo
 					bodyParts--
 				}
 				w.assistantDelivery.statusOutboxID, err = w.b.db.AppendAssistantBodyReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts, header, bodyParts)
+				firstID = w.assistantDelivery.statusOutboxID
 			} else {
 				err = w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts)
 			}
@@ -204,7 +206,13 @@ func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bo
 				w.cancel()
 				return false
 			}
-			w.supersedePreview(w.previewReplyTo)
+			if firstID != 0 {
+				if !w.retirePreview(w.previewReplyTo, firstID, len(parts)) {
+					return false
+				}
+			} else {
+				w.rotatePreview(w.previewReplyTo)
+			}
 		}
 		w.assistantDelivery.queuedBytes += queuedBytes
 		w.assistantDelivery.queuedParts += len(parts)

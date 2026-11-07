@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 24
+const schemaVersion = 25
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -473,6 +473,14 @@ CREATE INDEX idx_outbox_assistant_header ON outbox(id) WHERE state='done' AND he
 			return e
 		}
 		version = 24
+	}
+	if version == 24 {
+		if _, e = tx.Exec(`ALTER TABLE progress_messages ADD COLUMN retired INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE progress_messages ADD COLUMN first_outbox_id INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE progress_messages ADD COLUMN last_outbox_id INTEGER NOT NULL DEFAULT 0;`); e != nil {
+			return e
+		}
+		version = 25
 	}
 	if e = backfillProgressChats(tx); e != nil {
 		return e
@@ -1845,6 +1853,29 @@ ON CONFLICT(inbox_id,message_id) DO UPDATE SET chat=COALESCE(progress_messages.c
 	return nil
 }
 
+// RetireProgressMessages freezes a preview's first replacement boundary.
+// A zero message ID selects all current previews; zero parts is an explicit UI-only replacement.
+func (s *Store) RetireProgressMessages(inboxID, messageID, firstID int64, parts int) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var lastID int64
+	if parts > 0 {
+		err = tx.QueryRow("SELECT id FROM outbox WHERE inbox_id=? AND id>=? ORDER BY id LIMIT 1 OFFSET ?", inboxID, firstID, parts-1).Scan(&lastID)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`UPDATE progress_messages SET retired=1,first_outbox_id=?,last_outbox_id=?
+WHERE inbox_id=? AND (?=0 OR message_id=?) AND retired=0`, firstID, lastID, inboxID, messageID, messageID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ProgressMessages snapshots known previews of one root before a UI boundary.
 func (s *Store) ProgressMessages(inboxID int64) ([]ProgressMessage, error) {
 	rows, err := s.DB.Query("SELECT inbox_id,chat,message_id FROM progress_messages WHERE inbox_id=? AND chat IS NOT NULL ORDER BY message_id", inboxID)
@@ -1863,7 +1894,7 @@ func (s *Store) ProgressMessages(inboxID int64) ([]ProgressMessage, error) {
 	return messages, rows.Err()
 }
 
-// CompletedProgressMessages returns deletion candidates after the owner and all deliveries settle.
+// CompletedProgressMessages returns previews whose replacement has been delivered successfully.
 // An inboxID of zero selects all roots; unknown legacy chats remain excluded and durable.
 func (s *Store) CompletedProgressMessages(inboxID int64) ([]ProgressMessage, error) {
 	tx, err := s.DB.Begin()
@@ -1878,8 +1909,19 @@ func (s *Store) CompletedProgressMessages(inboxID int64) ([]ProgressMessage, err
 SELECT p.inbox_id,p.chat,p.message_id
 FROM progress_messages p
 JOIN inbox i ON i.id=p.inbox_id
-WHERE (?=0 OR i.id=?) AND i.state IN ('done','cancelled','failed','ignored','uncertain') AND p.chat IS NOT NULL
-	  AND NOT EXISTS (SELECT 1 FROM outbox pending WHERE pending.inbox_id=i.id AND pending.state NOT IN ('done','failed','uncertain','cancelled','sent'))
+WHERE (?=0 OR i.id=?) AND p.chat IS NOT NULL AND (
+  (p.retired=1 AND (
+    p.first_outbox_id=0 OR (
+      EXISTS (SELECT 1 FROM outbox o WHERE o.inbox_id=i.id AND o.id=p.first_outbox_id)
+      AND EXISTS (SELECT 1 FROM outbox o WHERE o.inbox_id=i.id AND o.id=p.last_outbox_id)
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.inbox_id=i.id AND o.id BETWEEN p.first_outbox_id AND p.last_outbox_id AND o.state NOT IN ('done','sent'))
+    )
+  )) OR (
+    p.retired=0 AND i.state IN ('done','cancelled','failed','ignored','uncertain')
+    AND EXISTS (SELECT 1 FROM outbox o WHERE o.inbox_id=i.id AND o.kind='text')
+    AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.inbox_id=i.id AND o.state NOT IN ('done','sent'))
+  )
+)
 ORDER BY p.inbox_id,p.message_id`, inboxID, inboxID)
 	if err != nil {
 		return nil, err

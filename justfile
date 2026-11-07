@@ -31,6 +31,12 @@ test *args:
     umask 0077
     go test ./... "$@"
 
+# Run a stable CI shard without changing test coverage or service state.
+[positional-arguments]
+test-shard shard count *args:
+    umask 0077
+    bash .github/scripts/test-shard.sh "$@"
+
 # Run real OMP compatibility tests with an explicitly supplied binary, without installing it.
 smoke-omp binary:
     binary={{quote(binary)}}

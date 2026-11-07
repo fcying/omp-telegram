@@ -359,7 +359,9 @@ Very large output or many replies may be truncated with an explicit notice. OMP'
 
 Progress appears after about three seconds and includes **Stop | Follow-up** in one row. **Stop** cancels the current task; **Follow-up** opens a reply prompt without pausing or steering it. With the `status` field selected, its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies. `progress_mode = "off"` creates neither button.
 
-Steer input and completed assistant messages remove the task's older Progress bubbles without restarting OMP. A new preview waits for preceding formal replies to be delivered and appears below the latest input/reply. Remaining temporary Progress bubbles are cleaned up when the task ends; formal replies remain.
+Steer input replaces the current Progress preview without restarting OMP. After an assistant message completes, its older preview is frozen and removed only after all corresponding formal reply parts are successfully delivered. Failed or uncertain delivery preserves that visible copy; a later Steer cannot bypass this protection. A new preview waits for preceding formal replies to leave the delivery queue and appears below the latest input/reply. Cleanup retries include superseded previews of running tasks; formal replies are never cleanup targets.
+
+A native local command confirmed not to invoke the model retires its status-only Progress after its completion transaction commits, even when it creates no formal assistant reply. Late preview acknowledgments and temporary deletion failures follow the same cleanup policy.
 
 Completed assistant messages are sent immediately, even with progress off. With the `status` field selected, intermediate headers show **💬** and confirmed task success changes only the latest formal header to **✅**; cancellation, failure, uncertainty and ongoing research rounds do not gain a success marker. Only the first formal message quotes the original request. Bodies stay unchanged for Telegram Reply, with no body resend or separate completion message.
 
