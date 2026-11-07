@@ -3151,42 +3151,6 @@ func TestDeliveryCleansDoneProgressAfterAllReplies(t *testing.T) {
 	}
 }
 
-func TestDeliveryFailureCleansTerminalProgress(t *testing.T) {
-	db, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
-	requireStoreOK(t, db.Submit(10, 42))
-	requireStoreOK(t, db.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, db.SetProgressMessage(10, 7, 77))
-	fake := &fakeHTTP{sendResponses: map[int64][]fakeHTTPResponse{
-		7: {{status: http.StatusBadRequest, body: `{"ok":false,"error_code":400,"description":"reply rejected"}`}},
-	}}
-	previous := http.DefaultTransport
-	http.DefaultTransport = fake
-	defer func() { http.DefaultTransport = previous }()
-	b := testBridge(t, &Bridge{db: db, tg: newTestTelegram(t)})
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- b.deliver(ctx) }()
-	defer func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("delivery loop returned error: %v", err)
-		}
-	}()
-	waitFor(t, func() bool {
-		var state string
-		var progressID int64
-		err := db.DB.QueryRow("SELECT outbox.state,(SELECT COUNT(*) FROM progress_messages WHERE inbox_id=10) FROM outbox WHERE inbox_id=10").Scan(&state, &progressID)
-		return err == nil && state == "failed" && progressID == 0 && len(fake.deletedMessageIDs()) == 1
-	})
-	if got := fake.deletedMessageIDs(); len(got) != 1 || got[0] != 77 {
-		t.Fatalf("deleted progress messages = %v, want [77]", got)
-	}
-}
 func TestProgressDeletionTransientFailureRetainsAssociation(t *testing.T) {
 	db, err := store.Open(t.TempDir())
 	if err != nil {
@@ -4193,8 +4157,9 @@ func setupWorkspaceWorker(t *testing.T) (*worker, *fakeHTTP, func(string)) {
 	w := testWorker(t, &worker{b: testBridge(t, &Bridge{cfg: config.Config{OMP: binary, WorkspaceRoot: t.TempDir(), DataDir: dataDir}, db: db, tg: newTestTelegram(t), bot: telegram.User{ID: 99}, slots: make(chan struct{}, 1)}), key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)})
 	w.resumeResults = make(chan resumeListResult, 4)
 	t.Cleanup(func() {
-		w.teardownWorker(true)
+		// Stop worker-owned background lanes before releasing the runtime.
 		cancel()
+		w.teardownWorker(true)
 		w.background.Wait()
 		http.DefaultTransport = old
 		db.Close()

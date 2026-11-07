@@ -339,7 +339,10 @@ func TestFormalBodyDeliveryPrecedesNewPreview(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("formal body Send did not start")
 	}
-	awaitProgressDeletion(t, w, root, initial.id)
+	w.background.Wait()
+	if deleted := f.deletedMessageIDs(); len(deleted) != 0 {
+		t.Fatalf("progress deleted before formal acknowledgment: %v", deleted)
+	}
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Work after the formal body"}}`))
 	w.flushPreview()
 	if w.previewID != 0 || w.previewBusy || f.messageCount() != 2 {
@@ -351,6 +354,7 @@ func TestFormalBodyDeliveryPrecedesNewPreview(t *testing.T) {
 		err := w.b.db.DB.QueryRow("SELECT state FROM outbox WHERE id=?", outputID).Scan(&state)
 		return err == nil && state == "done"
 	})
+	awaitProgressDeletion(t, w, root, initial.id)
 	next := sendRealtimePreview(t, w)
 	if next.id <= initial.id || !next.created || !strings.Contains(next.text, "Work after the formal body") {
 		t.Fatal("new live output did not create a fresh preview")
@@ -418,7 +422,10 @@ func TestCompletedMessageDeletesLateAcceptedPreview(t *testing.T) {
 	case late := <-w.previewResult:
 		requireStoreOK(t, late.err)
 		w.previewFinished(late)
-		awaitProgressDeletion(t, w, root, late.id)
+		w.background.Wait()
+		if deleted := f.deletedMessageIDs(); len(deleted) != 0 {
+			t.Fatalf("late preview deleted before formal delivery: %v", deleted)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted preview identity did not arrive")
 	}

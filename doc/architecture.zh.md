@@ -292,7 +292,7 @@ ForceReply 提示通过 `tg://user?id=...` 链接显式 mention 目标用户. Se
 
 Assistant 预览保留当前文字尾部最多 2200 UTF-16 单位, 不修改正式正文. 最多显示六个活动工具, 名称最多 64 单位, payload 字段最多 100 单位, detail 总预算 1600 单位, preview 总预算 3500 单位. 有界 JSON payload decoder 扫描事件但只复制有限前缀. Verbose payload 不脱敏, 可向所有能读此会话的人暴露凭据或私有文件; 截断不是隐私过滤.
 
-Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 接受 Steer 和正文成功持久入队共用 `supersedePreview`: 推进 preview epoch, 对 root 较早的持久预览取快照并异步删除. discard-epoch 边界也会在任一替换前迟到的成功 Send 返回身份后清理它们. 删除沿用既有尽力而为策略, 不改变任务状态. 轮换取消过时 Edit, 但让初次 Send 返回消息身份以供清理. 新 preview 等待当前对话没有 pending/sending outbox 行后才创建, 不抢在正式回复前; 此 UI 屏障不延迟 RPC 消费或任务执行. Steer preview 回复该用户消息, 不改变 root 所有权, 不重启 OMP. 初始 Send 失败抑制该 epoch 后续 progress, 避免重复消息; Edit 失败仍可重试. 只有首条正式文本分片引用原 root 请求. 回复目标被拒绝时可退回普通消息, 不改变执行状态. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
+Root Stop 按钮检查 owner, generation, active inbox 和 turn. 有效点击先消费 token 再请求中断; 旧按钮不能终止后续工作. 接受 Steer 和正文持久入队通过 `retirePreview` 推进 preview epoch. Steer 可立即退役未受保护的实时预览; 已完成正文记录首个 outbox ID 和分片数量, 等待整个替代范围成功交付后才允许删除. 每个预览保留首次退役边界, 后续 Steer 或正文入队不能覆盖交付保护. 同步共享的退役凭据将边界带入迟到的初次 Send 回执, 包括 shutdown 处理. 轮换取消过时 Edit, 但让初次 Send 返回消息身份以供清理. 新 preview 等待当前对话没有 pending/sending outbox 行后才创建, 不抢在正式回复前; 此 UI 屏障不延迟 RPC 消费或任务执行. Steer preview 回复该用户消息, 不改变 root 所有权, 不重启 OMP. 初始 Send 失败抑制该 epoch 后续 progress, 避免重复消息; Edit 失败仍可重试. 只有首条正式文本分片引用原 root 请求. 回复目标被拒绝时可退回普通消息, 不改变执行状态. Typing 至多每五秒一次, 四秒超时, 在完成, turn 变化, runtime release 和 shutdown 时取消.
 
 已完成的 assistant 正文是独立持久消息, 不属于临时 Progress. 每条 preview 身份持久保存在 `progress_messages`, 包括旧 epoch 迟到但成功的 Send. 即使正文已在 inbox 完成前全部投递且没有新增终结行, 终结清理仍检查全部关联. 迟到的 Progress 结果按原 task/generation/turn/epoch fencing, 不能重新绑定当前 preview, 改写 assistant 问题或让替换任务接管旧消息.
 
@@ -747,7 +747,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 | `topic_names` | `(bot,chat,thread)`; 已知标题和单调递增 revision | 持久化已观察标题并分配预留 token; 空标题 tombstone 防止 revision 复用 |
 | `topic_name_reservations` | `(bot,chat,thread,revision)`; 预留标题和在途/保留状态 | 逐请求名称占用; 标题事件保留在途请求, 匹配的结果仅结算自身占用 |
 | `inbox` | Update ID; typed update JSON, 状态, reply target, 创建/更新时间 | 去重和输入的持久化结算 |
-| `progress_messages` | `(inbox_id,message_id)`, chat | 每条临时 preview 身份保留到完成清理 |
+| `progress_messages` | `(inbox_id,message_id)`, chat, 退役标记及替代 outbox 范围 | Preview 身份及持久删除资格, 包括运行中任务的清理重试 |
 | `outbox` | 递增 ID; 可选 inbox ID, chat/thread/reply target, 不可变正文或附件类型/路径/名称, 独立状态栏, Telegram 消息 ID, 待更新状态标记, 投递状态, 重试计数/时间 | 有序持久正文交付及尽力状态更新; 附件字节保存在私有文件 spool |
 
 迁移范围仅限 bridge. 早期版本补充启动 metadata, 输入/输出时间戳及 reply/progress 关联, 原生 session ID, 最近使用时间, 收藏和重试调度. 旧 `last_used_at` 保持为零; 独立的服务端拒绝计数从零开始, 不根据总尝试次数猜测. 版本 11/12 的迁移路径会移除 `activity_messages`, 当前 schema 不包含该表. 旧 intent 的创建时间记为迁移时间. 版本 14/15 直接推进, 不重建已废弃的 workspace 表; 版本 17 增加预设 singleton, 版本 18 删除存在的 `workspace_users` 和 `workspace_leases`. 不会把原生 session 文件, 已选择的 workspace 路径或已提交 binding 迁入另一套存储模型.
@@ -755,6 +755,8 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 Schema 版本 22 将原 inbox 单条 progress 关联迁入 `progress_messages`, 并为 outbox 增加独立状态栏/交付字段. 保留现有正文, 投递状态及原生 session; 不重新解析历史正文来推断可编辑状态栏.
 
 Schema 版本 24 将逐按钮一次性 claim 和尾片 reply-markup 状态与首片 header 编辑分别保存. 最小 follow-up 请求/tombstone metadata 记录 prompt 交付确定性, owner 及 session/binding 身份, 过期时间, bridge instance 和接受的 inbox 关联; 不维护第二份模型 transcript 或队列. 上一个 bridge instance 的未完成请求在重启后拒绝, 已消费/不确定工作不能作为普通输入重新执行.
+
+Schema 版本 25 增加 preview 退役和替代范围字段. 保留已有预览身份及 outbox 正文, 不推断缺失的替代边界. 无边界的终态预览必须有关联文本且所有关联输出成功交付才允许清理; 正式交付失败, 不确定或缺失时保留预览.
 
 ### 输入接收与结算
 
@@ -816,9 +818,11 @@ Schema 版本 24 将逐按钮一次性 claim 和尾片 reply-markup 状态与首
 
 ### 进度消息删除
 
-终态 inbox 存在关联 outbox, 且所有关联行均为终态时, progress 才具备删除条件. 最终交付 failed 或 uncertain 不阻止清理, pending/sending 会阻止. 清理在终态交付后, 启动时及每分钟执行, 每次 Delete 超时为五秒.
+已退役预览记录的替代范围内所有 outbox 分片均为 `done` 或旧 `sent` 后, 才具备删除资格. 显式 Steer-only 退役无交付范围, 可立即清理, 但不能覆盖已有受保护边界. 运行中的任务也参与此检查, 删除暂时失败不必等到任务结束才重试. 未退役的终态预览要求有关联文本且所有关联输出成功交付. Failed, uncertain, cancelled 或缺失的交付不授权删除. 清理在交付后, 预览退役或迟到回执时, 启动时及每分钟执行, 每次 Delete 超时为五秒.
 
-成功会清除匹配的本地关联. 明确的永久 4xx (429 除外) 会放弃删除并清除关联. 429, 5xx, 传输失败或不确定响应保留关联, 等待再次清理. 清理不改变任务或 outbox 结果. 即使 Telegram 删除一直失败, retention 最终也会清除超期且无活动交付的本地关联; 无法保证每条 preview 都从远端消失.
+明确确认的本地命令完成也会显式无范围退役: `finishLocalCommandSubmission` 选择 `finishResult(true)`, 仅在持久完成事务成功提交且未观察到 assistant 正文后退役状态预览. 此路径覆盖延迟 `prompt_result` 完成和初次预览回执迟到, 不虚构 assistant 回复. 提交失败仍保留预览保护. 既有 assistant 正文边界不变, 不能仅凭缺少 outbox 行就删除历史或不确定任务的预览.
+
+成功会清除匹配的本地关联. 明确的永久 4xx (429 除外) 会放弃删除并清除关联. 429, 5xx, 传输失败或不确定响应保留关联, 等待再次清理. 清理不改变任务或 outbox 结果, 从不以正式回复为目标. 保留中的预览关联保护其 inbox 和 outbox 记录不被 retention 删除; 因此正式交付未成功时保留冻结的可见预览及已存正文, 不静默删除最后一个可见副本. 不重放不确定的交付或模型任务, 尽力而为的删除也无法保证每条旧预览都从远端消失.
 
 ## 附件与 host tool 文件边界
 
@@ -910,17 +914,22 @@ Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时�
 | `just fmt` | 使用 `go.mod` 的 Go 版本格式化源码和测试, 与 CI 保持一致 |
 | `just test` | 运行单元测试, 不启动或重启服务 |
 | `just check` | 单元测试, race 检查, vet; 不启动 Telegram polling |
+| `just test-shard 0 4 -race` | 运行四片中从零编号的第零片, 每个根测试的子测试及 fuzz seeds 始终一起运行 |
 | `just smoke-omp /absolute/path/to/omp` | 运行 opt-in 真实 OMP Bridge 和迁移兼容检查; 不安装或部署 |
 | `just install` | 构建并仅安装二进制; 配置和数据由用户管理 |
 | `just deploy` | 安装后, 安排五秒后分离执行已有 supervisor 服务重启 |
 
-`just test` 和 `just check` 在各自 recipe shell 内设置 `umask 0077`. Go 的 `testing.T.TempDir` 以 `0777` 经进程 umask 过滤后创建编号子目录, 调用方使用 `0002` 等掩码时会令 store fixture 可被组写入, 在业务断言之前就初始化失败. Recipe 内的掩码不影响调用方 shell, 也不对已有目录执行 chmod. 保持 store 对组/其他用户可写数据目录的拒绝校验不变.
+`just test`, `just test-shard` 和 `just check` 在各自 recipe shell 内设置 `umask 0077`. Go 的 `testing.T.TempDir` 以 `0777` 经进程 umask 过滤后创建编号子目录, 调用方使用 `0002` 等掩码时会令 store fixture 可被组写入, 在业务断言之前就初始化失败. Recipe 内的掩码不影响调用方 shell, 也不对已有目录执行 chmod. 保持 store 对组/其他用户可写数据目录的拒绝校验不变.
 
 本地配置检查先构建, 再运行 `./omp-telegram --check`; 需要时显式指定 `--config`. 该命令会创建目录, 测试配置行为时使用一次性路径.
 
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
 
 共享假 Telegram transport 使用 `fakeHTTP.mu` 保护 `failProgress` 的读写, 包括后台键盘清理运行时由测试切换开关. 故障判定和 `progressCalls` 递增位于同一临界区.
+
+路由断言通过原始 Send 目标解析编辑请求: `editMessageText` 携带 chat/message ID, 不携带 topic ID. Edit 缺少 thread 字段不能被视为投递到了私聊主会话.
+
+测试 worker 在 runtime teardown 及等待整个 background group 前主动取消自有 context. 该组包含只在取消时退出的常驻键盘清理通道. 需要保持 worker 运行的测试等待明确的有界结果, 不等待所有通道退出; 终态清理测试在观察到操作后取消, 后续清理重试使用仍有效的 context. 不为停止 UI 通道而等待 fixture 的自然 deadline.
 
 Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 request 和 epoch, 再注入 deadline 错误; 根任务, session 和队列断言仍然适用. RPC 测试单独覆盖真实 context deadline, 合并发现请求和迟到响应. 不为测试提速缩短生产查询 deadline.
 
@@ -950,10 +959,10 @@ Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 
 
 应用版本来自 [`main.go`](../cmd/omp-telegram/main.go) 的 `Version`, 可用 `-ldflags "-X main.Version=..."` 覆盖. `--version`, `-v`, `/help`, `/start` 使用同一 display version, 构建信息可用时附带 Git revision/dirty 标记. 应用版本与 SQLite schema 版本独立.
 
-[发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 格式和依赖一致性检查只在 amd64 执行一次, 在 Linux amd64/arm64 原生 runner 上运行 `govulncheck`, vet 和普通测试. 完整 amd64 race 测试独立为一个 job, 与两个架构构建并行. 测试命令使用 `-vet=off` 避免重复执行自动 vet 子集; 两个原生构建仍分别执行独立的完整 vet 检查. 各架构以 CGO disabled 构建, 实跑 version/help, 将二进制和 LICENSE 打包为 `.txz`; 发布包附带 `SHA256SUMS`. 迁移 Extension 内嵌于二进制, 只在配置开关启用时加载. CI 门禁和发布都要求两个原生构建及 race job 成功.
+[发布工作流](../.github/workflows/release.yaml) 响应 `main` push, PR 和手动触发. 根据 `go.mod` 选择 Go, 格式和依赖一致性检查只在 amd64 执行一次, 保留 Linux amd64/arm64 原生 runner 的 `govulncheck`, vet 和普通测试. 每个架构的普通测试拆成两个独立分片, amd64 race 覆盖拆成四个独立分片. [分片执行器](../.github/scripts/test-shard.sh) 使用一致的 Go flags 发现全部 Test/Fuzz/Example 根测试名, 按稳定 checksum 分配每个唯一名称, 不维护白名单. 每个根测试的全部子测试及 fuzz seeds 一起运行, 新增根测试自动纳入. 独立进程不共享测试全局变量或环境修改. 发现失败会使该分片失败; 现有 CI 门禁和发布要求所有分片成功. 测试使用 `-count=1 -vet=off`, 每个架构仍执行一次完整 vet 和漏洞检查. 仅第零片以 CGO disabled 构建, 实跑 version/help, 上传二进制和 LICENSE 的 `.txz` 归档; 发布包附带 `SHA256SUMS`. 迁移 Extension 内嵌于二进制, 只在配置开关启用时加载.
 
 工作流固定 `govulncheck` 版本. 升级 Go 时还需选择 `x/tools` SSA 实现支持新 Go 语法的扫描器. 扫描器崩溃仍须使 CI 失败, 不通过忽略错误或降低扫描深度绕过兼容问题.
 
-缓存 action 固定到 commit SHA, 使用 Node.js 24. Go module 和编译缓存按 runner OS/架构, build/race job 及依赖文件 hash 隔离. 每个源码 revision 使用新缓存键, 恢复前一个兼容缓存, 无需等待 `go.sum` 变化才能更新编译产物. 新缓存前缀的首次运行是冷缓存; 普通测试不会因缓存而跳过执行.
+缓存 action 固定到 commit SHA, 使用 Node.js 24. Go module 和编译缓存按 runner OS/架构, build/race job 及依赖文件 hash 隔离. 每个源码 revision 使用新缓存键, 恢复前一个兼容缓存, 无需等待 `go.sum` 变化才能更新编译产物. 相同架构和 job 类型的分片共享兼容的编译缓存; 不可变缓存只接受一个并发保存. 新缓存前缀的首次运行是冷缓存; `-count=1` 保证普通及 race 测试不依赖已缓存结果跳过执行. 分片用额外 runner 启动开销换取关键路径缩短, 不减少覆盖或放宽测试超时.
 
 `main` 上的新源码版本创建正式 release, 不移动已有版本 tag. 其他符合条件的运行发布滚动 `dev-latest` prerelease. 同仓库 PR 构建/发布真实 head commit; fork PR 只构建, 不发布. 只有 release job 有仓库内容写权限. 发布串行化, workflow 只替换滚动 prerelease tag 或创建新版本 tag. 发布要求显式更新源码版本, 不等于升级数据库 schema.

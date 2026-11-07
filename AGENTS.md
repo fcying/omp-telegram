@@ -8,6 +8,10 @@ Build a Go Telegram daemon that manages an independent `omp --mode rpc` process 
 
 Use Chinese for conversations and explanations, and English for code comments, this file, and the default README.md. Maintain the Chinese translation in README.zh.md, with links between the two README files. Keep both versions consistent. Use ASCII punctuation. State assumptions and acceptance criteria before making changes.
 
+## Pull Requests
+
+- When asked to create a pull request, use `gh pr create -f` to generate its title and description from commit messages. Do not supply a custom title or body unless the user explicitly requests it.
+
 ## Engineering
 
 - Keep the implementation minimal. Do not parse PTY/ANSI output or introduce leader/follower coordination or a generic backend framework.

@@ -235,16 +235,16 @@ const (
 )
 
 type progressTransport struct {
-	finishing            bool
-	previewBusy          bool
-	previewEpoch         uint64
-	previewDiscardBefore uint64
-	previewCancel        context.CancelFunc
-	previewReplyTo       int64
-	previewID            int64
-	previewStopToken     string
-	progressSuppressed   bool
-	lastPreview          string
+	finishing          bool
+	previewBusy        bool
+	previewEpoch       uint64
+	previewCancel      context.CancelFunc
+	previewReplyTo     int64
+	previewID          int64
+	previewStopToken   string
+	progressSuppressed bool
+	lastPreview        string
+	previewRetirement  *previewRetirement
 }
 
 type runtimeLifecycle struct {
@@ -368,6 +368,14 @@ type terminalAssistant struct {
 	ErrorStatus                int
 }
 
+// Retirement follows an initial Send even when its acknowledgment arrives after rotation.
+type previewRetirement struct {
+	mu      sync.Mutex
+	retired bool
+	firstID int64
+	parts   int
+}
+
 type previewResult struct {
 	id         int64
 	taskID     int64
@@ -378,6 +386,7 @@ type previewResult struct {
 	turn       uint64
 	epoch      uint64
 	err        error
+	retirement *previewRetirement
 }
 
 const (
@@ -3644,6 +3653,10 @@ func (w *worker) resetAssistantResult() {
 }
 
 func (w *worker) finish() {
+	w.finishResult(false)
+}
+
+func (w *worker) finishResult(localOnly bool) {
 	defer w.beginConsumerPhase("result", "finish").end()
 	w.stopTyping()
 	w.resetIdleProbe()
@@ -3681,6 +3694,11 @@ func (w *worker) finish() {
 				w.cancel()
 			}
 			return
+		}
+		if localOnly && !w.hasAssistantBody() {
+			if !w.retirePreview(0, 0, 0) {
+				return
+			}
 		}
 		w.providerUsage.target = target
 		w.providerUsage.targetProvider = w.replyStatus.provider
@@ -3906,19 +3924,6 @@ func (w *worker) cleanupCompletedProgress(taskID int64) {
 	}()
 }
 
-func (w *worker) cleanupSupersededProgress(messages ...store.ProgressMessage) {
-	if len(messages) == 0 {
-		return
-	}
-	w.background.Add(1)
-	go func() {
-		defer w.background.Done()
-		for _, message := range messages {
-			w.b.deleteProgressMessage(w.ctx, message)
-		}
-	}()
-}
-
 func (w *worker) finishProgressWhenReady() {
 	if w.previewBusy {
 		w.finishing = true
@@ -3947,19 +3952,34 @@ func (w *worker) rotatePreview(replyTo int64) {
 	w.previewID = 0
 	w.previewReplyTo = replyTo
 	w.lastPreview = ""
+	w.previewRetirement = nil
 	w.previewStopToken = ""
 	w.progressSuppressed = false
 }
 
 func (w *worker) supersedePreview(replyTo int64) {
-	w.rotatePreview(replyTo)
-	w.previewDiscardBefore = w.previewEpoch
-	previews, err := w.b.db.ProgressMessages(w.active)
-	if err != nil {
-		w.b.storeLog.Warn("superseded progress lookup failed", "event", "progress_cleanup_state_failed")
-		return
+	w.retirePreview(replyTo, 0, 0)
+}
+
+func (w *worker) retirePreview(replyTo, firstID int64, parts int) bool {
+	retirement := w.previewRetirement
+	if retirement != nil {
+		retirement.mu.Lock()
+		defer retirement.mu.Unlock()
 	}
-	w.cleanupSupersededProgress(previews...)
+	if err := w.b.db.RetireProgressMessages(w.active, 0, firstID, parts); err != nil {
+		w.b.fail(err)
+		w.cancel()
+		return false
+	}
+	if retirement != nil {
+		retirement.retired = true
+		retirement.firstID = firstID
+		retirement.parts = parts
+	}
+	w.rotatePreview(replyTo)
+	w.cleanupCompletedProgress(w.active)
+	return true
 }
 
 func (w *worker) drainPreviewResults() {
@@ -4533,11 +4553,21 @@ func (w *worker) recordProgressMessage(result previewResult) {
 	if !result.created || result.err != nil || result.id == 0 || result.taskID == 0 || w.b.db == nil {
 		return
 	}
+	retirement := result.retirement
+	if retirement != nil {
+		retirement.mu.Lock()
+		defer retirement.mu.Unlock()
+	}
 	if err := w.b.db.SetProgressMessage(result.taskID, w.key.chat, result.id); err != nil {
 		w.b.storeLog.Error("progress message association failed", "event", "progress_message_write_failed", "inbox_id", result.taskID, "message_id", result.id)
 		w.deleteOrphanProgressMessage(result.id)
 		w.b.fail(err)
 		return
+	}
+	if retirement != nil && retirement.retired {
+		if err := w.b.db.RetireProgressMessages(result.taskID, result.id, retirement.firstID, retirement.parts); err != nil {
+			w.b.fail(err)
+		}
 	}
 }
 
@@ -4557,11 +4587,7 @@ func (w *worker) previewFinished(result previewResult) {
 				delete(w.confirms, result.stopToken)
 			}
 		}
-		if result.created && result.err == nil && result.epoch < w.previewDiscardBefore {
-			w.cleanupSupersededProgress(store.ProgressMessage{InboxID: result.taskID, Chat: w.key.chat, MessageID: result.id})
-		} else {
-			w.cleanupCompletedProgress(result.taskID)
-		}
+		w.cleanupCompletedProgress(result.taskID)
 		return
 	}
 	w.previewBusy = false
@@ -4647,6 +4673,11 @@ func (w *worker) flushPreview() {
 	text := telegram.ClipConvertible(snapshot, telegram.MaxMessageUTF16)
 	id := w.previewID
 	creating := id == 0
+	retirement := w.previewRetirement
+	if creating {
+		retirement = &previewRetirement{}
+		w.previewRetirement = retirement
+	}
 	gen := w.binding.Generation
 	turn := w.turn
 	epoch := w.previewEpoch
@@ -4682,9 +4713,9 @@ func (w *worker) flushPreview() {
 			err = w.b.tg.Edit(ctx, w.key.chat, id, text, keyboard)
 		}
 		select {
-		case w.previewResult <- previewResult{id: id, taskID: taskID, created: creating, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, epoch: epoch, err: err}:
+		case w.previewResult <- previewResult{id: id, taskID: taskID, created: creating, text: snapshot, stopToken: stopToken, generation: gen, turn: turn, epoch: epoch, err: err, retirement: retirement}:
 		case <-w.ctx.Done():
-			result := previewResult{id: id, taskID: taskID, created: creating, err: err}
+			result := previewResult{id: id, taskID: taskID, created: creating, err: err, retirement: retirement}
 			w.recordProgressMessage(result)
 			w.b.cleanupDeliveredProgress(context.Background(), taskID)
 		}

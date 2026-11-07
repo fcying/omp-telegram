@@ -245,6 +245,7 @@ func TestHeaderEditabilityMigrationFromVersion22(t *testing.T) {
 	requireStoreOK(t, s.MarkOutputDelivered(id, 100, out.Header, ""))
 	requireStoreOK(t, s.SetAssistantHeader(ctx, id, "pending legacy header"))
 	requireStoreOK(t, s.Enqueue(7, 8, "ordinary legacy text"))
+	restoreProgressSchema24(t, s)
 	_, err = s.DB.Exec(`DROP INDEX idx_outbox_assistant_header;
 ALTER TABLE outbox DROP COLUMN header_editable;
 CREATE INDEX idx_outbox_assistant_header ON outbox(id) WHERE state='done' AND header_pending=1 AND message_id>0 AND header<>'';
@@ -350,6 +351,7 @@ func TestHeaderEditabilityMigrationRollsBackOnFailure(t *testing.T) {
 	requireStoreOK(t, s.Submit(10, 42))
 	id, err := s.AppendAssistantReplies(ctx, 10, 7, 8, []string{"legacy body"}, "legacy header")
 	requireStoreOK(t, err)
+	restoreProgressSchema24(t, s)
 	_, err = s.DB.Exec(`DROP INDEX idx_outbox_assistant_header;
 ALTER TABLE outbox DROP COLUMN header_editable;
 PRAGMA user_version=22;`)

@@ -57,6 +57,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        arch: [amd64, arm64]
+        shard: [0, 1]
         include:
           - arch: amd64
             runner: ubuntu-24.04
@@ -85,7 +87,7 @@ jobs:
             go-${{ runner.os }}-${{ runner.arch }}-build-${{ hashFiles('go.mod', 'go.sum') }}-
 
       - name: Check format
-        if: matrix.arch == 'amd64'
+        if: matrix.arch == 'amd64' && matrix.shard == 0
         run: |
           unformatted=$(gofmt -l .)
           if [[ -n "$unformatted" ]]; then
@@ -94,21 +96,24 @@ jobs:
           fi
 
       - name: Check dependencies
-        if: matrix.arch == 'amd64'
+        if: matrix.arch == 'amd64' && matrix.shard == 0
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
 
       - name: Vulnerability scan
+        if: matrix.shard == 0
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - name: Vet
+        if: matrix.shard == 0
         run: go vet ./...
 
       - name: Test
-        run: go test -vet=off -count=1 ./...
+        run: bash .github/scripts/test-shard.sh "${{ matrix.shard }}" 2 -vet=off -count=1
 
       - name: Build and smoke test
+        if: matrix.shard == 0
         run: |
           set -euo pipefail
           test "$(go env GOOS)/$(go env GOARCH)" = "linux/$TARGET_ARCH"
@@ -121,6 +126,7 @@ jobs:
           tar cJf "dist/omp-telegram-linux-${TARGET_ARCH}.txz" -C dist omp-telegram -C "$GITHUB_WORKSPACE" LICENSE
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: matrix.shard == 0
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/omp-telegram-linux-${{ matrix.arch }}.txz
@@ -128,6 +134,10 @@ jobs:
 
   race:
     needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -148,7 +158,7 @@ jobs:
             go-${{ runner.os }}-${{ runner.arch }}-race-${{ hashFiles('go.mod', 'go.sum') }}-
 
       - name: Race test
-        run: go test -race -vet=off ./...
+        run: bash .github/scripts/test-shard.sh "${{ matrix.shard }}" 4 -race -vet=off -count=1
 
   CI:
     name: CI

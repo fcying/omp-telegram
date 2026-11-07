@@ -36,6 +36,14 @@ func requireNoActivityTable(t *testing.T, s *Store) {
 	}
 }
 
+func restoreProgressSchema24(t *testing.T, s *Store) {
+	t.Helper()
+	_, err := s.DB.Exec(`ALTER TABLE progress_messages DROP COLUMN retired;
+ALTER TABLE progress_messages DROP COLUMN first_outbox_id;
+ALTER TABLE progress_messages DROP COLUMN last_outbox_id;`)
+	requireStoreOK(t, err)
+}
+
 func restoreLegacyProgressSchema(t *testing.T, s *Store) {
 	t.Helper()
 	_, err := s.DB.Exec(`ALTER TABLE inbox ADD COLUMN progress_message_id INTEGER NOT NULL DEFAULT 0;
@@ -604,36 +612,6 @@ func TestProgressMessageWaitsForAllFinalReplies(t *testing.T) {
 	}
 }
 
-func TestProgressWithoutOutboxAndLateCreatedMessage(t *testing.T) {
-	s := openTestStore(t, t.TempDir())
-	for _, id := range []int64{10, 11} {
-		requireStoreOK(t, s.Accept(id, []byte(`{}`)))
-		requireStoreOK(t, s.Mark(id, InboxDone))
-		requireStoreOK(t, s.SetProgressMessage(id, -7, 99))
-	}
-	requireStoreOK(t, s.ClearProgressMessage(10, 99))
-	requireStoreOK(t, s.SetProgressMessage(10, -7, 100))
-	requireStoreOK(t, s.SetProgressMessage(10, -8, 100))
-	targets, err := s.CompletedProgressMessages(10)
-	requireStoreOK(t, err)
-	if len(targets) != 1 || targets[0] != (ProgressMessage{InboxID: 10, Chat: -7, MessageID: 100}) {
-		t.Fatalf("late-created progress without outbox = %+v", targets)
-	}
-	targets, err = s.CompletedProgressMessages(11)
-	requireStoreOK(t, err)
-	if len(targets) != 1 || targets[0] != (ProgressMessage{InboxID: 11, Chat: -7, MessageID: 99}) {
-		t.Fatalf("clearing another root removed progress = %+v", targets)
-	}
-	if err := s.SetProgressMessage(12, -7, 100); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("missing inbox registration error = %v, want sql.ErrNoRows", err)
-	}
-	for _, identity := range [][3]int64{{0, -7, 100}, {10, 0, 100}, {10, -7, 0}} {
-		if err := s.SetProgressMessage(identity[0], identity[1], identity[2]); err == nil {
-			t.Fatalf("invalid progress identity accepted: %v", identity)
-		}
-	}
-}
-
 func TestVersionTwentyOneMigratesProgressChatsWithoutGuessing(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
@@ -687,8 +665,8 @@ PRAGMA user_version=21;`)
 	}
 	targets, err := s.CompletedProgressMessages(0)
 	requireStoreOK(t, err)
-	if len(targets) != 4 {
-		t.Fatalf("safe migrated cleanup candidates = %+v, want four known chats", targets)
+	if len(targets) != 2 || targets[0].InboxID != 1 || targets[1].InboxID != 7 {
+		t.Fatalf("migrated cleanup must require known chat and delivered text: %+v", targets)
 	}
 	result, err := s.CleanupMessages(context.Background(), time.Now().AddDate(0, 0, -90).Unix())
 	requireStoreOK(t, err)
@@ -815,32 +793,6 @@ func TestFinishSubmittedRejectsWrongSourceAndTarget(t *testing.T) {
 	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=106").Scan(&state))
 	if state != string(InboxSubmitted) {
 		t.Fatalf("rejected root mark changed state to %q", state)
-	}
-}
-
-func TestFailedReplyMakesProgressCleanupReady(t *testing.T) {
-	s := openTestStore(t, t.TempDir())
-	requireStoreOK(t, s.Accept(10, []byte(`{}`)))
-	requireStoreOK(t, s.Submit(10, 42))
-	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 7, 8, []string{"reply"}))
-	requireStoreOK(t, s.SetProgressMessage(10, 7, 99))
-	out, err := s.NextOutput()
-	requireStoreOK(t, err)
-	requireStoreOK(t, s.MarkOutput(out.ID, OutboxSending))
-	if targets, err := s.CompletedProgressMessages(10); err != nil || len(targets) != 0 {
-		t.Fatalf("in-flight reply progress = %+v, err=%v", targets, err)
-	}
-	requireStoreOK(t, s.MarkOutput(out.ID, OutboxFailed))
-	targets, err := s.CompletedProgressMessages(10)
-	requireStoreOK(t, err)
-	want := ProgressMessage{InboxID: 10, Chat: 7, MessageID: 99}
-	if len(targets) != 1 || targets[0] != want {
-		t.Fatalf("failed reply progress = %+v", targets)
-	}
-	messages, err := s.CompletedProgressMessages(0)
-	requireStoreOK(t, err)
-	if len(messages) != 1 || messages[0] != want {
-		t.Fatalf("startup failed-reply progress = %+v, want [%+v]", messages, want)
 	}
 }
 

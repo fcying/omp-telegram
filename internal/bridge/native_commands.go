@@ -511,7 +511,7 @@ func (w *worker) queuedCommandDispatchReady(client *omp.Client) bool {
 // Local acknowledgment settles submission, not any later background output.
 func (w *worker) finishLocalCommandSubmission() {
 	w.stream.Reset()
-	w.finish()
+	w.finishResult(true)
 }
 
 // Native output has no request ID, so publish it outside task replies.

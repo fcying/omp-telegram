@@ -294,6 +294,7 @@ func TestFinalActionsSchema24UpgradePreservesOutbox(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.Enqueue(7, 8, "existing body"))
+	restoreProgressSchema24(t, s)
 	_, err := s.DB.Exec(`DROP TRIGGER delete_outbox_final_actions;
 DROP TABLE final_actions;
 DROP INDEX idx_outbox_final_actions;
@@ -308,7 +309,7 @@ PRAGMA user_version=23;`)
 	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
 	out, err := s.NextOutput()
 	requireStoreOK(t, err)
-	if version != 24 || out.Text != "existing body" || out.FinalActions != "" || out.AssistantBody {
+	if version != schemaVersion || out.Text != "existing body" || out.FinalActions != "" || out.AssistantBody {
 		t.Fatalf("schema24 changed existing delivery: version=%d output=%+v", version, out)
 	}
 }

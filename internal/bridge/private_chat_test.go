@@ -41,8 +41,20 @@ func TestPrivateChatRoutingIsolationAndResume(t *testing.T) {
 	has := func(chat, thread int64, text string) bool {
 		d.fake.mu.Lock()
 		defer d.fake.mu.Unlock()
-		for _, m := range d.fake.messages {
-			gotThread, _ := m["message_thread_id"].(float64)
+		for i, m := range d.fake.messages {
+			target := m
+			if id, editing := m["message_id"].(float64); editing {
+				// Edits identify a message, not a topic. The fixture assigns Send IDs by request position.
+				index := int(id) - 1
+				if index < 0 || index >= i {
+					t.Fatalf("edit refers to an unknown message: %+v", m)
+				}
+				target = d.fake.messages[index]
+				if target["chat_id"] != m["chat_id"] {
+					t.Fatalf("edit refers to a different chat: %+v", m)
+				}
+			}
+			gotThread, _ := target["message_thread_id"].(float64)
 			if m["chat_id"] == float64(chat) && gotThread == float64(thread) && strings.Contains(m["text"].(string), text) {
 				return true
 			}
