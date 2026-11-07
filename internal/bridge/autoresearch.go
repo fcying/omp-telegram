@@ -229,6 +229,13 @@ func (w *worker) commitResearchRound() bool {
 	if target != 0 {
 		w.replyStatus.roundStatusOutboxID = target
 		w.replyStatus.roundMetrics = w.replyStatus.metrics
+		w.replyStatus.roundSub2apiUsage = sub2apiUsageState{}
+		if w.sub2api.inbox == w.active {
+			w.sub2api.target = target
+			w.sub2api.provider = w.replyStatus.metrics.provider
+			w.replyStatus.roundSub2apiUsage = w.sub2api
+			w.resetSub2apiUsage()
+		}
 	}
 	w.research.roundOpen = false
 	w.resetAssistantResult()

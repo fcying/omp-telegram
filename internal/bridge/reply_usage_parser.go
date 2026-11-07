@@ -3,6 +3,7 @@ package bridge
 import (
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -12,11 +13,11 @@ const (
 	replyUsageMarker   = "  ← in use by this session"
 )
 
-// replyUsageHeader reads only native, fenced /usage reports, never token/cost tallies.
+// replyUsageSample reads only native, fenced /usage reports, never token/cost tallies.
 // Native labels and account markers come from coding-agent's usage-report.ts,
 // ai/src/usage/{claude,openai-codex}.ts, and tui/src/chrome/format.ts:
 // https://github.com/can1357/oh-my-pi/tree/main/packages
-func replyUsageHeader(text, provider string) string {
+func replyUsageSample(text, provider string, observedAt time.Time) quotaSample {
 	var heading string
 	var labels [2]string
 	switch provider {
@@ -25,25 +26,29 @@ func replyUsageHeader(text, provider string) string {
 	case "openai-codex":
 		heading, labels = "Openai Codex", [2]string{"- 5 hours", "- 7 days"}
 	default:
-		return ""
+		return quotaSample{}
 	}
 	if len(text) > replyUsageMaxBytes {
-		return ""
+		return quotaSample{}
 	}
 	text = strings.Trim(text, "\r\n")
 	var windows [2]struct {
-		seen    bool
-		invalid bool
-		percent string
+		seen           bool
+		invalid        bool
+		used           float64
+		resetSeen      bool
+		resetInvalid   bool
+		resetAt        time.Time
+		resetPrecision time.Duration
 	}
 	account := ""
 	selected, closed := false, false
-	pending, sections, count := -1, 0, 0
+	pending, eligible, sections, count := -1, -1, 0, 0
 	for line := range strings.Lines(text) {
 		count++
 		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 		if count > replyUsageMaxLines || len(line) > replyUsageMaxLine || closed {
-			return ""
+			return quotaSample{}
 		}
 		// Ignore native decorative bars without interpreting their terminal styling.
 		if count > 2 && pending < 0 && replyUsageBar(line) {
@@ -51,28 +56,31 @@ func replyUsageHeader(text, provider string) string {
 		}
 		for _, c := range line {
 			if c < ' ' || c == '\x7f' {
-				return ""
+				return quotaSample{}
 			}
 		}
 		switch count {
 		case 1:
 			if line != "```" {
-				return ""
+				return quotaSample{}
 			}
 			continue
 		case 2:
 			if line != "Usage" && !(strings.HasPrefix(line, "Usage (") && strings.HasSuffix(line, " ago)")) {
-				return ""
+				return quotaSample{}
 			}
 			continue
 		}
 		if line == "```" {
 			closed = true
+			eligible = -1
 			continue
 		}
 		if pending >= 0 {
-			window := &windows[pending]
+			index := pending
+			window := &windows[index]
 			pending = -1
+			eligible = -1
 			if strings.HasPrefix(line, "  ") && strings.HasSuffix(line, replyUsageMarker) {
 				if window.seen {
 					window.invalid = true
@@ -91,7 +99,7 @@ func replyUsageHeader(text, provider string) string {
 				}
 				// Preserve organization and Codex plan qualifiers when comparing accounts.
 				if account != "" && account != identity {
-					return ""
+					return quotaSample{}
 				}
 				account = identity
 				amount := row[separator+2:]
@@ -108,16 +116,31 @@ func replyUsageHeader(text, provider string) string {
 						continue
 					}
 				}
-				window.percent = percent
+				window.used = percent
+				eligible = index
 				continue
 			}
 		}
+		if eligible >= 0 && strings.HasPrefix(line, "  resets") {
+			window := &windows[eligible]
+			duration, precision, valid := replyUsageReset(line)
+			if window.resetSeen || !valid {
+				window.resetInvalid = true
+			}
+			window.resetSeen = true
+			if valid && !window.resetInvalid {
+				window.resetAt = observedAt.Add(duration)
+				window.resetPrecision = precision
+			}
+			continue
+		}
+		eligible = -1
 		if line != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "- ") {
 			selected = line == heading
 			if selected {
 				sections++
 				if sections > 1 {
-					return ""
+					return quotaSample{}
 				}
 			}
 		}
@@ -132,17 +155,21 @@ func replyUsageHeader(text, provider string) string {
 		}
 	}
 	if !closed {
-		return ""
+		return quotaSample{}
 	}
-	var parts [2]string
-	partCount := 0
-	for i, label := range [...]string{"5h", "7d"} {
-		if window := windows[i]; window.seen && !window.invalid && window.percent != "" {
-			parts[partCount] = label + window.percent + "%"
-			partCount++
+	var sample quotaSample
+	for i, window := range windows {
+		if !window.seen || window.invalid {
+			continue
+		}
+		sample.windows[i] = quotaWindow{present: true, used: window.used}
+		if window.resetSeen && !window.resetInvalid {
+			sample.windows[i].resetAt = window.resetAt
+			sample.windows[i].approximate = true
+			sample.windows[i].resetPrecision = window.resetPrecision
 		}
 	}
-	return strings.Join(parts[:partCount], " ")
+	return sample
 }
 
 func replyUsageBar(line string) bool {
@@ -165,20 +192,51 @@ func replyUsageBar(line string) bool {
 	return valid
 }
 
-func replyUsagePercent(text string) (string, bool) {
+func replyUsagePercent(text string) (float64, bool) {
 	// Native usage amounts have at most two decimal places; no exponents or signs.
 	whole, fraction, decimal := strings.Cut(text, ".")
 	if len(whole) == 0 || len(whole) > 3 || decimal && (len(fraction) == 0 || len(fraction) > 2) {
-		return "", false
+		return 0, false
 	}
 	for _, digit := range text {
 		if digit != '.' && (digit < '0' || digit > '9') {
-			return "", false
+			return 0, false
 		}
 	}
 	value, err := strconv.ParseFloat(text, 64)
 	if err != nil || !validStatusNumber(value) || value > 100 {
-		return "", false
+		return 0, false
 	}
-	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(value, 'f', 2, 64), "0"), "."), true
+	return value, true
+}
+
+func replyUsageReset(line string) (time.Duration, time.Duration, bool) {
+	amount, ok := strings.CutPrefix(line, "  resets in ")
+	if !ok || len(amount) < 2 {
+		return 0, 0, false
+	}
+	var precision time.Duration
+	switch amount[len(amount)-1] {
+	case 'd':
+		precision = 24 * time.Hour
+	case 'h':
+		precision = time.Hour
+	case 'm':
+		precision = time.Minute
+	case 's':
+		precision = time.Second
+	default:
+		return 0, 0, false
+	}
+	amount = amount[:len(amount)-1]
+	for _, digit := range amount {
+		if digit < '0' || digit > '9' {
+			return 0, 0, false
+		}
+	}
+	value, err := strconv.ParseUint(amount, 10, 64)
+	if err != nil || value == 0 || value > uint64((1<<63-1)/precision) {
+		return 0, 0, false
+	}
+	return time.Duration(value) * precision, precision, true
 }

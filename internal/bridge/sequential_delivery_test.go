@@ -745,7 +745,7 @@ func TestCommittedBodyIgnoresNoninteractiveUIMetadata(t *testing.T) {
 	}
 	awaitProviderUsage(t, w)
 	header := finalReplyStatus(t, w, 2, "Only final body.")
-	for _, metric := range []string{"`safe`", "100 t/s", "46% (500k)", "5h30% 7d65%"} {
+	for _, metric := range []string{"`safe`", "100 t/s", "46% (500k)", "30% 65%"} {
 		if !strings.Contains(header, metric) {
 			t.Fatalf("final header lost actual sampled metric %q after UI metadata: %q", metric, header)
 		}

@@ -39,6 +39,7 @@ type Config struct {
 	ProgressRecentTools   int
 	StatusBar             StatusBar
 	FinalActions          []FinalAction
+	Sub2API               Sub2API
 	UnknownFields         []UnknownField
 	IdleTimeout           time.Duration
 	LogLevel              string
@@ -62,6 +63,7 @@ const (
 type fileConfig struct {
 	Telegram telegramFileConfig `toml:"telegram"`
 	OMP      ompFileConfig      `toml:"omp"`
+	Sub2API  Sub2API            `toml:"sub2api"`
 	Storage  storageFileConfig  `toml:"storage"`
 	Worker   workerFileConfig   `toml:"worker"`
 	Logging  loggingFileConfig  `toml:"logging"`
@@ -199,6 +201,13 @@ func load(path, baseDir string) (Config, error) {
 		return c, err
 	}
 	c.FinalActions = raw.Telegram.FinalActions
+	c.Sub2API, err = prepareSub2API(raw.Sub2API)
+	if err != nil {
+		return c, err
+	}
+	if c.Sub2API.Enabled() && !c.Sub2API.Extension {
+		return c, errors.New("sub2api requires explicit sub2api.extension = true")
+	}
 	for _, field := range []struct {
 		name  string
 		value *string
@@ -270,6 +279,13 @@ func load(path, baseDir string) (Config, error) {
 		}
 		if err = omp.ValidateArgs(args); err != nil {
 			return c, err
+		}
+		if c.Sub2API.Enabled() {
+			for _, arg := range args {
+				if arg == "--no-ui" {
+					return c, errors.New("sub2api observer requires RPC notifications; remove --no-ui from omp.args")
+				}
+			}
 		}
 		c.OMPArgs[i] = args
 	}
@@ -402,6 +418,15 @@ func load(path, baseDir string) (Config, error) {
 		path, err := prepareMigrationExtension(c.DataDir)
 		if err != nil {
 			return c, errors.New("omp.migration_extension: cannot prepare bundled Extension in storage.data_dir")
+		}
+		for i := range c.OMPArgs {
+			c.OMPArgs[i] = append(c.OMPArgs[i], "-e", path)
+		}
+	}
+	if c.Sub2API.Extension {
+		path, err := prepareSub2apiExtension(c.DataDir)
+		if err != nil {
+			return c, errors.New("sub2api.extension: cannot prepare bundled Extension in storage.data_dir")
 		}
 		for i := range c.OMPArgs {
 			c.OMPArgs[i] = append(c.OMPArgs[i], "-e", path)

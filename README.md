@@ -60,53 +60,19 @@ go build -o omp-telegram ./cmd/omp-telegram
 
 ## Configuration
 
-Copy [config.toml](config.toml) beside the binary, or create a configuration file with the following settings:
+Copy [config.toml](config.toml) beside the binary for a complete annotated example, or start with this minimal configuration. Other settings use the defaults in the [settings reference](#settings).
 
 ```toml
 [telegram]
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${OMP_TELEGRAM_ALLOWED_USERS}"]
 allowed_chats = ["${OMP_TELEGRAM_ALLOWED_CHATS}"]
-progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
-progress_recent_tools = 5
-final_actions = []
+progress_mode = "${OMP_TELEGRAM_PROGRESS_MODE}"
 
-[telegram.status_bar]
-progress = ["status", "thinking", "model", "fast", "context", "speed"]
-intermediate = ["status", "thinking", "model", "fast", "context", "speed"]
-final = ["status", "thinking", "model", "fast", "context", "speed"]
-
-[omp]
-binary = "omp"
-args = ["${OMP_TELEGRAM_ARGS}"]
-args_labels = ["Default"]
-migration_extension = false
-
+# Keep the bot token out of OMP's inherited environment.
 [omp.environment]
 mode = "denylist"
 deny = ["OMP_TELEGRAM_BOT_TOKEN"]
-
-[storage]
-data_dir = "."
-workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
-database_retention_days = 90
-
-[worker]
-max_workers = 8
-queue_capacity = 16
-idle_timeout = "30m"
-
-[logging]
-level = "info"
-format = "text"
-
-[logging.component_levels]
-# daemon = "debug"
-# bridge = "debug"
-# rpc = "debug"
-# telegram = "warn"
-# store = "debug"
-# media = "debug"
 ```
 
 ### Configuration files and environment variables
@@ -138,10 +104,12 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.status_bar.progress`, `.intermediate`, `.final` | Ordered field arrays for Progress, intermediate assistant messages, and final results. `[]` disables that header. Omitted arrays default to `["status", "thinking", "model", "fast", "context", "speed"]`. See [Status bars](#status-bars). |
 | `telegram.status_bar.git_command` | Optional literal argv for the final `git` field. Omitted or `[]` uses the built-in safe Git probe. Custom commands run without a shell in the current session workspace; users own their safety and side effects. |
 | `telegram.status_bar.git_timeout` | Positive literal Go duration for both built-in and custom Git sampling, default `"450ms"`. Increase to e.g. `"2s"` for large repositories. Empty, zero, negative, invalid, overflowing or non-string values are rejected; environment references are not expanded and the timeout cannot be disabled. |
-| `omp.binary` | OMP executable name found through `PATH`, or an absolute path. It is not a shell command. |
+| `omp.binary` | OMP executable name found through `PATH`, or an absolute path. Default: `"omp"`. It is not a shell command. |
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
 | `omp.args_labels` | Optional Telegram picker labels, one per preset; invalid labels fall back to `Preset N`. Labels are visible in the conversation, so never put credentials in them. |
 | `omp.migration_extension` | Load the bundled migration Extension on every OMP startup, including resume, for all argument presets. Default: `false`. No separate Extension installation is required. |
+| `[sub2api]` | Optional bridge-only upstream quota: `base_url`, `api_key`, and exact OMP `providers`. All empty disables; partial configuration fails. See [sub2api upstream quota](#sub2api-upstream-quota). |
+| `sub2api.extension` | Enable the bundled sub2api quota Extension for all argument presets. Default: `false`; required when the quota source is enabled. |
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
 | `storage.data_dir` | Database, lock, incoming/outgoing attachment storage, and generated bridge Extension cache. Default: the executable directory. |
 | `storage.workspace_root` | Base directory for `/new <name>`. Defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then `workspace/` beside the executable. |
@@ -221,7 +189,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
-| `/queue` | View running and queued work. Cancel buttons remove individual waiting tasks, not the active task. |
+| `/queue` | View running and queued work. Cancel buttons remove individual bridge-pending tasks, not the active task or native queued prompts. |
 | `/followup <message>` | Queue a separate prompt instead of steering the active task. |
 | `/close` | Close the current session while preserving its files and OMP history. |
 | `/bindings` | List and manage this chat's saved conversation/session bindings. Icons show logical Open, Closed, or Pending state, not process liveness. See deletion options below. |
@@ -345,7 +313,7 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 | `/compact` fails | Short sessions may have nothing to compact. Check OMP's model configuration if local compaction also fails. |
 | Unsupported database schema | Back up the data and use a supported database or fresh data directory; do not change a version number by hand. |
 
-Voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
+Undo/rewind and redo, voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
 
 Very large output or many replies may be truncated with an explicit notice. OMP's native session history is not truncated.
 
@@ -359,19 +327,15 @@ Very large output or many replies may be truncated with an explicit notice. OMP'
 
 Progress appears after about three seconds and includes **Stop | Follow-up** in one row. **Stop** cancels the current task; **Follow-up** opens a reply prompt without pausing or steering it. With the `status` field selected, its **⚙️** marker shares the first line with available status fields. `/stop` also clears waiting tasks. Progress updates and cleanup are best-effort and do not delay formal replies. `progress_mode = "off"` creates neither button.
 
-Steer input replaces the current Progress preview without restarting OMP. After an assistant message completes, its older preview is frozen and removed only after all corresponding formal reply parts are successfully delivered. Failed or uncertain delivery preserves that visible copy; a later Steer cannot bypass this protection. A new preview waits for preceding formal replies to leave the delivery queue and appears below the latest input/reply. Cleanup retries include superseded previews of running tasks; formal replies are never cleanup targets.
+Steer input updates the current preview without restarting OMP. Previews are normally removed after formal replies arrive; failed or uncertain delivery can leave a preview visible. Formal replies are not deleted by progress cleanup.
 
-A native local command confirmed not to invoke the model retires its status-only Progress after its completion transaction commits, even when it creates no formal assistant reply. Late preview acknowledgments and temporary deletion failures follow the same cleanup policy.
-
-Completed assistant messages are sent immediately, even with progress off. With the `status` field selected, intermediate headers show **💬** and confirmed task success changes only the latest formal header to **✅**; cancellation, failure, uncertainty and ongoing research rounds do not gain a success marker. Only the first formal message quotes the original request. Bodies stay unchanged for Telegram Reply, with no body resend or separate completion message.
+Completed assistant messages are sent immediately, even with progress off. With `status` selected, intermediate headers show **💬** and confirmed task success marks the latest formal reply **✅**. Cancellation, failure, uncertainty and ongoing research rounds do not gain a success marker. Only the first formal message quotes the original request; completion updates do not resend the answer.
 
 ### Follow-up input
 
 Click **Follow-up**, then reply to the bot's ForceReply prompt with nonempty text. Only the clicking user's reply to that particular prompt in the same chat/topic is accepted, as a separate queued task just like `/followup <message>`. Opening the prompt does not pause the running task. After acceptance, the bot confirms that the follow-up was queued; a full queue or empty/nontext reply does not consume the request or report success, so you can retry while it is valid.
 
-Requests expire after ten minutes. Clicking again replaces your previous request in that conversation. Natural task completion keeps the issued request valid if the session/binding is unchanged; Stop, Close, session replacement and service restart invalidate unfinished requests. Replies to recognized stale, unauthorized or uncertain-delivery prompts are rejected, including `/stop`, `/close` and other commands. Only valid requests allow recognized Bridge commands to use their ordinary control path. A well-formed marker from this bot is rejected even if its database record is missing. Ordinary text not replying to a recognized prompt keeps its existing prompt/steer behavior. Telegram clients control how ForceReply is displayed; the bridge does not provide an inline text-entry widget.
-
-Marker fallback requires a complete `[followup:token]` line at the very end of a nonempty prompt body. Inline fragments and markers followed by more text do not match. Stored prompt IDs remain authoritative even if the quoted marker is omitted.
+Requests expire after ten minutes. Clicking again replaces your previous request in that conversation. Natural completion keeps it valid if the session is unchanged; Stop, Close, session replacement and service restart invalidate unfinished requests. Replies to stale, unauthorized or uncertain-delivery prompts are rejected, including commands: send a command as a new message instead. A valid prompt accepts recognized Bridge commands with their normal effects. Other ordinary text keeps its usual prompt/steer behavior. ForceReply presentation depends on the Telegram client; there is no inline text-entry widget.
 
 ### Completion shortcuts
 
@@ -385,13 +349,45 @@ final_actions = [
 ]
 ```
 
-Omit the setting or use `final_actions = []` to disable it (the default). Order is preserved; labels are user-defined and are not translated. Labels must be nonempty and single-line, with at most 64 UTF-16 units (an emoji outside the BMP uses two). Up to six entries are allowed. Each command must start with a slash and contain one command name, optionally followed by fixed arguments; no newlines or control characters are allowed. Labels and commands stay literal: `$VAR`, `${VAR}`, shell syntax and argument text are never expanded or executed by a shell. Arguments retain the existing command's parsing rules, not a second shortcut language. Do not put secrets in visible button labels or command arguments.
+Omit the setting or use `final_actions = []` to disable it (the default). Order is preserved and labels are not translated. Up to six entries are allowed. Labels must be nonempty, single-line and at most 64 UTF-16 units (an emoji outside the BMP uses two). Commands are one slash invocation with optional fixed arguments, without newlines or control characters. Labels and commands are literal: no environment expansion or shell execution. Do not put secrets in visible labels or arguments. Buttons wrap into rows of at most three; long labels may occupy a row alone.
 
-Rows contain at most three buttons and use a 24-UTF-16-unit combined-label budget to move longer labels onto additional rows. A single long label remains intact on its own row; Telegram clients determine actual button widths.
+Buttons appear on the last assistant reply only after successful task completion, even with status headers hidden. They do not appear on intermediate replies, error/truncation notices, stopped/uncertain results or native command output. Each button can execute once; busy state, invalid arguments or an unavailable command allow another click. Pending confirmations prevent overlapping clicks; cancelling or expiring a confirmation allows retry. Opening a command's menu counts as execution. Submitted or uncertain actions are not replayed, including actions interrupted by restart. Session changes and removed or changed shortcut configuration invalidate old buttons; other unused buttons remain available.
 
-Buttons appear only on the last real assistant body part after the root task successfully completes, including when status headers are hidden. They do not appear on intermediate replies, error/truncation notices, stopped/uncertain results or native command output. Updating buttons does not resend the answer. Each button is one-shot after command admission, not after the first click: deterministic local rejection such as busy state, invalid arguments or unavailable commands leaves it retryable with a new click. A reservation prevents overlapping clicks while eligibility or an execution confirmation is pending; cancelling or expiring that confirmation releases it. Successfully opening a command's menu counts as executing that menu command. Accepted queue input, target RPC submission and local execution consume the button; submitted or uncertain operations are never replayed. A reservation interrupted by restart is conservatively consumed. Another unused button or a later completed reply can still be used. Changed sessions/bindings or removed/changed configuration invalidate old actions.
+Clicks use the clicking user's permissions and the same chat/topic, arguments, busy-state restrictions and confirmations as typing the command. Unknown or unavailable commands report an error, never become a model prompt or a different action. Native commands must be available in the current session and obey the [native command limitations](#native-omp-commands). For example, **Shake** invokes `/shake` only when OMP supports it; there is no fallback action.
 
-Clicks use the same chat/topic, the real clicking user's permissions, original command arguments, busy-state restrictions and confirmations as typing the command. Unknown or unavailable commands give an error, never become a model prompt or silently run a different action. Native shortcuts require an executable command advertised by the **current session's** native command catalog and remain subject to source/lifecycle restrictions; configuration loading does not prove availability. The native OMP catalog used for this implementation advertised builtin `/shake` ("Shake heavy content out of the conversation context"), so the example maps **Shake explicitly to `/shake`**. Availability can differ by runtime/session: an unavailable `/shake` rejects, and is never automatically mapped to Queue or another operation.
+### sub2api upstream quota
+
+This is an opt-in source for the status bar's `quota` field, not a model provider configuration. Keep OMP's existing provider URL, model/context settings and credentials unchanged. The bridge does not automatically change models, providers or global OMP configuration. Merge the following tables into the bridge's `config.toml`:
+
+```toml
+[sub2api]
+extension = true
+base_url = "https://sub2api.example.com"
+# usage.read (required, global): Read all-site logs to identify the serving account.
+# openai.quota.read (required, resource): Scope to the target OpenAI OAuth groups.
+# accounts.identity.read (optional, resource): Show plan names instead of account IDs.
+api_key = "<management-key>"
+providers = ["my-openai-gateway"]
+
+[telegram.status_bar]
+final = ["status", "model", "context", "speed", "quota"]
+```
+
+`base_url`, `api_key` and each `providers` element use the existing one-pass environment expansion. All three empty disables this source; partial settings, invalid HTTP(S) URLs, duplicate/invalid provider IDs, or an enabled source without explicit `sub2api.extension = true` fail startup with redacted errors. URLs may have a path prefix, but not credentials, query, fragment or dot-path segments. Use HTTPS for remote administration. Provider matching is exact and case-sensitive: use the actual OMP provider ID, not a model name, URL or guessed alias. Add `quota` independently to `progress`, `intermediate` and/or `final`; defaults remain unchanged.
+
+The management key needs global `usage.read` and resource `openai.quota.read` scoped to the target OpenAI OAuth groups. Global `usage.read` exposes all-site logs, not only the selected groups. Optional resource `accounts.identity.read` adds plan labels; otherwise confirmed account IDs label the quota.
+
+Keep the management key private, use HTTPS for remote administration, and do not reuse model credentials. The key is used by the bridge, not added to OMP arguments. If using an environment reference for it, explicitly exclude that variable from OMP's inherited environment with [the child environment policy](#settings).
+
+Configuration validation rejects enabled sub2api with `--no-ui` in any OMP argument preset; remove that option to enable quota. RPC does not require an interactive terminal. `--no-extensions` remains compatible with this explicitly enabled Extension.
+
+HTTP and SSE responses support request attribution through the server's `x-client-request-id` response header. WebSocket is not supported: a `101` handshake does not establish the serving account for each later turn, and the bridge does not infer per-turn usage from a handshake ID. The bridge does not change OMP's transport configuration; WebSocket requests have no attributed sub2api quota.
+
+Once the task has finally completed and the worker is idle, the bridge resolves all of that task's request IDs to actual upstream OpenAI OAuth accounts and deduplicates those accounts. Requests from multiple configured provider IDs in the same task contribute to this shared account set. The field shows their recognized 5h/7d **used** percentages and available reset countdowns, using the [status-bar format](#status-bars) below; multiple accounts can appear separately. Missing or ambiguous attribution, unsupported OMP hooks/headers and unavailable quota omit the affected values. The bridge never borrows a previous task's identity, guesses an account from a model, or substitutes gateway credential quota.
+
+Usage logs may appear after task completion. While the task scope remains valid and the worker is idle, bounded attribution retries can backfill the latest corresponding final header without delaying completion, changing the answer or replaying the task. Research retains attribution from the round that produced the actual body, not a later empty round. Queued work, a new scope or a retired runtime take priority; historical headers are not guaranteed to be backfilled.
+
+Native and sub2api quota share the same idle-only refresh, cache and rendering flow; only account attribution and quota acquisition differ. Refresh attempts for the same account are gated for five minutes. Refreshing, failed reads and empty results retain the last successful sample without a display TTL, but a new task must confirm its own account before reusing cached quota. Keys and raw responses are not logged or sent to Telegram; detailed `/status` is unchanged. See [architecture](doc/architecture.md#sub2api-quota) for implementation details.
 
 ### Status bars
 
@@ -410,16 +406,16 @@ final = ["status", "model", "thinking", "fast", "context", "speed", "quota", "gi
 | `model` | Literal model ID, without provider. |
 | `thinking` | Configured thinking selector symbol. |
 | `fast` | Confirmed fast-mode activity/setting. |
-| `context` | Confirmed usage and window, e.g. `46% (500k)`. |
+| `context` | Confirmed used percentage of the context window and its capacity, e.g. `46% (500k)`. |
 | `speed` | Native live speed or confirmed reply average, e.g. `3.8 t/s`. |
-| `quota` | Native 5h/7d used percentages from the same-account cache. |
+| `quota` | Used percentage of native or actual upstream account quota, with available reset countdowns. |
 | `git` | Final results only: current branch and optional dirty `*`, or custom command stdout. |
 
-Unavailable or unread values are omitted, including failed reads: no `ctx ?`, `quota ?` or `n/a` placeholders. Already confirmed values may appear immediately. Refreshes do not backfill older intermediate messages. Fields that are not selected do not enable display-only sampling; task-safety and command queries are unchanged. Detailed `/status` is unchanged.
+Unavailable or unread values are omitted: no `ctx ?`, `quota ?` or `n/a` placeholders. Quota refresh failures retain any confirmed last-good sample. Confirmed values may appear immediately; refreshes do not backfill older intermediate replies. Oversized headers omit whole fields rather than cutting values. Detailed `/status` is unchanged.
 
-`git` is sampled at completion in the session's current workspace, not at task startup. With `git_command` omitted or empty, the built-in read-only probe shows `main` when clean and `main*` for staged, unstaged or nonignored untracked changes; ahead/behind alone is not dirty. Detached HEAD shows `HEAD`. Outside a repository, on failure or when the bounded probe cannot finish, the field is omitted, never presented as known clean. Ongoing research rounds do not sample Git; root settlement does.
+Both `context` and `quota` show **percentage used**, not remaining: higher values mean closer to the limit. `context` measures the occupied context window; `quota` measures account usage in each rate-limit window. With both quota windows, `20%(2h) 60%(5d12h)` means 20% used of the 5-hour quota, resetting in 2 hours, then 60% used of the 7-day quota, resetting in 5 days 12 hours. A single window keeps its label, e.g. `7d 60%(5d12h)`. `~` marks approximate reset times, e.g. `(~6d)`; an exact countdown below one hour shows `(<1h)`. Missing or elapsed reset times omit only the countdown, without assuming quota has recovered. Countdowns update when a header is rendered, not continuously in old messages.
 
-The built-in probe checks tracked-file attributes and initialized submodules before reading status. If content filters would make a safe read-only result unavailable, it omits the Git field instead of executing them; unused global filter definitions do not hide ordinary repositories. Trace2 output is explicitly disabled even when global/system Git configuration enables it. The bounded probe is not an atomic snapshot of concurrent Git configuration or attribute changes.
+`git` shows the current workspace's branch at task completion: `main` when clean, `main*` for staged, unstaged or nonignored untracked changes, and `HEAD` for detached HEAD. Ahead/behind alone is not dirty. It is omitted outside a repository or when a safe read fails or times out, including repositories whose content filters prevent a safe read. Ongoing research rounds do not show a new Git sample until research finishes.
 
 To override the `git` field, configure a nonempty `git_command` argv:
 
@@ -438,25 +434,23 @@ git_timeout = "450ms"
 # git_command = ["/usr/local/bin/my-git-status"]    # dev@a1b2c3d*
 ```
 
-Custom argv entries are literal: no shell, environment-reference expansion or extra Git arguments. The command uses the existing `omp.environment` child policy, without the built-in probe's Git-specific environment rewriting or safety preflight. It runs only when `final` selects `git`. Its stdout is displayed literally, not parsed as Git output: trailing CR/LF is removed, other spaces are preserved, and a single valid UTF-8 line is clipped to 64 bytes at a character boundary before Telegram escaping. Commands use `git_timeout` and retain the 64 KiB stdout cap; failures, timeouts, empty output, embedded line breaks/control characters or invalid UTF-8 omit the field, with no built-in fallback. Stderr is discarded. Research settlement may re-probe; do not rely on exactly-once invocation. Later quota edits retain the captured output rather than rerunning the command.
+Custom commands run only when `final` selects `git`, using the current workspace and `omp.environment` policy. Arguments are literal: no shell or environment expansion. Unlike the built-in probe, custom commands have no Git-specific safety protections; use a safe, read-only command and do not rely on exactly-once invocation. Stdout must be a nonempty valid UTF-8 single line; trailing line endings are removed and the label is clipped to 64 bytes. Failure, timeout, invalid output or output above 64 KiB omits the field without falling back to the built-in probe. Later quota updates do not rerun it.
 
-`git_timeout` applies to the entire built-in safety preflight/status probe or to the custom command, without retries. Its default is `"450ms"`; large repositories can use e.g. `"2s"`. It must be a positive literal Go duration string: environment references are not expanded, and empty, zero, negative, invalid, overflowing or non-string values are rejected. The timeout cannot be disabled. Increasing it does not relax the built-in safety checks, the 64 KiB output cap or the 64-byte label limit; large repositories can still omit the field if they exceed the output cap.
-
-Git's budget is separate from native status/account RPC deadlines: each ordinary final-sampling RPC remains bounded to 1 second, each research-settlement RPC to 5 seconds. Ordinary sampling shares cancellation while giving Git its own configured budget. Research settlement keeps operation cancellation and ownership/session fences, but no longer has a generic 30-second operation cap: its finite RPCs and Git probe each enforce their own deadlines.
+`git_timeout` defaults to `"450ms"`; increase it to e.g. `"2s"` for large repositories. It must be a positive literal Go duration string, without environment expansion, and cannot be disabled. Increasing it does not relax safety or output limits, so the field may still be omitted. See [architecture](doc/architecture.md#git-status-sampling) for Git sampling details.
 
 Migration: the old `telegram.provider_usage` key is ignored and produces an ERROR log, but no longer prevents startup. Remove it and add `"quota"` only to the arrays where it should appear; omit it everywhere to disable quota reads. Quota and Git are not selected by default.
 
-When only intermediate/Progress quota is selected, an idle runtime can still identify the account and warm the cache after a short task; completion never waits for it. Quota selected only in disabled Progress does not enable reads. Oversized headers omit whole fields rather than cutting a literal value or its dirty marker.
+Quota is independent of progress mode, but selecting it only in disabled Progress does not enable reads. Available quota may appear after a short task without delaying completion.
 
 Replies support Markdown and split long text automatically. Large tables may use a plain-text layout; formatting unsupported by Telegram falls back to readable text.
 
-Selecting `quota` enables native Claude (`anthropic`) or OpenAI Codex (`openai-codex`) account quota in the selected headers, independently of progress mode. The field appears only after a current-scope account read confirms a usable same-account cache value, for example `5h30% 7d65%`. Only 5h/7d used percentages are shown, without a reading timestamp; account identities, emails, credential IDs and raw reports are not sent to Telegram or written to logs or the database.
+#### Native provider quota
 
-Cache visibility does not trigger or wait for refresh. Refresh uses the existing native builtin `/usage` only while idle, with at least five minutes between attempts for the same account scope and a three-second deadline; queued prompts and controls take priority. Busy or long-running tasks show the cache when available, otherwise omit the field. Failed, skipped or empty reads do not clear a last-good value. A successful refresh may update the latest matching final header only when its array selects `quota`, never its body or captured Git result. No direct provider API request is made.
+Selecting `quota` enables native Claude (`anthropic`) or OpenAI Codex (`openai-codex`) quota in the selected headers, independently of progress mode. It shows recognized 5h/7d used percentages and any approximate reset times from OMP, without a reading timestamp. Account identities, emails, credential IDs and raw reports are not sent to Telegram or stored in logs or the database.
 
-Final answers supplied only by `agent_end.messages` also keep an editable header. Later quota refreshes update that final answer, not an earlier intermediate reply.
+Quota refreshes are best-effort while OMP is idle; queued prompts and controls take priority. Busy or long-running tasks show a cached value when available, otherwise omit the field. Cached values may be stale; failed or empty reads retain the last good value. Successful refreshes may update the latest final header if it selects `quota`, without changing or resending the answer or its Git result. Restarting the service clears the cache.
 
-The cache lives only in the Bridge process and is not persisted across daemon restarts. It can be shared across messages and native sessions only for the same startup argv namespace and the same uniquely active OAuth credential reported by `get_logout_accounts`. Account scope must match before and after the quota query. Ambiguous or unknown scope never displays another account's cached value; the stored value is retained. These separate RPC reads are not an atomic account-and-quota snapshot and cannot attribute each rotating request to its actual billed account.
+Unknown or ambiguous account information omits quota rather than showing another account's value. Native quota cannot identify which account was billed for each request when credentials rotate. For a configured sub2api provider, the [upstream quota source](#sub2api-upstream-quota) is used instead. See [architecture](doc/architecture.md#native-provider-quota) for native account and refresh mechanisms.
 
 ## Attachments
 
@@ -517,7 +511,7 @@ Recovery does not rerun handoff or create another session. If the candidate is u
 
 Bridge data is stored in `<storage.data_dir>/omp-telegram.db`, including accepted Telegram input content, outgoing replies, and message metadata. Attachments are stored as files under the same data directory. Treat the database, attachment caches, and their backups as sensitive. `storage.data_dir` defaults to the real executable directory; relative storage paths use that directory rather than the launch directory.
 
-`storage.database_retention_days` controls retention of terminal bridge messages, eligible attachment caches and expired Follow-up request metadata. Default: `90` days. Set it to `0` to disable automatic retention cleanup. Follow-up age uses its expiration time; unread expired prompts are eligible too, while correlations with pending/submitted inbox work are retained until settled. Workspace files, OMP session data, and saved conversation bindings are not removed. Retention does not delete delivered Telegram replies.
+`storage.database_retention_days` controls retention of terminal bridge messages, eligible attachment caches and expired Follow-up request metadata. Default: `90` days; `0` disables automatic retention cleanup. Pending work and records still needed for delivery or progress cleanup may be retained longer. Workspace files, OMP session data, and saved conversation bindings are not removed. Retention does not delete delivered Telegram replies.
 
 Before upgrading, stop the service and back up the data directory, workspaces, and OMP's own session storage. The bridge database alone is not a complete backup of OMP conversations.
 
@@ -525,38 +519,15 @@ Authorize trusted users only. The service runs with the filesystem permissions a
 
 ## Logging
 
-Logs support `text` and `json`, selected by `logging.format`. `logging.level` sets the global threshold; `[logging.component_levels]` overrides it for `daemon`, `bridge`, `rpc`, `telegram`, `store`, or `media`. See the complete [configuration example](#configuration).
+Logs support `text` and `json`, selected by `logging.format`. `logging.level` sets the global threshold; `[logging.component_levels]` overrides it for `daemon`, `bridge`, `rpc`, `telegram`, `store`, or `media`. See the annotated [configuration example](config.toml).
 
 Logs are written to stderr; use your process manager for storage and rotation. Prompts, model replies, credentials, tool payloads, and workspace/session paths are not logged. Chat and thread IDs may still identify conversations, so restrict log access.
 
-`rpc_queue_overflow` is an ERROR visible at the default info level. `reason=event_slots|byte_budget` and `stage=event_enqueue|physical_read|chunk_reassembly` identify the exhausted resource and detection point. Compare `queued_events/queue_capacity`, `rejected_used_bytes/rejected_bytes/buffer_limit_bytes`, and `forward_wait_ms`; `buffered_bytes` is sampled after rejected-frame cleanup, not the occupancy at rejection. Correlate `client_id` with `consumer_phase/consumer_phase_ms` and nearby `rpc_consumer_slow` WARN records. The latter report actor operations taking at least one second, with a fixed `point`, duration and task identity. Normal fast operations do not produce these warnings; RPC frames and tool content are never included. These snapshots help locate pressure or blocking but do not by themselves prove its root cause.
-
-## Roadmap
-
-- [ ] **Undo/rewind and redo.** Requires reliable input-to-session tracking and remote rewind support from OMP. Track [#12991](https://github.com/can1357/oh-my-pi/issues/12991), [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026), and [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663).
-- [ ] **Reuse the OMP process after Stop.** Requires reliable upstream cancellation. For now, Stop retires the process while preserving its session.
-- [ ] **Cancel individual native queued prompts.** Requires reliable upstream cancellation results. `/queue` currently cancels only bridge-pending tasks.
-- [ ] **Sub2API account quota.** Requires the deployed fix for [#8473](https://github.com/Wei-Shaw/sub2api/issues/8473) ([PR #8476](https://github.com/Wei-Shaw/sub2api/pull/8476)), quota-read permission, and reliable attribution to the account serving each reply.
-- [ ] **Structured native account-and-quota snapshots.** Wait for an upstream interface with a reliable opaque account scope, per-account report timestamps and refresh without a prompt, replacing the identity displayed in native reports and the before/after scope checks. Existing RPC reads are not atomic and cannot identify the account actually billed for each rotating request.
+`rpc_queue_overflow` ERROR and `rpc_consumer_slow` WARN indicate RPC pressure or slow bridge operations. Check `/status` and the workspace before resending interrupted or uncertain work; it is not replayed automatically. Preserve nearby logs for diagnosis, but these warnings alone do not establish the cause. See the [architecture logging contract](doc/architecture.md#logging-contract) for diagnostic field interpretation.
 
 ## Development
 
-| Command | Purpose |
-| --- | --- |
-| `just build` | Build the binary. |
-| `just fmt` | Format Go code with the version declared in `go.mod`, matching CI. |
-| `just test` | Run unit tests without starting or restarting the service. |
-| `just check` | Run tests, race checks and `go vet` without starting Telegram polling. |
-| `just install` | Install only the binary; configuration and data remain user-managed. |
-| `just deploy` | Install and schedule a restart of the existing `supervisord` service after five seconds. Returning does not confirm restart success. |
-
-To check an explicitly selected OMP binary without installing or deploying it:
-
-```sh
-just smoke-omp /absolute/path/to/omp
-```
-
-This runs real OMP with isolated sessions and a local test provider, without contacting Telegram or a production provider. The [OMP compatibility workflow](.github/workflows/omp-compatibility.yaml) also runs manually and weekly; neither check upgrades the deployed OMP.
+For contributor workflows, verification and release recipes, see [Development, verification and release](doc/architecture.md#development-verification-and-release).
 
 ## Architecture
 
