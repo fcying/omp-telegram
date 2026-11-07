@@ -1062,7 +1062,7 @@ func (b *Bridge) deliver(ctx context.Context) error {
 			}
 		}
 		if !retryExhausted {
-			if state == store.OutboxDone && o.Header != "" {
+			if state == store.OutboxDone && o.HeaderEditable {
 				err = b.db.MarkOutputDelivered(o.ID, message.MessageID, o.Header)
 			} else {
 				err = b.db.MarkOutput(o.ID, state)
@@ -1411,6 +1411,7 @@ func (w *worker) runtimeStopped() {
 	w.providerUsage = providerUsageState{}
 	w.commitPendingReplyStatus()
 	w.cancelProgressNative()
+	w.invalidateResearchSettlement()
 	w.configuredThinking = ""
 	w.statusReleaseClientID = 0
 	w.research.known, w.research.enabled = false, false
@@ -2021,6 +2022,7 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 		w.cancelMigration("shutdown", false)
 	}
 	w.flushReplyStatus()
+	w.invalidateResearchSettlement()
 	w.rotatePreview(0)
 	var interruptedReplies []string
 	if w.taskActive() && w.assistantDelivery.body {
@@ -2349,8 +2351,13 @@ func (w *worker) dispatchRPCOperation() {
 		if request.kind == "compact" || request.kind == "handoff" {
 			timeout = 180 * time.Second
 		}
-		ctx, cancel := context.WithTimeout(w.ctx, timeout)
-		defer cancel()
+		ctx := w.ctx
+		// Research settlement owns cancellation and separate native/Git deadlines.
+		if request.kind != "research_settlement" {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(w.ctx, timeout)
+			defer cancel()
+		}
 		data, err := request.call(ctx)
 		result := operationResult{
 			generation: request.generation,
@@ -3474,23 +3481,26 @@ func (w *worker) finish() {
 	if w.active != 0 {
 		taskID := w.active
 		target := w.assistantDelivery.statusOutboxID
-		metadata := w.replyStatus.header
 		if target == 0 && w.research.root && w.replyStatus.roundStatusOutboxID != 0 {
 			target = w.replyStatus.roundStatusOutboxID
-			metadata = w.replyStatus.roundStatusHeader
-		} else if metadata == "" {
-			metadata = w.intermediateAssistantHeader()
 		}
-		header := w.assistantHeader(metadata, true)
-		parts, _ := w.boundedAssistantRepliesWithHeader(w.stream.String(), header)
-		if len(parts) != 0 {
-			body, attached := strings.CutPrefix(parts[0], header)
-			if attached && strings.HasPrefix(body, "\n\n") && len(body) > 2 {
-				parts[0] = body[2:]
-				target = 0
-			} else if target == 0 {
-				header = ""
+		if !w.replyStatus.prepared {
+			fields := compactFields(w.b.language(), statusState{}, w.finalReplyMetrics(false), false, false)
+			w.prepareReplyStatus(false, fields, false)
+		}
+		header := w.replyStatus.header
+		parts, truncated := w.boundedAssistantRepliesWithHeader(w.stream.String(), header)
+		hasBody := assistantReplyHasBody(parts, truncated)
+		if hasBody {
+			if header != "" {
+				body, attached := strings.CutPrefix(parts[0], header)
+				if attached && strings.HasPrefix(body, "\n\n") {
+					parts[0] = body[2:]
+				}
 			}
+			target = 0
+		} else if target == 0 {
+			header = ""
 		}
 		target, err := w.b.db.CompleteInboxWithAssistantHeader(w.ctx, taskID, w.key.chat, w.key.thread, target, header, parts)
 		if err != nil {
@@ -3501,10 +3511,8 @@ func (w *worker) finish() {
 			}
 			return
 		}
-		if !w.research.root {
-			w.providerUsage.target = target
-			w.providerUsage.targetProvider = w.replyStatus.metrics.provider
-		}
+		w.providerUsage.target = target
+		w.providerUsage.targetProvider = w.replyStatus.provider
 		w.cancelHostRequests()
 		w.logTaskComplete(taskID, "done")
 		w.clearTask()
@@ -4225,12 +4233,11 @@ func (w *worker) renderProgress() string {
 		return ""
 	}
 	nativeStatus := w.progressNativeStatus()
-	header := w.tr(i18n.Msg.Processing)
-	if nativeStatus != "" {
-		header += compactHeaderSeparator + nativeStatus
+	header := w.renderStatusBar("progress", w.progressStatusFields())
+	sections := make([]string, 0, 3)
+	if header != "" {
+		sections = append(sections, header)
 	}
-	sections := make([]string, 1, 3)
-	sections[0] = header
 	if status := w.progressStatus(); status != "" {
 		sections = append(sections, w.tr(i18n.Msg.StatusValue, status))
 	}

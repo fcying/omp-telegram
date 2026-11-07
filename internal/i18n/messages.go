@@ -279,7 +279,6 @@ var Msg = struct {
 	Assistant                                                                 Message
 	PromptExceedsOmpRPCFrameLimitNoTaskSubmitted                              Message
 	ProvideOldFullSessionIDAbsolutePathNewJSONL                               Message
-	ProviderUsageUnavailable                                                  Message
 	QueueRunningPending                                                       Message
 	QueuePromptAfterCurrentTask                                               Message
 	QueuedAlbum                                                               Message
@@ -775,7 +774,6 @@ var Msg = struct {
 	Assistant:           message("💬", "💬"),
 	PromptExceedsOmpRPCFrameLimitNoTaskSubmitted: message("Prompt exceeds the omp RPC frame limit. No task was submitted.", "提示词超过 omp RPC 帧大小限制. 未提交任务."),
 	ProvideOldFullSessionIDAbsolutePathNewJSONL:  message("Provide old, a full session ID, or the absolute path to the new JSONL file.", "请提供 old, 完整会话 ID, 或新 JSONL 的绝对路径."),
-	ProviderUsageUnavailable:                     message("quota ?", "quota ?"),
 	QueueRunningPending:                          message("Queue\nRunning: %s\nPending: %d", "队列\n运行中: %s\n待处理: %d"),
 	QueuePromptAfterCurrentTask:                  message("Queue a prompt after the current task", "将消息加入当前任务之后的队列"),
 	QueuedAlbum:                                  message("Queued album", "排队中的相册"),

@@ -1,7 +1,9 @@
 # Default test configuration. Keep credentials in environment variables.
 # Use --config config.local.toml or -c config.local.toml for private overrides.
 # Configuration references expand once after TOML parsing, except literal
-# omp.environment mode and allow/deny variable names; $$ is a literal dollar sign.
+# omp.environment settings and telegram.status_bar fields; $$ is a literal dollar sign.
+# Unknown settings are ignored and logged at ERROR with their source location.
+# Invalid values for known settings still fail validation.
 
 [telegram]
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
@@ -23,8 +25,24 @@ progress_mode = "$OMP_TELEGRAM_PROGRESS_MODE"
 # Long histories show the newest rows that fit, with an omitted count for older rows.
 progress_recent_tools = 5
 
-# Show native /usage provider windows only in final reply headers. Default: false.
-provider_usage = false
+[telegram.status_bar]
+# Fields appear in array order; unavailable values are omitted. [] hides that header.
+# Available fields: "status", "model", "thinking", "fast", "context", "speed", "quota", "git".
+# Omitted arrays use these defaults. Add "quota" to opt in to provider windows;
+# "git" is supported only in final. Fields are literal names, not environment references.
+progress = ["status", "thinking", "model", "fast", "context", "speed"]
+intermediate = ["status", "thinking", "model", "fast", "context", "speed"]
+final = ["status", "thinking", "model", "fast", "context", "speed"]
+
+# Empty uses the built-in safe Git status implementation.
+git_command = []
+# Custom commands run with the session workspace as the working directory.
+# Users are responsible for the safety and side effects of custom commands.
+# git_command = ["git", "log", "-1", "--format=%h"]
+# git_command = ["/usr/local/bin/my-git-status"]
+# Positive literal Go duration for both built-in and custom Git commands; cannot disable.
+# Increase to e.g. "2s" for large repositories; the 64 KiB output cap still applies.
+git_timeout = "450ms"
 
 [omp]
 binary = "omp"

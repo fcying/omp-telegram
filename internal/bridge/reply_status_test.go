@@ -229,8 +229,8 @@ func TestFinalReplyMetadataTimeoutDoesNotDiscardConfirmedAnswer(t *testing.T) {
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"duplicate"}]}]}`))
 	w.operationReturned(receiveReplyStatus(t, w))
 	metadata := finalReplyStatus(t, w, 2, "answer")
-	if queueState(t, w, 2) != "done" || !strings.Contains(metadata, "100 t/s") || !strings.Contains(metadata, compactUnknownContext) {
-		t.Fatalf("read timeout changed confirmed answer, metrics, or unknown context: %q", metadata)
+	if queueState(t, w, 2) != "done" || !strings.Contains(metadata, "100 t/s") || strings.Contains(metadata, "ctx ?") {
+		t.Fatalf("read timeout changed confirmed answer or displayed a context placeholder: %q", metadata)
 	}
 	if strings.Contains(metadata, "% (") || strings.Contains(metadata, "duplicate") || w.client == nil {
 		t.Fatal("read timeout fabricated final context or retired a healthy runtime")
@@ -334,7 +334,7 @@ func TestIntermediateReplyUsesRunningCapacityWithoutProgressUI(t *testing.T) {
 			if !strings.Contains(header, "11% (10k)") || !strings.Contains(header, "100 t/s") || body != "answer" {
 				t.Fatalf("completed middle body lost confirmed usage or used live input usage: %q", rows)
 			}
-			if !*w.replyStatus.liveState.IsStreaming || strings.Contains(compactHeader("en", w.replyStatus.liveState, &w.replyStatus.metrics), "% (") {
+			if !*w.replyStatus.liveState.IsStreaming || compactFields("en", w.replyStatus.liveState, &w.replyStatus.metrics, false, true).context != "" {
 				t.Fatal("intermediate formatting forged idle state or relaxed final context eligibility")
 			}
 			if f.messageCount() != 0 || w.progressNative.pending != nil || !w.progressNative.next.Equal(next) {
@@ -409,15 +409,15 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 		want   string
 	}{
 		{"known", map[string]any{"tokens": 900, "contextWindow": 10000}, nil, "11% (10k)"},
-		{"missing", nil, nil, compactUnknownContext},
-		{"invalid", map[string]any{"tokens": 1100, "contextWindow": 0}, nil, compactUnknownContext},
-		{"query_failure", nil, func(r *replyStatusResult) { r.valid = false }, compactUnknownContext},
+		{"missing", nil, nil, ""},
+		{"invalid", map[string]any{"tokens": 1100, "contextWindow": 0}, nil, ""},
+		{"query_failure", nil, func(r *replyStatusResult) { r.valid = false }, ""},
 		{"stale_session", nil, func(r *replyStatusResult) { r.state.SessionID = "other-session" }, ""},
 		{"stale_epoch", nil, func(r *replyStatusResult) { r.request.epoch++ }, ""},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, _, _, _ := replyStatusWorker(t)
-			w.b.cfg.ProviderUsage = true
+			setProviderUsageFields(w, true)
 			nativeRPC(t, w, "fixture_get_state_update", map[string]any{"contextUsage": scenario.usage})
 			replyStatusMessage(t, w, 100, 1000, 1100)
 			endReplyStatus(w)
@@ -449,8 +449,8 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 				if strings.Contains(header, "ctx ?") || strings.Contains(header, "% (") || strings.Contains(header, "quota ?") {
 					t.Fatalf("stale final read marked current context as read: %q", header)
 				}
-			} else if !strings.Contains(header, scenario.want) || !strings.Contains(header, "quota ?") {
-				t.Fatalf("completed final read omitted context state %q: %q", scenario.want, header)
+			} else if !strings.Contains(header, scenario.want) || strings.Contains(header, "quota ?") {
+				t.Fatalf("completed final read omitted context %q or displayed a quota placeholder: %q", scenario.want, header)
 			}
 		})
 	}
@@ -458,7 +458,7 @@ func TestFinalContextIsAbsentUntilCurrentScopeReadCompletes(t *testing.T) {
 
 func TestInterruptedFirstFinalReadDoesNotDisplayUnknownContext(t *testing.T) {
 	w, _, _, _ := replyStatusWorker(t)
-	w.b.cfg.ProviderUsage = true
+	setProviderUsageFields(w, true)
 	replyStatusMessage(t, w, 100, 1000, 1100)
 	endReplyStatus(w)
 	late := receiveReplyStatus(t, w)

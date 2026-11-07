@@ -24,6 +24,11 @@ type researchSettlementProbe struct {
 	admission              uint64
 	epoch, catalogRevision uint64
 	sessionID, rootRequest string
+	workspace              string
+	status                 statusState
+	account                [32]byte
+	git                    string
+	cancel                 context.CancelFunc
 }
 
 type researchSettlementState struct {
@@ -34,6 +39,9 @@ type researchSettlementState struct {
 }
 
 func (w *worker) invalidateResearchSettlement() {
+	if probe := w.research.settlement.probe; probe != nil && probe.cancel != nil {
+		probe.cancel()
+	}
 	w.research.settlement.revision++
 	w.research.settlement.probe = nil
 }
@@ -44,23 +52,33 @@ func (w *worker) probeResearchSettlement() {
 	}
 	client := w.client
 	catalog := client.CommandCatalog()
+	ctx, cancel := context.WithCancel(w.ctx)
 	probe := &researchSettlementProbe{
 		client: client, generation: w.binding.Generation, root: w.active,
 		turn: w.turn, revision: w.research.settlement.revision,
 		admission: w.steerFence.admission, epoch: catalog.Epoch, catalogRevision: catalog.Revision,
 		sessionID: catalog.SessionID, rootRequest: w.rootRequestID,
+		workspace: w.binding.Workspace,
+		cancel:    cancel,
 	}
 	w.research.settlement.probe = probe
-	w.startOperation("research_settlement", client, func(ctx context.Context) (json.RawMessage, error) {
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	git := w.b.cfg.StatusBar.Has("final", "git")
+	quota := w.b.cfg.StatusBar.Has("final", "quota")
+	var environment []string
+	if git {
+		environment = omp.ChildEnv(w.b.cfg.OMPEnvironment)
+	}
+	w.startOperation("research_settlement", client, func(_ context.Context) (json.RawMessage, error) {
 		defer cancel()
-		enabled, err := client.AutoresearchMode(ctx)
+		nativeCtx, nativeCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer nativeCancel()
+		enabled, err := client.AutoresearchMode(nativeCtx)
 		if err != nil {
 			return nil, err
 		}
 		state := researchSettlementState{Enabled: enabled}
 		if !enabled {
-			raw, err := client.Call(ctx, "get_state", nil)
+			raw, err := client.Call(nativeCtx, "get_state", nil)
 			if err != nil {
 				return nil, err
 			}
@@ -79,6 +97,20 @@ func (w *worker) probeResearchSettlement() {
 			state.Idle = !*native.Streaming && !*native.Compacting
 			state.Settled = *native.Settled
 			state.Pending = *native.Async || *native.Queued != 0
+			if state.Idle && state.Settled && !state.Pending {
+				// Reuse the authoritative final read before accepting settlement,
+				// rather than opening another asynchronous completion window.
+				var status statusState
+				if json.Unmarshal(raw, &status) == nil && status.SessionID == probe.sessionID {
+					probe.status = status
+					if quota {
+						probe.account = w.readProviderUsageScope(nativeCtx, client, status)
+					}
+				}
+				if git {
+					probe.git = readReplyGitField(ctx, probe.workspace, environment, w.b.cfg.StatusBar.GitCommand, w.b.cfg.StatusBar.GitTimeout)
+				}
+			}
 		}
 		current := client.CommandCatalog()
 		if current.Epoch != probe.epoch || current.Revision != probe.catalogRevision || current.SessionID != probe.sessionID {
@@ -140,10 +172,13 @@ drained:
 	}
 	// flushResearchRound already committed each round's replies. Finish only
 	// the root's ownership; copying the final native messages would duplicate it.
-	w.finish()
-	if w.taskActive() || w.ctx.Err() != nil {
-		return
+	probe.status.ConfiguredThinking = w.configuredThinking
+	fields := compactFields(w.b.language(), probe.status, &w.replyStatus.roundMetrics, false, true)
+	if probe.git != "" && probe.workspace == w.binding.Workspace {
+		fields.git = progressToolLiteral(probe.git)
 	}
-	w.invalidateResearchSettlement()
-	w.clearSteerFence()
+	w.setProviderUsageScope(probe.status.Model.Provider, probe.account)
+	w.prepareReplyStatus(false, fields, true)
+	w.commitReplyStatus(false)
+	w.refreshProviderUsage(time.Now())
 }

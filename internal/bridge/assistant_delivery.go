@@ -43,17 +43,6 @@ func (w *worker) remainingAssistantReplies(notice string) []string {
 	return parts
 }
 
-func (w *worker) assistantHeader(header string, completed bool) string {
-	label := w.tr(i18n.Msg.Assistant)
-	if completed {
-		label = assistantCompletedIcon
-	}
-	if header != "" {
-		label += compactHeaderSeparator + header
-	}
-	return telegram.ClipConvertible(label, assistantHeaderUnits)
-}
-
 // Limits apply to the whole root (or research round), not each message. Capacity
 // for the terminal status and one truncation notice cannot be reclaimed later.
 func (w *worker) boundedAssistantReplies(text string) ([]string, bool) {
@@ -78,7 +67,7 @@ func (w *worker) boundedAssistantRepliesWithHeader(text, header string) ([]strin
 	// Reserve header space while splitting the body, rather than splitting a
 	// combined string: a fitting code block must not push the header out alone.
 	limit := telegram.MaxMessageUTF16
-	if header != "" {
+	if header != "" || len(w.b.cfg.StatusBar.Fields("intermediate")) != 0 || len(w.b.cfg.StatusBar.Fields("final")) != 0 {
 		limit -= assistantHeaderUnits + 2
 	}
 	parts, overflow := splitTaskTextLimit(text, partBudget, max(1, limit))
@@ -103,6 +92,11 @@ func (w *worker) boundedAssistantRepliesWithHeader(text, header string) ([]strin
 		parts = append(parts, notice)
 	}
 	return parts, truncated
+}
+
+func assistantReplyHasBody(parts []string, truncated bool) bool {
+	// Truncation appends one synthetic notice after any real body parts.
+	return len(parts) != 0 && (!truncated || len(parts) > 1)
 }
 
 func (w *worker) acceptAssistantMessage(m message, enforceInputBudget, terminalOnly bool) bool {
@@ -185,7 +179,6 @@ func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bo
 		return false
 	}
 	if text != "" {
-		header = w.assistantHeader(header, false)
 		parts, truncated := w.boundedAssistantRepliesWithHeader(text, header)
 		queuedBytes := 0
 		for _, part := range parts {
@@ -193,9 +186,10 @@ func (w *worker) queueAssistantTextWithHeader(text string, enforceInputBudget bo
 		}
 		if len(parts) != 0 {
 			var err error
-			prefix := header + "\n\n"
-			if len(parts[0]) > len(prefix) && parts[0][:len(prefix)] == prefix {
-				parts[0] = parts[0][len(prefix):]
+			if assistantReplyHasBody(parts, truncated) {
+				if header != "" {
+					parts[0] = parts[0][len(header)+2:]
+				}
 				w.assistantDelivery.statusOutboxID, err = w.b.db.AppendAssistantReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts, header)
 			} else {
 				err = w.b.db.AppendInboxReplies(w.ctx, w.active, w.key.chat, w.key.thread, parts)

@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"omp-telegram/internal/omp"
@@ -12,10 +13,12 @@ const replyStatusTimeout = time.Second
 
 type replyStatusState struct {
 	metrics             replyMetrics
+	roundMetrics        replyMetrics
 	pending             *replyStatusRequest
 	header              string
+	prepared            bool
+	provider            string
 	roundStatusOutboxID int64
-	roundStatusHeader   string
 	liveState           statusState
 	liveScope           *progressNativeRequest
 }
@@ -28,6 +31,8 @@ type replyStatusRequest struct {
 	epoch      uint64
 	sessionID  string
 	round      bool
+	workspace  string
+	native     bool
 	cancel     context.CancelFunc
 }
 
@@ -36,6 +41,7 @@ type replyStatusResult struct {
 	state   statusState
 	valid   bool
 	account [32]byte
+	git     string
 }
 
 func (w *worker) resetReplyStatus() {
@@ -47,16 +53,13 @@ func (w *worker) resetReplyStatus() {
 
 // Streamed text without a completed message has no confirmed reply metrics.
 func (w *worker) unconfirmedAssistantHeader() string {
-	readCompleted := w.progressContextReadCompleted()
-	header := ""
-	if readCompleted {
-		header = compactUnknownContext
-	}
+	fields := compactStatusFields{}
 	provider := w.replyStatus.metrics.provider
 	if provider == "" {
 		provider = w.replyStatus.liveState.Model.Provider
 	}
-	return w.withProviderUsage(header, provider, readCompleted)
+	fields.quota = w.providerUsageText(provider, w.progressContextReadCompleted())
+	return w.renderStatusBar("intermediate", fields)
 }
 
 // Reuse only a validated, same-run status projection. No formatted status is
@@ -75,45 +78,94 @@ func (w *worker) intermediateAssistantHeader() string {
 	}
 	state.ConfiguredThinking = w.configuredThinking
 	readCompleted := w.progressContextReadCompleted()
-	header := compactMessageHeader(w.b.language(), state, metrics, readCompleted)
-	return w.withProviderUsage(header, metrics.provider, readCompleted)
+	fields := compactFields(w.b.language(), state, metrics, true, readCompleted)
+	fields.quota = w.providerUsageText(metrics.provider, readCompleted)
+	return w.renderStatusBar("intermediate", fields)
+}
+
+func (w *worker) finalReplyMetrics(round bool) *replyMetrics {
+	if !round && w.research.root {
+		return &w.replyStatus.roundMetrics
+	}
+	return &w.replyStatus.metrics
+}
+
+func (w *worker) prepareReplyStatus(round bool, fields compactStatusFields, readCompleted bool) {
+	kind := "final"
+	if round {
+		kind = "intermediate"
+	}
+	provider := w.finalReplyMetrics(round).provider
+	w.replyStatus.provider = provider
+	w.replyStatus.prepared = true
+	w.providerUsage.baseFields = fields
+	fields.quota = w.providerUsageText(provider, readCompleted)
+	w.replyStatus.header = w.renderStatusBar(kind, fields)
 }
 
 func (w *worker) finishReplyWithStatus(round bool) {
 	if w.replyStatus.pending != nil {
 		return
 	}
-	readCompleted := w.progressContextReadCompleted()
-	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, readCompleted)
-	w.providerUsage.baseHeader = w.replyStatus.header
-	w.replyStatus.header = w.withProviderUsage(w.replyStatus.header, w.replyStatus.metrics.provider, readCompleted)
+	fields := compactFields(w.b.language(), statusState{}, w.finalReplyMetrics(round), false, false)
+	w.prepareReplyStatus(round, fields, w.progressContextReadCompleted())
 	client, connected := w.runtimeClient()
-	if !connected || !w.taskActive() || !w.hasAssistantBody() || w.ctx.Err() != nil {
+	kind := "final"
+	if round {
+		kind = "intermediate"
+	}
+	native := connected && w.statusNeedsNative(kind)
+	git := !round && w.b.cfg.StatusBar.Has("final", "git")
+	hasBody := w.hasAssistantBody() || w.research.root && w.replyStatus.roundStatusOutboxID != 0
+	if !w.taskActive() || !hasBody || w.ctx.Err() != nil || !native && !git {
 		w.commitReplyStatus(round)
+		w.refreshProviderUsage(time.Now())
 		return
 	}
 	w.stopTyping()
 	w.resetIdleProbe()
 	w.cancelSteerProbe()
 	w.cancelProgressNative()
-	catalog := client.CommandCatalog()
-	ctx, cancel := context.WithTimeout(w.ctx, replyStatusTimeout)
+	var epoch uint64
+	if connected {
+		epoch = client.CommandCatalog().Epoch
+	}
+	ctx, cancel := context.WithCancel(w.ctx)
 	request := &replyStatusRequest{
 		client: client, generation: w.binding.Generation, active: w.active, turn: w.turn,
-		epoch: catalog.Epoch, sessionID: w.binding.SessionID, round: round, cancel: cancel,
+		epoch: epoch, sessionID: w.binding.SessionID, round: round, cancel: cancel,
+		workspace: w.binding.Workspace, native: native,
 	}
 	w.replyStatus.pending = request
+	var environment []string
+	if git {
+		environment = omp.ChildEnv(w.b.cfg.OMPEnvironment)
+	}
+	quota := w.b.cfg.StatusBar.Has(kind, "quota")
 	w.background.Add(1)
 	// This read never owns the mutation lane; controls can flush the confirmed reply.
 	go func() {
 		defer w.background.Done()
 		defer cancel()
 		sample := replyStatusResult{request: request}
-		raw, err := client.Call(ctx, "get_state", nil)
-		sample.valid = err == nil && json.Unmarshal(raw, &sample.state) == nil
-		if sample.valid && sample.state.SessionID == request.sessionID {
-			sample.account = w.readProviderUsageScope(ctx, client, sample.state)
+		var probes sync.WaitGroup
+		if git {
+			probes.Add(1)
+			go func() {
+				defer probes.Done()
+				sample.git = readReplyGitField(ctx, request.workspace, environment, w.b.cfg.StatusBar.GitCommand, w.b.cfg.StatusBar.GitTimeout)
+			}()
 		}
+		if native {
+			nativeCtx, nativeCancel := context.WithTimeout(ctx, replyStatusTimeout)
+			defer nativeCancel()
+			raw, err := client.Call(nativeCtx, "get_state", nil)
+			sample.valid = err == nil && json.Unmarshal(raw, &sample.state) == nil
+			if quota && sample.valid && sample.state.SessionID == request.sessionID {
+				sample.account = w.readProviderUsageScope(nativeCtx, client, sample.state)
+			}
+		}
+		probes.Wait()
 		select {
 		case w.operations <- operationResult{kind: "reply_status", meta: sample}:
 		case <-w.ctx.Done():
@@ -136,24 +188,27 @@ func (w *worker) replyStatusFinished(result operationResult) {
 	if !w.replyStatusMatches(request) {
 		return
 	}
-	catalog := request.client.CommandCatalog()
-	// A stale response is not evidence that this scope's context was read.
-	w.replyStatus.header = formatCompactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics, false, false)
+	fields := compactFields(w.b.language(), statusState{}, w.finalReplyMetrics(request.round), false, false)
 	readCompleted := false
-	if request.sessionID != "" && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && w.binding.SessionID == request.sessionID {
-		if !sample.valid {
-			readCompleted = true
+	current := w.binding.SessionID == request.sessionID && w.binding.Workspace == request.workspace
+	if request.client != nil {
+		catalog := request.client.CommandCatalog()
+		current = current && catalog.Epoch == request.epoch && catalog.SessionID == request.sessionID && request.sessionID != ""
+	}
+	if current {
+		if request.native && !sample.valid {
 			w.setProviderUsageScope("", [32]byte{})
-			w.replyStatus.header = compactHeader(w.b.language(), statusState{}, &w.replyStatus.metrics)
-		} else if sample.state.SessionID == request.sessionID {
+		} else if sample.valid && sample.state.SessionID == request.sessionID {
 			readCompleted = true
 			sample.state.ConfiguredThinking = w.configuredThinking
 			w.setProviderUsageScope(sample.state.Model.Provider, sample.account)
-			w.replyStatus.header = compactHeader(w.b.language(), sample.state, &w.replyStatus.metrics)
+			fields = compactFields(w.b.language(), sample.state, w.finalReplyMetrics(request.round), false, true)
+		}
+		if sample.git != "" {
+			fields.git = progressToolLiteral(sample.git)
 		}
 	}
-	w.providerUsage.baseHeader = w.replyStatus.header
-	w.replyStatus.header = w.withProviderUsage(w.replyStatus.header, w.replyStatus.metrics.provider, readCompleted)
+	w.prepareReplyStatus(request.round, fields, readCompleted)
 	w.commitReplyStatus(request.round)
 	w.refreshProviderUsage(time.Now())
 }
@@ -184,8 +239,12 @@ func (w *worker) commitReplyStatus(round bool) {
 		}
 		return
 	}
+	research := w.research.root
 	w.finish()
 	if !w.taskActive() {
+		if research {
+			w.invalidateResearchSettlement()
+		}
 		w.clearSteerFence()
 	}
 }
