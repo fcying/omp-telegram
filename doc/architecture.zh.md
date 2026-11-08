@@ -110,6 +110,8 @@ Polling 失败采用可取消的指数退避, 从一秒增加到 30 秒. Telegra
 
 命令菜单注册失败不阻止 polling. 尽力而为的 UI 路径不能掩盖持久状态失败. SIGINT/SIGTERM 取消共享 context; worker 保守结算/取消未完成工作, 关闭所属进程, 等待后台工作结束后再关闭 store. Session 相关的关闭和未完成启动恢复见后文生命周期章节.
 
+Fatal 边界仅将匹配已结束 daemon context 的错误视为正常关闭. Daemon 仍运行时的取消以及其他上报错误继续传播. 停机取消进行中的 assistant append 时, 未提交文字保留给保守的 teardown 结算, 不重放.
+
 ### 配置与路径契约
 
 [`config.Load`](../internal/config/config.go) 解析 bridge 可执行文件符号链接, 使用真实目录作为默认路径基准. 隐式 `config.toml` 位于该目录; 只有隐式文件不存在时才回退到内嵌根配置. 显式文件缺失, 不可读, TOML 无效或已知配置项非法会报错. 未知键/table 被忽略, 将类型化解码器的缺失字段诊断转为仅包含行列号的启动 ERROR 日志, `--check` 也会打印. 即使存在未知项, 已知字段的类型和值仍须验证. 显式相对 `--config`/`-c` 路径仍相对于调用目录.
@@ -160,6 +162,20 @@ Linux 上通过 [`startProcess`](../internal/omp/process_linux.go) 启动的原�
 ### 传输与完成边界
 
 [`Client`](../internal/omp/client.go) 拥有 OMP 进程组, 连续 stdout reader, 串行 stdin 写入, pending request ID 和异步事件转发器. 启动验证 `ready` 的传输限制并协商公开 RPC v2. `Call` 在写入前注册关联, 等待命令 acknowledgment, 而非 agent 完成. 响应 ID 和命令名必须匹配; 无关联/畸形响应按失败关闭处理, 已放弃 ID 的迟到响应直接丢弃, 不重新解释为事件. 文本 steering 还要求请求关联的 `prompt_result` 和 settlement 支持.
+
+进程保持 Bridge 持有的 `--mode rpc-ui`. `ready` 后先尝试 `set_ask_dialog enabled:true`, 再进行普通 v2 协商. 只有请求关联正确的 `success:false` 且错误字符串精确为 `Unknown command: set_ask_dialog`, 才允许在同一进程继续使用原生 `select`/`editor` 代替组合对话. 其他拒绝, 畸形成功, 超时, 断连, 无关联或命令不匹配响应均关闭进程; 它们不能证明版本较旧, 也不允许切换到普通 `rpc`. 公开 RPC v2 协商仍为必需. 原生对话路径已通过 OMP 18.18.1 实机验证.
+
+启动仍是同步流程: worker 仅在 `Start` 完成协商后接管 UI 事件. 不支持在接管前阻塞 `session_start` 的对话; 协商超时后启动失败, Telegram 不会出现可操作的对话. Bridge 不自动回答. 连接后的无 root UI 不会仅因没有活动任务而拒绝.
+
+在接管前, reader 旁观未应答的 `ask`/`confirm`/`select`/`input`/`editor` 请求, 不消费或回答事件. 仅启动期使用的 tracker 最多保留 128 个 SHA-256 ID 键和 allowlist 方法名; `cancel.targetId` 只移除对应请求. 失败时先冻结证据, 再读取终态错误并关闭进程; 冻结期间发布的协议/传输错误优先于 deadline, 由父 deadline 触发的 teardown 取消仍保留原超时分类. 启动成功即丢弃 tracker. 只有超时且仍有 pending 证据时, 才分类为 `startup_timeout_pending_confirm` (确认优先) 或 `startup_timeout_pending_ui`; 拒绝, 协议失败, 断连及正常取消不会借用该诊断. Pending UI 是线索, 不能证明它是超时的唯一原因.
+
+`rpc_startup_failed` 记录 `client_id`, `stage` (`ready`, `set_ask_dialog`, `negotiate_protocol`), 安全 `reason`, `pending_ui_count` 和 allowlist `pending_ui_methods`. Bridge 的 `runtime_start_failed` 补充对话/generation 关联, 并根据错误分类选择本地化恢复提示. 两类诊断均不包含原始 UI ID, 标题, 问题, 选项, 默认值, 输入值或 RPC 帧; 正常 context cancellation 不产生这些失败日志. 启动 deadline, 协议回退规则和 startup intent 恢复规则不变.
+
+启动失败处理分别接收生命周期父 context 和 startup 请求 context. 读取终态错误后直接检查父 context, 即使 deadline 尚未传播至子 context, 父 deadline 的 teardown 也不能覆盖已确定的握手拒绝, 协议失败或超时. 真正的父取消归一为 `context.Canceled`, 不产生失败诊断. Ready 前的已保存模型识别仍使用 startup 请求 context; timeout/UI 证据与协议/传输错误的优先级保持不变.
+
+除正常取消外, 每个阶段均返回并记录最终解析的失败分类. 仅 ready 前的 `process_exit` 可根据完整回收后的 stderr 识别为 `model_restore`, 保留已有 startup context 和协议保护; 其他 ready 失败不再回读原始 client 错误.
+
+Ask 接纳及 response 完成同时检查 reader 权威 catalog 的 session ID 和 epoch, 旧排队事件不能接管替换后的原生 session.
 
 Root 请求发送前, inbox 必须已持久标记为 `submitted`. Steer 先验证帧大小, 预留 ID, 持久提交, 再注册 `(request, root, client, generation, turn, admission)`, 最后发送. 异步 operation 结果携带 client/generation/root/turn 围栏. 释放 runtime 会丢弃等待中的旧 client operation, 但正在执行的 RPC 通道须等结果返回才能释放. 进程在调用期间退出时, 退出策略也等待其结果; 旧退出围栏不能阻塞替换 runtime.
 
@@ -228,7 +244,7 @@ RPC client 消费私有元数据及 `/usage` 查询回复后, 已连接 runtime 
 
 [`command_menu.go`](../internal/bridge/command_menu.go) 保留默认桥接菜单, 并发布 chat 范围的桥接命令与可执行原生名称/别名并集. Telegram 没有 topic 命令 scope: 同 chat topic 共享并集, 不同 chat 相互独立. 菜单可见性不授予执行权限. 名称本身须匹配 `[a-z0-9_]{1,32}`; 桥接条目/描述优先, 排除隐藏 `/start` 与被拒绝生命周期名称, 排序去重的原生条目填充剩余空间直到总数 100. 省略的可执行名称仍能手动调用.
 
-恢复 worker 和开始轮询前, 启动流程在 `storage.workspace_root` 中运行一个有界的 `omp --mode rpc --no-session` 发现进程, 沿用已选启动参数和配置的环境, 不覆盖 OMP 设置. [`DiscoverCommands`](../internal/omp/catalog.go) 持续读取并丢弃事件, 请求官方目录, 返回前关闭并回收进程和事件读取协程. 发现 deadline 为 20 秒, 不发送 prompt, 不写原生 session 历史或 bridge binding/start intent, 在正常运行时名额投入使用前结束. 仅允许的 builtin 名称和别名填充内存回退目录; workspace 专属来源等待真实会话. 失败只记录通用分类, 保留 bridge 菜单及后续 worker 的发现路径.
+恢复 worker 和开始轮询前, 启动流程在 `storage.workspace_root` 中运行一个有界的 `omp --mode rpc-ui --no-session` 发现进程, 沿用已选启动参数和配置的环境, 不覆盖 OMP 设置. [`DiscoverCommands`](../internal/omp/catalog.go) 持续读取并丢弃事件, 请求官方目录, 返回前关闭并回收进程和事件读取协程. 发现 deadline 为 20 秒, 不发送 prompt, 不写原生 session 历史或 bridge binding/start intent, 在正常运行时名额投入使用前结束. 仅允许的 builtin 名称和别名填充内存回退目录; workspace 专属来源等待真实会话. 失败只记录通用分类, 保留 bridge 菜单及后续 worker 的发现路径.
 
 每个 chat 在活跃 topic 公布权威目录前使用启动回退目录. 真实 topic 目录随后替换回退目录, 包括空目录和不支持目录. 未知目录清除该 topic 的旧贡献, 但不把回退目录替换成权威空列表. 移除或使最后一个已知贡献失效后恢复回退目录. 探针仍会正常初始化 OMP 配置和扩展; `--no-session` 不保证隔离或没有任何副作用.
 
@@ -256,11 +272,31 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ### 原生对话与 session operation
 
-[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. `input`/`editor` 请求被取消并提示发送普通文本; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 bridge 自有菜单, 原生对话没有 bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 没有取消时, 按钮一直有效到用户决定, 任务结算或 runtime/session teardown, 等待期间阻止正常空闲释放.
+[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理组合 `ask` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
+
+活跃的 Ask/文字对话在显示确认前后均排除卡死任务恢复, 即使原生报告 idle 且没有 active tool. 对话结束后恢复原有 watchdog 策略; 只有暂存指导不算等待用户.
 
 原生 cancel 使匹配 token 失效. Teardown 先移除失效 token, 再进行有界键盘清理. 菜单 receipt 记录用户选择, 不是操作成功; confirm/select 写入失败按保守策略退役 runtime.
 
-连续的原生 `select` 仅在相同活动 root, turn, client 和 generation 内复用前一个已完成菜单, 中间不能跨模型 run/消息或 session 变化. 后续选择处于 pending, 翻页, 取消或失效状态时, 之前的选择仍在菜单文字预算内保持可见. 被复用的 Telegram 消息已不存在时, 重新发送可用菜单; 其他编辑失败不重发交付状态不明的菜单. Pending 菜单保留创建时的 scope, 包括 root/turn 为零的情况, 完成时不能借用后来的 root. 并发待处理的对话不合并. 取消, 任务结算和 runtime teardown 清除可复用回执缓存, 不移除已显示的历史选择; 原有单次 token, 消息绑定和原生 response 处理保持不变.
+连续的原生 `select` 仅在相同活动 root, turn, client 和 generation 内复用前一个已完成菜单, 中间不能跨模型 run/消息或 session 变化. 后续选择处于 pending, 翻页, 取消或失效状态时, 之前的选择仍在菜单文字预算内保持可见. 被复用的 Telegram 消息已不存在时, 重新发送可用菜单; 其他编辑失败不重发交付状态不明的菜单. Pending 菜单保留创建时的 scope, 包括 root/turn 为零的情况, 完成时不能借用后来的 root. 并发请求会取消, 不修改当前菜单或原有回执. 取消, 任务结算和 runtime teardown 清除可复用回执缓存, 不移除已显示的历史选择; 原有单次 token, 消息绑定和原生 response 处理保持不变.
+
+组合 Ask 保留不可变的 client/generation/session/catalog-epoch/root/turn/request 身份和可变的 question/interaction epoch. 逐题编辑一条主消息, 选项分页不改变标签, 最后一题完成后才按原问题顺序提交全部答案. 单选直接推进; 多选切换勾选并要求确认, 包括明确确认的空集合. 多选自定义文字补充已选选项. 进入/退出文字输入或切题时撤销旧 token 和提示身份. 每次文字输入单独发送定向 ForceReply 提示, 带不透明且由 bot 发出的 `[ask:...]` marker. 返回的消息 ID 及当前 token/owner/对话必须同时匹配. 一条早到回复可以等待显示回执确认精确 ID; 取消时结算该 pending inbox, 不重放. Marker 识别过期/重启后的提示, 不持久化另一份对话副本. 普通文本和 queued followup 不取消 Ask, 也不进入答案路由.
+
+[`steer.go`](../internal/bridge/steer.go) 在 Ask/文字对话, response 写入或原生 `ask` 工具活跃时, 按 FIFO 暂存本应作为 steer 的输入. Inbox 保持 pending, 与普通排队任务和 in-flight steer 共用容量. 每条绑定原 root/client/generation/turn 及已绑定的原生 session/catalog epoch, 不变成独立 followup. 派发重新校验身份, 等待 UI 结算和 `tool_execution_end`, 且要求 RPC lane 空闲及无原生输出缓冲. `BufferedOutput` 同时包含 reader 尚未分帧的 `bufio` 预读和 frame/event byte credit, 已发布的旧 tool end 不能遮蔽已预读的后继对话帧. 随后由原有 steer 提交流程负责接纳与完成. Stop, runtime/session 替换和 root 完成取消未发送指导; 最终回复在异步 metadata 采样前取消这些输入. 不覆盖 OMP interrupt 策略, 不重放不确定输入, 控制命令仍走原有路径.
+
+首次 steering admission 与 deferred dispatch 共用同一 `steeringBlocked` 门限. Actor 优先处理 Telegram input 时, 也不能绕过已经缓冲的原生 Ask 或终止事件. 无阻塞的首次 steer 仍直接提交, 不额外分配临时 deferred 队列.
+
+预读非空标志与 frame/event byte credit 共用一个 atomic 占用状态. `BufferedOutput` 只读取一次: 清除旧预读标志前先申请 frame credit, 释放对应 frame credit 前先发布新的预读标志. 该标志不计入分配预算和字节诊断数值.
+
+私有 stdout reader 在底层 `Read` 返回非空数据后立即发布该标志, 早于 `bufio` 等待物理行剩余内容. 空闲阻塞读取不发布占用. 完整行保留标志直到申请 frame credit; EOF 和致命解码路径清除标志, 不改变仍由事件持有的 credit.
+
+已识别的 Bridge 命令, 原生 `/autoresearch off` 控制和 foreign-bot 命令先于 Ask 的早到回复等待及过期答案拒绝分类. 研究关闭复用既有 `autoresearchArguments` 精确解析, 其他原生 slash 输入不变. 检查 bot 发出的回复目标及对话后, 去掉 Ask 引用并进入既有命令路由, 沿用正常授权/生命周期或 foreign 命令忽略逻辑, 均不作为答案. 专属提示中的问题正文截断至 1000 UTF-16 units, 使用已有的不冲突 fenced literal 编码, 与 owner mention 和 marker 独立构造. 这限制 Markdown 渲染规模, 防止表格展开或引入额外 mention, 保留 selective ForceReply 的定向目标.
+
+`ui` 入口为原生 `ask`/`select`/`confirm`/`input`/`editor` 共用接纳检查: 已有 Ask/文字请求或 pending 原生 UI confirmation 时, 不接纳新请求. 不同并发 ID 通过现有 response sender 取消一次, 当前菜单不变. 若仅剩 response 写入结果尚未消费, 则将一条后继 UI 事件暂存在已有 `askRequest` 中, 占用同一个单请求槽位, 不显示也不取消. 写入结算后, actor 重新核验其 client/generation/session/catalog-epoch/root/turn 和存活 runtime, 再由 `applyUI` 显示, 不重复接纳. Stop, 原生 cancel, 任务/runtime teardown 及当前 runtime 的写失败会撤销待显示事件, 迟到结果不能重开. 相同 ID 在 pending, 完成或拒绝后均忽略. 每个 runtime 共用的请求 receipt 上限为 4096; 耗尽时保守退役该 runtime, 不重新开放旧请求. 原生 cancel 只清理本地状态. Stop 立即撤销输入, 保留已有普通/research/steer 停止路径. Root 结算, session 替换和 runtime teardown 使交互失效. Ask/文字显示在 actor 外执行, deadline 十秒; 迟到完成仅清理旧键盘. 显示失败取消请求. 提交先消费本地状态, 再独立于 RPC operation lane 尝试一次五秒的 `extension_ui_response` 写入. 没有业务 ACK 或重试; 不确定写入仅退役仍对应原身份的 runtime/session. 空闲释放和新 root 派发等待未完成的 response 写入. 超时和默认答案仅由 OMP 决定; 启用 UI 从不改变审批策略.
+
+Stop 会记录任务级 UI 接纳围栏, 即使当前没有 `askRequest`, 仅剩上一条 response 写入结果尚未消费. 围栏生效时取消新 UI ID, 延后显示也检查同一围栏. 新任务或 runtime 替换/teardown 会重置围栏. Stop 成功结算也会清除围栏, 包括确认空闲或确认关闭 autoresearch 模式后保留连接中 runtime 的 Stop; 结算前围栏仍生效. Stop 已撤销 pending Ask 输入后, 即使原生 abort 明确拒绝也会退役该 runtime, 将活动 root 结算为 uncertain, 不能让无法回答的对话继续阻塞 worker. 没有 pending Ask 时的 abort 拒绝会清除围栏, 继续沿用原有 runtime 可复用策略.
+
+当前会话导出复用既有 runtime 交互忙闲判断, 存在 active/deferred 对话或未结算的 response 写入时拒绝开始快照. 导出期间, 共用 UI 接纳入口记录作用域有效的新请求 ID, 但在问题校验, 显示及自动取消前直接拒绝, 不发送任何原生 response. 导出结束后不重放这些 ID. 过期显示结果仍只清理旧界面. 导出其他会话不阻止当前 UI.
 
 手动 `/compact` 要求逻辑 session 空闲, 不要求进程已连接; 恢复已释放 runtime 后直接开始, 无需确认. 它尝试用五秒超时发送无按钮 `Compacting...`, 再以 180 秒 deadline 在 operation 通道执行原生 `compact`. 成功后 `get_state` 在剩余 deadline 内最多再用三秒. 缺失/非法 usage 或采样失败显示 `n/a`, 不把确认完成的 compaction 改为失败. 不同且非空的原生 session ID 还会退役 runtime, 保留原绑定/claim. 完成后替换状态消息; 状态消息不存在或 edit 失败则经持久 outbox 发送结果.
 
@@ -312,9 +348,9 @@ Progress 关闭或被抑制时, 采样仍可服务中间状态栏. 已完成中�
 
 选择 `status` 时, 正式 assistant 消息显示 **💬**, 仅 root 确认成功后将最新首片状态栏改为 **✅**. 一条 `message_end` 完成不代表 root 已结束. 取消, 结果不确定的任务和仍在继续的研究轮次不标成功. 研究轮次重置时仅保留最新状态栏 outbox ID 和有界 metrics, 不复制历史正文. 只要 intermediate 或 final 选择了字段, 正文分片就预留 512 UTF-16 单位的状态栏预算, 包括初始无状态栏的消息, 保证后续可附加状态栏而不改写或重发正文.
 
-[`assistant_delivery.go`](../internal/bridge/assistant_delivery.go) 在 root 仍为 submitted 时, 通过 `AppendAssistantReplies` 立即排入每条完成的 assistant `message_end`, 包括模型 stop 正文. Outbox 将首片状态栏与不可变正文分开保存, 保留 bot 消息顺序. 只有该 inbox 首条持久文本回复引用原始请求; 后续消息及分片不设置回复目标. 投递不等待最终 metadata. 只有缺少 `message_end` 的 terminal-only 文字可继续 staged 并等待最终采样. 内存仅保留当前未提交文字, 最多一条 staged 正文及位置/资源计数, 不保存另一份已完成正文历史. `message_end` 不结束 root, 不派发下一个 prompt. 不增加问题检测器, 自动审批, RPC 模式变化或原生 Ask 支持.
+[`assistant_delivery.go`](../internal/bridge/assistant_delivery.go) 在 root 仍为 submitted 时, 通过 `AppendAssistantReplies` 立即排入每条完成的 assistant `message_end`, 包括模型 stop 正文. Outbox 将首片状态栏与不可变正文分开保存, 保留 bot 消息顺序. 只有该 inbox 首条持久文本回复引用原始请求; 后续消息及分片不设置回复目标. 投递不等待最终 metadata. 只有缺少 `message_end` 的 terminal-only 文字可继续 staged 并等待最终采样. 内存仅保留当前未提交文字, 最多一条 staged 正文及位置/资源计数, 不保存另一份已完成正文历史. `message_end` 不结束 root, 不派发下一个 prompt. 不使用问题检测器或自动审批.
 
-位置去重区分 staged 文字与不可变的已排入历史. `agent_end` 快照包括 `isTerminal:false` 时只能修正未提交正文; 重复位置可更新终结 metadata, 但不能改写已提交文字或重复累计指标. 只有 metadata 的快照保留未提交文字. 非终结修正在排入输出前仍受任务剩余输入预算限制. UI 请求仅 `confirm`, `select`, `input` 和 `editor` 属于交互式 continuation. 被动 UI metadata 不冲刷 staged 文字, 也不中断正在等待的最终状态采样.
+位置去重区分 staged 文字与不可变的已排入历史. `agent_end` 快照包括 `isTerminal:false` 时只能修正未提交正文; 重复位置可更新终结 metadata, 但不能改写已提交文字或重复累计指标. 只有 metadata 的快照保留未提交文字. 非终结修正在排入输出前仍受任务剩余输入预算限制. UI 请求仅 `ask`, `confirm`, `select`, `input` 和 `editor` 属于交互式 continuation. 被动 UI metadata 不冲刷 staged 文字, 也不中断正在等待的最终状态采样.
 
 原生 `agent_end` 可能重复已流送消息, 也可能只包含压缩后的后缀. 对账按所有 role 的位置计数, 包括 user 和 tool-result, 存在原始 `messageCount` 时使用它定位后缀; 不同位置的相同 assistant 正文仍是独立消息. 缺少最终 `message_end` 或原生 continuation/中断时保留未提交正文, 不重发此前内容. 原有每 root 或研究 round 的字节/消息预算跨所有正文消息累计, 预留终结状态及单次明确截断提示. 普通输入, steer, 所有权, session 围栏及交付不确定时不重放的策略不变.
 
@@ -491,6 +527,8 @@ Bridge 管理研究操作的所有权, 不管理实验本身. 实验准备, Git 
 
 模式开启或仍有待处理工作时保留所有权. 字段缺失或查询错误会将根任务退役为 `uncertain`, 暂停队列. 结果受客户端, 代次, 根任务/请求, 轮次, 目录/会话, 终态修订号和引导准入约束. 接受关闭证据前, actor 先处理已排队的原生事件并检查 reader 缓冲输出; 新轮次或引导会使旧证据失效. 确认完成后将根任务标为 `done`, 不复制已经提交的轮次回复.
 
+Deferred 指导在原生 admission 前也是原 owner 持有的 pending 工作, 因而阻止新 settlement probe 和旧 off/idle 结果的接纳. 若派发因原生 session/epoch 变化取消指导, 且其 Bridge owner 仍匹配当前 research root, 则将该 owner 退役为 `uncertain`: 替换会话不能确认旧 root, 且不会再有 steer 回调唤醒 settlement. 其他 owner 的旧指导不会退役当前 root.
+
 ### Stop, 显式 off 和未确认关闭
 
 [研究控制](../internal/bridge/research_control.go) 按 actor 拥有的阶段执行: 查询, 身份/目录校验, 最终空闲检查, 提交, 接受, 关联的本地完成, 以及控制后的模式确认. RPC 闭包只返回结果, 不修改 worker 状态或消费原生事件. 本地研究命令完成要求同时具备接受结果和匹配的 `prompt_result`, 其中 `status=completed`, `agentInvoked=false`, `sessionSettled=true`; off/clear 还要求后续证据确认保存模式已关闭. 通知从不作为完成证据. 展示通知经过净化和长度限制, 每个轮次/本地控制最多八条.
@@ -566,7 +604,7 @@ Clear 要求实例空闲, 队列为空, 没有未解决引导, 并取得绑定�
 
 [`config.go`](../config.go) 内嵌 Extension. 启用时, [`prepareMigrationExtension`](../internal/config/migration_extension.go) 在 `<storage.data_dir>/.bridge-extensions/` 中以内容寻址文件名原子释放 `.ts` 文件, 使用私有目录/文件权限, 拒绝缓存符号链接. 使用与 worker workspace 无关的绝对路径, 内容版本化使另一个二进制或 `--check` 不会替换现有 runtime 使用的代码. 配置加载器向每个解析后的预设追加独立的 `-e` 和路径 argv, 再计算参数指纹. 普通启动, 惰性/显式 resume, 迁移恢复和原生发现复用这些有效预设. 不重写用户参数或 OMP 配置文件. 缓存是 bridge 拥有的生成资源, 不是 workspace 或 session 历史; 仅安装二进制即可使用.
 
-原生迁移兼容已验证 OMP 18.12.2; 不能仅凭支持 RPC v2 就推定其他版本兼容. 可选的 [`TestRealOMPMigrationCompatibility`](../internal/config/migration_integration_test.go) 实跑内嵌 Extension, handoff 被拒绝后的预算清理, 严格 journal/实时上下文验证, 非默认模型跨进程恢复, configured thinking `auto` 和 Fast `false`. 新增或变化的初始化记录在语义验证前必须安全拒绝, 不应只为通过升级而扩大 metadata 白名单. 该测试不覆盖 Fast 已启用的 provider 或生产 provider 行为.
+原生迁移兼容已验证 OMP 18.18.1; 不能仅凭支持 RPC v2 就推定其他版本兼容. 可选的 [`TestRealOMPMigrationCompatibility`](../internal/config/migration_integration_test.go) 实跑内嵌 Extension, handoff 被拒绝后的预算清理, 严格 journal/实时上下文验证, 非默认模型跨进程恢复, configured thinking `auto` 和 Fast `false`. 新增或变化的初始化记录在语义验证前必须安全拒绝, 不应只为通过升级而扩大 metadata 白名单. 该测试不覆盖 Fast 已启用的 provider 或生产 provider 行为.
 
 Worker 首先检查精确源身份, 原生已静止状态, 空 bridge 队列及没有竞争控制, 冻结 provider/model, configured thinking 和 fast-mode 设置. `PrepareMigration` 用 CAS 核对源并排斥待定启动/迁移, 不修改源 binding 或 `running` 标记. 持久阶段为 `prepared`, `handoff`, `initialize`, `verify`; 未解决失败保留阶段及有界错误分类. 每个有副作用步骤之前先持久化阶段. Handoff deadline 为 180 秒, 其他迁移 RPC 阶段分别有界.
 
@@ -991,11 +1029,13 @@ Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时�
 just smoke-omp /absolute/path/to/omp
 ```
 
-Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行两个真实兼容测试. 未设置该变量时两者均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
+Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行三个真实兼容测试. 未设置该变量时这些测试均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
 
 [`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) 使用真实 worker 和 RPC client, 对接确定性的本地 OpenAI-compatible HTTP/SSE provider. 检查启动/catalog 和 host-tool 注册, prompt 接受与任务完成的区别, root 暂停期间的 fast 控制, 排队最终回复归属及后续请求实际携带的 `service_tier=priority`. 原生 `telegram_send` 调用/结果必须为原 topic 入队不可变 workspace 快照, 不宣称已交付. Stop 必须退役旧 runtime 并取消排队任务; 惰性 resume 必须保留 session 身份和原生上下文, 不重放任务. 已有迁移兼容测试继续独立检查原生 Extension/journal. 两者都不证明生产 provider 或线上 Bot API 兼容.
 
-独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 支持手动和每周运行. 官方 standalone 资产下载到 runner 临时目录, 按 release 提供的 SHA-256 摘要校验, 并记录解析后的 release tag. 基线固定为 18.12.2; 候选默认为最新正式 release, 也可显式指定 tag. 两个矩阵结果独立可见, 候选失败不取消基线. 不改变发布 CI, 不安装或重启生产 daemon.
+[`TestRealOMPAskCompatibility`](../internal/bridge/ask_real_integration_test.go) 沿用相同隔离和本地 provider 模式, 执行真实原生 `ask` 工具调用. 组合多题的单选/多选/自定义答案, 以及明确选择的 `select`/`editor` 回退, 必须产生原 turn 的工具结果和最终回复, 且只有一条用户输入, 不新增 prompt/steer. 原生 Ask 等待期间的 Stop 必须退役 runtime, 取消 root 和 queued followup, 使旧按钮失效, 且不发起后续 provider 请求.
+
+独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 支持手动和每周运行. 官方 standalone 资产下载到 runner 临时目录, 按 release 提供的 SHA-256 摘要校验, 并记录解析后的 release tag. 基线固定为 18.18.1; 候选默认为最新正式 release, 也可显式指定 tag. 两个矩阵结果独立可见, 候选失败不取消基线. 不改变发布 CI, 不安装或重启生产 daemon.
 
 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 

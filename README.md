@@ -18,7 +18,7 @@ Each ordinary private chat or topic has its own OMP session. Different conversat
 ## Requirements
 
 - Linux on amd64 or arm64.
-- An omp installation supporting RPC protocol v2 and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
+- OMP 18.18.1 or a current version supporting RPC protocol v2, `rpc-ui`, and combined Ask dialogs, plus its runtime, such as Bun. Older OMP versions are not compatibility targets. Configure models and authentication for the same user that will run this service.
 - Git is needed only for OMP's native autoresearch workflows.
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
@@ -284,6 +284,8 @@ Native session deletion is irreversible. Workspace files and Telegram topics are
 
 Both formats export only the main session, not companion or subagent transcripts, and have a 50 MB document limit.
 
+Finish pending dialogs and replies before exporting the current session. New native dialogs are unavailable during that export and are not reopened afterward; request a new dialog explicitly if still needed. Exporting a different saved session does not block the current dialog.
+
 Direct forms are also supported:
 
 ```text
@@ -303,6 +305,21 @@ Exported session files may contain sensitive conversation, tool, command, and pa
 
 In a group topic, `/export` sends the session file into that topic, not a private chat. Any group member with access to the topic may download it, even if they are not allowed to send commands to the bot.
 
+### Native Ask questions
+
+The bridge uses OMP's `rpc-ui` mode without changing its enabled tools or approval policy. If native `ask` is enabled in OMP, ask the agent to use it, for example: "Use Ask to let me choose between Programming, Investing, and Languages."
+
+- Questions appear one at a time in one message. Single-choice buttons advance immediately; multi-choice buttons toggle selections, then **Confirm selection** submits them. An explicitly confirmed empty multi-selection is allowed.
+- **Custom answer** opens a separate reply prompt. Reply to that exact message with nonempty text. Multi-choice answers can include both selected options and custom text.
+- Ordinary guidance sent while a task waits for Ask is buffered, then forwarded to that same running task after the dialog/tool finishes. It does not answer or cancel Ask, and is not a separate followup. Buffered guidance shares the queue limit; if the original task ends, is stopped, or its session/runtime is replaced before dispatch, it is cancelled without replay. Resend it explicitly if needed. Controls such as `/stop` are not held behind it.
+- **Back to options** cancels only text entry. **Cancel** cancels the native dialog; **Stop** stops the task. OMP owns timeout/default-answer behavior. Old buttons and reply prompts cannot answer a replacement question or session.
+- Bridge commands such as `/stop` and the native `/autoresearch off` control keep their normal effects even when replying to an expired or still-delivering Ask prompt. Commands addressed to another bot are ignored, never used as answers.
+- Only the task's originating user can answer. One native interaction (Ask, selection, confirmation, or text input) is active per conversation; additional concurrent requests are cancelled without replacing its menu. After answering, the next dialog may briefly wait for the previous response delivery to settle. Duplicate request IDs never reopen dialogs or replay answers. Answers continue the existing task, never create a new prompt, and are not replayed after failure or restart.
+
+Combined dialogs are enabled automatically when OMP supports the opt-in. An explicit unsupported-command response keeps `rpc-ui` and uses native selection/plain-text entry instead; other negotiation failures abort startup. Sensitive inputs marked secret and arbitrary terminal editors are not supported.
+
+Dialogs that block OMP startup before connection are not supported: startup times out and fails, with no actionable Telegram question or buttons. If an unanswered confirmation or other RPC dialog is detected at timeout, Telegram reports the detection, not a proven cause. Configure the extension for noninteractive startup or move its question to a user-invoked command; follow any `/close` instruction before retrying. The bridge never automatically answers startup dialogs. See [native dialog implementation](doc/architecture.md#native-dialogs-and-session-operations).
+
 ### Troubleshooting and limitations
 
 | Symptom | Check |
@@ -313,7 +330,7 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 | `/compact` fails | Short sessions may have nothing to compact. Check OMP's model configuration if local compaction also fails. |
 | Unsupported database schema | Back up the data and use a supported database or fresh data directory; do not change a version number by hand. |
 
-Undo/rewind and redo, voice and transcription, automatic topic creation, and arbitrary terminal/editor dialogs are not supported. Some confirmation and selection flows use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
+Undo/rewind and redo, voice and transcription, automatic topic creation, and arbitrary terminal/editor interfaces are not supported. Native Ask, selection, confirmation, and plain-text input dialogs are supported as described above, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge.
 
 Very large output or many replies may be truncated with an explicit notice. OMP's native session history is not truncated.
 

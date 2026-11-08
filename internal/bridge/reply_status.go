@@ -111,6 +111,9 @@ func (w *worker) prepareReplyStatus(round bool, fields compactStatusFields, read
 }
 
 func (w *worker) finishReplyWithStatus(round bool) {
+	if !round {
+		w.cancelDeferredSteers()
+	}
 	if w.replyStatus.pending != nil {
 		return
 	}

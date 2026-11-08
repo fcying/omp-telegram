@@ -462,6 +462,7 @@ func (w *worker) finishResearchControl(c *researchControl, enabled bool) {
 	w.research.root = false
 	w.touchBinding()
 	if c.intent == "off" {
+		w.uiStopped = false
 		w.mark(c.inbox, store.InboxDone)
 		w.say(w.tr(i18n.Msg.AutoresearchModeDisabledOldResearchTaskNotReplayed))
 	} else {

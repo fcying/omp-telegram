@@ -45,6 +45,8 @@ func TestDeleteMockChild(t *testing.T) {
 			os.Exit(2)
 		}
 		switch command["type"] {
+		case "set_ask_dialog":
+			reply(command, true, map[string]any{"enabled": true})
 		case "negotiate_protocol":
 			reply(command, true, map[string]any{"accepted": true})
 		case "get_state":
@@ -195,7 +197,7 @@ func TestDeleteSessionNativeCommandAndHardStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"--mode", "rpc", "--cwd", cfg.CWD, "--resume", "native-id", "--model", "fixture-model"}
+	want := []string{"--mode", "rpc-ui", "--cwd", cfg.CWD, "--resume", "native-id", "--model", "fixture-model"}
 	if strings.TrimSpace(string(args)) != strings.Join(want, "\n") {
 		t.Fatalf("unexpected RPC argv: %q", args)
 	}

@@ -287,7 +287,7 @@ func assertDiscoveryReaped(t *testing.T, cfg Config) {
 		t.Fatal(err)
 	}
 	for _, request := range strings.Fields(string(requests)) {
-		if request != "negotiate_protocol" && request != "get_available_commands" {
+		if request != "set_ask_dialog" && request != "negotiate_protocol" && request != "get_available_commands" {
 			t.Fatal("discovery submitted a task or performed unrelated RPC work")
 		}
 	}

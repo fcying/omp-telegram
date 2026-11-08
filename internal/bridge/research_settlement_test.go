@@ -145,16 +145,24 @@ func TestAutoresearchOldOffCannotFinishNewRoundOrSteer(t *testing.T) {
 			w, _, trace := researchWorker(t, "autoresearch")
 			researchRoot(t, w, 100, "/autoresearch fenced rounds")
 			result := researchHeldOffResult(t, w, trace)
+			client, rootRequest, turn, generation := w.client, w.rootRequestID, w.turn, w.binding.Generation
+			epoch, admission := client.CommandCatalog().Epoch, w.steerFence.admission
 			if !steer {
 				researchAdmitNewRound(t, w)
 			} else {
-				// Steering admission must fence independently of agent_start.
+				// Pending guidance must fence independently of agent_start or submission.
 				nativeRPC(t, w, "fixture_autoresearch_metadata", map[string]any{"mode": "on", "streaming": true})
 			}
 			if steer {
 				nativeInput(t, w, 101, "instruction for the new round", false)
-				if queueState(t, w, 101) != "submitted" || len(w.steers) != 1 {
-					t.Fatal("steer was not durably admitted before the old result")
+				if queueState(t, w, 101) != "pending" || len(w.deferredSteers) != 1 || len(w.steers) != 0 ||
+					!w.rpcOperationActive || w.steerFence.admission != admission || researchTraceCount(trace, "prompt", "instruction for the new round") != 0 {
+					t.Fatal("guidance bypassed the held settlement RPC lane or was treated as submitted")
+				}
+				pending := w.deferredSteers[0]
+				if pending.owner.rootID != 100 || pending.owner.clientID != client.ID() || pending.owner.turn != turn ||
+					pending.owner.generation != generation || pending.epoch != epoch || pending.session != w.sessionID {
+					t.Fatal("pending guidance lost its original research owner")
 				}
 			}
 			w.operationReturned(result)
@@ -162,7 +170,21 @@ func TestAutoresearchOldOffCannotFinishNewRoundOrSteer(t *testing.T) {
 				t.Fatal("old off snapshot settled newly admitted research work")
 			}
 			if steer {
+				if queueState(t, w, 101) != "pending" || len(w.deferredSteers) != 1 || w.rpcOperationActive || w.research.settlement.probe != nil {
+					t.Fatal("old settlement result discarded pending guidance or retained its RPC lane")
+				}
+				w.probeResearchSettlement()
+				if w.research.settlement.probe != nil {
+					t.Fatal("pending guidance allowed another settlement probe before dispatch")
+				}
+				w.dispatch()
 				nativeUntil(t, w, func() bool { return queueState(t, w, 101) == "done" && !w.rpcOperationActive })
+				if queueState(t, w, 100) != "submitted" || w.active != 100 || w.client != client || w.rootRequestID != rootRequest ||
+					w.turn != turn || w.binding.Generation != generation || client.CommandCatalog().Epoch != epoch ||
+					len(w.deferredSteers) != 0 || len(w.steers) != 0 || w.steerFence.admission != admission+1 ||
+					researchTraceCount(trace, "prompt", "instruction for the new round") != 1 || w.resumeFailed {
+					t.Fatal("guidance did not finish exactly once through native ACK/result in its original research root")
+				}
 				nativeRPC(t, w, "fixture_autoresearch_metadata", map[string]any{"streaming": false})
 				researchAdmitNewRound(t, w)
 			}
@@ -171,7 +193,75 @@ func TestAutoresearchOldOffCannotFinishNewRoundOrSteer(t *testing.T) {
 			if len(w.steers) != 0 || w.steerFence.active {
 				t.Fatal("natural completion lost steer ownership or retained its fence")
 			}
+			if steer && (researchTraceCount(trace, "prompt", "/autoresearch fenced rounds") != 1 || researchTraceCount(trace, "prompt", "instruction for the new round") != 1) {
+				t.Fatal("natural settlement replayed the research root or its guidance")
+			}
 		})
+	}
+}
+
+func TestAutoresearchStaleDeferredGuidanceRetiresUnconfirmedRoot(t *testing.T) {
+	w, _, trace := researchWorker(t, "autoresearch")
+	researchRoot(t, w, 100, "/autoresearch obsolete native scope")
+	result := researchHeldOffResult(t, w, trace)
+	client, session, epoch := w.client, w.sessionID, w.client.CommandCatalog().Epoch
+	nativeInput(t, w, 101, "obsolete research guidance", false)
+	if queueState(t, w, 101) != "pending" || len(w.deferredSteers) != 1 || len(w.steers) != 0 {
+		t.Fatal("guidance did not remain pending behind the held settlement result")
+	}
+	// Change the reader's scope without delivering the session event to the
+	// actor: pending guidance still fences the already completed old probe.
+	nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": map[string]any{
+		"type": "session_info_update", "sessionId": "replacement-research-session",
+	}})
+	if client.CommandCatalog().SessionID != "replacement-research-session" || client.CommandCatalog().Epoch == epoch || w.sessionID != session {
+		t.Fatal("fixture did not establish a reader-ahead replacement session")
+	}
+	w.operationReturned(result)
+	if queueState(t, w, 100) != "submitted" || w.research.settlement.probe != nil || w.rpcOperationActive {
+		t.Fatal("old settlement evidence completed the root or retained its RPC lane")
+	}
+	// Deliver the queued session event and let ordinary dispatch cancel the
+	// stale guidance. Its missing native ACK/result must not strand the root.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for sessionUpdated := false; !sessionUpdated; {
+		select {
+		case raw, open := <-client.Events():
+			if !open {
+				t.Fatal("native events closed before the replacement session")
+			}
+			var event struct{ Type string }
+			if err := json.Unmarshal(raw, &event); err != nil {
+				t.Fatal(err)
+			}
+			w.event(raw)
+			sessionUpdated = event.Type == "session_info_update"
+		case <-timer.C:
+			t.Fatal("replacement session event was not delivered")
+		}
+	}
+	w.dispatch()
+	// A catalog refresh started by the replacement event may finish after
+	// retirement; delivering it must not revive settlement in the new session.
+	select {
+	case catalog := <-w.nativeCatalog.results:
+		w.commandCatalogFinished(catalog)
+	case <-timer.C:
+		t.Fatal("replacement catalog lookup did not return")
+	}
+	nativeUntil(t, w, func() bool { return queueState(t, w, 100) != "submitted" && w.nativeCatalog.cancel == nil })
+	if queueState(t, w, 100) != "uncertain" || queueState(t, w, 101) != "cancelled" ||
+		!w.resumeFailed || !w.research.disablePending || w.taskActive() || w.client != nil ||
+		len(w.deferredSteers) != 0 || len(w.steers) != 0 || w.research.settlement.probe != nil {
+		t.Fatal("lost native research scope was falsely completed or left without a terminal outcome")
+	}
+	w.operationFinished(result)
+	w.dispatch()
+	if queueState(t, w, 100) != "uncertain" || researchTraceCount(trace, "prompt", "/autoresearch obsolete native scope") != 1 ||
+		researchTraceCount(trace, "prompt", "obsolete research guidance") != 0 ||
+		strings.Count(strings.Join(researchReplies(t, w, 100), "\n"), "completed old round") != 1 {
+		t.Fatal("late settlement replayed stale guidance, changed the retired root, or lost its durable round")
 	}
 }
 

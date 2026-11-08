@@ -38,6 +38,17 @@ func awaitProgressDeletion(t *testing.T, w *worker, taskID, messageID int64) {
 	})
 }
 
+func awaitRealtimePreviewSteer(t *testing.T, w *worker, id int64) {
+	t.Helper()
+	// Reader-ahead events can defer submission, so an idle RPC lane alone is not an ACK.
+	nativeUntil(t, w, func() bool {
+		return queueState(t, w, id) == "submitted" && !w.rpcOperationActive && len(w.rpcOperations) == 0
+	})
+	// When the fixture emits agent_end/agent_start before the ACK, the actor may
+	// consume the RPC result first. Drain those events before the next preview.
+	researchBarrier(t, w)
+}
+
 func realtimePreviewWorker(t *testing.T) (*worker, *fakeHTTP) {
 	t.Helper()
 	w, f, command := setupWorkspaceWorker(t)
@@ -73,7 +84,8 @@ func TestRealtimePreviewKeepsBoundedTailWithoutChangingBody(t *testing.T) {
 }
 
 func TestSteerRotatesPreviewAndCompletionDeletesOnlyProgress(t *testing.T) {
-	t.Setenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER", "executing")
+	// Steer within the live message; a native yield would formalize its partial tail.
+	t.Setenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER", "hold")
 	w, f := realtimePreviewWorker(t)
 	root, client, turn := w.active, w.client, w.turn
 	stoppedAssistantMessage(t, w, "Completed before steering.")
@@ -85,8 +97,12 @@ func TestSteerRotatesPreviewAndCompletionDeletesOnlyProgress(t *testing.T) {
 	boundary := len(f.messages)
 	f.mu.Unlock()
 	for i, id := range []int64{101, 102} {
+		body := w.stream.String()
 		nativeInput(t, w, id, "Steer this running task", false)
-		w.operationReturned(waitOperation(t, w))
+		awaitRealtimePreviewSteer(t, w, id)
+		if w.stream.String() != body {
+			t.Fatal("steer changed the live assistant body before its completed snapshot")
+		}
 		awaitProgressDeletion(t, w, root, progress[i])
 		w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"New preview after steering."}}`))
 		result := sendRealtimePreview(t, w)
@@ -152,7 +168,7 @@ func TestSteerProgressDeletionFailurePreservesRuntimeAndCleanupIdentity(t *testi
 	f.progressDeleteStatus = http.StatusInternalServerError
 	f.mu.Unlock()
 	nativeInput(t, w, 101, "Continue despite a Telegram deletion failure", false)
-	w.operationReturned(waitOperation(t, w))
+	awaitRealtimePreviewSteer(t, w, 101)
 	w.background.Wait()
 	previews, err := w.b.db.ProgressMessages(root)
 	requireStoreOK(t, err)
@@ -164,7 +180,7 @@ func TestSteerProgressDeletionFailurePreservesRuntimeAndCleanupIdentity(t *testi
 	f.progressDeleteStatus = 0
 	f.mu.Unlock()
 	nativeInput(t, w, 102, "Replace both retained previews", false)
-	w.operationReturned(waitOperation(t, w))
+	awaitRealtimePreviewSteer(t, w, 102)
 	awaitProgressDeletion(t, w, root, old.id)
 	awaitProgressDeletion(t, w, root, current.id)
 	latest := sendRealtimePreview(t, w)
@@ -176,7 +192,8 @@ func TestSteerProgressDeletionFailurePreservesRuntimeAndCleanupIdentity(t *testi
 }
 
 func TestSteerCancelsPendingPreviewEditWithoutRebindingItsResult(t *testing.T) {
-	t.Setenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER", "executing")
+	// Keep the edited partial message live while the steer RPC is acknowledged.
+	t.Setenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER", "hold")
 	w, f := realtimePreviewWorker(t)
 	initial := sendRealtimePreview(t, w)
 	transport := &pendingProgressEditHTTP{fallback: f, started: make(chan struct{}), gate: make(chan struct{})}
@@ -189,6 +206,10 @@ func TestSteerCancelsPendingPreviewEditWithoutRebindingItsResult(t *testing.T) {
 		t.Fatal("old preview edit did not start")
 	}
 	nativeInput(t, w, 101, "Use a new preview", false)
+	awaitRealtimePreviewSteer(t, w, 101)
+	if w.stream.String() != "Blocked old preview update." {
+		t.Fatal("steer changed the assistant body while cancelling its preview edit")
+	}
 	w.flushPreview()
 	var current previewResult
 	for i := 0; i < 2; i++ {
@@ -262,10 +283,10 @@ func TestSteerPreservesAcceptedPreviewSendIdentity(t *testing.T) {
 		t.Fatal("initial preview did not reach Telegram")
 	}
 	nativeInput(t, w, 101, "Steer before the preview response arrives", false)
+	awaitRealtimePreviewSteer(t, w, 101)
 	if transport.requestCtx.Err() != nil {
 		t.Fatal("steer cancelled an accepted Send before its identity arrived")
 	}
-	w.operationReturned(waitOperation(t, w))
 	current := sendRealtimePreview(t, w)
 	release()
 	var late previewResult

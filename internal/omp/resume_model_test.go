@@ -297,7 +297,7 @@ func TestResumeModelFallback(t *testing.T) {
 			if len(launches) != tc.launches {
 				t.Fatalf("launch count = %d, want %d", len(launches), tc.launches)
 			}
-			wantArgs := []string{"--mode", "rpc", "--cwd", root}
+			wantArgs := []string{"--mode", "rpc-ui", "--cwd", root}
 			if tc.resume {
 				wantArgs = append(wantArgs, "--resume", cfg.Resume)
 			}
