@@ -212,7 +212,7 @@ func TestFinalReplyMetadataPreservesPendingStatusAndUsage(t *testing.T) {
 	requireStoreOK(t, os.WriteFile(gate, nil, 0600))
 	awaitProviderUsage(t, w)
 	header := finalReplyStatus(t, w, 2, "answer")
-	for _, want := range []string{"11% (10k)", "100 t/s", "5h30% 7d65%"} {
+	for _, want := range []string{"11% (10k)", "100 t/s", "30% 65%"} {
 		if !strings.Contains(header, want) {
 			t.Fatalf("metadata prevented confirmed final metric %q: %s", want, header)
 		}

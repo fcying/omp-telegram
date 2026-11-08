@@ -65,6 +65,7 @@ type Bridge struct {
 	languageMu           sync.Mutex
 	interfaceLanguage    atomic.Uint32
 	providerUsage        providerUsageCache
+	sub2api              sub2apiBridge
 	quickActionsOnce     sync.Once
 	quickActionsInstance string
 }
@@ -299,6 +300,7 @@ type worker struct {
 	progressNative         progressNativeState
 	replyStatus            replyStatusState
 	providerUsage          providerUsageState
+	sub2api                sub2apiUsageState
 	operations             chan operationResult
 	albums                 map[albumKey]*pendingAlbum
 	rpcOperations          []rpcOperation
@@ -1308,6 +1310,7 @@ func (w *worker) taskActive() bool { return w.active != 0 }
 func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
+	w.resetSub2apiUsage()
 	w.rotatePreview(0)
 	w.cancelProgressNative()
 	w.resetReplyStatus()
@@ -1479,6 +1482,7 @@ func (w *worker) runtimeStopped() {
 	w.uiSelection = nativeSelectionReceipt{}
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
+	w.resetSub2apiUsage()
 	w.cancelProviderUsage()
 	w.providerUsage = providerUsageState{}
 	w.commitPendingReplyStatus()
@@ -1743,6 +1747,9 @@ func (w *worker) run() {
 				w.flushPreview()
 			}
 			continue
+		case result := <-w.sub2api.results:
+			w.sub2apiUsageFinished(result, time.Now())
+			continue
 		case result := <-w.topicRenameResults:
 			w.topicRenameFinished(result)
 			w.dispatch()
@@ -1855,6 +1862,8 @@ func (w *worker) run() {
 			if w.progressNativeFinished(result) {
 				w.flushPreview()
 			}
+		case result := <-w.sub2api.results:
+			w.sub2apiUsageFinished(result, time.Now())
 		case <-tick.C:
 			if onTick() {
 				return
@@ -3700,8 +3709,15 @@ func (w *worker) finishResult(localOnly bool) {
 				return
 			}
 		}
+		if w.research.root {
+			w.restoreResearchSub2apiUsage()
+		}
 		w.providerUsage.target = target
 		w.providerUsage.targetProvider = w.replyStatus.provider
+		if w.sub2api.inbox == taskID && (!w.research.root || w.sub2api.target == target) {
+			w.sub2api.target = target
+			w.sub2api.provider = w.replyStatus.provider
+		}
 		w.cancelHostRequests()
 		w.logTaskComplete(taskID, "done")
 		w.clearTask()
@@ -4002,6 +4018,9 @@ func (w *worker) event(raw []byte) {
 		w.statusReleaseClientID = 0
 		return
 	}
+	if w.captureSub2apiRequest(e) {
+		return
+	}
 	if w.migrationLocked() {
 		if e.Type == "agent_start" || e.Type == "tool_execution_start" || e.Type == "host_tool_call" {
 			w.cancelMigration("unexpected_activity", true)
@@ -4092,6 +4111,9 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		if w.research.root || !w.taskActive() {
+			w.resetSub2apiUsage()
+		}
 		w.uiSelection = nativeSelectionReceipt{}
 		if w.research.root {
 			w.invalidateResearchSettlement()

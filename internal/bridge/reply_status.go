@@ -19,6 +19,7 @@ type replyStatusState struct {
 	prepared            bool
 	provider            string
 	roundStatusOutboxID int64
+	roundSub2apiUsage   sub2apiUsageState
 	liveState           statusState
 	liveScope           *progressNativeRequest
 }
@@ -100,6 +101,12 @@ func (w *worker) prepareReplyStatus(round bool, fields compactStatusFields, read
 	w.replyStatus.prepared = true
 	w.providerUsage.baseFields = fields
 	fields.quota = w.providerUsageText(provider, readCompleted)
+	if !round && w.research.root && w.b.cfg.Sub2API.HasProvider(provider) {
+		fields.quota = ""
+		if readCompleted {
+			fields.quota = w.replyStatus.roundSub2apiUsage.sub2apiQuotaSnapshot.text(time.Now())
+		}
+	}
 	w.replyStatus.header = w.renderStatusBar(kind, fields)
 }
 
@@ -215,6 +222,7 @@ func (w *worker) replyStatusFinished(result operationResult) {
 
 func (w *worker) flushReplyStatus() {
 	w.commitPendingReplyStatus()
+	w.cancelSub2apiUsage()
 	w.flushProviderUsage()
 }
 

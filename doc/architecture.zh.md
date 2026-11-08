@@ -122,11 +122,15 @@ Polling 失败采用可取消的指数退避, 从一秒增加到 30 秒. Telegra
 | Lock, 数据库, 附件 spool | `storage.data_dir` 下 |
 | 原生 OMP 配置, 凭据和 session 存储 | OMP 默认值或显式原生参数; bridge 不重定位 |
 
-支持 `[telegram]`, `[telegram.status_bar]`, `[omp]`, `[omp.environment]`, `[storage]`, `[worker]`, `[logging]` 和 `[logging.component_levels]`. 未知和错位字段直接忽略, 不自动迁移或展开环境变量. 未知日志组件名同样作为未知键处理; 六个已知组件的非法值仍拒绝. 两个白名单都必须非空; user ID 必须为正数, chat ID 不能为零. `max_workers` 范围为 `1..64`, `queue_capacity` 为 `1..1024`, 保留天数不能为负. 正数 Go duration 启用空闲释放; 空值, `0` 或 `disabled` 关闭.
+支持 `[telegram]`, `[telegram.status_bar]`, `[omp]`, `[omp.environment]`, `[sub2api]`, `[storage]`, `[worker]`, `[logging]` 和 `[logging.component_levels]`. 未知和错位字段直接忽略, 不自动迁移或展开环境变量. 未知日志组件名同样作为未知键处理; 六个已知组件的非法值仍拒绝. 两个白名单都必须非空; user ID 必须为正数, chat ID 不能为零. `max_workers` 范围为 `1..64`, `queue_capacity` 为 `1..1024`, 保留天数不能为负. 正数 Go duration 启用空闲释放; 空值, `0` 或 `disabled` 关闭.
 
 TOML 解析后仅展开一次字符串引用: `$VAR`, `${VAR}`, `$$` 表示字面美元符号. 插入的环境变量内容不会再次展开, 也不能注入 TOML. 数值和白名单字段支持其文档中约定的环境引用字符串. 默认 `OMP_TELEGRAM_ARGS` 和 workspace-root 引用允许未设置; progress mode 无效或未设置时回退为 `summary`. 其他必需引用未设置时报错. Environment 策略的 mode/变量名, 仅展示的 `omp.args_labels`, `telegram.status_bar` 字段以及 `telegram.final_actions` 标签/命令保持字面值. 不读取 `.env` 文件.
 
 `omp.args` 接受有序预设字符串数组, 或归一化为一个预设的标量字符串. 每项使用支持引号的 tokenizer 解析, 不经过 shell; 启动前校验全部预设. 拒绝覆盖 bridge 管理的 mode/cwd/session 选项及受保护短选项, `--`, NUL 字节. 只持久化归一化预设 fingerprint 与所选 index, 不保存原始参数. 选择语义和每 runtime 快照见运行设置章节.
+
+`[sub2api]` 仅在 `base_url`, `api_key`, `providers` 全空时关闭. 这些字符串及每个 provider 元素沿用单次环境变量展开. 部分配置, 不安全的 HTTP(S) base URL (凭据, query, fragment, 非法 port 或点路径段), 非法/重复 provider ID, 或未显式启用 `sub2api.extension = true` 时启用数据源, 都校验失败, 不回显输入或环境引用名称. Provider 按精确且区分大小写的 OMP ID 匹配, 不是 model selector 或 URL alias. 也允许仅显式启用观察器而不配置额度源.
+
+根 [`config.go`](../config.go) 内嵌 `Sub2apiExtension`. 显式启用观察器后复用迁移 Extension 的私有, 内容寻址, 原子释放机制, 缓存在 `<storage.data_dir>/.bridge-extensions/`, 拒绝缓存符号链接, 向全部 OMP argv 预设只追加绝对 `-e` 路径. 启动及 `--check` 均不修改全局 OMP 配置. Sub2api 模型/provider URL, context 设置及凭据仍由 OMP 管理; 管理 key 仅由 bridge HTTP client 使用, 不加入 OMP argv, 不注入子环境. 既有环境策略不变: 使用环境变量存放管理 key 时应显式 deny, 或不列入 allowlist.
 
 ### 子进程环境与隔离限制
 
@@ -149,7 +153,7 @@ Linux 上通过 [`startProcess`](../internal/omp/process_linux.go) 启动的原�
 | 延后 root | `/followup`, 附件, 桥接 `/review` 和已识别原生命令保留 FIFO 位置, 成为独立提交. 附件异步准备; 未准备好的队首不能被越过. |
 | Control | 桥接控制和回调不进入 prompt FIFO. 慢速变更/控制 RPC 通过单一异步 operation 通道执行, actor 仍单独处理事件. 启动及部分有超时限制的 Telegram/RPC 调用仍可能占用 actor. |
 
-`worker.queue_capacity` 限制排队 root 与未解决 steer 的总数. `/queue` 只读取当前 worker 的运行时 queue/active/busy 状态; Cancel 按钮取消选定 pending inbox 及准备资源, 不终止活动 root, 也不管理 OMP 原生 steer 队列. 关闭会取消等待输入. 重启后不自动重放队列输入或 uncertain 提交.
+`worker.queue_capacity` 限制排队 root 与未解决 steer 的总数. 队列检查读取当前 worker 的运行时 queue/active/busy 状态; 取消 pending 工作会结算选定 inbox 并释放已准备资源. 关闭会取消等待输入. 重启后不自动重放队列输入或 uncertain 提交.
 
 原生命令的 acceptance 若省略 `agentInvoked`, 仍保留 native owner, 新普通文本继续排队. 只有 `agentInvoked:true` 或 `agent_start` 能证明已进入 agent 执行, 从而在原回复 owner 下允许普通 root steering. `controlAbort` 期间收到的普通文本成为新的排队 root; slash invocation 仍须严格 Bridge/native 分类, 未知命令不能变成模型 prompt. 托管研究使用特殊长期 owner, 不采用普通 root 的终结/settlement 规则.
 
@@ -266,7 +270,7 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ### 完成快捷按钮与后续输入 (#99 契约)
 
-`telegram.final_actions` 是按顺序排列的 literal `{label, command}` 列表, 最多六项; 省略或空列表关闭完成按钮. 标签非空, 单行, 最多 64 个 UTF-16 单位. Command 只能是一个 slash invocation, 不允许控制字符, 变量展开或 shell 解释. 加载配置不虚构原生命令目录: 点击时重新检查实际可用性, 来源策略, binding 和 session. 自定义标签与命令永不记入日志. 本次实现的隔离原生 catalog 检查公布 builtin `shake` ("Shake heavy content out of the conversation context"), 示例显式将 Shake 映射为 `/shake`. 执行仍以当前 runtime/session 可用性为准, Queue 不能替代 Shake.
+`telegram.final_actions` 是按顺序排列的 literal `{label, command}` 列表, 最多六项; 省略或空列表关闭完成按钮. 标签非空, 单行, 最多 64 个 UTF-16 单位. Command 只能是一个 slash invocation, 不允许控制字符, 变量展开或 shell 解释. 加载配置不虚构原生命令目录: 点击时重新检查实际可用性, 来源策略, binding 和 session. 自定义标签与命令永不记入日志.
 
 完成按钮只属于成功结算的 root task 的最后一个真实 assistant 正文片段, 不挂在 header, 截断/错误提示或原生命令输出上. 尾片 Telegram ID 与首片 header 目标分别跟踪, header 关闭时也保存. 待发正文携带 keyboard; 已发正文只编辑 reply markup. Markup 失败或不确定不能重发正文, header/quota 编辑须保留当前 markup. 现有 outbox 顺序, claim 和不确定交付策略继续有效. 每个按钮拥有独立持久化一次性 token. 接收时先预留且不移除 markup (`consumed=0, consumed_by>0`); 原命令 handler 保留资格检查, 确定性本地拒绝时原子释放预留并结算该 callback inbox. 接受任务入队, 提交目标 RPC 或开始本地操作前才消费 token. 执行确认携带预留直到接受, 取消或超时; 已成功打开的菜单视为菜单命令已执行. 重复 update 不能重新打开已结算的尝试. 旧 binding/generation/configuration 动作拒绝. 启动恢复保守消费中断的预留, 取消其 pending callback inbox, 不重放. 预留期间保留清理不能删除来源正文.
 
@@ -334,25 +338,63 @@ Progress 和中间/最终回复 header 共用 model/thinking/fast 格式, 精简
 
 Schema 23 增加独立于 header 内容的 `outbox.header_editable`, 回填现有 assistant 状态栏. 仅 assistant 正文的首片可编辑. 即使 header 为空也保存 Telegram ID; pending 编辑可添加或删除 header, 使用快照 CAS 确认, 相同内容不产生冗余编辑. 普通输出不可编辑. Intermediate 关闭/final 开启和相反组合均支持发送前, 发送中及发送后切换.
 
-[`reply_git.go`](../internal/bridge/reply_git.go) 在完成时从当前原生确认的 binding workspace 采样. 安全预检和状态命令共用配置的 Git deadline (默认 450 ms) 及累计 64 KiB stdout 预算. [`reply_git_probe.go`](../internal/bridge/reply_git_probe.go) 检查配置, 已跟踪文件属性和已初始化子模块, 不对工作区正文做哈希. 相关内容过滤器使字段不可用, 未使用的全局 driver 定义不影响普通仓库. 对已知 driver 设置空 clean/process 命令及 `required=true` guard, 状态读取后再次检查属性. 父 status 使用 `--ignore-submodules=dirty`, 通过独立受保护的子探测补充子模块工作区/untracked 改动, 不让 Git 隐式递归调用未经检查的 helper. 每条命令禁用 optional locks 和 fsmonitor; 子环境显式关闭三个 Trace2 目标, 交互提示和 lazy fetch, 不绕过 ownership 检查. 不对并发同时新增未知 filter driver 和属性提供原子快照. Staged, unstaged 和未忽略的 untracked 条目追加字面 `*`; ahead/behind 不算 dirty. Detached HEAD 显示 `HEAD`; 失败, 不安全, 超预算或不完整结果省略. 不发布文件名或诊断. 普通最终采样让 Git 与所需原生读取并行; 研究结算复用权威 idle/off 读取及既有围栏, 中间轮次不采样 Git. 后续额度编辑保留已捕获的 Git 字段.
-
-[`reply_git_command.go`](../internal/bridge/reply_git_command.go) 为普通任务和研究 root 的最终采样选择实现. `telegram.status_bar.git_command` 未配置或为空时, 调用安全 `readReplyGit`, 保留全部内置防护. 非空 argv 直接使用 `exec.CommandContext`, `Dir` 为当前 binding workspace, 沿用现有 OMP 子环境策略, 不经过 shell, 不展开变量, 不添加 Git 参数, 不做 Git 专用环境清理或安全预检. 自定义命令的安全及副作用由用户负责. 自定义路径使用配置的 Git deadline, 保留 64 KiB stdout 上限及有界管道清理; 丢弃 stderr, 去掉末尾 CR/LF, 拒绝内嵌换行/控制字符和非法 UTF-8, 将原始单行文本按字符边界裁剪至 64 UTF-8 字节, 不做 Git 格式解析. 渲染复用内置结果的字面字段编码和 header 预算. 失败及空输出省略字段, 不回退到 Git. 只有最终状态栏选择 Git 才执行命令, 研究中间轮次不执行. 既有研究围栏可能要求再次结算探测, 自定义命令不能假设恰好执行一次. 后续额度编辑复用已捕获的文本.
-
-`telegram.status_bar.git_timeout` 是正数字面 Go duration 字符串, 内置和自定义采样默认均为 `"450ms"`; 大仓库可增至如 `"2s"`. 配置拒绝显式空串, 零, 负数, 非法, 溢出及非字符串值, 错误不包含输入内容, 不展开环境引用. `config.DefaultGitTimeout` 提供共享默认值; 程序直接构造的 `StatusBar.GitTimeout` 非正时, 两个 bridge 读取函数均回退此默认值. 内置预检和状态命令消耗同一个 deadline, 不为每个子进程重新计时. 不增加重试或关闭超时的配置值. 增大预算不改变内置防护, 64 KiB 输出及 64 字节 label 上限; 大仓库超过输出上限仍可能省略字段.
-
 普通最终采样使用共享可取消父 context, 每次原生状态/账号 RPC 使用独立的 1 秒 context, Git 使用配置预算. 研究结算为每次状态/账号 RPC 单独建立 5 秒 context, Git 从 operation 父 context 而非 RPC context 派生配置 deadline. 仅 `research_settlement` 移除通用的 30 秒 operation 上限, 因为有限次 RPC 和 Git 探针仍各自有界. Operation/控制取消及全部所有权/session 围栏保持有效.
 
 最终 context 使用最后一次调用包含输出的 usage: 优先显式 `contextTokens`, 否则用正 `totalTokens` 或完整 input/output/cache 总和, 再减 orchestration input/output/cache-read usage, 最低为零. 缺失, 负值或溢出不估算. 这不同于可能仍指向最终 input anchor 的 `get_state.contextUsage.tokens`.
 
 确认文本完成后, 仅当选定状态栏需要原生字段时, [`reply_status.go`](../internal/bridge/reply_status.go) 独立发出一秒 deadline 的 `get_state`. 只有 model/provider/native session 匹配, 且明确非 streaming/非 compacting 时才显示 context; 百分比由含输出 usage 与采样窗口重新计算. Thinking/fast 也须匹配 model 身份. 该 query 不能释放变更通道. Client/generation/root/turn/catalog epoch/session 围栏拒绝迟到结果; 新输入, 原生活动, retirement 或查询失败时, 使用已知 model/average 字段提交确认答案. 无害元数据/完成尾事件可继续消费而不替换答案.
 
-选择 `quota` 后, 对应状态栏从 Bridge 进程内的 last-good 缓存读取额度, 独立于刷新及 progress 模式. 只有同 scope 的账号读取确认存在可用缓存时, 受支持的 provider 才显示已识别的 5h/7d **已用**百分比, 如 `5h30% 7d65%`. 未读取, 未知, 不明确或空值始终省略. 读取失败, 跳过或不受支持都不清除已有缓存. 缓存跨消息及同 scope 原生 session 共享, 但不跨 daemon restart 持久化, 不增加额度数据库表.
+#### Git 状态采样
 
-短任务在实时采样前完成且 final 未选择 quota 时, 仅 idle 进行有界 scope 发现, 不占住任务结算. 未知 scope 的发现至少间隔五秒; 已确认账号的刷新仍经过五分钟缓存门控. 可见状态栏均未选择 quota 时不发出 account/quota 展示查询. Header 预算省略完整字段, 不截断字面围栏或 dirty 标记.
+[`reply_git.go`](../internal/bridge/reply_git.go) 在完成时从当前原生确认的 binding workspace 采样. 安全预检和状态命令共用配置的 Git deadline (默认 450 ms) 及累计 64 KiB stdout 预算. [`reply_git_probe.go`](../internal/bridge/reply_git_probe.go) 检查配置, 已跟踪文件属性和已初始化子模块, 不对工作区正文做哈希. 相关内容过滤器使字段不可用, 未使用的全局 driver 定义不影响普通仓库. 对已知 driver 设置空 clean/process 命令及 `required=true` guard, 状态读取后再次检查属性. 父 status 使用 `--ignore-submodules=dirty`, 通过独立受保护的子探测补充子模块工作区/untracked 改动, 不让 Git 隐式递归调用未经检查的 helper. 每条命令禁用 optional locks 和 fsmonitor; 子环境显式关闭三个 Trace2 目标, 交互提示和 lazy fetch, 不绕过 ownership 检查. 不对并发同时新增未知 filter driver 和属性提供原子快照. Staged, unstaged 和未忽略的 untracked 条目追加字面 `*`; ahead/behind 不算 dirty. Detached HEAD 显示 `HEAD`; 失败, 不安全, 超预算或不完整结果省略. 不发布文件名或诊断. 普通最终采样让 Git 与所需原生读取并行; 研究结算复用权威 idle/off 读取及既有围栏, 中间轮次不采样 Git. 后续额度编辑保留已捕获的 Git 字段.
 
-缓存键包含 provider, 启动 argv namespace 及只读 `get_logout_accounts` RPC 返回的唯一 active OAuth credential 所确定的保守账号 scope. 不按 provider 单独回退缓存. Scope 未知或不明确时隐藏其他账号的缓存, 不删除已有值. Metadata 采样只通过只读账号 RPC 建立 scope, 不调用 `/usage` 或账号变更操作. 刷新在额度查询前后读取账号 scope, 只有两次 scope 一致才接受结果. Client/generation/native-session 和 operation 所有权围栏也拒绝迟到结果; 编辑 header 还必须匹配最近对应的最终状态栏目标. 这些分开的 RPC 读取不能原子绑定账号与额度样本, scope 检查和报告的当前账号标记都不能识别每次轮换请求实际结算的账号.
+[`reply_git_command.go`](../internal/bridge/reply_git_command.go) 为普通任务和研究 root 的最终采样选择实现. `telegram.status_bar.git_command` 未配置或为空时, 调用安全 `readReplyGit`, 保留全部内置防护. 非空 argv 直接使用 `exec.CommandContext`, `Dir` 为当前 binding workspace, 沿用现有 OMP 子环境策略, 不经过 shell, 不展开变量, 不添加 Git 参数, 不做 Git 专用环境清理或安全预检. 自定义命令的安全及副作用由用户负责. 自定义路径使用配置的 Git deadline, 保留 64 KiB stdout 上限及有界管道清理; 丢弃 stderr, 去掉末尾 CR/LF, 拒绝内嵌换行/控制字符和非法 UTF-8, 将原始单行文本按字符边界裁剪至 64 UTF-8 字节, 不做 Git 格式解析. 渲染复用内置结果的字面字段编码和 header 预算. 失败及空输出省略字段, 不回退到 Git. 只有最终状态栏选择 Git 才执行命令, 研究中间轮次不执行. 既有研究围栏可能要求再次结算探测, 自定义命令不能假设恰好执行一次. 后续额度编辑复用已捕获的文本.
 
-额度刷新是仅在 idle 时进行的 best-effort 工作, 独立于任务结算, 最终 metadata 及五秒 Progress 采样. 同一账号 scope 的尝试间隔至少五分钟, deadline 为三秒; 不重置 runtime 的空闲活动计时. 排队 prompt, 控制操作, 活动 root/研究 round, 原生活动和忙碌的变更通道优先; 不会只为查询额度而启动进程. 忙碌或长任务有缓存就显示, 否则省略字段. 刷新成功后仅在 final 选择 `quota` 时更新最近匹配的最终 header, 不修改不可变正文. 刷新失败不延迟结算, 不重发答案, 不另建状态气泡.
+`telegram.status_bar.git_timeout` 是正数字面 Go duration 字符串, 内置和自定义采样默认均为 `"450ms"`; 大仓库可增至如 `"2s"`. 配置拒绝显式空串, 零, 负数, 非法, 溢出及非字符串值, 错误不包含输入内容, 不展开环境引用. `config.DefaultGitTimeout` 提供共享默认值; 程序直接构造的 `StatusBar.GitTimeout` 非正时, 两个 bridge 读取函数均回退此默认值. 内置预检和状态命令消耗同一个 deadline, 不为每个子进程重新计时. 不增加重试或关闭超时的配置值. 增大预算不改变内置防护, 64 KiB 输出及 64 字节 label 上限; 大仓库超过输出上限仍可能省略字段.
+
+#### sub2api 额度
+
+在可见状态栏数组选择 `quota` 开启显示, 但上游采样还要求完整 `[sub2api]` 配置和显式观察器 opt-in. 内嵌[观察器](../extensions/omp-telegram-sub2api.ts) 处理 `after_provider_response`, 仅用 `ctx.ui.notify` 发送 `omp-telegram.sub2api.v1 ` marker 和紧凑 `{sessionId,provider,clientRequestId}` JSON. Request ID 来自服务端 `x-client-request-id` UUID, 不本地生成猜测值. 不写 session entry/history, 不发送整组 header. Bridge 在通用 UI 处理前消费已识别 marker, 包括非法 payload, 防止私有元数据成为 Telegram 通知.
+
+归属支持 HTTP/SSE 响应头. `after_provider_response` 观察到 header 时, 响应流和异步 usage 记账写入不一定已经完成, 因此有效 Request ID 不代表对应 usage 行已经可查询. 观察器严格只接受成功的 `2xx` 响应, 不接受 WebSocket `101` upgrade. WebSocket 每轮归属不受支持: 握手 ID 不能证明后续轮次实际服务的账号或对应 usage 行. Bridge 尊重 OMP 的 transport 配置, 不切换 transport 或修改 provider/model 凭据.
+
+观察器依赖 RPC 扩展通知: 启用 sub2api 时拒绝任一包含 `--no-ui` 的参数预设. Headless 扩展 UI 会丢弃 `notify`, bridge 不覆盖用户的显式选项. `--no-extensions` 只关闭发现, 与显式观察器路径兼容.
+
+Bridge 侧有界 HTTP 工作不占 RPC 操作通道. 每批归属/额度查询使用独立的 10 秒总预算, 覆盖所有顺序执行的 Request ID 反查和账号额度读取; 原生 RPC `/usage` 保留三秒预算. 任务 scope 或 runtime 取消可提前结束 HTTP 工作. GET 使用 `x-api-key`, 拒绝 redirect, 不暴露原始 HTTP/RPC 响应或秘密. 精确 `client:<UUID>` usage 查询必须在经过校验的分页中得到唯一匹配账号; 对配置的 provider 不回退到最新日志, provider 单独 scope 或原生凭据. 真实账号的 `/api/v1/admin/openai/accounts/:id/quota` 响应只提供 18000/604800 秒窗口中有限且在 0..100 范围内的已用百分比. ID 缺失, hook/header 不受支持, 映射歧义/缺失, HTTP/权限失败及窗口缺失均省略不可用值, 不延迟任务结算或重放模型工作.
+
+每次占用账号额度缓存的刷新槽位前, 批次检查 context, 已取消或超时则停止 HTTP 工作. 批次尚未访问的账号不进入刷新冷却; 已占用的槽位保留正常冷却, 不回滚共享缓存状态. 下次额度刷新取全部已确认账号的共享 claim 截止时间的最小值, 包括尚未访问的账号; 批次错误不对整个 worker 施加统一冷却.
+
+响应头通知只收集任务的全部 Request ID, 不在执行中启动 HTTP 工作. 任务最终完成后, 共享 idle gate 才允许批次解析全部保留 ID, 按实际账号去重后读取额度. 对 `ErrNotReady` 的 usage 查询在 scope 仍有效且 idle 时以至少一秒的间隔重试, 窗口为 10 秒; 实际调度由 worker 的 1.5 秒 tick 决定, scope 失效可提前取消. 批次 context 仍有效时, 一个 ID 查询失败不阻断其他 ID. 只要存在未就绪结果, 独立查询失败就不覆盖有界短重试; 没有未就绪结果时, 查询错误保留五分钟的归属查询退避, 与账号额度调度分开. 记账未就绪不占用五分钟账号额度刷新槽位. 重试不占住任务完成, 不重放 provider 请求; 迟到成功结果只能在既有围栏内更新最新对应的最终 header 目标.
+
+窗口耗尽只停止未解析 Request ID 的归属查询; 已确认账号仍按常规额度刷新门控采样. 仅刷新额度不会延长或重启已耗尽的归属窗口. 全部任务 ID 在 idle 采样前收集完毕, 不只保留最后一个响应 ID, 也不在执行中对变化中的请求集合发起探测.
+
+[`client.go`](../internal/sub2api/client.go) 保留各窗口的 `reset_at` Unix 秒数, 或以正数 `reset_after_seconds` 加 `fetched_at` (缺失时取本地接收时间) 推导粗略重置时间. 绝对时间优先, 包括已过去的时间. 重置元数据缺失, 无效或溢出不影响原本可用的百分比. 窗口时长仅用于识别 5h/7d, 不用于估算重置时间.
+
+请求身份属于当前任务, 受 runtime generation, 原生 session 和 turn 围栏约束. 新任务在自己的真实账号确认前不能显示前一任务账号的额度; model 名或缓存额度均不能证明身份. 同一任务用到多个真实账号时, 去重后分别保留. 迟到结果不能修改新任务或无关最终状态栏. 仅在 Telegram header 中持久化选定的格式化套餐/账号标签, 百分比及倒计时; 不持久化关联 ID, key 或原始响应. 其他 provider 从下述原生来源获取样本; model/context 计量及详细 `/status` 不变.
+
+普通 `agent_start` 续跑保留同一任务已确认的账号和未解析 ID. 真正的任务/scope 替换会重置它们, 而 research `agent_start` 开启独立归属的轮次, 不复用上一轮请求集合. 全部已配置 provider ID 共用同一 Sub2api 后端, 其请求进入同一集合, 跨 provider 按账号去重. 状态中的 provider 绑定实际正文的 header, 在最终完成或 research 正文轮提交时赋值, 不取首个响应的 provider. `get_state` 模型投影只更新原生展示/缓存 scope, 不删除这些响应身份.
+
+两种来源在 [`reply_usage.go`](../internal/bridge/reply_usage.go) 中共用 `providerUsageCache` 生命周期: `claim` 只推进同账号五分钟刷新门控而不删除样本, `save` 仅提交可用样本, `load` 独立于门控返回保留的 last-good 样本. 刷新中, 失败或空结果均不清除成功样本. 两种来源都没有显示 TTL. 缓存仅在内存中, 跨消息及已确认的同账号 scope 共享, daemon 重启后清空, 不增加额度数据库表. 来源代码只负责确认账号 scope 和采集规范化额度样本; 缓存, 渲染与 idle 调度共用.
+
+`providerUsageRefreshReady()` 是原生与 sub2api 刷新的共享调度 gate, 周期尝试也必须遵守. 必须启用额度, 且没有活动任务, session control, awaiting continuation, steer, enabled/disabling/restoring research, runtime resume, 进行中或排队的 RPC operation, 队列工作或待处理输入. 两种来源均不在任务执行或研究轮次中采样. 队列与控制操作优先; 不会只为查询额度启动进程, 刷新不重置 runtime 空闲活动计时. 忙碌时若当前 scope 已确认, 仍可渲染缓存数据.
+
+新输入取消待处理采样, 不清除已确认 scope 或缓存值; 普通只读控制保留身份. 真正的任务/scope 或 generation 替换丢弃旧归属. 已占用的刷新槽位保留冷却. Research 保留实际正文所属轮次的完整 deferred 归属状态, 包括 Request ID 和最终 header 目标, 而非仅保留预先读取的额度快照. 提交有正文轮次时转移该状态所有权并重置当前轮次, 空轮不覆盖它. 仅在最终完成事务成功后, 才以新 epoch 和当前结果通道恢复正文轮状态, 绑定实际最终目标. 清除任务状态并通过共享 idle gate 后, 归属与额度可回填该 header. 队列派发, 新 scope 或 runtime 退役可抢占这些工作; 不保证历史必补, 研究执行中不发 HTTP 探测.
+
+HTTP API 边界要求可读取全站 usage 日志的全局 `usage.read`, 以及目标 OpenAI OAuth 组上的资源 `openai.quota.read`. 可选资源 `accounts.identity.read` 用于套餐标签; 否则用已确认账号 ID 标记额度. Client 只访问只读 endpoint, 不枚举账号或请求通用 account-usage 报告.
+
+#### 原生 provider 额度
+
+未配置 sub2api 的 provider 使用下述原生路径.
+
+选择 `quota` 后, 对应状态栏从共享 last-good 缓存读取额度, 独立于刷新及 progress 模式. 原生额度只有在同 scope 的账号读取确认可用缓存后, 才显示已识别的 5h/7d **已用**百分比. 未读取, 未知或不明确的 scope 始终省略; 失败, 跳过, 不受支持或空的刷新结果均保留已确认账号的 last-good 样本, 无年龄上限.
+
+[`reply_quota.go`](../internal/bridge/reply_quota.go) 从结构化窗口样本而非缓存文本渲染: 直接使用 `used`, 双窗口固定 5h/7d 顺序且省略标签, 单窗口标签后加空格. 百分比方向与 context 字段的已用比例一致. 每次渲染以重置时间减去当前时间, 不触发额度查询或定时修改历史消息. 原生 `resets in Nd/Nh/Nm/Ns` 仅关联当前账号行, 以观测时刻为基准并标记粗略值. 保留原始单位精度, 不编造更细时间. 重置行缺失, 无效或重复时只省略倒计时. 精确时长不足一小时显示 `<1h`; 重置时间已过时省略倒计时, 不恢复额度或滚动到下一周期. Sub2api 使用相同结构化样本和渲染器, 包括保留的研究正文轮状态.
+
+短任务完成后仍未确认原生 scope 且 final 未选择 quota 时, 仅 idle 进行有界 scope 发现, 不占住任务结算. 未知 scope 的发现至少间隔五秒; 已确认账号的刷新使用共享五分钟缓存门控. 可见状态栏均未选择 quota 时不发出 account/quota 展示查询. Header 预算省略完整字段, 不截断字面围栏或 dirty 标记.
+
+缓存键包含 provider, 启动 argv namespace 及只读 `get_logout_accounts` RPC 返回的唯一 active OAuth credential 所确定的保守账号 scope. 不按 provider 单独回退缓存. Scope 未知或不明确时隐藏其他账号的缓存, 不删除已有值. Metadata 采样只通过只读账号 RPC 建立 scope, 不调用 `/usage` 或账号变更操作. 刷新在额度查询前后读取账号 scope, 只有两次 scope 一致才接受结果. Client/generation/native-session 和 operation 所有权围栏也拒绝迟到结果; 编辑 header 还必须匹配最近对应的最终状态栏目标. 该上游接口的限制集中记录在[已知上游限制与依赖](#已知上游限制与依赖).
+
+原生额度刷新使用共享仅 idle 调度器, 独立于任务结算, 最终 metadata 及五秒 Progress 采样. 其 RPC 工作保留三秒 deadline, 并独占既有 operation lane; sub2api 的有界 HTTP 批次在该通道外执行, 但遵守相同 idle gate 和账号冷却. 刷新成功后仅在 final 选择 `quota` 时更新最近匹配的最终 header, 不修改不可变正文. 刷新失败不延迟结算, 不重发答案, 不另建状态气泡.
 
 Terminal-only 最终正文与首片 header 在同一完成事务中分开存储. 提交后的 outbox ID 作为额度刷新目标, 即使之前已有中间消息也不会更新其中间 header. 完成失败会同时回滚最终输出和 owner 状态.
 
@@ -362,7 +404,11 @@ Terminal-only 最终正文与首片 header 在同一完成事务中分开存储.
 
 私有 `/usage` 保存获准时的 session ID 和 catalog epoch, 获取 RPC 写门后, 在启用捕获前复核作用域及 builtin 身份. 发送边界前授权失效会返回错误, 不发送或重放 prompt, 不标记执行不确定, 也不退役原本健康的 client. 同一作用域中的 builtin 仍有效时, 仅目录 revision 更新不会取消查询.
 
-进入最终状态渲染时取消残留的 steer settlement probe; 最终 metadata 等待期间, 迟到的探针结果不能退役 runtime. Runtime teardown 只提交等待中的已确认答案, client 关闭及进程 slot 的一次归还由外层释放负责. 新输入或控制工作在后续提交前取消 idle 额度刷新. 取消检查及私有发送 hook 在 client mutex 下串行: 未发送即取消时保留 runtime, 已发送或不确定的私有工作仍退役 runtime, 不重放, 不从 `runtimeStopped` 重入释放. 后续提交仍由既有 RPC 操作通道串行化, 不改变排队任务的 root 归属. 额度刷新不占住最终结算.
+新输入或控制工作在后续提交前取消 idle 额度刷新. Sub2api HTTP 工作通过 context 取消. 对原生私有 `/usage`, 取消检查及私有发送 hook 在 client mutex 下串行: 未发送即取消时保留 runtime, 已发送或不确定的私有工作仍退役 runtime, 不重放, 不从 `runtimeStopped` 重入释放. 后续提交仍由既有 RPC 操作通道串行化, 不改变排队任务的 root 归属. 取消不清除已确认 scope 或 last-good 缓存, 不回滚已占用冷却, 不占住最终结算.
+
+#### 结算与失败处理
+
+进入最终状态渲染时取消残留的 steer settlement probe; 最终 metadata 等待期间, 迟到的探针结果不能退役 runtime. Runtime teardown 只提交等待中的已确认答案, client 关闭及进程 slot 的一次归还由外层释放负责.
 
 原生事件触发等待中最终回复的 flush 时, 若 flush 退役或替换了事件所属 client, 就消费并丢弃当前事件, 不再在 teardown 后更新 compaction, progress 或 tool 状态. 若保留同一 client, 则继续正常处理该事件, 包括原生 compaction start/end 状态转换.
 
@@ -892,7 +938,9 @@ Bridge 不提供日志文件, 轮转, 网络 exporter, 异步队列或运行时�
 
 RPC debug 记录使用 `event=rpc_lifecycle`, 白名单 `rpc_event` 和阶段, 包括 `received`, `event_queued`, `response_queued`, `response_ignored`, `rejected` 及 bridge 侧 `handled`. 可选 terminal metadata 分为 `absent|true|false|invalid`. Request ID 只有安全解析为十进制数后才能记录. 同时将 `logging.component_levels.rpc` 和 `logging.component_levels.bridge` 设为 `debug`, 可跟踪 transport 接收到 actor 处理的路径; 这不会开启 frame 日志.
 
-Overflow ERROR 使用 `reason=event_slots|byte_budget` 和 `stage=event_enqueue|physical_read|chunk_reassembly` 区分来源. 记录队列占用/容量, 共享字节上限, 失败申请大小及清理前精确占用 (`rejected_bytes`, `rejected_used_bytes`), 清理后的 `buffered_bytes`, 白名单 `rpc_event` (其他归为 `other`), `forward_wait_ms` 及当前 `consumer_phase/consumer_phase_ms`. Forwarder 仅在不能立即交付时使用单调时钟计时. Consumer phase 快照同步读取; 嵌套 actor span 恢复原 client 及原 phase 起始时间, 不修改 replacement runtime. 各计数/耗时快照不构成全局原子状态转储.
+`rpc_queue_overflow` ERROR 在默认 info 级别仍可见. `reason=event_slots|byte_budget` 和 `stage=event_enqueue|physical_read|chunk_reassembly` 区分耗尽资源和检测点. 比较队列占用/容量 (`queued_events`, `queue_capacity`), 以及清理前精确字节占用和失败申请大小 (`rejected_used_bytes`, `rejected_bytes`) 与 `buffer_limit_bytes`; `buffered_bytes` 是拒绝帧清理后的采样, 不是拒绝瞬间的占用. 记录还包含白名单 `rpc_event` (其他归为 `other`), `forward_wait_ms` 及当前 `consumer_phase/consumer_phase_ms`. 结合相同 `client_id` 和附近的 `rpc_consumer_slow` 记录定位压力或阻塞, 不能仅凭快照认定根因.
+
+Forwarder 仅在不能立即交付时使用单调时钟计时. Consumer phase 快照同步读取; 嵌套 actor span 恢复原 client 及原 phase 起始时间, 不修改 replacement runtime. 各计数/耗时快照不构成全局原子状态转储.
 
 Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时一秒时发出 `rpc_consumer_slow` WARN. 包含固定 `phase/point`, `duration_ms` 及进入时捕获的 client/generation/turn/inbox 身份. 覆盖 input/callback, RPC event/result, dispatch/tick, runtime 生命周期, 常用持久化及菜单/键盘操作. 未单独包裹的专用调用保留外围 phase. 后台 HTTP/清理不修改 actor phase. 不增加监控 goroutine, 不逐帧输出 info 或记录 payload, 不改变 transport 上限, 调度, 失败退役或重放策略.
 
@@ -917,29 +965,25 @@ Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时�
 | `just test-shard 0 4 -race` | 运行四片中从零编号的第零片, 每个根测试的子测试及 fuzz seeds 始终一起运行 |
 | `just smoke-omp /absolute/path/to/omp` | 运行 opt-in 真实 OMP Bridge 和迁移兼容检查; 不安装或部署 |
 | `just install` | 构建并仅安装二进制; 配置和数据由用户管理 |
-| `just deploy` | 安装后, 安排五秒后分离执行已有 supervisor 服务重启 |
+| `just deploy` | 安装后, 安排五秒后分离执行已有 supervisor 服务重启; 命令返回不表示重启成功 |
 
-`just test`, `just test-shard` 和 `just check` 在各自 recipe shell 内设置 `umask 0077`. Go 的 `testing.T.TempDir` 以 `0777` 经进程 umask 过滤后创建编号子目录, 调用方使用 `0002` 等掩码时会令 store fixture 可被组写入, 在业务断言之前就初始化失败. Recipe 内的掩码不影响调用方 shell, 也不对已有目录执行 chmod. 保持 store 对组/其他用户可写数据目录的拒绝校验不变.
+`just test`, `just test-shard` 和 `just check` 在各自 recipe shell 内设置 `umask 0077`, 让临时 store fixture 满足拒绝组/其他用户可写数据目录的要求. 这不影响调用方 shell, 也不对已有目录执行 chmod; 不为测试方便削弱 store 边界.
 
-本地配置检查先构建, 再运行 `./omp-telegram --check`; 需要时显式指定 `--config`. 该命令会创建目录, 测试配置行为时使用一次性路径.
+本地配置检查先运行 `just build`, 再运行 `./omp-telegram --check`; 需要时显式指定 `--config`. 该命令会创建目录, 测试配置行为时使用一次性路径.
 
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
 
-共享假 Telegram transport 使用 `fakeHTTP.mu` 保护 `failProgress` 的读写, 包括后台键盘清理运行时由测试切换开关. 故障判定和 `progressCalls` 递增位于同一临界区.
+异步测试应保持确定性及所有权边界:
 
-路由断言通过原始 Send 目标解析编辑请求: `editMessageText` 携带 chat/message ID, 不携带 topic ID. Edit 缺少 thread 字段不能被视为投递到了私聊主会话.
-
-测试 worker 在 runtime teardown 及等待整个 background group 前主动取消自有 context. 该组包含只在取消时退出的常驻键盘清理通道. 需要保持 worker 运行的测试等待明确的有界结果, 不等待所有通道退出; 终态清理测试在观察到操作后取消, 后续清理重试使用仍有效的 context. 不为停止 UI 通道而等待 fixture 的自然 deadline.
-
-Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 request 和 epoch, 再注入 deadline 错误; 根任务, session 和队列断言仍然适用. RPC 测试单独覆盖真实 context deadline, 合并发现请求和迟到响应. 不为测试提速缩短生产查询 deadline.
-
-恢复测试等待新交付的状态回执确认已保存的会话身份, 不依赖瞬时的 `OMP: released` 标签. 临时状态 runtime 排空缓冲元数据期间仍可能显示已连接. 独立的 runtime 释放测试覆盖最终进程释放及新到任务不被中断.
-
-服务端拒绝退避测试在完整解码拒绝响应后停止交付循环, 检查持久化重试状态, 并确认到期前不能领取. 随后模拟期限到达并恢复交付, 验证成功且总共只发送两次. 不在自动交付仍运行时轮询瞬时的首次重试状态, 也不依赖睡眠跨越 Unix 整秒边界.
+- 共享 fake transport 状态和计数须与后台 UI 工作同步. 路由断言通过原始 Send 目标解析: Telegram 编辑携带 chat/message ID, 不携带 topic ID. 分别断言持久 session 身份和最终 runtime 释放, 不依赖瞬时连接标签.
+- Worker 仍运行时等待明确的有界结果. Runtime teardown 及等待常驻后台通道前先取消自有 context; 清理重试需要仍有效的 context. 不为停止后台工作而等待 fixture 自然到期.
+- 完整响应或持久状态转换完成后再检查重试状态, 随后显式推进 deadline. 不轮询瞬时状态或依赖睡眠跨越时钟边界. 注入故障时保留 request/session/epoch 围栏; 在 RPC 边界覆盖真实 deadline, 合并发现请求和迟到响应, 不缩短生产 deadline.
 
 仅 Linux 运行的 [`TestCrashRecovery`](../internal/bridge/crash_recovery_linux_test.go) 在三个同步断点向独立 daemon 子进程发送 `SIGKILL`: prompt 已提交但未收到确认, 本地 Telegram 服务端已接收发送但未返回响应, startup intent 已持久化但 binding 尚未提交. 每次崩溃后由新 daemon 打开同一数据库. 断言覆盖 uncertain 结算且不重放/重发, 排队任务取消, 已保存 session 身份保留, 以及启动中断后的显式取消/resume. 父进程通过只读连接观察 SQLite, 避免观察本身触发启动对账. 进程内独立 subreaper 在清理临时目录前终止并回收测试所属的 RPC fixture 子进程. 这些测试使用 RPC 子进程 fixture 和本地假 Telegram HTTP 服务, 不验证真实 OMP, provider 或线上 Bot API.
 
 会进入原生启动路径的单元测试必须使用 RPC 子进程 fixture 的绝对可执行路径和隔离 workspace. 启动取消及菜单注册拒绝场景在 `PATH` 中没有 `omp` 的环境下验证; 只有显式真实 OMP smoke 可以依赖本机安装的 OMP.
+
+所有启动真实 OMP 的测试, smoke 和诊断, 包括手动命令及临时脚本, 都必须显式传入 `--session-dir`, 值为专用临时测试目录内的绝对路径. 仅使用临时工作目录不能隔离 session. 禁止回退到用户默认 session store; 无法建立隔离时必须停止. 隔离 profile, workspace, 数据库及子进程环境; 可能修改可写 agent 状态时使用临时 agent 目录. 删除临时目录前先停止所有测试所属 OMP 进程; 仅为诊断有意保留产物. 访问真实用户 session 必须得到用户明确授权, 这些规则不允许删除现有历史, 也不改变正常 bridge session 持久化.
 
 显式验证某个已安装的 OMP 版本:
 
@@ -947,15 +991,20 @@ Worker 生命周期测试可取消真实的命令发现 waiter, 保留其 reques
 just smoke-omp /absolute/path/to/omp
 ```
 
-Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行两个真实兼容测试. 未设置该变量时两者均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本. Profile, workspace, session, data 和子进程环境均隔离; 每个原生进程都显式传入临时目录内的绝对 `--session-dir`. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
+Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行两个真实兼容测试. 未设置该变量时两者均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
 
 [`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) 使用真实 worker 和 RPC client, 对接确定性的本地 OpenAI-compatible HTTP/SSE provider. 检查启动/catalog 和 host-tool 注册, prompt 接受与任务完成的区别, root 暂停期间的 fast 控制, 排队最终回复归属及后续请求实际携带的 `service_tier=priority`. 原生 `telegram_send` 调用/结果必须为原 topic 入队不可变 workspace 快照, 不宣称已交付. Stop 必须退役旧 runtime 并取消排队任务; 惰性 resume 必须保留 session 身份和原生上下文, 不重放任务. 已有迁移兼容测试继续独立检查原生 Extension/journal. 两者都不证明生产 provider 或线上 Bot API 兼容.
 
 独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 支持手动和每周运行. 官方 standalone 资产下载到 runner 临时目录, 按 release 提供的 SHA-256 摘要校验, 并记录解析后的 release tag. 基线固定为 18.12.2; 候选默认为最新正式 release, 也可显式指定 tag. 两个矩阵结果独立可见, 候选失败不取消基线. 不改变发布 CI, 不安装或重启生产 daemon.
 
-真实 OMP smoke 必须使用隔离的 profile, workspace, 数据库和显式 environment 策略. 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
+确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 
-当前实现没有 bridge 侧 undo/rewind/redo 或文件回滚引擎. `/queue` 管理 bridge-pending 工作, 不逐条控制原生排队 prompt. Stop 不能把 idle 快照当作取消 barrier; runtime 退役和不重放仍是架构约束, 不承诺原生任务 exactly-once 执行.
+### 已知上游限制与依赖
+
+- **Undo/rewind/redo:** 当前没有 bridge 侧历史 rewind 或文件回滚引擎. 可靠的输入与 session 关联及上游远程 rewind 是前提; 参见 [#12991](https://github.com/can1357/oh-my-pi/issues/12991), [PR #10026](https://github.com/can1357/oh-my-pi/pull/10026) 和 [PR #11663](https://github.com/can1357/oh-my-pi/pull/11663).
+- **取消:** 上游取消能够可靠隔离异步 continuation 之前, Stop 需要退役 runtime, 同时保留 session 身份. Idle 快照不是取消 barrier, 原生执行也不保证 exactly-once.
+- **原生排队输入:** `/queue` 只管理 bridge-pending 任务, 不逐条控制原生排队 prompt. 逐 prompt 原生取消依赖可靠的上游取消结果.
+- **原生账号/额度归属:** 分开的账号与额度 RPC 读取不具原子性, 前后 scope 检查和原生报告的当前账号标记都不能证明每次轮换请求实际结算的账号. 包含可靠不透明账号 scope, 每账号时间戳及无 prompt 刷新的结构化上游快照, 可替代对这些报告身份和检查的依赖.
 
 ### 构建与发布
 

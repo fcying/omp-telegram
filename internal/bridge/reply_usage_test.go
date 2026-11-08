@@ -106,7 +106,9 @@ func seedProviderUsage(t *testing.T, w *worker) {
 	requireStoreOK(t, err)
 	w.setProviderUsageScope("openai-codex", account)
 	w.b.providerUsage.claim(w.providerUsage.key, time.Now())
-	w.b.providerUsage.save(w.providerUsage.key, "5h30% 7d65%")
+	w.b.providerUsage.save(w.providerUsage.key, quotaSample{windows: [2]quotaWindow{
+		{present: true, used: 30}, {present: true, used: 65},
+	}})
 }
 
 func assertUsagePrivate(t *testing.T, w *worker) {
@@ -130,7 +132,7 @@ func TestFinalReplyProviderUsage(t *testing.T) {
 			}
 			awaitProviderUsage(t, w)
 			metadata := finalReplyStatus(t, w, 2, "answer")
-			if !strings.Contains(metadata, "100 t/s") || strings.Contains(metadata, "5h30% 7d65%") != enabled {
+			if !strings.Contains(metadata, "100 t/s") || strings.Contains(metadata, "30% 65%") != enabled {
 				t.Fatalf("quota opt-in changed the final reply: %q", metadata)
 			}
 			wantQueries := 0
@@ -197,7 +199,7 @@ func TestSnapshotFinalReplyProviderUsage(t *testing.T) {
 			requireStoreOK(t, os.WriteFile(gate, nil, 0600))
 			awaitProviderUsage(t, w)
 			header := finalReplyStatus(t, w, 2, bodies...)
-			if !strings.Contains(header, "5h30% 7d65%") {
+			if !strings.Contains(header, "30% 65%") {
 				t.Fatalf("successful quota refresh missed the actual final answer: %q", header)
 			}
 			if tc.mixed {
@@ -215,7 +217,7 @@ func TestSnapshotFinalReplyProviderUsage(t *testing.T) {
 			edit := f.messages[len(bodies)]
 			text, _ := edit["text"].(string)
 			header, body := attachedReplyBody(t, text)
-			if edit["message_id"] != float64(len(bodies)) || body != "answer" || !strings.Contains(header, "5h30% 7d65%") {
+			if edit["message_id"] != float64(len(bodies)) || body != "answer" || !strings.Contains(header, "30% 65%") {
 				t.Fatalf("quota edit missed the final answer or changed its body: %+v", edit)
 			}
 		})
@@ -227,7 +229,7 @@ func TestProviderUsageCacheVisibleDuringQueuedWork(t *testing.T) {
 	seedProviderUsage(t, w)
 	w.b.cfg.ProgressMode = "summary"
 	for name, header := range map[string]string{"progress": w.renderProgress(), "intermediate": w.intermediateAssistantHeader()} {
-		if strings.Contains(header, "5h30%") || strings.Contains(header, "quota ?") {
+		if strings.Contains(header, "30%") || strings.Contains(header, "quota ?") {
 			t.Fatalf("%s exposed quota before the current scope was sampled: %q", name, header)
 		}
 	}
@@ -240,14 +242,14 @@ func TestProviderUsageCacheVisibleDuringQueuedWork(t *testing.T) {
 		t.Fatal("live account sample did not finish")
 	}
 	for name, header := range map[string]string{"progress": w.renderProgress(), "intermediate": w.intermediateAssistantHeader()} {
-		if !strings.Contains(header, "5h30% 7d65%") {
+		if !strings.Contains(header, "30% 65%") {
 			t.Fatalf("%s lost cached usage: %q", name, header)
 		}
 	}
 	nativeInput(t, w, 100, "/followup queued next task", false)
 	endUsageReply(w)
 	awaitReplyStatus(t, w)
-	if !strings.Contains(finalReplyStatus(t, w, 2, "answer"), "5h30% 7d65%") || researchTraceCount(trace, "prompt", "/usage") != 0 {
+	if !strings.Contains(finalReplyStatus(t, w, 2, "answer"), "30% 65%") || researchTraceCount(trace, "prompt", "/usage") != 0 {
 		t.Fatal("queued work hid cached usage or triggered a blocking refresh")
 	}
 	w.dispatch()
@@ -275,7 +277,7 @@ func TestProviderUsageCacheSurvivesSessionReplacement(t *testing.T) {
 	active := w.active
 	endUsageReply(w)
 	awaitReplyStatus(t, w)
-	if !strings.Contains(finalReplyStatus(t, w, active, "answer"), "5h30% 7d65%") || researchTraceCount(trace, "prompt", "/usage") != 1 {
+	if !strings.Contains(finalReplyStatus(t, w, active, "answer"), "30% 65%") || researchTraceCount(trace, "prompt", "/usage") != 1 {
 		t.Fatal("same account did not reuse its cache across native sessions")
 	}
 }
@@ -290,7 +292,7 @@ func TestProviderUsageDoesNotBorrowAnotherAccount(t *testing.T) {
 			endUsageReply(w)
 			awaitReplyStatus(t, w)
 			header := finalReplyStatus(t, w, 2, "answer")
-			if strings.Contains(header, "5h30%") || researchTraceCount(trace, "prompt", "/usage") != 0 {
+			if strings.Contains(header, "30%") || researchTraceCount(trace, "prompt", "/usage") != 0 {
 				t.Fatalf("unverified account borrowed another account's cache: %q", header)
 			}
 		})
@@ -307,7 +309,7 @@ func TestFinalReplyUsageFailuresPreserveCachedAnswer(t *testing.T) {
 			w.refreshProviderUsage(time.Now().Add(providerUsageInterval))
 			awaitProviderUsage(t, w)
 			header := finalReplyStatus(t, w, 2, "answer")
-			if queueState(t, w, 2) != "done" || !strings.Contains(header, "5h30% 7d65%") {
+			if queueState(t, w, 2) != "done" || !strings.Contains(header, "30% 65%") {
 				t.Fatalf("refresh failure lost cached data: %q", header)
 			}
 			wantQueries := 1
@@ -361,14 +363,14 @@ func TestFinalReplyUsageInterruptionFencesLateResult(t *testing.T) {
 				t.Fatal("quota refresh blocked the final answer")
 			}
 			header := finalReplyStatus(t, w, 2, "answer")
-			if strings.Contains(header, "5h") || strings.Contains(header, "7d") {
+			if strings.Contains(header, "30%") || strings.Contains(header, "65%") {
 				t.Fatal("first reply invented quota before any successful reading")
 			}
 			command(input)
 			late := waitOperation(t, w)
 			active := w.active
 			w.operationReturned(late)
-			if w.active != active || strings.Contains(finalReplyStatus(t, w, 2, "answer"), "5h30%") {
+			if w.active != active || strings.Contains(finalReplyStatus(t, w, 2, "answer"), "30%") {
 				t.Fatal("late quota result changed a replacement or the old final header")
 			}
 		})
@@ -499,7 +501,7 @@ func TestProviderUsageRejectsAccountChangeDuringRefresh(t *testing.T) {
 	endUsageReply(w)
 	awaitReplyStatus(t, w)
 	header := finalReplyStatus(t, w, active, "answer")
-	if !strings.Contains(header, "5h30% 7d65%") || strings.Contains(header, "5h55%") {
+	if !strings.Contains(header, "30% 65%") || strings.Contains(header, "55%") {
 		t.Fatalf("account change overwrote the previous account's last-good sample: %q", header)
 	}
 }
@@ -525,13 +527,13 @@ func TestProviderUsageRefreshCannotChangeReplyProvider(t *testing.T) {
 	w.event([]byte(`{"type":"agent_end","messages":[]}`))
 	awaitProviderUsage(t, w)
 	header := finalReplyStatus(t, w, 2, "answer")
-	if strings.Contains(header, "5h30%") {
+	if strings.Contains(header, "30%") {
 		t.Fatalf("Codex quota was written into another provider's answer: %q", header)
 	}
 	nativeInput(t, w, 100, "missing-terminal", false)
 	endUsageReply(w)
 	awaitReplyStatus(t, w)
-	if !strings.Contains(finalReplyStatus(t, w, 100, "answer"), "5h30% 7d65%") {
+	if !strings.Contains(finalReplyStatus(t, w, 100, "answer"), "30% 65%") {
 		t.Fatal("provider mismatch discarded the correctly scoped Codex cache")
 	}
 }

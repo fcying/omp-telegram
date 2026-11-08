@@ -77,6 +77,20 @@ deny = ["OMP_TELEGRAM_BOT_TOKEN"]
 # Do not configure allow and deny together, even if one list is empty.
 # allow = ["PATH", "HOME", "YOUR_PROVIDER_API_KEY"]
 
+#[sub2api]
+# Explicitly load the bundled request observer; required for an enabled source.
+# Do not combine enabled sub2api with --no-ui: headless extensions discard notify.
+# extension = false
+# Optional bridge-only upstream quota; all empty disables, partial settings fail.
+# Select "quota" in the desired telegram.status_bar arrays as well.
+# Use exact, case-sensitive OMP provider IDs, never model names or URL guesses.
+# base_url = ""
+# usage.read (required, global): Read all-site logs to identify the serving account.
+# openai.quota.read (required, resource): Read quota for OpenAI OAuth accounts in allowed groups.
+# accounts.identity.read (optional, resource): Show plan names instead of account IDs.
+# api_key = ""
+# providers = []
+
 [storage]
 # Relative data paths resolve beside the executable, not the shell working directory.
 data_dir = "."

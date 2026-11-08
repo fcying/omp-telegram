@@ -23,8 +23,8 @@ type providerUsageKey struct {
 }
 
 type providerUsageEntry struct {
-	text string
-	next time.Time
+	sample quotaSample
+	next   time.Time
 }
 
 type providerUsageCache struct {
@@ -53,11 +53,14 @@ func (c *providerUsageCache) claim(key providerUsageKey, now time.Time) bool {
 	return true
 }
 
-func (c *providerUsageCache) save(key providerUsageKey, text string) {
+func (c *providerUsageCache) save(key providerUsageKey, sample quotaSample) {
 	c.Lock()
 	defer c.Unlock()
 	entry := c.entries[key]
-	entry.text = text
+	if !sample.available() {
+		return
+	}
+	entry.sample = sample
 	c.entries[key] = entry
 }
 
@@ -87,7 +90,7 @@ type providerUsageRequest struct {
 	cancel         context.CancelFunc
 	scopeOnly      bool
 	// The operation result channel publishes these fields to the actor.
-	text         string
+	sample       quotaSample
 	scopeChanged bool
 }
 
@@ -101,7 +104,7 @@ func (w *worker) providerUsageEnabled() bool {
 }
 
 func (w *worker) readProviderUsageScope(ctx context.Context, client *omp.Client, state statusState) [32]byte {
-	if !w.providerUsageEnabled() || !supportedProviderUsage(state.Model.Provider) {
+	if !w.providerUsageEnabled() || w.b.cfg.Sub2API.HasProvider(state.Model.Provider) || !supportedProviderUsage(state.Model.Provider) {
 		return [32]byte{}
 	}
 	scope, _ := client.ProviderAccountScope(ctx, state.Model.Provider)
@@ -117,6 +120,10 @@ func (w *worker) resetProviderUsage(args []string) {
 func (w *worker) setProviderUsageScope(provider string, account [32]byte) {
 	u := &w.providerUsage
 	u.key = providerUsageKey{}
+	if w.providerUsageEnabled() && w.b.cfg.Sub2API.HasProvider(provider) {
+		u.key.provider = provider
+		return
+	}
 	if !w.providerUsageEnabled() || !supportedProviderUsage(provider) || account == ([32]byte{}) || w.client == nil {
 		return
 	}
@@ -137,20 +144,31 @@ func (w *worker) providerUsageText(provider string, readCompleted bool) string {
 	if !w.providerUsageEnabled() || !readCompleted {
 		return ""
 	}
+	if w.b.cfg.Sub2API.HasProvider(provider) {
+		return w.sub2apiUsageText(provider)
+	}
 	u := &w.providerUsage
 	if u.key.provider == provider && w.providerUsageMatches(u.client, u.generation, u.epoch, u.sessionID) {
-		return w.b.providerUsage.load(u.key).text
+		return w.b.providerUsage.load(u.key).sample.text(time.Now())
 	}
 	return ""
 }
 
+func (w *worker) providerUsageRefreshReady() bool {
+	return w.providerUsageEnabled() && w.ctx.Err() == nil &&
+		!w.taskActive() && !w.sessionControlBusy() && !w.awaitingContinuation && !w.steerFence.active &&
+		!w.research.enabled && !w.research.disablePending && !w.restoring && !w.runtimeResuming &&
+		!w.rpcOperationActive && len(w.rpcOperations) == 0 && len(w.queue) == 0 && len(w.input) == 0
+}
+
 // Refresh only an already connected idle runtime. Rendering never waits for it.
 func (w *worker) refreshProviderUsage(now time.Time) {
+	w.refreshSub2apiUsage(now)
+	if w.b.cfg.Sub2API.HasProvider(w.sub2api.provider) || w.b.cfg.Sub2API.HasProvider(w.providerUsage.key.provider) {
+		return
+	}
 	u := &w.providerUsage
-	if !w.providerUsageEnabled() || u.pending != nil ||
-		w.taskActive() || w.sessionControlBusy() || w.awaitingContinuation || w.steerFence.active ||
-		w.research.enabled || w.research.disablePending || w.restoring || w.runtimeResuming ||
-		w.rpcOperationActive || len(w.rpcOperations) != 0 || len(w.queue) != 0 || len(w.input) != 0 {
+	if u.pending != nil || !w.providerUsageRefreshReady() {
 		return
 	}
 	client, connected := w.runtimeClient()
@@ -190,12 +208,13 @@ func (w *worker) refreshProviderUsage(now time.Time) {
 		if err != nil {
 			return nil, err
 		}
+		sampledAt := time.Now()
 		account, err = request.client.ProviderAccountScope(ctx, request.key.provider)
 		if err != nil || account != request.key.account {
 			request.scopeChanged = true
 			return nil, errors.New("provider usage account changed")
 		}
-		request.text = replyUsageHeader(text, request.key.provider)
+		request.sample = replyUsageSample(text, request.key.provider, sampledAt)
 		return nil, nil
 	}, 0, "", request)
 }
@@ -253,10 +272,10 @@ func (w *worker) replyUsageFinished(result operationResult) {
 		w.providerUsage.key = providerUsageKey{}
 		return
 	}
-	if result.err != nil || request.text == "" || request.client.Stopping() {
+	if result.err != nil || !request.sample.available() || request.client.Stopping() {
 		return
 	}
-	w.b.providerUsage.save(request.key, request.text)
+	w.b.providerUsage.save(request.key, request.sample)
 	if w.b.cfg.StatusBar.Has("final", "quota") && request.target != 0 && request.targetProvider == request.key.provider && w.providerUsage.target == request.target && w.providerUsage.key == request.key {
 		fields := request.baseFields
 		fields.quota = w.providerUsageText(request.key.provider, true)
