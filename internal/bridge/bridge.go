@@ -314,6 +314,7 @@ type worker struct {
 	rpcExitPendingClientID uint64
 	modelMenuID            int64
 	topicRenameResults     chan topicRenameResult
+	topicRenamePending     bool
 	albumEvents            chan albumEvent
 	albumVersion           uint64
 	albumSuppressed        map[albumKey]time.Time
@@ -469,6 +470,7 @@ type rpcOperation struct {
 }
 type topicRenameResult struct {
 	generation        int64
+	manual            bool
 	err               error
 	persistenceFailed bool
 }
@@ -560,6 +562,7 @@ var botCommands = []struct {
 	{Command: "status", Description: i18n.Msg.ShowSessionModelContextSpeedQueue},
 	{Command: "doctor", Description: i18n.Msg.RunSafeDiagnostics},
 	{Command: "name", Description: i18n.Msg.NameOmpSessionNameTitle},
+	{Command: "title", Description: i18n.Msg.RenameTelegramTopicTitle},
 	{Command: "model", Description: i18n.Msg.ChooseCycleRoleModelProviderModel},
 	{Command: "thinking", Description: i18n.Msg.ChooseThinkingLevelSession},
 	{Command: "fast", Description: i18n.Msg.ToggleNativeFastMode},
@@ -2664,7 +2667,7 @@ func (w *worker) reportStartFailure(message string) string {
 }
 
 func (w *worker) renameNewTopic(workspace string) {
-	if w.key.thread == 0 || w.b.tg == nil {
+	if w.key.thread == 0 || w.b.tg == nil || w.topicRenamePending {
 		return
 	}
 	name := clipUTF16(menuText(filepath.Base(filepath.Clean(workspace)), 128), 128)
@@ -2672,11 +2675,44 @@ func (w *worker) renameNewTopic(workspace string) {
 		return
 	}
 	reservation, err := w.b.db.ReserveTopicName(w.b.bot.ID, w.key.chat, w.key.thread, name)
+	if errors.Is(err, store.ErrTopicNameExplicit) {
+		return
+	}
 	if err != nil {
 		w.b.storeLog.Error("topic name reservation failed", "event", "topic_name_write_failed", "reason", "reserve", "error_kind", "persistence")
 		w.say(w.tr(i18n.Msg.SessionStartedButTelegramTopicTitleCouldNotUpdated))
 		return
 	}
+	w.renameTopic(reservation, false)
+}
+
+func (w *worker) renameTopicTitle(title string) {
+	if title == "" {
+		w.say(w.tr(i18n.Msg.UsageTitleTopicTitle))
+		return
+	}
+	if w.key.thread == 0 {
+		w.say(w.tr(i18n.Msg.TopicTitleRequiresTopic))
+		return
+	}
+	if w.topicRenamePending {
+		w.say(w.tr(i18n.Msg.TopicTitleRenamePending))
+		return
+	}
+	if !w.consumeFinalAction() {
+		return
+	}
+	reservation, err := w.b.db.ReserveExactTopicName(w.b.bot.ID, w.key.chat, w.key.thread, title)
+	if err != nil {
+		w.b.storeLog.Error("topic name reservation failed", "event", "topic_name_write_failed", "reason", "reserve", "error_kind", "persistence")
+		w.say(w.tr(i18n.Msg.TopicTitleRenameFailed))
+		return
+	}
+	w.renameTopic(reservation, true)
+}
+
+func (w *worker) renameTopic(reservation store.TopicNameReservation, manual bool) {
+	w.topicRenamePending = true
 	if w.topicRenameResults == nil {
 		w.topicRenameResults = make(chan topicRenameResult, 1)
 	}
@@ -2706,7 +2742,7 @@ func (w *worker) renameNewTopic(workspace string) {
 			storeLog.Error("topic name settlement failed", "event", "topic_name_write_failed", "reason", reason, "error_kind", "persistence")
 		}
 		select {
-		case results <- topicRenameResult{generation: generation, err: err, persistenceFailed: settlementErr != nil}:
+		case results <- topicRenameResult{generation: generation, manual: manual, err: err, persistenceFailed: settlementErr != nil}:
 		case <-workerCtx.Done():
 		}
 	}()
@@ -2714,7 +2750,22 @@ func (w *worker) renameNewTopic(workspace string) {
 
 func (w *worker) topicRenameFinished(result topicRenameResult) {
 	defer w.beginConsumerPhase("result", "topic_rename_finished").end()
-	if w.ctx.Err() != nil || result.generation != w.binding.Generation {
+	w.topicRenamePending = false
+	if w.ctx.Err() != nil {
+		return
+	}
+	if result.manual {
+		switch {
+		case result.err == nil:
+			w.say(w.tr(i18n.Msg.TopicTitleRenameAccepted))
+		case telegram.ClassifyError(result.err).Uncertain:
+			w.say(w.tr(i18n.Msg.TopicTitleRenameUnconfirmed))
+		default:
+			w.say(w.tr(i18n.Msg.TopicTitleRenameFailed))
+		}
+		return
+	}
+	if result.generation != w.binding.Generation {
 		return
 	}
 	if result.err == nil && !result.persistenceFailed {
@@ -3254,6 +3305,8 @@ func (w *worker) handleSlash(in incoming, text string) {
 			return
 		}
 		w.runDoctor()
+	case "/title":
+		w.renameTopicTitle(arg)
 	case "/name":
 		if arg == "" {
 			w.say(w.tr(i18n.Msg.UsageNameSessionTitle))

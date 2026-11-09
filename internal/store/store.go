@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 25
+const schemaVersion = 26
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -481,6 +481,12 @@ ALTER TABLE progress_messages ADD COLUMN last_outbox_id INTEGER NOT NULL DEFAULT
 			return e
 		}
 		version = 25
+	}
+	if version == 25 {
+		if _, e = tx.Exec("ALTER TABLE topic_names ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0 CHECK(explicit IN (0,1))"); e != nil {
+			return e
+		}
+		version = 26
 	}
 	if e = backfillProgressChats(tx); e != nil {
 		return e

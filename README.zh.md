@@ -203,6 +203,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/args [预设编号]` | 查看预设标签, 或在空闲时选择预设并立即应用于当前对话已开启的会话. 其他对话在下次启动进程时使用新预设. |
 | `/doctor` | 运行安全的 bridge 诊断, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
+| `/title <标题>` | 请求 Telegram 重命名当前 topic. 不修改 OMP session 名称. |
 | `/model` | 用按钮选择 OMP 配置的 model role. |
 | `/model provider/model` | 空闲时切换到指定 model. |
 | `/thinking` | 空闲时选择 thinking level. |
@@ -215,7 +216,9 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/lang [en\|zh]` | 查看全局 Bridge 界面语言, 或将所有私聊和 topic 统一切换为英文或中文. |
 | `/help` | 查看帮助和当前 bridge 版本 (与 `-v` 一致). |
 
-Topic 的首次 session 会尝试使用 workspace 名称作为标题, 与同一 chat 中已知名称重复时添加 `[thread ID]`. Telegram 不提供完整 Topic 列表, 未观察到或手动改名的标题可能导致漏判冲突或保留不必要的后缀. 不会重命名其他 Topic.
+Topic 的首次 session 会尝试使用 workspace 名称作为标题, 与同一 chat 中已知名称重复时添加 `[thread ID]`. 成功执行 `/title` 后不会再被自动命名覆盖, worker 重建或重启后仍有效. 对于引入此保护前设置的标题, 升级后请再执行一次 `/title`. Telegram 不提供完整 Topic 列表, 未观察到或手动改名的标题可能导致漏判冲突或保留不必要的后缀. 不会重命名其他 Topic.
+
+在要改名的 topic 内使用 `/title Trading research`. 不需要 OMP session, 也不会打断正在运行的任务. 回执仅报告 Bot API 接受或失败, 不表示客户端已显示新标题; 不保证同步 ([上游问题](https://github.com/tdlib/telegram-bot-api/issues/915)). 如果另一次改名尚未完成, 请等待后重试. 在 supergroup 中, bot 需要管理员身份及 `can_manage_topics` 权限, 但它自己创建的非 General topic 除外. General 始终需要这些权限.
 
 Model 或 thinking 修改成功后, 仍可能因无法读取配置等级而显示 `Thinking: n/a`. 这不会撤销修改; 如果必须关闭进程, 回执会说明 session 已保留.
 

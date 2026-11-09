@@ -124,6 +124,8 @@ func (w *worker) handleMigrationIncoming(in incoming) bool {
 	}
 	if !attached {
 		switch command {
+		case "/title":
+			return false
 		case "/lang":
 			w.handleLanguageCommand(slashCommandArguments(tail))
 			w.mark(in.id, store.InboxDone)

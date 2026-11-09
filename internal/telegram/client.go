@@ -463,11 +463,16 @@ func (c *Client) EditKeyboard(ctx context.Context, chatID, messageID int64, keyb
 	return err
 }
 
-// EditForumTopic changes a forum topic's display name.
+// EditForumTopic changes a topic's display name, including supergroup General.
 func (c *Client) EditForumTopic(ctx context.Context, chatID, threadID int64, name string) error {
-	err := c.call(ctx, "editForumTopic", map[string]any{
-		"chat_id": chatID, "message_thread_id": threadID, "name": name,
-	}, nil, true)
+	method := "editForumTopic"
+	fields := map[string]any{"chat_id": chatID, "name": name}
+	if chatID < 0 && threadID == 1 {
+		method = "editGeneralForumTopic"
+	} else {
+		fields["message_thread_id"] = threadID
+	}
+	err := c.call(ctx, method, fields, nil, true)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Code == 400 {
 		description := strings.ToLower(apiErr.Description)

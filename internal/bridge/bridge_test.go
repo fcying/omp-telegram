@@ -1609,7 +1609,7 @@ func (f *fakeHTTP) RoundTrip(r *http.Request) (*http.Response, error) {
 		if response != nil {
 			return &http.Response{StatusCode: response.status, Body: fakeHTTPResponseBody{Reader: strings.NewReader(response.body), onClose: response.onClose}, Header: make(http.Header), Request: r}, nil
 		}
-	case "editForumTopic":
+	case "editForumTopic", "editGeneralForumTopic":
 		f.mu.Lock()
 		f.forumTopicEdits = append(f.forumTopicEdits, req)
 		gate, started := f.forumTopicEditGate, f.forumTopicEditStarted

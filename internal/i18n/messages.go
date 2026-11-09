@@ -252,6 +252,13 @@ var Msg = struct {
 	MigrationNotStartedCheckOmpTelegramMigrateV1Extension                     Message
 	ModelSwitched                                                             Message
 	NameOmpSessionNameTitle                                                   Message
+	RenameTelegramTopicTitle                                                  Message
+	UsageTitleTopicTitle                                                      Message
+	TopicTitleRequiresTopic                                                   Message
+	TopicTitleRenamePending                                                   Message
+	TopicTitleRenameAccepted                                                  Message
+	TopicTitleRenameFailed                                                    Message
+	TopicTitleRenameUnconfirmed                                               Message
 	NativeCommandCompletionCouldNotConfirmedTaskOutcomeUncertain              Message
 	NativeCommandDiscoveryUnavailableWaitingSlashCommandsNotSubmitted         Message
 	NativeCommandFailedBeforeProducingConfirmedResultTaskOutcome              Message
@@ -767,8 +774,15 @@ var Msg = struct {
 	MigrationUnresolvedOperationPhaseSourceSession:                   message("Migration unresolved.\nOperation: %s\nPhase: %s\nSource session: %s", "迁移尚未解决.\n操作: %s\n阶段: %s\n源会话: %s"),
 	MigrationNotConfirmedRuntimeStoppedBindingMigrationLockPreserved: message("Migration was not confirmed. The runtime was stopped; the binding and migration lock were preserved. No automatic retry will occur.\n", "迁移未确认, Runtime 已停止, 绑定和迁移锁已保留. 不会自动重试.\n"),
 	MigrationNotStartedCheckOmpTelegramMigrateV1Extension:            message("Migration was not started. Check that the omp_telegram_migrate_v1 extension is explicitly loaded through omp.args, and that the source session can be restored and is fully idle.", "未开始迁移. 请确认已通过 omp.args 显式加载 omp_telegram_migrate_v1 Extension, 且源会话可恢复并已完全空闲."),
-	ModelSwitched:           message("Model switched to %s.", "模型已切换为 %s."),
-	NameOmpSessionNameTitle: message("Name the omp session: /name <title>", "命名 omp 会话: /name <标题>"),
+	ModelSwitched:               message("Model switched to %s.", "模型已切换为 %s."),
+	NameOmpSessionNameTitle:     message("Name the omp session: /name <title>", "命名 omp 会话: /name <标题>"),
+	RenameTelegramTopicTitle:    message("Rename the Telegram topic: /title <title>", "重命名 Telegram 话题: /title <标题>"),
+	UsageTitleTopicTitle:        message("Usage: /title <topic title>", "用法: /title <话题标题>"),
+	TopicTitleRequiresTopic:     message("Use /title inside a Telegram topic. Ordinary chats have no topic title to change.", "请在 Telegram 话题内使用 /title. 普通对话没有可修改的话题标题."),
+	TopicTitleRenamePending:     message("A topic rename is still pending. Wait for it to finish before using /title again.", "话题改名仍在处理中. 请等待完成后再使用 /title."),
+	TopicTitleRenameAccepted:    message("Telegram accepted the topic rename. Client display may be delayed or stale; synchronization is not guaranteed.", "Telegram 已接受话题改名. 客户端显示可能延迟或过时, 不保证同步."),
+	TopicTitleRenameFailed:      message("Could not rename the Telegram topic. Check the title (1-128 characters), topic support, and the bot's topic-management permissions.", "无法重命名 Telegram 话题. 请检查标题 (1-128 个字符), 话题支持及 bot 的话题管理权限."),
+	TopicTitleRenameUnconfirmed: message("Telegram's topic rename result could not be confirmed. The title may have changed; client display may be stale.", "无法确认 Telegram 话题改名结果. 标题可能已修改, 客户端显示可能过时."),
 	NativeCommandCompletionCouldNotConfirmedTaskOutcomeUncertain:      message("Native command completion could not be confirmed. The task outcome is uncertain and will not be replayed automatically.", "无法确认原生命令完成. 任务结果不确定, 不会自动重放."),
 	NativeCommandDiscoveryUnavailableWaitingSlashCommandsNotSubmitted: message("Native command discovery is unavailable. Waiting slash commands were not submitted; the running task and runtime were preserved. Use /queue and Cancel on the waiting slash item to let later tasks continue.", "原生命令发现不可用. 未提交等待中的斜杠命令; 当前任务和运行时保持不变. 使用 /queue 并取消等待中的斜杠命令, 让后续任务继续."),
 	NativeCommandFailedBeforeProducingConfirmedResultTaskOutcome:      message("Native command failed before producing a confirmed result. The task outcome is uncertain and will not be replayed automatically.", "原生命令在产生确认结果前失败. 任务结果不确定, 不会自动重放."),

@@ -203,6 +203,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/args [preset-number]` | View preset labels or, while idle, select a preset and immediately apply it to this conversation's open session. Other conversations use it on their next process start. |
 | `/doctor` | Run safe bridge diagnostics without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
+| `/title <title>` | Ask Telegram to rename the current topic. Does not rename the OMP session. |
 | `/model` | Choose a configured OMP model role with buttons. |
 | `/model provider/model` | Switch to a specific model while idle. |
 | `/thinking` | Choose the thinking level while idle. |
@@ -215,7 +216,9 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/lang [en\|zh]` | Show the global Bridge interface language, or switch it to English or Chinese for all chats and topics. |
 | `/help` | Show help and the running bridge version (the same version as `-v`). |
 
-On a topic's first session, the bridge attempts to use the workspace name as its title, adding `[thread ID]` for a known duplicate in the same chat. Telegram cannot provide a complete topic list, so unobserved or manually renamed titles may cause missed collisions or unnecessary suffixes. Other topics are not renamed.
+On a topic's first session, the bridge attempts to use the workspace name as its title, adding `[thread ID]` for a known duplicate in the same chat. A successful `/title` prevents this automatic rename, including after worker recreation or restart. For a title set before this protection was introduced, repeat `/title` once after upgrading. Telegram cannot provide a complete topic list, so unobserved or manually renamed titles may cause missed collisions or unnecessary suffixes. Other topics are not renamed.
+
+Use `/title Trading research` inside the topic to rename. No OMP session is required, and a running task is not interrupted. The reply reports Bot API acceptance or failure, not whether clients display the new title; synchronization is not guaranteed ([upstream issue](https://github.com/tdlib/telegram-bot-api/issues/915)). If another rename is pending, wait and retry. In supergroups, the bot needs administrator status and `can_manage_topics`, unless it created a non-General topic. General always requires these permissions.
 
 A successful model or thinking change can still show `Thinking: n/a` when the configured level is unavailable. This does not undo the change; if the process must close, the reply says that the session was kept.
 
