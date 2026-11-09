@@ -22,7 +22,7 @@ func configureFinalActionFixture(w *worker) {
 	w.b.cfg.FinalActions = []config.FinalAction{{Label: "Continue", Command: "/followup next task"}, {Label: "Queue", Command: "/queue"}}
 	w.b.cfg.AllowedUsers = []int64{7}
 	w.b.cfg.AllowedChats = []int64{-10}
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{}}
 }
 
 func readFinalActionFixture(t *testing.T, w *worker) (int64, []store.FinalAction) {

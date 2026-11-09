@@ -3178,7 +3178,7 @@ func TestProgressModeDoesNotChangeDurableCompletion(t *testing.T) {
 			w.stream.WriteString("answer")
 			w.finish()
 			output, err := db.NextOutput()
-			if err != nil || replyBody(t, assistantOutputText(output)) != "answer" {
+			if err != nil || output.Text != "answer" {
 				t.Fatalf("durable output = %#v, err = %v", output, err)
 			}
 			var state string
@@ -3477,7 +3477,7 @@ func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	w.stream.WriteString("answer")
 	w.finish()
 	o, e := db.NextOutput()
-	if e != nil || replyBody(t, assistantOutputText(o)) != "answer" {
+	if e != nil || o.Text != "answer" {
 		t.Fatalf("final was not persisted before preview completion: %v", e)
 	}
 	if !w.finishing {
@@ -3673,7 +3673,7 @@ func TestNormalTerminalCompletionIsDone(t *testing.T) {
 		t.Fatalf("normal terminal state = %q, error %v", state, err)
 	}
 	o, err := db.NextOutput()
-	if err != nil || replyBody(t, assistantOutputText(o)) != "final answer" {
+	if err != nil || o.Text != "final answer" {
 		t.Fatalf("normal terminal output = %q, error %v", o.Text, err)
 	}
 }
@@ -3686,6 +3686,7 @@ func TestContinuationRepliesPreserveEarlierRounds(t *testing.T) {
 		{"terminal messages", "complete result", `[]`, "follow-up", `[{"role":"assistant","content":[{"type":"text","text":"follow-up"}]}]`},
 		{"changed earlier snapshot ignored", "original question", `[{"role":"assistant","content":[{"type":"text","text":"changed snapshot"}]}]`, "follow-up", `[]`},
 		{"changed current snapshot ignored", "complete result", `[]`, "original follow-up", `[{"role":"assistant","content":[{"type":"text","text":"changed follow-up"}]}]`},
+		{"headerless paragraphs", "First paragraph.\n\nSecond paragraph.", `[]`, "Final paragraph.\n\nMore final text.", `[]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, err := store.Open(t.TempDir())
@@ -3697,7 +3698,7 @@ func TestContinuationRepliesPreserveEarlierRounds(t *testing.T) {
 			defer cancel()
 			w := testWorker(t, &worker{b: testBridge(t, &Bridge{db: db}), ctx: ctx, cancel: cancel, taskState: taskState{active: 10, busy: true}, confirms: map[string]confirmation{}})
 			w.event([]byte(`{"type":"agent_start"}`))
-			w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"` + tc.firstText + `"}]}}`))
+			assistantMessage(t, w, tc.firstText)
 			w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":` + tc.firstEnd + `}`))
 			var count int
 			requireStoreOK(t, db.DB.QueryRow("SELECT count(*) FROM outbox WHERE inbox_id=10").Scan(&count))
@@ -3705,19 +3706,16 @@ func TestContinuationRepliesPreserveEarlierRounds(t *testing.T) {
 				t.Fatal("nonterminal round did not queue its body while preserving the root")
 			}
 			w.event([]byte(`{"type":"agent_start"}`))
-			w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"` + tc.lastText + `"}]}}`))
+			assistantMessage(t, w, tc.lastText)
 			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":` + tc.lastEnd + `}`))
-			parts := researchReplies(t, w, 10)
-			if len(parts) != 2 || replyBody(t, parts[0]) != tc.firstText || replyBody(t, parts[1]) != tc.lastText {
-				t.Fatalf("continued task rewrote or merged completed messages: %q", parts)
-			}
+			finalReplyStatus(t, w, 10, tc.firstText, tc.lastText)
 			requireStoreOK(t, db.Accept(11, []byte(`{"update_id":11}`)))
 			requireStoreOK(t, db.Mark(11, "submitted"))
 			w.beginTask(queued{id: 11})
 			w.event([]byte(`{"type":"agent_start"}`))
 			w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"next task"}]}]}`))
-			parts = researchReplies(t, w, 11)
-			if len(parts) != 1 || replyBody(t, parts[0]) != "next task" {
+			parts := researchReplies(t, w, 11)
+			if len(parts) != 1 || replyBody(t, w, 11, 0) != "next task" {
 				t.Fatalf("previous task output leaked into next root: %q", parts)
 			}
 		})
@@ -3950,7 +3948,7 @@ func TestTerminalAbortIsCancelled(t *testing.T) {
 			if len(replies) != wantParts {
 				t.Fatalf("terminal abort lost its body or cancellation notice: %q", replies)
 			}
-			if tc.body != "" && replyBody(t, replies[0]) != tc.body {
+			if tc.body != "" && replyBody(t, w, 10, 0) != tc.body {
 				t.Fatalf("terminal abort changed partial body: %q", replies)
 			}
 			if strings.TrimSpace(replies[len(replies)-1]) == "" || strings.Contains(strings.Join(replies, "\n"), tc.hidden) {

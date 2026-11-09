@@ -101,7 +101,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `telegram.progress_mode` | Live task progress: `off`, `summary`, or `verbose`. The default reads `OMP_TELEGRAM_PROGRESS_MODE`; empty or invalid values fall back to `summary`. See [Progress UI](#progress-ui). |
 | `telegram.progress_recent_tools` | Maximum completed tools retained in verbose Recent history. Default: `5`; range: `1..100`. Display may show fewer to fit Telegram's message limit. |
 | `telegram.final_actions` | Optional ordered completion shortcuts `{ label, command }`. Omitted or `[]` disables them. At most six buttons; labels are nonempty, single-line and at most 64 UTF-16 units. Commands are one slash invocation with optional literal fixed arguments and no controls or line breaks. See [Completion shortcuts](#completion-shortcuts). |
-| `telegram.status_bar.progress`, `.intermediate`, `.final` | Ordered field arrays for Progress, intermediate assistant messages, and final results. `[]` disables that header. Omitted arrays default to `["status", "thinking", "model", "fast", "context", "speed"]`. See [Status bars](#status-bars). |
+| `telegram.status_bar.progress`, `.intermediate`, `.final` | Ordered field arrays for Progress, intermediate assistant messages, and final results. Nested arrays group fields with spaces; outer items use ` \| `. `[]` disables that header. Omitted `intermediate` defaults to `[]`; `progress` and `final` default to `["status", ["thinking", "model", "fast"], "context", "speed"]`. See [Status bars](#status-bars). |
 | `telegram.status_bar.git_command` | Optional literal argv for the final `git` field. Omitted or `[]` uses the built-in safe Git probe. Custom commands run without a shell in the current session workspace; users own their safety and side effects. |
 | `telegram.status_bar.git_timeout` | Positive literal Go duration for both built-in and custom Git sampling, default `"450ms"`. Increase to e.g. `"2s"` for large repositories. Empty, zero, negative, invalid, overflowing or non-string values are rejected; environment references are not expanded and the timeout cannot be disabled. |
 | `omp.binary` | OMP executable name found through `PATH`, or an absolute path. Default: `"omp"`. It is not a shell command. |
@@ -408,13 +408,13 @@ Native and sub2api quota share the same idle-only refresh, cache and rendering f
 
 ### Status bars
 
-Configure the three header types independently. Fields appear in array order; unknown or duplicate names are rejected. `[]` removes the entire header, including its icon and separator. Disabling the Progress header does not hide its tool body, text preview or **Stop | Follow-up** buttons; use `progress_mode = "off"` to disable Progress itself.
+Configure the three header types independently. Fields appear in array order. Outer items use ` | `; fields within a nested array use spaces. Flat arrays remain supported. Unavailable fields and empty groups leave no separators; unknown names and duplicates, including across groups, are rejected. `[]` removes the entire header, including its icon and separator. Disabling the Progress header does not hide its tool body, text preview or **Stop | Follow-up** buttons; use `progress_mode = "off"` to disable Progress itself.
 
 ```toml
 [telegram.status_bar]
 progress = ["status", "model", "context"]
 intermediate = []
-final = ["status", "model", "thinking", "fast", "context", "speed", "quota", "git"]
+final = ["status", ["thinking", "model", "fast"], ["context", "speed"], "quota", "git"]
 ```
 
 | Field | Display |

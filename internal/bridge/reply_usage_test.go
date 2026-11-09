@@ -58,14 +58,16 @@ func replyUsageWorker(t *testing.T, mode string) (*worker, func(string), string)
 func setProviderUsageFields(w *worker, enabled bool) {
 	for _, kind := range []string{"progress", "intermediate", "final"} {
 		fields := w.b.cfg.StatusBar.Fields(kind)
-		selected := make([]string, 0, len(fields)+1)
-		for _, field := range fields {
-			if field != "quota" {
-				selected = append(selected, field)
+		selected := make([][]string, 0, len(fields)+1)
+		for _, group := range fields {
+			for _, field := range group {
+				if field != "quota" {
+					selected = append(selected, []string{field})
+				}
 			}
 		}
 		if enabled {
-			selected = append(selected, "quota")
+			selected = append(selected, []string{"quota"})
 		}
 		switch kind {
 		case "progress":

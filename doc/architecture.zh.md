@@ -370,7 +370,7 @@ Progress 和中间/最终回复 header 共用 model/thinking/fast 格式, 精简
 
 通过 splitter 的截断标记及片段数量区分实际 assistant 正文与纯生成提示, 不按正文是否等于本地化截断提示分类. 即使真实正文与提示完全同名, 仍保留其可编辑最终目标, 包括 terminal-only 完成和后续额度编辑; 生成提示不替换此前的真实正文目标.
 
-`[telegram.status_bar]` 包含有序的 `progress`, `intermediate`, `final` 数组. 未配置的数组默认 `status, thinking, model, fast, context, speed`; 显式 `[]` 隐藏对应状态栏及图标, 不隐藏 Progress 正文及 Stop/Follow-up 控件. 数组中未知/重复的字段值及非 final 中的 `git` 会报错. 旧 `telegram.provider_usage` 键被忽略并打印 ERROR 日志, 改为选择 `quota` 显式启用. 未选择的字段不启动仅为显示服务的 native/account/quota/Git 采样; 任务安全及显式命令查询不变.
+`[telegram.status_bar]` 包含有序的 `progress`, `intermediate`, `final` 数组. 解析时将字符串归一化为单字段组, 将内层字符串数组归一化为字段组, 省略空组. 渲染直接遍历组, 不在每次渲染时展平: 组内可见字段用一个空格分隔, 可见组间用 ` | ` 分隔. 无数据或超出预算的字段不消耗分隔符; UTF-16 预算仍按完整字段省略. 未配置时 `intermediate` 默认使用 `[]`, `progress` 和 `final` 默认使用 `["status", ["thinking", "model", "fast"], "context", "speed"]`. 显式 `[]` 隐藏对应状态栏及图标, 不隐藏 Progress 正文及 Stop/Follow-up 控件. 未知/重复字段值 (含跨组重复), 非字符串成员, 更深层嵌套及非 final 中的 `git` 会报错. 字段选择检查遍历各组, 因此分组不改变采样需求. 旧 `telegram.provider_usage` 键被忽略并打印 ERROR 日志, 改为选择 `quota` 显式启用. 未选择的字段不启动仅为显示服务的 native/account/quota/Git 采样; 任务安全及显式命令查询不变.
 
 Schema 23 增加独立于 header 内容的 `outbox.header_editable`, 回填现有 assistant 状态栏. 仅 assistant 正文的首片可编辑. 即使 header 为空也保存 Telegram ID; pending 编辑可添加或删除 header, 使用快照 CAS 确认, 相同内容不产生冗余编辑. 普通输出不可编辑. Intermediate 关闭/final 开启和相反组合均支持发送前, 发送中及发送后切换.
 
@@ -1010,6 +1010,8 @@ Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时�
 本地配置检查先运行 `just build`, 再运行 `./omp-telegram --check`; 需要时显式指定 `--config`. 该命令会创建目录, 测试配置行为时使用一次性路径.
 
 回归应覆盖可观察边界: 鉴权, request 关联, 取消, 过期 callback, 原子结算, 重启身份, 交付不确定, 保留清理和进程所有权. 代表性测试包括 [`bridge`](../internal/bridge/bridge_test.go), [`steer`](../internal/bridge/steer_test.go), [`recovery`](../internal/bridge/recovery_test.go), [`research control`](../internal/bridge/research_control_test.go), [`store`](../internal/store/store_test.go), [`RPC`](../internal/omp/client_test.go), [`Telegram`](../internal/telegram/client_test.go) 和 [`logging`](../internal/bridge/logging_test.go). 保存历史测试包含超过单个 RPC frame 大小的文件; 测试 deadline 不改变生产查询 deadline.
+
+Assistant 正文断言独立读取持久化的 `outbox.text`, 不解析可选状态栏, 避免测试辅助函数在中间状态栏关闭时丢弃正文段落或代码块. 专门验证状态栏的测试显式选择 intermediate 字段. 最终状态栏断言仍要求完整正文上方存在非空 final header.
 
 异步测试应保持确定性及所有权边界:
 

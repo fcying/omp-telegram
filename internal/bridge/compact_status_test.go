@@ -17,7 +17,7 @@ func TestRenderCompactFieldsPreservesSelectedOrderAndSubset(t *testing.T) {
 		status: "running", model: "`model`", thinking: "◒", fast: "⚡",
 		context: "25% (128k)", speed: "10 t/s", quota: "quota 80%", git: "`main`",
 	}
-	selected := []string{"git", "quota", "speed", "context", "fast", "model", "thinking", "status"}
+	selected := [][]string{{"git"}, {"quota"}, {"speed"}, {"context"}, {"fast"}, {"model"}, {"thinking"}, {"status"}}
 	header := renderCompactFields(selected, values)
 	previous := -1
 	for _, value := range []string{values.git, values.quota, values.speed, values.context, values.fast, values.model, values.thinking, values.status} {
@@ -35,23 +35,42 @@ func TestRenderCompactFieldsPreservesSelectedOrderAndSubset(t *testing.T) {
 		{"context", values.context}, {"speed", values.speed}, {"quota", values.quota}, {"git", values.git},
 	} {
 		t.Run(scenario.field, func(t *testing.T) {
-			if got := renderCompactFields([]string{scenario.field}, values); got != scenario.want {
+			if got := renderCompactFields([][]string{{scenario.field}}, values); got != scenario.want {
 				t.Fatalf("individual field included unselected values: %q", got)
 			}
 		})
 	}
-	if got := renderCompactFields([]string{}, values); got != "" {
+	if got := renderCompactFields([][]string{}, values); got != "" {
 		t.Fatalf("disabled header retained fields: %q", got)
 	}
 }
 
 func TestRenderCompactFieldsSkipsUnavailableValuesWithoutSeparators(t *testing.T) {
 	values := compactStatusFields{model: "`model`"}
-	if got := renderCompactFields([]string{"quota", "unknown", "thinking", "model", "context", "git"}, values); got != values.model {
+	if got := renderCompactFields([][]string{{"quota"}, {"unknown"}, {"thinking"}, {"model"}, {"context"}, {"git"}}, values); got != values.model {
 		t.Fatalf("missing values left labels or separators: %q", got)
 	}
 	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactStatusFields{}); got != "" {
 		t.Fatalf("unavailable fields fabricated a header: %q", got)
+	}
+}
+
+func TestRenderCompactFieldGroups(t *testing.T) {
+	fields := [][]string{{}, {"status"}, {"quota"}, {"thinking", "model", "fast"}, {"context", "speed"}, {"git"}, {}}
+	values := compactStatusFields{status: "done", thinking: "high", model: "`model`", context: "25% (128k)", speed: "10 t/s", git: "`main*`"}
+	want := "done | high `model` | 25% (128k) 10 t/s | `main*`"
+	if got := renderCompactFields(fields, values); got != want {
+		t.Fatalf("field groups left wrong separators: got %q, want %q", got, want)
+	}
+	if got := renderCompactFields(fields, compactStatusFields{}); got != "" {
+		t.Fatalf("unavailable groups left separators: %q", got)
+	}
+	values.model = strings.Repeat("x", assistantHeaderUnits+1)
+	values.fast, values.context, values.speed = "fast", "ctx", "speed"
+	fields = [][]string{{"status"}, {"model", "fast"}, {"context", "speed"}, {"git"}}
+	want = "done | fast | ctx speed"
+	if got := renderCompactFieldsLimit(fields, values, utf16Length(want)); got != want {
+		t.Fatalf("group budget split a field or retained its separator: got %q, want %q", got, want)
 	}
 }
 
@@ -88,7 +107,7 @@ func TestCompactFieldsSeparatesIdentitySettings(t *testing.T) {
 	}{
 		{"model", "`answer-model`"}, {"thinking", "◒"}, {"fast", "⚡"},
 	} {
-		if got := renderCompactFields([]string{scenario.field}, values); got != scenario.want {
+		if got := renderCompactFields([][]string{{scenario.field}}, values); got != scenario.want {
 			t.Fatalf("field %s was not independent: %q", scenario.field, got)
 		}
 	}
@@ -162,7 +181,7 @@ func TestCompactFieldsPreservesNativeNumericValidation(t *testing.T) {
 func TestCompactHeaderBudgetNeverCutsLiteralFields(t *testing.T) {
 	for _, width := range []int{498, 500, 504, 510, 512, 600} {
 		values := compactStatusFields{model: progressToolLiteral(strings.Repeat("x", width)), git: "`main*`", status: assistantCompletedIcon}
-		header := renderCompactFieldsLimit([]string{"model", "git", "status"}, values, assistantHeaderUnits)
+		header := renderCompactFieldsLimit([][]string{{"model"}, {"git"}, {"status"}}, values, assistantHeaderUnits)
 		if utf16Length(header) > assistantHeaderUnits {
 			t.Fatalf("bounded header exceeded the reserved space: %d", utf16Length(header))
 		}
@@ -175,7 +194,7 @@ func TestCompactHeaderBudgetNeverCutsLiteralFields(t *testing.T) {
 	}
 	values := compactStatusFields{git: "`main*`", status: assistantCompletedIcon, model: "`overflow`"}
 	limit := utf16Length(values.git + compactHeaderSeparator + values.status)
-	if got := renderCompactFieldsLimit([]string{"git", "status", "model"}, values, limit); got != values.git+compactHeaderSeparator+values.status {
+	if got := renderCompactFieldsLimit([][]string{{"git"}, {"status"}, {"model"}}, values, limit); got != values.git+compactHeaderSeparator+values.status {
 		t.Fatalf("exact budget lost a separator or accepted an overflowing field: %q", got)
 	}
 }
@@ -194,12 +213,12 @@ func TestCompactLeadingLiteralPreservesTelegramBodyAndFieldOrder(t *testing.T) {
 				values := compactFields("en", state, nil, false, false)
 				values.git = progressToolLiteral(branch)
 				values.status = "unselected status"
-				selected := []string{"unknown", "quota", first}
+				selected := [][]string{{"unknown"}, {"quota"}, {first}}
 				wantHeader := "<code>" + branch + "</code> | <code>" + model + "</code> | ◒"
 				if first == "git" {
-					selected = append(selected, "model", "thinking")
+					selected = append(selected, []string{"model"}, []string{"thinking"})
 				} else {
-					selected = append(selected, "git", "thinking")
+					selected = append(selected, []string{"git"}, []string{"thinking"})
 					wantHeader = "<code>" + model + "</code> | <code>" + branch + "</code> | ◒"
 				}
 				header := renderCompactFieldsLimit(selected, values, assistantHeaderUnits)
@@ -208,7 +227,7 @@ func TestCompactLeadingLiteralPreservesTelegramBodyAndFieldOrder(t *testing.T) {
 				if got := telegram.ConvertMarkdown(assistantOutputText(output)); got != want {
 					t.Fatalf("leading literal changed field visibility, order, or body entities:\ngot:  %s\nwant: %s", got, want)
 				}
-				if got := renderCompactFieldsLimit([]string{}, values, assistantHeaderUnits); got != "" {
+				if got := renderCompactFieldsLimit([][]string{}, values, assistantHeaderUnits); got != "" {
 					t.Fatalf("disabled fields retained a literal safety prefix: %q", got)
 				}
 			})
@@ -235,7 +254,7 @@ func TestCompactLeadingLiteralIncludesEncodingInHeaderBudget(t *testing.T) {
 					} else {
 						values.model = progressToolLiteral(literal)
 					}
-					header := renderCompactFieldsLimit([]string{"unknown", first, "status"}, values, assistantHeaderUnits)
+					header := renderCompactFieldsLimit([][]string{{"unknown"}, {first}, {"status"}}, values, assistantHeaderUnits)
 					wantHeader := "<code>" + literal + "</code>"
 					if units > assistantHeaderUnits {
 						if header != assistantCompletedIcon {

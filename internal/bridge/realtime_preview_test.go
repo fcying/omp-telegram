@@ -458,7 +458,7 @@ func TestCompletedMessageDeletesLateAcceptedPreview(t *testing.T) {
 		t.Fatal("late preview cleanup changed execution or removed the newest preview")
 	}
 	rows := researchReplies(t, w, root)
-	if len(rows) != 1 || replyBody(t, rows[0]) != "Confirmed body while the preview response is pending" {
+	if len(rows) != 1 || replyBody(t, w, root, 0) != "Confirmed body while the preview response is pending" {
 		t.Fatal("preview cleanup lost or duplicated the formal reply")
 	}
 }

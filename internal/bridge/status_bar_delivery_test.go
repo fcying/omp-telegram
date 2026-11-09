@@ -21,12 +21,12 @@ func TestAssistantStatusBarTransitionsPreserveDeliveredBody(t *testing.T) {
 			for _, final := range []bool{false, true} {
 				t.Run(fmt.Sprintf("delivered=%t/intermediate=%t/final=%t", delivered, intermediate, final), func(t *testing.T) {
 					w, f, _, _ := replyStatusWorker(t)
-					w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{}}
+					w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{}}
 					if intermediate {
-						w.b.cfg.StatusBar.Intermediate = []string{"model", "status"}
+						w.b.cfg.StatusBar.Intermediate = [][]string{{"model"}, {"status"}}
 					}
 					if final {
-						w.b.cfg.StatusBar.Final = []string{"speed", "status"}
+						w.b.cfg.StatusBar.Final = [][]string{{"speed"}, {"status"}}
 					}
 					replyStatusMessage(t, w, 100, 1000, 1100)
 					var id int64
@@ -79,8 +79,8 @@ func TestAssistantStatusBarTransitionsPreserveDeliveredBody(t *testing.T) {
 
 func TestHeaderlessIntermediateReservesSpaceForFinalHeader(t *testing.T) {
 	w, f, _, _ := replyStatusWorker(t)
-	w.b.cfg.StatusBar.Intermediate = []string{}
-	w.b.cfg.StatusBar.Final = []string{"status", "model"}
+	w.b.cfg.StatusBar.Intermediate = [][]string{}
+	w.b.cfg.StatusBar.Final = [][]string{{"status"}, {"model"}}
 	text := strings.Repeat("x", telegram.MaxMessageUTF16)
 	w.stream.WriteString(text)
 	if !w.queueAssistantText(text, false) {
@@ -116,7 +116,7 @@ func TestHeaderlessIntermediateReservesSpaceForFinalHeader(t *testing.T) {
 func TestDisabledStatusBarsDoNotSampleOrHideProgressControls(t *testing.T) {
 	w, _, _, trace := replyStatusWorker(t)
 	w.b.cfg.ProgressMode = "summary"
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{}}
 	allowInitialProgress(w)
 	before := researchTraceCount(trace, "get_state", "")
 	w.refreshProgressNative(time.Now())
@@ -156,7 +156,7 @@ func TestFinalGitAndLateQuotaKeepSameAnswer(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_USAGE_RELEASE", gate)
 	w, _, _ := replyUsageWorker(t, "hold-report")
 	t.Cleanup(func() { requireStoreOK(t, os.WriteFile(gate, nil, 0600)) })
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git", "quota", "status"}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}, {"quota"}, {"status"}}}
 	workspace := w.binding.Workspace
 	statusBarGit(t, workspace, "init", "-b", "before")
 	w.event([]byte(`{"type":"message_end","message":{"role":"assistant","stopReason":"stop","model":"safe","provider":"openai-codex","duration":1000,"usage":{"output":100,"totalTokens":1100},"content":[{"type":"text","text":"answer"}]}}`))
@@ -189,7 +189,7 @@ func TestTerminalOnlyQuotaHeaderWaitsForRealValue(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_USAGE_RELEASE", gate)
 	w, _, _ := replyUsageWorker(t, "hold-report")
 	t.Cleanup(func() { requireStoreOK(t, os.WriteFile(gate, nil, 0600)) })
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"quota"}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"quota"}}}
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","model":"safe","provider":"openai-codex","content":[{"type":"text","text":"answer"}]}]}`))
 	awaitReplyStatus(t, w)
 	var id int64
@@ -210,7 +210,7 @@ func TestTerminalOnlyQuotaHeaderWaitsForRealValue(t *testing.T) {
 
 func TestResearchStatusBarsApplyGitOnlyAtRootSettlement(t *testing.T) {
 	w, _, _ := researchWorker(t, "autoresearch")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git", "status"}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}, {"status"}}}
 	researchRoot(t, w, 100, "/autoresearch status bar")
 	workspace := w.binding.Workspace
 	statusBarGit(t, workspace, "init", "-b", "main")
@@ -237,7 +237,7 @@ func TestResearchStatusBarsApplyGitOnlyAtRootSettlement(t *testing.T) {
 
 func TestIntermediateOnlyQuotaWarmsCacheAfterShortTask(t *testing.T) {
 	w, _, trace := replyUsageWorker(t, "normal")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{"quota"}, Final: []string{}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{{"quota"}}, Final: [][]string{}}
 	endUsageReply(w)
 	if queueState(t, w, 2) != "done" || w.replyStatus.pending != nil {
 		t.Fatal("intermediate-only quota delayed a headerless completion")
@@ -264,7 +264,7 @@ func TestIntermediateOnlyQuotaWarmsCacheAfterShortTask(t *testing.T) {
 
 func TestQuotaInDisabledProgressDoesNotStartQueries(t *testing.T) {
 	w, _, trace := replyUsageWorker(t, "normal")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{"quota"}, Intermediate: []string{}, Final: []string{}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{{"quota"}}, Intermediate: [][]string{}, Final: [][]string{}}
 	before := researchTraceCount(trace, "get_state", "")
 	endUsageReply(w)
 	w.refreshProviderUsage(time.Now())
@@ -294,7 +294,7 @@ func TestResearchFinalThinkingPreservesActorSelection(t *testing.T) {
 		t.Run(scenario.configured, func(t *testing.T) {
 			t.Setenv("OMP_TELEGRAM_FIXTURE_CONFIGURED_THINKING", scenario.configured)
 			w, _, _ := researchWorker(t, "autoresearch")
-			w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{"thinking"}, Final: []string{"thinking"}}
+			w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{{"thinking"}}, Final: [][]string{{"thinking"}}}
 			researchRoot(t, w, 100, "/autoresearch thinking selection")
 			researchRound(t, w, "middle")
 			awaitReplyStatus(t, w)
@@ -319,7 +319,7 @@ func TestRealTruncationNoticeBodyRemainsFinalHeaderTarget(t *testing.T) {
 		for _, earlier := range []bool{false, true} {
 			t.Run(fmt.Sprintf("delivered=%t/earlier=%t", delivered, earlier), func(t *testing.T) {
 				w, f, _, _ := replyStatusWorker(t)
-				w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"status"}}
+				w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"status"}}}
 				if earlier {
 					assistantMessage(t, w, "earlier")
 				}
@@ -374,7 +374,7 @@ func TestTerminalTruncationNoticeBodyReceivesLateQuota(t *testing.T) {
 	t.Setenv("OMP_TELEGRAM_FIXTURE_USAGE_RELEASE", gate)
 	w, _, trace := replyUsageWorker(t, "hold-report")
 	t.Cleanup(func() { requireStoreOK(t, os.WriteFile(gate, nil, 0600)) })
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"quota"}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"quota"}}}
 	assistantMessage(t, w, "earlier")
 	deliverReplies(t, w)
 	notice := w.tr(i18n.Msg.ReplyTruncated)
@@ -403,7 +403,7 @@ func TestBudgetExhaustedNoticeKeepsEarlierBodyTarget(t *testing.T) {
 	for _, terminalOnly := range []bool{false, true} {
 		t.Run(fmt.Sprintf("terminalOnly=%t", terminalOnly), func(t *testing.T) {
 			w, _, _, _ := replyStatusWorker(t)
-			w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"status"}}
+			w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"status"}}}
 			for range maxFinalReplyMessages - 2 {
 				stoppedAssistantMessage(t, w, "body")
 			}

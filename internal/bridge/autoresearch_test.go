@@ -16,6 +16,7 @@ func researchWorker(t *testing.T, mode string) (*worker, func(string), string) {
 	t.Helper()
 	w, command, trace := nativeWorker(t, mode)
 	nativeCatalogReady(t, w)
+	w.b.cfg.StatusBar.Intermediate = w.b.cfg.StatusBar.Fields("final")
 	return w, command, trace
 }
 
@@ -140,7 +141,7 @@ func TestAutoresearchRoundsRetainRootAndDurablyFlushWithoutDuplicates(t *testing
 		researchRound(t, w, text)
 		awaitReplyStatus(t, w)
 		roundReplies := researchReplies(t, w, 100)
-		if len(roundReplies) != i+1 || replyBody(t, roundReplies[i]) != text || !strings.Contains(roundReplies[i], "`safe`") {
+		if len(roundReplies) != i+1 || replyBody(t, w, 100, i) != text || !strings.Contains(roundReplies[i], "`safe`") {
 			t.Fatalf("round did not persist its intact reply with an attached status: %q", roundReplies)
 		}
 		if queueState(t, w, 100) != "submitted" || w.active != 100 || !w.taskActive() || w.client != client || w.turn != turn || w.binding.Generation != generation {

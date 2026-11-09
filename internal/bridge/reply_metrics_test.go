@@ -47,7 +47,7 @@ func TestReplyMetricsWeightsCallsAndResetsBetweenReplies(t *testing.T) {
 		t.Fatalf("non-assistant changed reply metadata: %s", got)
 	}
 	metrics = replyMetrics{}
-	if got := renderCompactFields((config.StatusBar{}).Fields("intermediate"), compactFields("en", statusState{}, &metrics, true, false)); got != "" {
+	if got := renderCompactFields((config.StatusBar{}).Fields("final"), compactFields("en", statusState{}, &metrics, true, false)); got != "" {
 		t.Fatalf("new reply inherited metadata: %q", got)
 	}
 	metrics.observe(replyMetricsMessage(30, 2000))
@@ -348,10 +348,10 @@ func TestSequentialReplyPreservesMarkdownAndUnicode(t *testing.T) {
 	awaitReplyStatus(t, w)
 	parts := researchReplies(t, w, 2)
 	assertReplyMetricsBudget(t, parts)
-	if len(parts) < 4 || replyBody(t, parts[0]) != body || !strings.Contains(parts[1], "`safe`") {
+	if len(parts) < 4 || replyBody(t, w, 2, 0) != body || !strings.Contains(parts[1], "`safe`") {
 		t.Fatalf("Markdown intermediate body or attached final status changed: %q", parts)
 	}
-	visible := replyBody(t, parts[1]) + strings.Join(parts[2:], "")
+	visible := replyBody(t, w, 2, 1) + strings.Join(parts[2:], "")
 	if strings.Count(visible, "😀") != 5000 || strings.Contains(visible, replyTruncatedNotice) || strings.Count(strings.Join(parts[1:], ""), "`safe`") != 1 {
 		t.Fatal("Unicode pagination lost or duplicated body text")
 	}
