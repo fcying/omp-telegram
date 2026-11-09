@@ -522,7 +522,7 @@ func TestContextVisibilityFollowsCompletedScopedReads(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			w, _, _, _ := replyStatusWorker(t)
-			fields := []string{"status", "thinking", "model", "fast", "context", "speed", "quota"}
+			fields := [][]string{{"status"}, {"thinking"}, {"model"}, {"fast"}, {"context"}, {"speed"}, {"quota"}}
 			w.b.cfg.StatusBar = config.StatusBar{Progress: fields, Intermediate: fields, Final: fields}
 			allowInitialProgress(w)
 			nativeRPC(t, w, "fixture_get_state_update", map[string]any{"contextUsage": scenario.usage})

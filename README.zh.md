@@ -101,7 +101,7 @@ deny = ["OMP_TELEGRAM_BOT_TOKEN"]
 | `telegram.progress_mode` | 任务实时进度: `off`, `summary` 或 `verbose`. 默认读取 `OMP_TELEGRAM_PROGRESS_MODE`; 为空或非法时回退到 `summary`. 见[进度界面](#进度界面). |
 | `telegram.progress_recent_tools` | verbose Recent 历史保留的已完成工具上限. 默认 `5`, 范围 `1..100`; 受 Telegram 消息长度限制, 实际显示可能更少. |
 | `telegram.final_actions` | 可选的有序完成快捷按钮 `{ label, command }`. 省略或 `[]` 关闭. 最多六项; 标签非空, 单行, 最多 64 个 UTF-16 单位. Command 是一个 slash invocation, 可带固定字面参数, 不能含控制字符或换行. 见[完成快捷按钮](#完成快捷按钮). |
-| `telegram.status_bar.progress`, `.intermediate`, `.final` | 按顺序选择 Progress, 中间 assistant 消息和最终结果的字段. `[]` 关闭对应状态栏. 未配置的数组默认 `["status", "thinking", "model", "fast", "context", "speed"]`. 见[状态栏](#状态栏). |
+| `telegram.status_bar.progress`, `.intermediate`, `.final` | 按顺序选择 Progress, 中间 assistant 消息和最终结果的字段. 内层数组中的字段用空格分隔, 外层各项用 ` \| ` 分隔. `[]` 关闭对应状态栏. 未配置时 `intermediate` 默认 `[]`, `progress` 和 `final` 默认 `["status", ["thinking", "model", "fast"], "context", "speed"]`. 见[状态栏](#状态栏). |
 | `telegram.status_bar.git_command` | 最终 `git` 字段的可选字面 argv. 未配置或 `[]` 使用内置安全 Git 探针. 自定义命令在当前 session workspace 中执行, 不经过 shell; 安全与副作用由用户负责. |
 | `telegram.status_bar.git_timeout` | 内置和自定义 Git 采样共用的正数字面 Go duration, 默认 `"450ms"`. 大仓库可增至如 `"2s"`. 空串, 零, 负数, 非法, 溢出或非字符串均拒绝; 不展开环境引用, 不允许关闭超时. |
 | `omp.binary` | 从 `PATH` 查找的可执行文件名或绝对路径, 默认 `"omp"`, 不是 shell 命令. |
@@ -408,13 +408,13 @@ Usage 日志可能在任务完成后才可查询. 在任务 scope 仍有效且 w
 
 ### 状态栏
 
-三种状态栏独立配置, 按数组顺序显示字段, 未知或重复名称会报错. `[]` 删除整个状态栏, 包括图标和分隔符. 关闭 Progress 状态栏不隐藏工具正文, 文本预览或 **Stop | Follow-up** 按钮; 关闭整个 Progress 仍使用 `progress_mode = "off"`.
+三种状态栏独立配置, 按数组顺序显示字段. 外层各项用 ` | ` 分隔, 内层数组中的字段用空格分隔, 仍支持原来的一维数组. 无数据的字段及空组不留下分隔符; 未知名称及重复字段会报错, 包括跨组重复. `[]` 删除整个状态栏, 包括图标和分隔符. 关闭 Progress 状态栏不隐藏工具正文, 文本预览或 **Stop | Follow-up** 按钮; 关闭整个 Progress 仍使用 `progress_mode = "off"`.
 
 ```toml
 [telegram.status_bar]
 progress = ["status", "model", "context"]
 intermediate = []
-final = ["status", "model", "thinking", "fast", "context", "speed", "quota", "git"]
+final = ["status", ["thinking", "model", "fast"], ["context", "speed"], "quota", "git"]
 ```
 
 | 字段 | 显示内容 |

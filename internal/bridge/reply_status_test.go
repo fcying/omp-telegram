@@ -32,6 +32,7 @@ func replyStatusWorker(t *testing.T) (*worker, *fakeHTTP, func(string), string) 
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "off"
 	w.b.cfg.QueueCapacity = 4
+	w.b.cfg.StatusBar.Intermediate = w.b.cfg.StatusBar.Fields("final")
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	requireStoreOK(t, err)
@@ -194,7 +195,7 @@ func TestFinalReplyMetadataPreservesPendingStatusAndUsage(t *testing.T) {
 			requireStoreOK(t, err)
 			w.event(raw)
 			rows := researchReplies(t, w, 2)
-			if w.replyStatus.pending != pending || w.providerUsage.pending != usage || w.client != client || client.Stopping() || queueState(t, w, 2) != state || len(rows) != 1 || replyBody(t, rows[0]) != "answer" {
+			if w.replyStatus.pending != pending || w.providerUsage.pending != usage || w.client != client || client.Stopping() || queueState(t, w, 2) != state || len(rows) != 1 || replyBody(t, w, 2, 0) != "answer" {
 				t.Fatalf("%s interrupted status or quota sampling or changed the committed body", method)
 			}
 		}

@@ -185,7 +185,7 @@ func TestGitTimeoutOrdinaryLongGitKeepsNativeLimitsAndBodyDelivery(t *testing.T)
 			w, f, _, trace := replyStatusWorker(t)
 			gitTimeoutIsolateWorker(t, w)
 			gate := newGitTimeoutGate(t)
-			w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git", "context", "quota"}, GitTimeout: 4 * time.Second}
+			w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}, {"context"}, {"quota"}}, GitTimeout: 4 * time.Second}
 			phase := "get_state"
 			want := "main"
 			if custom {
@@ -229,14 +229,14 @@ func TestGitTimeoutResearchLongGitAndIndependentAccountLimit(t *testing.T) {
 	for _, custom := range []bool{false, true} {
 		t.Run(fmt.Sprintf("custom=%t", custom), func(t *testing.T) {
 			w, _, trace := researchWorker(t, "autoresearch")
-			w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git"}, GitTimeout: 8 * time.Second}
+			w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}}, GitTimeout: 8 * time.Second}
 			researchRoot(t, w, 100, "/autoresearch long Git budget")
 			gitTimeoutIsolateWorker(t, w)
 			gate := newGitTimeoutGate(t)
 			want := "main"
 			if custom {
 				want = "custom"
-				w.b.cfg.StatusBar.Final = []string{"git", "quota"}
+				w.b.cfg.StatusBar.Final = [][]string{{"git"}, {"quota"}}
 				w.b.cfg.StatusBar.GitCommand = []string{replyGitCommandScript(t, gate.body+"printf custom")}
 				nativeRPC(t, w, "set_model", map[string]any{"provider": "openai-codex", "modelId": "safe"})
 				nativeRPC(t, w, "fixture_research_control_hold", map[string]any{"phase": "get_logout_accounts"})
@@ -275,7 +275,7 @@ func TestGitTimeoutResearchLongGitAndIndependentAccountLimit(t *testing.T) {
 			gate.open(t)
 			gitTimeoutUntil(t, w, 4*time.Second, func() bool { return queueState(t, w, 100) == "done" })
 			rows := researchReplies(t, w, 100)
-			if len(rows) != 1 || replyBody(t, rows[0]) != "research answer" || !strings.Contains(rows[0], "`"+want+"`") {
+			if len(rows) != 1 || replyBody(t, w, 100, 0) != "research answer" || !strings.Contains(rows[0], "`"+want+"`") {
 				t.Fatalf("research did not preserve the long Git snapshot and single body: %q", rows)
 			}
 		})
@@ -284,7 +284,7 @@ func TestGitTimeoutResearchLongGitAndIndependentAccountLimit(t *testing.T) {
 
 func TestGitTimeoutResearchNativeLookupRemainsFiveSeconds(t *testing.T) {
 	w, _, trace := researchWorker(t, "autoresearch")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git"}, GitTimeout: 20 * time.Second}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}}, GitTimeout: 20 * time.Second}
 	researchRoot(t, w, 100, "/autoresearch bounded native evidence")
 	gate := newGitTimeoutGate(t)
 	w.b.cfg.StatusBar.GitCommand = []string{replyGitCommandScript(t, gate.body+"printf custom")}
@@ -314,12 +314,12 @@ func TestGitTimeoutPendingGitDoesNotBlockControls(t *testing.T) {
 				id := int64(2)
 				if research {
 					w, _, _ = researchWorker(t, "autoresearch")
-					w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git"}, GitTimeout: 20 * time.Second}
+					w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}}, GitTimeout: 20 * time.Second}
 					researchRoot(t, w, 100, "/autoresearch responsive controls")
 					id = 100
 				} else {
 					w, _, _, _ = replyStatusWorker(t)
-					w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git"}, GitTimeout: 20 * time.Second}
+					w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}}, GitTimeout: 20 * time.Second}
 				}
 				gate := newGitTimeoutGate(t)
 				w.b.cfg.StatusBar.GitCommand = []string{replyGitCommandScript(t, gate.body+"printf stale")}

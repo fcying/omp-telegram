@@ -1,7 +1,7 @@
 package config
 
 import (
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,20 +19,25 @@ func TestStatusBarDefaults(t *testing.T) {
 	if c.StatusBar.GitTimeout != 450*time.Millisecond {
 		t.Fatalf("default Git timeout = %v, want 450ms", c.StatusBar.GitTimeout)
 	}
-	want := []string{"status", "thinking", "model", "fast", "context", "speed"}
+	want := [][]string{{"status"}, {"thinking", "model", "fast"}, {"context"}, {"speed"}}
 	for _, settings := range []StatusBar{{}, c.StatusBar} {
-		for _, kind := range []string{"progress", "intermediate", "final"} {
-			if got := settings.Fields(kind); !slices.Equal(got, want) {
+		for _, kind := range []string{"progress", "final"} {
+			if got := settings.Fields(kind); !reflect.DeepEqual(got, want) {
 				t.Fatalf("%s default fields = %v, want %v", kind, got, want)
 			}
-			for _, field := range want {
-				if !settings.Has(kind, field) || !settings.Uses(field) {
-					t.Fatalf("default %s field %q was not selected", kind, field)
+			for _, group := range want {
+				for _, field := range group {
+					if !settings.Has(kind, field) || !settings.Uses(field) {
+						t.Fatalf("default %s field %q was not selected", kind, field)
+					}
 				}
 			}
 			if settings.Has(kind, "quota") || settings.Has(kind, "git") {
 				t.Fatalf("%s enabled an opt-in field by default", kind)
 			}
+		}
+		if len(settings.Fields("intermediate")) != 0 {
+			t.Fatal("omitted intermediate fields must disable its header")
 		}
 		if settings.Uses("quota") || settings.Uses("git") || settings.Uses("unknown") {
 			t.Fatal("defaults selected an opt-in or unknown field")
@@ -58,7 +63,7 @@ func TestStatusBarExplicitEmptyDisablesOnlySelectedHeader(t *testing.T) {
 			if c.StatusBar.Has(kind, "status") {
 				t.Fatal("disabled header retained a default field")
 			}
-			for _, other := range []string{"progress", "intermediate", "final"} {
+			for _, other := range []string{"progress", "final"} {
 				if other != kind && !c.StatusBar.Has(other, "status") {
 					t.Fatalf("disabling %s also disabled omitted %s", kind, other)
 				}
@@ -97,13 +102,13 @@ func TestStatusBarPreservesOrderAndIndependentSelections(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		kind string
-		want []string
+		want [][]string
 	}{
-		{"progress", []string{"quota", "model"}},
-		{"intermediate", []string{"thinking", "fast"}},
-		{"final", []string{"git", "quota", "speed", "context", "fast", "model", "thinking", "status"}},
+		{"progress", [][]string{{"quota"}, {"model"}}},
+		{"intermediate", [][]string{{"thinking"}, {"fast"}}},
+		{"final", [][]string{{"git"}, {"quota"}, {"speed"}, {"context"}, {"fast"}, {"model"}, {"thinking"}, {"status"}}},
 	} {
-		if got := c.StatusBar.Fields(tc.kind); !slices.Equal(got, tc.want) {
+		if got := c.StatusBar.Fields(tc.kind); !reflect.DeepEqual(got, tc.want) {
 			t.Fatalf("%s fields = %v, want %v", tc.kind, got, tc.want)
 		}
 	}
@@ -112,6 +117,25 @@ func TestStatusBarPreservesOrderAndIndependentSelections(t *testing.T) {
 	}
 	if !c.StatusBar.Has("progress", "quota") || !c.StatusBar.Has("final", "git") || !c.StatusBar.Uses("quota") || !c.StatusBar.Uses("git") {
 		t.Fatal("explicit opt-in fields were not selected")
+	}
+}
+
+func TestStatusBarGroupedFields(t *testing.T) {
+	path, source := configFixture(t)
+	source = setTOMLField(source, "telegram.status_bar", "progress", `[["status", "model"], ["context", "speed"]]`)
+	source = setTOMLField(source, "telegram.status_bar", "intermediate", `[[], ["quota"], []]`)
+	source = setTOMLField(source, "telegram.status_bar", "final", `["status", ["thinking", "model", "fast"], "git"]`)
+	c, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.StatusBar.Progress, [][]string{{"status", "model"}, {"context", "speed"}}) ||
+		!reflect.DeepEqual(c.StatusBar.Intermediate, [][]string{{"quota"}}) ||
+		!reflect.DeepEqual(c.StatusBar.Final, [][]string{{"status"}, {"thinking", "model", "fast"}, {"git"}}) {
+		t.Fatalf("field groups lost order or boundaries: %+v", c.StatusBar)
+	}
+	if !c.StatusBar.Has("progress", "speed") || !c.StatusBar.Uses("quota") || !c.StatusBar.Has("final", "fast") {
+		t.Fatal("grouped fields did not enable their sampling requirements")
 	}
 }
 
@@ -127,6 +151,9 @@ func TestStatusBarRejectsInvalidFields(t *testing.T) {
 			`["${BRIDGE_TEST_STATUS_FIELD}"]`,
 			`["status", "model", "status"]`,
 			`["quota", "quota"]`,
+			`[["status", "model"], ["status"]]`,
+			`["quota", ["quota"]]`,
+			`[["unknown-private-field"]]`,
 		} {
 			t.Run(kind+"/"+value, func(t *testing.T) {
 				_, err := loadSource(t, path, setTOMLField(source, "telegram.status_bar", kind, value))
@@ -140,7 +167,7 @@ func TestStatusBarRejectsInvalidFields(t *testing.T) {
 		}
 	}
 	for _, kind := range []string{"progress", "intermediate"} {
-		if _, err := loadSource(t, path, setTOMLField(source, "telegram.status_bar", kind, `["git"]`)); err == nil {
+		if _, err := loadSource(t, path, setTOMLField(source, "telegram.status_bar", kind, `[["status", "git"]]`)); err == nil {
 			t.Fatalf("git was accepted in %s", kind)
 		}
 	}
@@ -152,7 +179,7 @@ func TestStatusBarRejectsInvalidFields(t *testing.T) {
 func TestStatusBarRejectsInvalidSchema(t *testing.T) {
 	path, source := configFixture(t)
 	for _, kind := range []string{"progress", "intermediate", "final"} {
-		for _, value := range []string{`true`, `"model"`, `42`, `["model", 7]`, `[false]`, `{field = "model"}`} {
+		for _, value := range []string{`true`, `"model"`, `42`, `["model", 7]`, `[false]`, `{field = "model"}`, `[["model", 7]]`, `[[["model"]]]`, `[{field = "model"}]`} {
 			t.Run(kind+"/"+value, func(t *testing.T) {
 				if _, err := loadSource(t, path, setTOMLField(source, "telegram.status_bar", kind, value)); err == nil {
 					t.Fatalf("invalid %s array type %s was accepted", kind, value)
@@ -182,7 +209,7 @@ func TestLegacyProviderUsageIsIgnored(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !slices.Equal(c.StatusBar.Final, []string{"quota", "git"}) || c.StatusBar.Has("progress", "quota") || c.StatusBar.Has("intermediate", "quota") {
+			if !reflect.DeepEqual(c.StatusBar.Final, [][]string{{"quota"}, {"git"}}) || c.StatusBar.Has("progress", "quota") || c.StatusBar.Has("intermediate", "quota") {
 				t.Fatal("legacy provider_usage changed explicit status-bar selections")
 			}
 		})

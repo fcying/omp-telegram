@@ -87,7 +87,7 @@ func TestInitialProgressWaitsForDelayAndIsDeletedAfterDelivery(t *testing.T) {
 	w.event([]byte(`{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"short answer"}]}]}`))
 	awaitReplyStatus(t, w)
 	output, err := w.b.db.NextOutput()
-	if err != nil || replyBody(t, assistantOutputText(output)) != "short answer" || !strings.Contains(output.Header, "`safe`") {
+	if err != nil || output.Text != "short answer" || !strings.Contains(output.Header, "`safe`") {
 		t.Fatalf("final reply = %+v, err=%v", output, err)
 	}
 	if got := f.deletedMessageIDs(); len(got) != 0 {
@@ -315,7 +315,7 @@ func TestProgressStopContinuesQueuedTasks(t *testing.T) {
 		t.Fatalf("stopped root state = %q, error %v; want cancelled", state, err)
 	}
 	stoppedReplies := researchReplies(t, w, 2)
-	if len(stoppedReplies) != 3 || replyBody(t, stoppedReplies[0]) != "Completed question before Stop?" || stoppedReplies[1] != "**Pending whole body" {
+	if len(stoppedReplies) != 3 || replyBody(t, w, 2, 0) != "Completed question before Stop?" || stoppedReplies[1] != "**Pending whole body" {
 		t.Fatalf("Stop duplicated/dropped completed or interrupted body: %q", stoppedReplies)
 	}
 	w.dispatch()
@@ -422,7 +422,7 @@ func TestRootCompletionPersistsReplyToOrigin(t *testing.T) {
 	w.stream.WriteString("final")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || replyBody(t, assistantOutputText(out)) != "final" || out.ReplyTo != 2 {
+	if err != nil || out.Text != "final" || out.ReplyTo != 2 {
 		t.Fatalf("root final output = %+v, error %v", out, err)
 	}
 }
@@ -457,7 +457,7 @@ func TestQueuedRootRepliesRetainTheirOwnOrigins(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body := replyBody(t, assistantOutputText(out))
+		body := out.Text
 		if body != want.text || out.ReplyTo != want.replyTo {
 			t.Fatalf("queued root output = %+v", out)
 		}
@@ -710,7 +710,7 @@ func TestReviewFinalReplyRetainsCommandOrigin(t *testing.T) {
 	w.stream.WriteString("review complete")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || replyBody(t, assistantOutputText(out)) != "review complete" || out.ReplyTo != 2 {
+	if err != nil || out.Text != "review complete" || out.ReplyTo != 2 {
 		t.Fatalf("review final output = %+v, error %v", out, err)
 	}
 }
@@ -737,7 +737,7 @@ func TestAttachmentFinalReplyRetainsAttachmentOrigin(t *testing.T) {
 	w.stream.WriteString("attachment complete")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || replyBody(t, assistantOutputText(out)) != "attachment complete" || out.ReplyTo != 42 {
+	if err != nil || out.Text != "attachment complete" || out.ReplyTo != 42 {
 		t.Fatalf("attachment final output = %+v, error %v", out, err)
 	}
 }
@@ -753,7 +753,7 @@ func TestProgressAndFinalReplyShareRootOrigin(t *testing.T) {
 	w.stream.WriteString("final")
 	w.finish()
 	out, err := w.b.db.NextOutput()
-	if err != nil || replyBody(t, assistantOutputText(out)) != "final" || out.ReplyTo != 2 {
+	if err != nil || out.Text != "final" || out.ReplyTo != 2 {
 		t.Fatalf("final reply target = %+v, error %v", out, err)
 	}
 	waitKeyboardClears(t, f, messageID)

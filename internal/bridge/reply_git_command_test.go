@@ -119,7 +119,7 @@ func TestCustomGitCommandFinalAndLateQuotaKeepSnapshot(t *testing.T) {
 	w, _, _ := replyUsageWorker(t, "hold-report")
 	t.Cleanup(func() { requireStoreOK(t, os.WriteFile(gate, nil, 0600)) })
 	script := replyGitCommandScript(t, "printf 'run\\n' >> custom-git-runs\ncat custom-git-label")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git", "quota"}, GitCommand: []string{script}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}, {"quota"}}, GitCommand: []string{script}}
 	labelPath := filepath.Join(w.binding.Workspace, "custom-git-label")
 	label := "dev/``@a1b2c3d*"
 	requireStoreOK(t, os.WriteFile(labelPath, []byte(label+"\n"), 0600))
@@ -150,7 +150,7 @@ func TestCustomGitCommandFinalAndLateQuotaKeepSnapshot(t *testing.T) {
 func TestCustomGitCommandOnlyRunsAtResearchRoot(t *testing.T) {
 	w, _, _ := researchWorker(t, "autoresearch")
 	script := replyGitCommandScript(t, "printf 'run\\n' >> custom-git-runs\ncat custom-git-label")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{"git"}, GitCommand: []string{script}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{{"git"}}, GitCommand: []string{script}}
 	researchRoot(t, w, 100, "/autoresearch custom status")
 	workspace := w.binding.Workspace
 	requireStoreOK(t, os.WriteFile(filepath.Join(workspace, "custom-git-label"), []byte("startup"), 0600))
@@ -175,7 +175,7 @@ func TestCustomGitCommandOnlyRunsAtResearchRoot(t *testing.T) {
 func TestUnselectedGitDoesNotRunCustomCommand(t *testing.T) {
 	w, _, _, _ := replyStatusWorker(t)
 	script := replyGitCommandScript(t, "printf ran > custom-git-ran\nprintf 'dev*'")
-	w.b.cfg.StatusBar = config.StatusBar{Progress: []string{}, Intermediate: []string{}, Final: []string{}, GitCommand: []string{script}}
+	w.b.cfg.StatusBar = config.StatusBar{Progress: [][]string{}, Intermediate: [][]string{}, Final: [][]string{}, GitCommand: []string{script}}
 	endStatusBarBody(t, w, "answer", "safe-provider")
 	awaitReplyStatus(t, w)
 	replyGitExpectAbsent(t, filepath.Join(w.binding.Workspace, "custom-git-ran"))

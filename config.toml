@@ -40,12 +40,14 @@ final_actions = []
 
 [telegram.status_bar]
 # Fields appear in array order; unavailable values are omitted. [] hides that header.
+# Outer items use " | "; fields in a nested array use spaces. Flat arrays remain supported.
+# Example: final = ["status", ["thinking", "model", "fast"], ["context", "speed"]]
 # Available fields: "status", "model", "thinking", "fast", "context", "speed", "quota", "git".
 # Omitted arrays use these defaults. Add "quota" to opt in to provider windows;
 # "git" is supported only in final. Fields are literal names, not environment references.
-progress = ["status", "thinking", "model", "fast", "context", "speed"]
-intermediate = ["status", "thinking", "model", "fast", "context", "speed"]
-final = ["status", "thinking", "model", "fast", "context", "speed"]
+progress = ["status", ["thinking", "model", "fast"], "context", "speed"]
+intermediate = []
+final = ["status", ["thinking", "model", "fast"], "context", "speed"]
 
 # Empty uses the built-in safe Git status implementation.
 git_command = []

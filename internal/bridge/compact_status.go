@@ -105,56 +105,60 @@ func compactFields(language i18n.Language, s statusState, metrics *replyMetrics,
 	return values
 }
 
-func renderCompactFields(fields []string, values compactStatusFields) string {
+func renderCompactFields(fields [][]string, values compactStatusFields) string {
 	return renderCompactFieldsLimit(fields, values, 0)
 }
 
-func renderCompactFieldsLimit(fields []string, values compactStatusFields, limit int) string {
+func renderCompactFieldsLimit(fields [][]string, values compactStatusFields, limit int) string {
 	var result strings.Builder
 	remaining := limit
-	for _, field := range fields {
-		value := ""
-		switch field {
-		case "status":
-			value = values.status
-		case "model":
-			value = values.model
-		case "thinking":
-			value = values.thinking
-		case "fast":
-			value = values.fast
-		case "context":
-			value = values.context
-		case "speed":
-			value = values.speed
-		case "quota":
-			value = values.quota
-		case "git":
-			value = values.git
-		}
-		if value == "" {
-			continue
-		}
-		// A long inline-code delimiter at paragraph start is also a block
-		// fence. Emphasis keeps it inline without adding visible text; the
-		// Telegram converter leaves code entities outside emphasis styles.
-		if result.Len() == 0 && strings.HasPrefix(value, "```") {
-			value = "**" + value + "**"
-		}
-		if limit > 0 {
-			units := utf16Length(value)
-			if result.Len() > 0 {
-				units += len(compactHeaderSeparator)
+	for _, group := range fields {
+		shown := false
+		for _, field := range group {
+			value := ""
+			switch field {
+			case "status":
+				value = values.status
+			case "model":
+				value = values.model
+			case "thinking":
+				value = values.thinking
+			case "fast":
+				value = values.fast
+			case "context":
+				value = values.context
+			case "speed":
+				value = values.speed
+			case "quota":
+				value = values.quota
+			case "git":
+				value = values.git
 			}
-			if units > remaining {
+			if value == "" {
 				continue
 			}
-			remaining -= units
+			// Keep leading inline-code delimiters from becoming block fences.
+			if result.Len() == 0 && strings.HasPrefix(value, "```") {
+				value = "**" + value + "**"
+			}
+			separator := ""
+			if result.Len() > 0 {
+				separator = compactHeaderSeparator
+				if shown {
+					separator = " "
+				}
+			}
+			if limit > 0 {
+				units := utf16Length(value) + len(separator)
+				if units > remaining {
+					continue
+				}
+				remaining -= units
+			}
+			result.WriteString(separator)
+			result.WriteString(value)
+			shown = true
 		}
-		if result.Len() > 0 {
-			result.WriteString(compactHeaderSeparator)
-		}
-		result.WriteString(value)
 	}
 	return result.String()
 }

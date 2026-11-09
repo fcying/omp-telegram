@@ -25,7 +25,7 @@ func finalReplyStatus(t *testing.T, w *worker, id int64, bodies ...string) strin
 		t.Fatalf("task %d reply rows = %q, want %d bodies with attached final status", id, rows, len(bodies))
 	}
 	for i, body := range bodies[:len(bodies)-1] {
-		if replyBody(t, rows[i]) != body {
+		if replyBody(t, w, id, i) != body {
 			t.Fatalf("task %d intermediate body %d = %q, want %q", id, i, rows[i], body)
 		}
 	}
@@ -45,9 +45,11 @@ func attachedReplyBody(t *testing.T, text string) (string, string) {
 	return header, body
 }
 
-func replyBody(t *testing.T, text string) string {
+func replyBody(t *testing.T, w *worker, id int64, index int) string {
 	t.Helper()
-	_, body := attachedReplyBody(t, text)
+	var body string
+	err := w.b.db.DB.QueryRow("SELECT text FROM outbox WHERE inbox_id=? ORDER BY id LIMIT 1 OFFSET ?", id, index).Scan(&body)
+	requireStoreOK(t, err)
 	return body
 }
 
@@ -58,7 +60,7 @@ func researchBody(t *testing.T, w *worker, id int64) string {
 		t.Fatalf("task %d missing final reply", id)
 	}
 	for i := range rows {
-		rows[i] = replyBody(t, rows[i])
+		rows[i] = replyBody(t, w, id, i)
 	}
 	return strings.Join(rows, "\n\n")
 }
@@ -105,7 +107,7 @@ func TestCompletedQuestionDeliveredBeforeTaskEndsWithProgressOff(t *testing.T) {
 	client, binding, task := w.client, w.binding, w.active
 	assistantMessage(t, w, "May I proceed?")
 	rows := researchReplies(t, w, task)
-	if len(rows) != 1 || replyBody(t, rows[0]) != "May I proceed?" || queueState(t, w, task) != "submitted" || !w.taskActive() {
+	if len(rows) != 1 || replyBody(t, w, task, 0) != "May I proceed?" || queueState(t, w, task) != "submitted" || !w.taskActive() {
 		t.Fatalf("completed question not durably queued during active task: %q", rows)
 	}
 	deliverReplies(t, w)
@@ -173,6 +175,7 @@ func TestAcceptedReplyWhileProgressEditPendingPreservesWholeMarkdown(t *testing.
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.ProgressMode = "summary"
 	w.b.cfg.QueueCapacity = 4
+	w.b.cfg.StatusBar.Intermediate = w.b.cfg.StatusBar.Fields("final")
 	command("/new " + t.TempDir())
 	ready, err := w.b.db.NextOutput()
 	requireStoreOK(t, err)
@@ -224,7 +227,7 @@ func TestAcceptedReplyWhileProgressEditPendingPreservesWholeMarkdown(t *testing.
 		t.Fatal("pending progress edit did not finish")
 	}
 	rows := researchReplies(t, w, 2)
-	if len(rows) != 1 || replyBody(t, rows[0]) != "**May I proceed?**" {
+	if len(rows) != 1 || replyBody(t, w, 2, 0) != "**May I proceed?**" {
 		t.Fatalf("accepted reply froze a partial prefix or rewrote question: %q", rows)
 	}
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"option B.**"}}`))
@@ -285,7 +288,7 @@ func TestNativeYieldWithoutMessageEndKeepsBodiesSeparate(t *testing.T) {
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"First complete native round."}}`))
 	w.event([]byte(`{"type":"agent_end","isTerminal":false,"messages":[]}`))
 	rows := researchReplies(t, w, 2)
-	if len(rows) != 1 || replyBody(t, rows[0]) != "First complete native round." || queueState(t, w, 2) != "submitted" {
+	if len(rows) != 1 || replyBody(t, w, 2, 0) != "First complete native round." || queueState(t, w, 2) != "submitted" {
 		t.Fatalf("native yield dropped its unended body or settled root: %q", rows)
 	}
 	w.event([]byte(`{"type":"agent_start"}`))
@@ -365,7 +368,7 @@ func TestEmptyTerminalCommitCleansProgressAfterAlreadyDeliveredBody(t *testing.T
 		}
 	}
 	rows := researchReplies(t, w, 2)
-	if len(rows) != 1 || replyBody(t, rows[0]) != "Already delivered question?" {
+	if len(rows) != 1 || replyBody(t, w, 2, 0) != "Already delivered question?" {
 		t.Fatalf("empty completion invented a body or lost progress cleanup: %q", rows)
 	}
 }
@@ -379,7 +382,7 @@ func TestAssistantAppendFailureKeepsUncommittedWholeBody(t *testing.T) {
 	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"**Uncommitted whole body**"}}`))
 	assistantMessage(t, w, "**Uncommitted whole body**")
 	rows := researchReplies(t, w, active)
-	if len(rows) != 1 || replyBody(t, rows[0]) != "Committed question?" || queueState(t, w, active) != "submitted" {
+	if len(rows) != 1 || replyBody(t, w, active, 0) != "Committed question?" || queueState(t, w, active) != "submitted" {
 		t.Fatalf("failed append lost earlier body, leaked a partial write, or settled task: %q", rows)
 	}
 	if w.ctx.Err() == nil || w.stream.String() != "**Uncommitted whole body**" || w.client != client || !sameBindingIdentity(w.binding, binding) || w.active != active || w.owner != owner {
@@ -524,7 +527,7 @@ func TestMetadataOnlyTerminalPreservesCommittedBody(t *testing.T) {
 			if reason == "aborted" {
 				wantState = "cancelled"
 			}
-			if len(rows) != 2 || replyBody(t, rows[0]) != "Valid committed body." || rows[1] == "" || w.replyStatus.pending != nil || queueState(t, w, 2) != wantState {
+			if len(rows) != 2 || replyBody(t, w, 2, 0) != "Valid committed body." || rows[1] == "" || w.replyStatus.pending != nil || queueState(t, w, 2) != wantState {
 				t.Fatalf("terminal metadata lost immutable text or reported false success: %q", rows)
 			}
 		})
@@ -599,7 +602,7 @@ func TestMessageEndDeliversBeforeFinalMetadataAndOnlyHeaderChanges(t *testing.T)
 	})
 	stoppedAssistantMessage(t, w, answer)
 	rows := researchReplies(t, w, active)
-	if len(rows) != 2 || replyBody(t, rows[0]) != question || replyBody(t, rows[1]) != answer || w.replyStatus.pending != nil {
+	if len(rows) != 2 || replyBody(t, w, active, 0) != question || replyBody(t, w, active, 1) != answer || w.replyStatus.pending != nil {
 		t.Fatalf("message_end waited for final metadata instead of durably appending both bodies: %q", rows)
 	}
 	for _, row := range rows {
@@ -731,7 +734,7 @@ func TestCommittedBodyIgnoresNoninteractiveUIMetadata(t *testing.T) {
 		raw, err := json.Marshal(map[string]any{"type": "extension_ui_request", "id": "metadata-" + method, "method": method, "message": "Native metadata"})
 		requireStoreOK(t, err)
 		w.event(raw)
-		if rows := researchReplies(t, w, 2); len(rows) != 1 || replyBody(t, rows[0]) != "Only final body." || w.stream.Len() != 0 || w.assistantDelivery != delivery || w.replyStatus.metrics != metrics || w.replyStatus.pending != nil {
+		if rows := researchReplies(t, w, 2); len(rows) != 1 || replyBody(t, w, 2, 0) != "Only final body." || w.stream.Len() != 0 || w.assistantDelivery != delivery || w.replyStatus.metrics != metrics || w.replyStatus.pending != nil {
 			t.Fatalf("noninteractive %s changed the committed body or started final sampling: %q", method, rows)
 		}
 	}
@@ -773,11 +776,11 @@ func TestNewSteerPreservesAlreadyCommittedBody(t *testing.T) {
 	w, _, command, _ := replyStatusWorker(t)
 	stoppedAssistantMessage(t, w, "Awaiting native continuation?")
 	command("Yes, continue.")
-	if rows := researchReplies(t, w, 2); len(rows) != 1 || replyBody(t, rows[0]) != "Awaiting native continuation?" || queueState(t, w, 2) != "submitted" || queueState(t, w, 3) != "submitted" || w.owner != 7 {
+	if rows := researchReplies(t, w, 2); len(rows) != 1 || replyBody(t, w, 2, 0) != "Awaiting native continuation?" || queueState(t, w, 2) != "submitted" || queueState(t, w, 3) != "submitted" || w.owner != 7 {
 		t.Fatalf("incoming steer changed the immutable body or settled its root: %q", rows)
 	}
 	w.event([]byte(`{"type":"agent_start"}`))
-	if rows := researchReplies(t, w, 2); len(rows) != 1 || replyBody(t, rows[0]) != "Awaiting native continuation?" {
+	if rows := researchReplies(t, w, 2); len(rows) != 1 || replyBody(t, w, 2, 0) != "Awaiting native continuation?" {
 		t.Fatalf("native continuation changed or duplicated the committed body: %q", rows)
 	}
 }
@@ -802,7 +805,7 @@ func TestStopAndFailurePreserveCommittedBodyAndTruthfulNotice(t *testing.T) {
 			if len(rows) != 2 {
 				t.Fatalf("interruption lost committed body or truthful notice: %q", rows)
 			}
-			if replyBody(t, rows[0]) != "Whole committed body." || rows[1] == "" {
+			if replyBody(t, w, 2, 0) != "Whole committed body." || rows[1] == "" {
 				t.Fatalf("interruption lost immutable body, notice, or truthful status: %q", rows)
 			}
 			wantState := "uncertain"

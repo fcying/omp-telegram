@@ -20,10 +20,12 @@ func (w *worker) renderStatusBar(kind string, values compactStatusFields) string
 }
 
 func (w *worker) statusNeedsNative(kind string) bool {
-	for _, field := range w.b.cfg.StatusBar.Fields(kind) {
-		switch field {
-		case "model", "thinking", "fast", "context", "speed", "quota":
-			return true
+	for _, group := range w.b.cfg.StatusBar.Fields(kind) {
+		for _, field := range group {
+			switch field {
+			case "model", "thinking", "fast", "context", "speed", "quota":
+				return true
+			}
 		}
 	}
 	return false
