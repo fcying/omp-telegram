@@ -284,21 +284,26 @@ type worker struct {
 	stream strings.Builder
 	assistantDelivery
 	taskState
-	turn                uint64
-	steers              map[string]steerRequest
-	deferredSteers      []deferredSteer
-	steerFence          steerFence
-	activeAttachmentDir string
-	rootRequestID       string
-	nativeCatalog       nativeCommandCatalog
-	research            autoresearchState
-	nativeControl       *nativeControlRequest
-	ask                 *askRequest
-	uiSeen              map[string]struct{}
-	askSending          int
-	argsApply           *argsApplyRequest
-	argsResuming        bool
-	resumeFailed        bool
+	turn                        uint64
+	steers                      map[string]steerRequest
+	deferredSteers              []deferredSteer
+	steerFence                  steerFence
+	activeAttachmentDir         string
+	rootRequestID               string
+	nativeCatalog               nativeCommandCatalog
+	research                    autoresearchState
+	nativeControl               *nativeControlRequest
+	autoSessionName             *autoSessionNameRequest
+	autoSessionNameFence        *autoSessionNameRequest
+	autoSessionNameReady        bool
+	autoSessionNameInput        incoming
+	autoSessionNameInputPending bool
+	ask                         *askRequest
+	uiSeen                      map[string]struct{}
+	askSending                  int
+	argsApply                   *argsApplyRequest
+	argsResuming                bool
+	resumeFailed                bool
 	progressTransport
 	compacting             bool
 	progress               progressState
@@ -1402,7 +1407,7 @@ func (w *worker) canDispatch() bool {
 func (w *worker) canReleaseRuntime() bool {
 	return !w.migrationLocked() && w.runtime == runtimeConnected && w.client != nil &&
 		!w.taskActive() && !w.taskOrSessionBusy() && !w.controlInProgress() &&
-		!w.compacting && !w.finishing && !w.previewBusy &&
+		!w.compacting && !w.finishing && !w.previewBusy && w.autoSessionName == nil &&
 		len(w.queue) == 0 && len(w.hostRequests) == 0 && w.providerUsage.pending == nil &&
 		w.resumeCancel == nil && w.exportCancel == nil && w.deleteCancel == nil && w.startIntent == nil &&
 		!w.hasRuntimeConfirmation()
@@ -1506,6 +1511,8 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.cancelAutoSessionName()
+	w.autoSessionNameFence = nil
 	w.cancelDeferredSteers()
 	defer w.beginConsumerPhase("runtime", "runtime_stopped").end()
 	w.endAsk(false)
@@ -1735,6 +1742,11 @@ func (w *worker) run() {
 	}
 	for {
 		w.finishPendingStatusRelease()
+		input := w.input
+		if w.autoSessionNameInputPending {
+			// Preserve FIFO while the cancelled maintenance call releases its lane.
+			input = nil
+		}
 		var events <-chan json.RawMessage
 		var done <-chan struct{}
 		if client, ok := w.runtimeClient(); ok && w.rpcExitPendingClientID != client.ID() {
@@ -1751,7 +1763,7 @@ func (w *worker) run() {
 		case result := <-w.forgetResults:
 			w.forgetFinished(result)
 			continue
-		case in := <-w.input:
+		case in := <-input:
 			w.handle(in)
 			w.dispatch()
 			continue
@@ -1850,7 +1862,7 @@ func (w *worker) run() {
 			w.forgetBinding(request)
 		case result := <-w.forgetResults:
 			w.forgetFinished(result)
-		case in := <-w.input:
+		case in := <-input:
 			w.handle(in)
 		case raw, ok := <-events:
 			if !ok {
@@ -1906,6 +1918,15 @@ func (w *worker) run() {
 }
 
 func (w *worker) operationFinished(result operationResult) {
+	if result.kind == "auto_session_name" {
+		w.autoSessionNameFinished(result)
+		return
+	}
+	if result.kind == "name" {
+		if operation, ok := result.meta.(*sessionNameOperation); ok && operation != nil && operation.barrierConfirmed && w.autoSessionNameFence == operation.fence {
+			w.autoSessionNameFence = nil
+		}
+	}
 	if result.kind == "reply_usage" {
 		w.replyUsageFinished(result)
 		return
@@ -2150,6 +2171,11 @@ func (w *worker) operationFinished(result operationResult) {
 // Callers reusing the worker must clear its task fields separately.
 func (w *worker) teardownWorker(releaseSlot bool) {
 	defer w.beginConsumerPhase("runtime", "teardown_worker").end()
+	if w.autoSessionNameInputPending {
+		w.mark(w.autoSessionNameInput.id, store.InboxCancelled)
+		w.autoSessionNameInput = incoming{}
+		w.autoSessionNameInputPending = false
+	}
 	if w.migrationRun != nil {
 		w.cancelMigration("shutdown", false)
 	}
@@ -2549,6 +2575,10 @@ func (w *worker) dispatchRPCOperation() {
 func (w *worker) operationReturned(result operationResult) {
 	defer w.beginConsumerPhase("operation", "operation_returned").end()
 	defer w.withFinalAction(result.finalAction)()
+	if result.kind == "auto_session_name_state" {
+		w.autoSessionNameChecked(result)
+		return
+	}
 	if w.askOperationFinished(result) {
 		return
 	}
@@ -2575,10 +2605,13 @@ func (w *worker) operationReturned(result operationResult) {
 			w.rpcExitPendingClientID = 0
 		}
 	}
+	if result.kind == "auto_session_name" {
+		w.resumeAutoSessionNameInput()
+	}
 	w.dispatchRPCOperation()
 }
 
-func (w *worker) beginControl(kind string, call func(*omp.Client, context.Context) (json.RawMessage, error), message string) bool {
+func (w *worker) beginControl(kind string, call func(*omp.Client, context.Context) (json.RawMessage, error), message string, metadata ...any) bool {
 	if w.controlInProgress() {
 		w.say(w.tr(i18n.Msg.SessionOperationStillLoading))
 		return false
@@ -2599,7 +2632,7 @@ func (w *worker) beginControl(kind string, call func(*omp.Client, context.Contex
 	}
 	w.startOperation(kind, client, func(ctx context.Context) (json.RawMessage, error) {
 		return call(client, ctx)
-	}, 0, message)
+	}, 0, message, metadata...)
 	return true
 }
 
@@ -3010,6 +3043,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 		return w.tr(i18n.Msg.CannotRegisterTelegramAttachmentDeliveryInstanceClosed)
 	}
 	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, SessionID: info.ID, Generation: nextGeneration, LastUsedAt: old.LastUsedAt, Running: true}
+	binding.AutoSessionNamePending = !resume && !w.restoring && w.b.cfg.AutoSessionName
 
 	w.b.sessionMu.Lock()
 	if w.runtimeResuming {
@@ -3118,6 +3152,10 @@ func (w *worker) handle(in incoming) {
 		w.mark(in.id, "ignored")
 		return
 	}
+	if w.deferAutoSessionNameInput(in) {
+		return
+	}
+	w.cancelAutoSessionName()
 	w.cancelArgsApply(true)
 	w.flushReplyStatus()
 	w.statusReleaseClientID = 0
@@ -3308,18 +3346,7 @@ func (w *worker) handleSlash(in incoming, text string) {
 	case "/title":
 		w.renameTopicTitle(arg)
 	case "/name":
-		if arg == "" {
-			w.say(w.tr(i18n.Msg.UsageNameSessionTitle))
-			return
-		}
-		if w.exportingSession != "" {
-			w.say(w.tr(i18n.Msg.WaitCurrentSessionExportFinishBeforeChangingName))
-			return
-		}
-		name := menuText(arg, 160)
-		w.beginControl("name", func(client *omp.Client, ctx context.Context) (json.RawMessage, error) {
-			return client.Call(ctx, "set_session_name", map[string]any{"name": arg})
-		}, w.tr(i18n.Msg.SessionNamed, name))
+		w.beginSessionName(arg)
 	case "/model":
 		if arg == "" {
 			w.showModelPicker(in.msg.From.ID)
@@ -3486,6 +3513,7 @@ func promptInlineCount(message string, images []media.Image, limit int) (int, bo
 
 func (w *worker) dispatch() {
 	defer w.beginConsumerPhase("dispatch", "dispatch").end()
+	defer w.dispatchAutoSessionName()
 	w.dispatchDeferredSteers()
 	if !w.canDispatch() {
 		return
@@ -3821,6 +3849,9 @@ func (w *worker) finishResult(localOnly bool) {
 				w.cancel()
 			}
 			return
+		}
+		if !localOnly && w.activeInputKind == queuedPrompt && !w.research.root && w.b.cfg.AutoSessionName && w.binding.AutoSessionNamePending {
+			w.autoSessionNameReady = true
 		}
 		if localOnly && !w.hasAssistantBody() {
 			if !w.retirePreview(0, 0, 0) {

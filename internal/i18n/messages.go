@@ -8,6 +8,7 @@ type sessionMessages struct {
 	Label                Message
 	RestoreFailed        Message
 	DefaultModelFallback Message
+	AutoNameFailed       Message
 }
 
 type queueMessages struct {
@@ -551,6 +552,7 @@ var Msg = struct {
 		Label:                message("Session", "会话"),
 		RestoreFailed:        message("Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session.", "无法恢复已保存的 omp 会话. 会话文件或工作目录不可用. 未创建替代会话; 使用 /resume 选择会话."),
 		DefaultModelFallback: message("The saved model is unavailable. The session was restored with the OMP default model.", "保存的模型不可用. 已使用 OMP 默认模型恢复会话."),
+		AutoNameFailed:       message("Automatic session naming was skipped because its state could not be saved. Your task result is saved and the session remains available. Naming will be checked again after the next successful ordinary task.", "自动命名状态保存失败, 已跳过本次命名. 任务结果已保存, Session 仍可使用. 下一次普通任务成功后会重新检查."),
 	},
 	Queue: queueMessages{
 		Full:      message("The queue is full. This message was not submitted.", "队列已满. 此消息未提交."),

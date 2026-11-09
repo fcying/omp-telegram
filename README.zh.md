@@ -108,6 +108,7 @@ deny = ["OMP_TELEGRAM_BOT_TOKEN"]
 | `omp.args` | 按顺序排列的 OMP 启动参数预设. 默认只有一个可选的 `OMP_TELEGRAM_ARGS` 预设. 旧的字符串格式仍作为单个预设接受. |
 | `omp.args_labels` | 可选的 Telegram 预设标签, 每个预设一个; 无效标签回退为 `Preset N`. 标签对能查看对话的人可见, 不要填写凭据. |
 | `omp.migration_extension` | 为所有参数预设在每次 OMP 启动时加载内嵌迁移 Extension, 包括 resume. 默认 `false`, 无需单独安装 Extension. |
+| `omp.auto_session_name` | 显式启用新建 session 的一次原生 `/rename` 尝试. 默认 `false`; 可能产生额外模型调用与费用. 见下文. |
 | `[sub2api]` | 可选的 bridge 专用上游额度: `base_url`, `api_key` 和精确 OMP `providers`. 全空关闭, 部分配置报错. 见 [sub2api 上游额度](#sub2api-上游额度). |
 | `sub2api.extension` | 为所有参数预设启用内嵌 sub2api 额度 Extension. 默认 `false`; 启用额度源时必须显式设为 `true`. |
 | `[omp.environment]` | 可选的子进程环境策略. 默认 `mode = "denylist"` 会传递当前及未来新增的服务环境变量, 只排除显式列入 `deny` 的名称. 随附的 `config.toml` 设置了 `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` 只传递列出且已存在的变量. |
@@ -120,6 +121,12 @@ deny = ["OMP_TELEGRAM_BOT_TOKEN"]
 | `logging.level` | 全局日志级别: `debug`, `info`, `warn` 或 `error`. 默认 `info`. |
 | `logging.format` | 日志格式: `text` 或 `json`. 默认 `text`. |
 | `[logging.component_levels]` | 可选的组件级别覆盖: `daemon`, `bridge`, `rpc`, `telegram`, `store` 和 `media`. |
+
+设置 `omp.auto_session_name = true` 后, 仅新建 session 有资格: 首个普通成功任务的 assistant 正文写入 outbox 后, 触发一次原生 `/rename`. 不覆盖已有 name, 不修改 Telegram topic 标题, 不补命名历史 session (包括 resume, fork 和 migrate). 自动命名尽力而为, 可能产生额外模型费用, 失败不保证生成标题; 可手动使用 `/name <title>` 或原生 `/rename`.
+
+如果自动命名状态保存失败, Bot 会通知本次命名已跳过; 任务结果仍已保存, Session 仍可使用. 仅在下一次普通任务成功后重新检查命名.
+
+如果 `/name` 无法确认先前的自动命名已通过原生输入处理, 会回报修改未确认, 不写入请求的名称. 若持续失败, 使用 `/close` 后 `/resume` 重新连接, 再重试 `/name`.
 
 `omp.args` 每项都是一套完整参数预设, 支持 shell-style 引号分组, 但不经过 shell 执行. 除下述保存模型恢复回退外, 只有显式参数或用户命令才会改变 OMP 配置.
 

@@ -38,7 +38,8 @@ func requireNoActivityTable(t *testing.T, s *Store) {
 
 func restoreProgressSchema24(t *testing.T, s *Store) {
 	t.Helper()
-	_, err := s.DB.Exec(`ALTER TABLE topic_names DROP COLUMN explicit;
+	_, err := s.DB.Exec(`ALTER TABLE bindings DROP COLUMN auto_session_name_pending;
+ALTER TABLE topic_names DROP COLUMN explicit;
 ALTER TABLE progress_messages DROP COLUMN retired;
 ALTER TABLE progress_messages DROP COLUMN first_outbox_id;
 ALTER TABLE progress_messages DROP COLUMN last_outbox_id;`)
@@ -47,7 +48,8 @@ ALTER TABLE progress_messages DROP COLUMN last_outbox_id;`)
 
 func restoreLegacyProgressSchema(t *testing.T, s *Store) {
 	t.Helper()
-	_, err := s.DB.Exec(`ALTER TABLE topic_names DROP COLUMN explicit;
+	_, err := s.DB.Exec(`ALTER TABLE bindings DROP COLUMN auto_session_name_pending;
+ALTER TABLE topic_names DROP COLUMN explicit;
 ALTER TABLE inbox ADD COLUMN progress_message_id INTEGER NOT NULL DEFAULT 0;
 UPDATE inbox SET progress_message_id=COALESCE((SELECT MAX(message_id) FROM progress_messages WHERE inbox_id=inbox.id),0);
 DROP TABLE progress_messages;

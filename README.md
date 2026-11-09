@@ -108,6 +108,7 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `omp.args` | Ordered OMP startup presets. Defaults to one optional `OMP_TELEGRAM_ARGS` preset. A legacy scalar string is accepted as one preset. |
 | `omp.args_labels` | Optional Telegram picker labels, one per preset; invalid labels fall back to `Preset N`. Labels are visible in the conversation, so never put credentials in them. |
 | `omp.migration_extension` | Load the bundled migration Extension on every OMP startup, including resume, for all argument presets. Default: `false`. No separate Extension installation is required. |
+| `omp.auto_session_name` | Opt in to one native `/rename` attempt for newly created sessions. Default: `false`; may incur extra model calls and cost. See below. |
 | `[sub2api]` | Optional bridge-only upstream quota: `base_url`, `api_key`, and exact OMP `providers`. All empty disables; partial configuration fails. See [sub2api upstream quota](#sub2api-upstream-quota). |
 | `sub2api.extension` | Enable the bundled sub2api quota Extension for all argument presets. Default: `false`; required when the quota source is enabled. |
 | `[omp.environment]` | Optional child environment policy. Default `mode = "denylist"` passes all present and future service variables except names explicitly listed in `deny`. The bundled `config.toml` sets `deny = ["OMP_TELEGRAM_BOT_TOKEN"]`. `mode = "allowlist"` passes only listed, present variables. |
@@ -120,6 +121,12 @@ Both `telegram.allowed_users` and `telegram.allowed_chats` are required. An upda
 | `logging.level` | Global log level: `debug`, `info`, `warn`, or `error`. Default: `info`. |
 | `logging.format` | Log format: `text` or `json`. Default: `text`. |
 | `[logging.component_levels]` | Optional per-component levels for `daemon`, `bridge`, `rpc`, `telegram`, `store`, and `media`. |
+
+With `omp.auto_session_name = true`, only newly created sessions qualify: the first successful ordinary task triggers a one-shot native `/rename` after its assistant body is committed to the outbox. Existing names are not overwritten, Telegram topic titles are unchanged, and historical sessions are not backfilled (including resume, fork, and migration). Naming is best-effort, may incur extra model fees, and does not guarantee a title on failure; use `/name <title>` or native `/rename` manually instead.
+
+If automatic naming state cannot be saved, the bot reports that naming was skipped; the task result stays saved and the session remains usable. Naming is checked again only after another successful ordinary task.
+
+If `/name` cannot confirm that a preceding automatic rename has passed native input handling, it reports an unconfirmed change without writing the requested name. If this persists, use `/close` followed by `/resume` to reconnect before retrying `/name`.
 
 Each `omp.args` item is a complete argument preset, with shell-style quoting but no shell execution. OMP configuration changes only through explicit arguments or user commands, apart from the saved-model recovery fallback described below.
 

@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 26
+const schemaVersion = 27
 const messageCleanupBatchSize = 1000
 const pendingIDQueryBatchSize = 500
 
@@ -64,6 +64,7 @@ type Binding struct {
 	LastUsedAt                    int64
 	Running                       bool
 	Interrupted                   bool
+	AutoSessionNamePending        bool
 }
 type BindingListEntry struct {
 	Binding     *Binding
@@ -488,6 +489,12 @@ ALTER TABLE progress_messages ADD COLUMN last_outbox_id INTEGER NOT NULL DEFAULT
 		}
 		version = 26
 	}
+	if version == 26 {
+		if _, e = tx.Exec("ALTER TABLE bindings ADD COLUMN auto_session_name_pending INTEGER NOT NULL DEFAULT 0 CHECK(auto_session_name_pending IN (0,1))"); e != nil {
+			return e
+		}
+		version = 27
+	}
 	if e = backfillProgressChats(tx); e != nil {
 		return e
 	}
@@ -866,14 +873,31 @@ func (s *Store) Submit(id, replyTo int64) error {
 }
 func (s *Store) Binding(bot, chat, thread int64) (Binding, error) {
 	b := Binding{Bot: bot, Chat: chat, Thread: thread}
-	err := s.DB.QueryRow("SELECT workspace,session,session_id,generation,last_used_at,running,interrupted FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.LastUsedAt, &b.Running, &b.Interrupted)
+	err := s.DB.QueryRow("SELECT workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending FROM bindings WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.LastUsedAt, &b.Running, &b.Interrupted, &b.AutoSessionNamePending)
 	return b, err
 }
 
 func scanBinding(scanner interface{ Scan(...any) error }) (Binding, error) {
 	var b Binding
-	err := scanner.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.LastUsedAt, &b.Running, &b.Interrupted)
+	err := scanner.Scan(&b.Bot, &b.Chat, &b.Thread, &b.Workspace, &b.Session, &b.SessionID, &b.Generation, &b.LastUsedAt, &b.Running, &b.Interrupted, &b.AutoSessionNamePending)
 	return b, err
+}
+
+// ConsumeAutoSessionName claims the current binding's one-shot naming eligibility.
+func (s *Store) ConsumeAutoSessionName(b Binding) (bool, error) {
+	if !b.AutoSessionNamePending {
+		return false, nil
+	}
+	result, err := s.DB.Exec(`UPDATE bindings SET auto_session_name_pending=0
+WHERE bot=? AND chat=? AND thread=? AND generation=? AND session_id=? AND session=? AND workspace=? AND auto_session_name_pending=1
+AND NOT EXISTS (SELECT 1 FROM migrations WHERE bot=? AND chat=? AND thread=?)
+AND NOT EXISTS (SELECT 1 FROM startup_intents WHERE bot=? AND chat=? AND thread=?)`,
+		b.Bot, b.Chat, b.Thread, b.Generation, b.SessionID, b.Session, b.Workspace, b.Bot, b.Chat, b.Thread, b.Bot, b.Chat, b.Thread)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
 }
 
 func (s *Store) PinnedSessions(bot, chat, thread int64, workspace string) (map[string]struct{}, error) {
@@ -1015,14 +1039,16 @@ func (s *Store) Save(b Binding) error {
 	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,session_id=excluded.session_id,generation=excluded.generation,last_used_at=excluded.last_used_at,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.SessionID, b.Generation, b.LastUsedAt, b.Running, b.Interrupted); err != nil {
+	if _, err = tx.Exec(`INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,session_id=excluded.session_id,generation=excluded.generation,last_used_at=excluded.last_used_at,running=excluded.running,interrupted=excluded.interrupted,
+auto_session_name_pending=CASE WHEN bindings.workspace=excluded.workspace AND bindings.session=excluded.session AND bindings.session_id=excluded.session_id AND bindings.generation=excluded.generation THEN bindings.auto_session_name_pending ELSE 0 END`, b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.SessionID, b.Generation, b.LastUsedAt, b.Running, b.Interrupted, b.AutoSessionNamePending); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func (s *Store) BindingsForChat(bot, chat int64) ([]BindingListEntry, error) {
-	rows, err := s.DB.Query("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted FROM bindings WHERE bot=? AND chat=? ORDER BY thread", bot, chat)
+	rows, err := s.DB.Query("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending FROM bindings WHERE bot=? AND chat=? ORDER BY thread", bot, chat)
 	if err != nil {
 		return nil, err
 	}
@@ -1120,7 +1146,7 @@ func (s *Store) DeleteClosedBinding(bot, chat, thread, generation int64) (bool, 
 }
 
 func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
-	rows, err := s.DB.Query("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted FROM bindings WHERE bot=? AND running=1 ORDER BY chat,thread", bot)
+	rows, err := s.DB.Query("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending FROM bindings WHERE bot=? AND running=1 ORDER BY chat,thread", bot)
 	if err != nil {
 		return nil, err
 	}
@@ -1392,11 +1418,15 @@ func (s *Store) CommitStart(b Binding) error {
 	}
 	defer tx.Rollback()
 	var generation int64
-	if err = tx.QueryRow("SELECT generation FROM startup_intents WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread).Scan(&generation); err != nil {
+	var kind string
+	if err = tx.QueryRow("SELECT generation,kind FROM startup_intents WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread).Scan(&generation, &kind); err != nil {
 		return err
 	}
 	if generation != b.Generation {
 		return errors.New("startup intent changed")
+	}
+	if kind != "new" {
+		b.AutoSessionNamePending = false
 	}
 	lastUsedAt := b.LastUsedAt
 	if err = tx.QueryRow("SELECT last_used_at FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread).Scan(&lastUsedAt); err != nil && err != sql.ErrNoRows {
@@ -1405,7 +1435,7 @@ func (s *Store) CommitStart(b Binding) error {
 	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,session_id=excluded.session_id,generation=excluded.generation,last_used_at=excluded.last_used_at,running=excluded.running,interrupted=excluded.interrupted", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.SessionID, b.Generation, lastUsedAt, b.Running, b.Interrupted); err != nil {
+	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,session_id=excluded.session_id,generation=excluded.generation,last_used_at=excluded.last_used_at,running=excluded.running,interrupted=excluded.interrupted,auto_session_name_pending=excluded.auto_session_name_pending", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.SessionID, b.Generation, lastUsedAt, b.Running, b.Interrupted, b.AutoSessionNamePending); err != nil {
 		return err
 	}
 	if _, err = tx.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", b.Bot, b.Chat, b.Thread, b.Generation); err != nil {
