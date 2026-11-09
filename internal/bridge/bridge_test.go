@@ -401,6 +401,10 @@ func recordBridgeFixtureTrace(name string, value any) {
 }
 
 func TestMain(m *testing.M) {
+	admissionBinary := os.Getenv("OMP_TELEGRAM_ADMISSION_BINARY")
+	if admissionBinary != "" {
+		runRealOMPAutoNameAdmissionProxy(admissionBinary)
+	}
 	if len(os.Args) == 5 && os.Args[1] == "config" && os.Args[2] == "get" && os.Args[4] == "--json" {
 		recordBridgeFixtureTrace("OMP_TELEGRAM_FIXTURE_MODEL_TRACE", map[string]string{"key": os.Args[3], "config_files": os.Getenv("PI_CONFIG_FILES")})
 		var value any
@@ -544,6 +548,9 @@ func TestMain(m *testing.M) {
 		var heldNativeLocalID string
 		fastMode := os.Getenv("OMP_TELEGRAM_FIXTURE_FAST_MODE")
 		var heldFastAck map[string]any
+		autoNameStateMode, autoNameMode, autoNameBarrierMode := "", "", ""
+		var heldAutoNameAck map[string]any
+		var heldAutoNameBarrier map[string]any
 		if nativeMode != "" {
 			nativeCommands = []map[string]any{{"name": "native_local", "source": "builtin"}, {"name": "native_agent", "source": "file"}, {"name": "status", "source": "builtin"}, {"name": "move", "source": "builtin"}, {"name": "wt", "aliases": []string{"worktree"}, "source": "builtin"}, {"name": "session", "source": "builtin"}}
 			nativeCommands = append(nativeCommands, map[string]any{"name": "plugin:command", "source": "file"}, map[string]any{"name": "foo", "source": "file"}, map[string]any{"name": "foo:bar", "source": "file"}, map[string]any{"name": "extension_switch", "aliases": []string{"extension_alias", "extension:session"}, "source": "extension"})
@@ -571,6 +578,9 @@ func TestMain(m *testing.M) {
 				source = strings.TrimPrefix(nativeMode, "fast-")
 			}
 			nativeCommands = append(nativeCommands, map[string]any{"name": "fast", "source": source})
+		}
+		if nativeMode == "auto-name" {
+			nativeCommands = append(nativeCommands, map[string]any{"name": "rename", "source": "builtin"})
 		}
 		usageMode := os.Getenv("OMP_TELEGRAM_FIXTURE_USAGE_MODE")
 		if usageMode != "" && usageMode != "unavailable" {
@@ -823,6 +833,33 @@ func TestMain(m *testing.M) {
 				if active, ok := cmd["streaming"].(bool); ok {
 					streaming.Store(active)
 				}
+			case "fixture_auto_name":
+				if mode, ok := cmd["stateMode"].(string); ok {
+					autoNameStateMode = mode
+				}
+				if mode, ok := cmd["renameMode"].(string); ok {
+					autoNameMode = mode
+				}
+				if mode, ok := cmd["barrierMode"].(string); ok {
+					autoNameBarrierMode = mode
+				}
+				if cmd["release"] == true && heldAutoNameAck != nil {
+					if autoNameMode == "hold-admission" {
+						sessionName = "Fixture task title"
+						emit(map[string]any{"type": "command_output", "text": "Session renamed to " + sessionName + "."})
+					}
+					emit(heldAutoNameAck)
+					heldAutoNameAck = nil
+					if heldAutoNameBarrier != nil {
+						cwd, err := os.Getwd()
+						if err != nil {
+							os.Exit(2)
+						}
+						emit(map[string]any{"type": "command_output", "text": fmt.Sprintf("Session: %s\nTitle: %s\nCWD: %s", sessionID, sessionName, cwd)})
+						emit(heldAutoNameBarrier)
+						heldAutoNameBarrier = nil
+					}
+				}
 			case "fixture_get_state_update":
 				// Count only subsequent get_state calls in this fixture process.
 				getStateUpdateRemaining = 1
@@ -949,6 +986,17 @@ func TestMain(m *testing.M) {
 					}
 				}
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies, "fixtureUIValue": uiValue}
+				switch autoNameStateMode {
+				case "reject":
+					resp["success"], resp["error"] = false, "PRIVATE_STATE_REJECTION"
+				case "wrong-session":
+					resp["data"].(map[string]any)["sessionId"] = "wrong-session"
+				case "malformed-name":
+					resp["data"].(map[string]any)["sessionName"] = 1
+				case "hold":
+					recordFixtureRPCTrace("auto_name_state_waiting", "")
+					continue
+				}
 				resp["data"].(map[string]any)["fixtureUIResponses"] = uiResponses
 				resp["data"].(map[string]any)["fixtureAskDialogEnabled"] = askDialogEnabled
 				if contextUsage != nil {
@@ -1106,6 +1154,22 @@ func TestMain(m *testing.M) {
 					continue
 				}
 				recordFixtureRPCTrace(typ, text)
+				if text == "/rename" && nativeMode == "auto-name" {
+					resp["data"] = map[string]any{"agentInvoked": false}
+					switch autoNameMode {
+					case "reject":
+						resp["success"], resp["error"] = false, "PRIVATE_RENAME_REJECTION"
+					case "hold", "hold-admission":
+						heldAutoNameAck = resp
+						recordFixtureRPCTrace("auto_name_waiting", "")
+						continue
+					default:
+						sessionName = "Fixture task title"
+						emit(map[string]any{"type": "command_output", "text": "Session renamed to " + sessionName + "."})
+					}
+					emit(resp)
+					continue
+				}
 				if text == "/fast" || strings.HasPrefix(text, "/fast ") {
 					if _, steered := cmd["streamingBehavior"]; steered {
 						os.Exit(2)
@@ -1288,6 +1352,17 @@ func TestMain(m *testing.M) {
 					continue
 				}
 				if text == "/session info" || nativeMode != "" && text == "/session:info" {
+					if autoNameBarrierMode == "reject" {
+						resp["success"], resp["error"] = false, "PRIVATE_BARRIER_REJECTION"
+						emit(resp)
+						continue
+					}
+					if heldAutoNameAck != nil && autoNameMode == "hold-admission" {
+						resp["data"] = map[string]any{"agentInvoked": false}
+						heldAutoNameBarrier = resp
+						recordFixtureRPCTrace("auto_name_barrier_waiting", "")
+						continue
+					}
 					cwd, err := os.Getwd()
 					if err != nil {
 						os.Exit(2)

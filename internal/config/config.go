@@ -30,6 +30,7 @@ type Config struct {
 	OMPArgs               [][]string
 	OMPArgsLabels         []string
 	OMPArgsFingerprint    string
+	AutoSessionName       bool
 	OMPEnvironment        omp.Environment
 	DataDir               string
 	MaxWorkers            int
@@ -84,6 +85,7 @@ type ompFileConfig struct {
 	Args               any                      `toml:"args"`
 	ArgsLabels         []string                 `toml:"args_labels"`
 	MigrationExtension bool                     `toml:"migration_extension"`
+	AutoSessionName    bool                     `toml:"auto_session_name"`
 	Environment        ompEnvironmentFileConfig `toml:"environment"`
 }
 
@@ -290,6 +292,7 @@ func load(path, baseDir string) (Config, error) {
 		c.OMPArgs[i] = args
 	}
 	c.OMPArgsLabels = append([]string(nil), raw.OMP.ArgsLabels...)
+	c.AutoSessionName = raw.OMP.AutoSessionName
 	mode := raw.OMP.Environment.Mode
 	var allow []string
 	if raw.OMP.Environment.Allow != nil {

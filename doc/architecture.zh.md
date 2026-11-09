@@ -719,6 +719,18 @@ Worker teardown 使等待中的 binding-forget confirmation 失效, 但不提前
 
 `/name <title>` 通过控制通道调用原生 `set_session_name`, 可在任务活跃时执行, 不创建新的模型轮次, 不替换身份, 不更换工作目录, 不打断排队工作. 标题由 OMP 持久化, `/status` 读回. 它不重命名 Telegram topic. 仅未绑定 topic 中首次成功 `/new` 会尽力异步将 topic 标题设为工作目录 basename; 失败不撤销启动.
 
+`omp.auto_session_name` 默认 `false`. 开启后, 新建 session 提交时授予持久化 `AutoSessionNamePending` 资格; resume, fork 和 migrate 不授予资格, 不补历史. Worker 重建保留未消费资格. 只有普通任务成功且 assistant 正文已提交到 outbox 后, 才可运行低优先级专用 `auto_session_name` operation. 它不拥有 `active`, `turn` 或 `controlOp`, 不创建普通 queue 条目.
+
+同一个 RPC operation 先执行 `get_state`, 再请求 worker actor 重新验证捕获的 Client, catalog epoch, binding generation/路径/workspace 和原生 session ID, 并解码 `sessionName`. Actor 按完整身份 CAS 消费持久化资格后才允许 `prompt("/rename")`; 已有名称时消费资格但不发 prompt. CAS 失败或未命中绝不提交命名. State 查询或资格写入失败不消费资格, 仅在后续普通成功任务后允许重查; 一旦消费不再重试命名. 资格写入失败会记录错误并排队本地化 Telegram 通知, 不终止 Bridge 或取消 worker; 通知持久化也仅尽力而为. Prompt ACK 只表示接受, 不表示生成完成, 因此不持有 lane 等待标题生成. Bridge 不复制或持久化 name.
+
+该 operation 仅在用户任务, 控制及排队 RPC 工作优先处理后启动, deadline 为 3 秒, 新用户输入或 runtime teardown 会取消它. 输入抢占时, actor 保留这一条尚未处理的消息或 callback, 暂停读取 mailbox, 直到取消的 operation 返回; 随后在派发排队 RPC 前恢复正常输入处理, 避免 `/args` 和 `/migrate` 将已取消的维护请求误判为 busy. Teardown 会取消保留输入, 不提交它. Actor 握手在状态检查与提交之间保留同一 RPC lane, RPC goroutine 不读取可变 worker 字段. 命名失败不进入普通 prompt 失败分支, 不退役 runtime. 提交前消费资格有意接受崩溃后漏命名的窗口, 避免重复模型调用.
+
+本地取消不会撤销已经发送的原生请求. Actor 从授权提交时保留 runtime 级 admission fence, 直到收到明确 `agentInvoked:false` ACK, 有序 barrier 成功或 runtime teardown. 后续 `/name` 遇到未解除的 fence 时, 先执行现有本地 `/session info` 元数据查询, 通过与 `/rename` 相同的原生 input gate; 验证 builtin 来源和绑定身份后才调用 `set_session_name`. 即使异步 input hook 延迟 `/rename` admission, 也能保证原生 title revision 预留先于手动写入. Barrier 失败不写名称, 回报修改未确认, 不退役 runtime, 不重放命名.
+
+自动命名提交 operation 返回前禁止空闲回收 runtime, 包括取消结果的交接窗口. 不等待原生后台标题生成完成.
+
+真实 OMP compatibility smoke 必须在 **18.18.1** baseline 验证原生 name revision 保护, 确保延迟的自动生成不会覆盖稍后的手动命名, 包括受控 input hook 延迟 builtin admission 前的取消. 仅 bridge state 检查或 prompt ACK 不能证明此保护成立.
+
 `/title <title>` 是直接调用 Telegram 话题编辑 API 的 Bridge 命令, 独立于 OMP 及其 RPC/prompt 通道, 迁移输入锁定时也可执行. 它不启动或恢复 OMP, 不修改 session binding. 共享 Telegram client 对负 chat ID 且 thread ID 为 1 的 supergroup General 调用 `editGeneralForumTopic`, 不传 `message_thread_id`; 其他话题, 包括私聊中 ID 为 1 的 topic, 使用 `editForumTopic`. General 始终需要管理员身份及 `can_manage_topics`, 不适用话题创建者例外. 改名复用异步话题名预留及结算, 原样保留指定标题, 不截断也不添加重名后缀. 每个 worker 仅允许一次在途改名; 重叠的 `/title` 请求会被拒绝, 自动命名会跳过在途的手动改名. 显式请求确认后, 在结算事务中原子设置 `topic_names.explicit`, 即使期间已有更新的标题观察也会保留该优先级. 自动预留在自身事务内检查此标记并跳过话题, 因此启动完成, worker 重建及重启均不会覆盖已确认的显式标题. HTTP deadline 仍为 10 秒. 显式命令回执仅报告 API 接受, 失败或结果不确定, 不保证客户端同步; 其归属是 topic, 而非 OMP generation.
 
 Topic 自动命名在异步 API 调用前原子预留标题. 优先使用无后缀 basename; 同一 bot/chat 内名称精确冲突时, 仅为新 Topic 添加 ` [thread ID]`. 如果候选名称仍被占用, 递增数字后缀. UTF-16 截断保留完整后缀. `topic_names` 保存已知标题, 与逐请求的 `topic_name_reservations` 分开; 查重同时考虑两者. 预留跨重启保留, 并发 worker 串行分配标题. 授权收到的 `forum_topic_created` 和非空 `forum_topic_edited.name` 更新已知标题, 不作为模型输入, 也不释放在途请求的名称占用. 仅图标编辑不清空名称. 记录独立于 session binding, 不随 Session 历史删除. 不按 workspace 推测回填, 不声称掌握全部 Telegram Topic; 缺失的外部编辑/删除事件可能留下过时记录.
@@ -788,7 +800,7 @@ Provider 能力, role 默认值, effective thinking 调整和 fast service tier 
 
 | 查询/结果 | 策略 |
 | --- | --- |
-| `/session info` 提交后未完整完成 | 元数据通道不可用; 启动身份验证失败, 桥接层关闭失败运行时. |
+| `/session info` 提交后未完整完成 | 元数据通道不可用. 启动身份验证会关闭失败运行时; 手动命名的排序 barrier 则拒绝名称写入并保留 runtime. 显式 `/close` 后 `/resume` 可恢复元数据查询. |
 | `/model @role` 任一修改/验证步骤未确认 | 元数据不可用且客户端停止; 不宣称切换成功. |
 | `/effort` 明确被拒绝 | 安全的查询失败; 元数据通道与可用客户端保持可用. |
 | `/effort` 已确认本地执行, 但输出缺失, 畸形或超过 4096 字节 | 有界的安全查询失败; 释放元数据通道, 不毒化后续 session/role 查询. |
@@ -818,12 +830,12 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 
 ### Schema 与迁移边界
 
-`PRAGMA user_version` 当前为 **24**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-23 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录, 版本 22 增加独立 progress/header 交付, 版本 23 增加 header 可编辑性, 版本 24 增加持久化完成快捷动作和后续输入请求 metadata. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
+`PRAGMA user_version` 当前为 **27**, 与应用版本独立变化. 新空库在一个事务中创建 schema, 索引和版本号. 版本 1-26 按内置迁移链升级; 版本 19 增加持久化上下文迁移, 版本 20 增加全局界面语言单例, 版本 21 增加用于自动命名条件后缀的 Topic 标题记录, 版本 22 增加独立 progress/header 交付, 版本 23 增加 header 可编辑性, 版本 24 增加持久化完成快捷动作和后续输入请求 metadata, 版本 27 增加原生 session 自动命名 pending 标记. 已有内容但没有版本的数据库, 负版本和未来版本均拒绝打开. Schema 迁移, session ID 回填和在途状态整理在同一事务中提交.
 
 | 表 | 身份与保留内容 | 职责 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和下次 polling offset |
-| `bindings` | `(bot,chat,thread)`; workspace, 原生 session 路径/ID, generation, 最近使用时间, running/interrupted 标记 | 最后验证的逻辑 session binding; `running` 表示恢复资格, 不是实时 PID |
+| `bindings` | `(bot,chat,thread)`; workspace, 原生 session 路径/ID, generation, 最近使用时间, running/interrupted 标记, 自动命名 pending 标记 | 最后验证的逻辑 session binding; `running` 表示恢复资格, 不是实时 PID; pending 是一次性命名资格, 不是保存的标题 |
 | `startup_intents` | `(bot,chat,thread)`; new/resume 类型, workspace, session 目标, 下一代 generation, 创建时间 | 尚未提交的启动转换; 发布 binding, 归档旧 binding 和删除匹配 intent 在同一事务中完成 |
 | `migrations` | `(bot,chat,thread)` 和唯一操作 ID; 不可变源/配置, 阶段/错误, 源摘要 entry/hash, 可选候选身份, 原始 inbox | 持久迁移锁与显式恢复证据; 不保存摘要副本或 PID, 不自动过期 |
 | `history` | Bot/对话, workspace, session 路径, generation | 旧 binding 快照, 不是原生 session 索引或对话 transcript |
@@ -1021,6 +1033,7 @@ Assistant 正文断言独立读取持久化的 `outbox.text`, 不解析可选状
 
 - 共享 fake transport 状态和计数须与后台 UI 工作同步. 路由断言通过原始 Send 目标解析: Telegram 编辑携带 chat/message ID, 不携带 topic ID. 分别断言持久 session 身份和最终 runtime 释放, 不依赖瞬时连接标签.
 - Worker 仍运行时等待明确的有界结果. Runtime teardown 及等待常驻后台通道前先取消自有 context; 清理重试需要仍有效的 context. 不为停止后台工作而等待 fixture 自然到期.
+- 获取数据库或修改全局 HTTP transport 后立即独立注册 cleanup. 真实 OMP 关闭 helper 须先回收进程并等待事件读取结束, 再非 fatal 地报告关闭错误, 避免关闭失败跳过状态恢复.
 - 完整响应或持久状态转换完成后再检查重试状态, 随后显式推进 deadline. 不轮询瞬时状态或依赖睡眠跨越时钟边界. 注入故障时保留 request/session/epoch 围栏; 在 RPC 边界覆盖真实 deadline, 合并发现请求和迟到响应, 不缩短生产 deadline.
 
 仅 Linux 运行的 [`TestCrashRecovery`](../internal/bridge/crash_recovery_linux_test.go) 在三个同步断点向独立 daemon 子进程发送 `SIGKILL`: prompt 已提交但未收到确认, 本地 Telegram 服务端已接收发送但未返回响应, startup intent 已持久化但 binding 尚未提交. 每次崩溃后由新 daemon 打开同一数据库. 断言覆盖 uncertain 结算且不重放/重发, 排队任务取消, 已保存 session 身份保留, 以及启动中断后的显式取消/resume. 父进程通过只读连接观察 SQLite, 避免观察本身触发启动对账. 进程内独立 subreaper 在清理临时目录前终止并回收测试所属的 RPC fixture 子进程. 这些测试使用 RPC 子进程 fixture 和本地假 Telegram HTTP 服务, 不验证真实 OMP, provider 或线上 Bot API.
@@ -1035,11 +1048,13 @@ Assistant 正文断言独立读取持久化的 `outbox.text`, 不解析可选状
 just smoke-omp /absolute/path/to/omp
 ```
 
-Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行三个真实兼容测试. 未设置该变量时这些测试均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
+Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行真实兼容测试. 未设置该变量时这些测试均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
 
 [`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) 使用真实 worker 和 RPC client, 对接确定性的本地 OpenAI-compatible HTTP/SSE provider. 检查启动/catalog 和 host-tool 注册, prompt 接受与任务完成的区别, root 暂停期间的 fast 控制, 排队最终回复归属及后续请求实际携带的 `service_tier=priority`. 原生 `telegram_send` 调用/结果必须为原 topic 入队不可变 workspace 快照, 不宣称已交付. Stop 必须退役旧 runtime 并取消排队任务; 惰性 resume 必须保留 session 身份和原生上下文, 不重放任务. 已有迁移兼容测试继续独立检查原生 Extension/journal. 两者都不证明生产 provider 或线上 Bot API 兼容.
 
 [`TestRealOMPAskCompatibility`](../internal/bridge/ask_real_integration_test.go) 沿用相同隔离和本地 provider 模式, 执行真实原生 `ask` 工具调用. 组合多题的单选/多选/自定义答案, 以及明确选择的 `select`/`editor` 回退, 必须产生原 turn 的工具结果和最终回复, 且只有一条用户输入, 不新增 prompt/steer. 原生 Ask 等待期间的 Stop 必须退役 runtime, 取消 root 和 queued followup, 使旧按钮失效, 且不发起后续 provider 请求.
+
+[`TestRealOMPAutoSessionNameCompatibility`](../internal/bridge/auto_session_name_real_test.go) 使用独立本地标题模型, 检查原生后台 `/rename`, 手动命名优先级, session 切换/abort 隔离, ACP 持久化标题及恢复后的对话身份. 显式临时 `--session-dir` 与隔离的原生 cwd bucket 一致, 因为 ACP 列举不遍历任意自定义 session 目录.
 
 独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 支持手动和每周运行. 官方 standalone 资产下载到 runner 临时目录, 按 release 提供的 SHA-256 摘要校验, 并记录解析后的 release tag. 基线固定为 18.18.1; 候选默认为最新正式 release, 也可显式指定 tag. 两个矩阵结果独立可见, 候选失败不取消基线. 不改变发布 CI, 不安装或重启生产 daemon.
 

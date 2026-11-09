@@ -312,7 +312,7 @@ func TestExplicitTopicNameSurvivesSchemaUpgradeAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	requireStoreOK(t, s.ObserveTopicName(1, 2, 3, "existing title"))
-	_, err := s.DB.Exec("ALTER TABLE topic_names DROP COLUMN explicit; PRAGMA user_version=25")
+	_, err := s.DB.Exec("ALTER TABLE bindings DROP COLUMN auto_session_name_pending; ALTER TABLE topic_names DROP COLUMN explicit; PRAGMA user_version=25")
 	requireStoreOK(t, err)
 	requireStoreOK(t, s.Close())
 	s = openTestStore(t, dir)

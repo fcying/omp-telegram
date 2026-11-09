@@ -126,7 +126,8 @@ func (s *Store) PrepareMigration(m Migration) error {
 		return err
 	}
 	var source Binding
-	source, err = scanBinding(tx.QueryRow("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted FROM bindings WHERE bot=? AND chat=? AND thread=?", m.Source.Bot, m.Source.Chat, m.Source.Thread))
+	source, err = scanBinding(tx.QueryRow("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending FROM bindings WHERE bot=? AND chat=? AND thread=?", m.Source.Bot, m.Source.Chat, m.Source.Thread))
+	source.AutoSessionNamePending = m.Source.AutoSessionNamePending
 	if errors.Is(err, sql.ErrNoRows) || err == nil && source != m.Source {
 		return ErrStaleBinding
 	}
@@ -155,6 +156,9 @@ func (s *Store) PrepareMigration(m Migration) error {
 }
 
 func sameMigrationSource(a, b Migration) bool {
+	// Naming eligibility belongs to the binding, not the migration snapshot.
+	a.Source.AutoSessionNamePending = false
+	b.Source.AutoSessionNamePending = false
 	return a.ID == b.ID && a.Source == b.Source && a.InboxID == b.InboxID && a.Provider == b.Provider && a.Model == b.Model && a.Thinking == b.Thinking && a.Fast == b.Fast && (a.CreatedAt == b.CreatedAt || b.CreatedAt == 0)
 }
 
@@ -233,9 +237,9 @@ func (s *Store) FailMigration(id, kind string) (Migration, error) {
 	return m, nil
 }
 
-// Interrupted is independent crash/stop bookkeeping, not migration identity.
+// Interrupted and naming eligibility are bookkeeping, not migration identity.
 func migrationSourceCAS(tx *sql.Tx, m Migration) error {
-	current, err := scanBinding(tx.QueryRow("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted FROM bindings WHERE bot=? AND chat=? AND thread=?", m.Source.Bot, m.Source.Chat, m.Source.Thread))
+	current, err := scanBinding(tx.QueryRow("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending FROM bindings WHERE bot=? AND chat=? AND thread=?", m.Source.Bot, m.Source.Chat, m.Source.Thread))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrStaleBinding
 	}
@@ -243,6 +247,7 @@ func migrationSourceCAS(tx *sql.Tx, m Migration) error {
 		return err
 	}
 	current.Interrupted = m.Source.Interrupted
+	current.AutoSessionNamePending = m.Source.AutoSessionNamePending
 	if current != m.Source {
 		return ErrStaleBinding
 	}
@@ -294,7 +299,7 @@ func (s *Store) publishMigration(m Migration, target Binding, notice string, rec
 	if _, err := tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", target.Bot, target.Chat, target.Thread); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("UPDATE bindings SET workspace=?,session=?,session_id=?,generation=?,last_used_at=?,running=?,interrupted=? WHERE bot=? AND chat=? AND thread=?", target.Workspace, target.Session, target.SessionID, target.Generation, target.LastUsedAt, target.Running, target.Interrupted, target.Bot, target.Chat, target.Thread); err != nil {
+	if _, err := tx.Exec("UPDATE bindings SET workspace=?,session=?,session_id=?,generation=?,last_used_at=?,running=?,interrupted=?,auto_session_name_pending=0 WHERE bot=? AND chat=? AND thread=?", target.Workspace, target.Session, target.SessionID, target.Generation, target.LastUsedAt, target.Running, target.Interrupted, target.Bot, target.Chat, target.Thread); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM migrations WHERE id=?", current.ID); err != nil {

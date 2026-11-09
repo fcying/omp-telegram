@@ -68,6 +68,9 @@ args = ["${OMP_TELEGRAM_ARGS}"]
 args_labels = ["Default"]
 # Load the bundled migration Extension for /migrate on every OMP startup.
 migration_extension = false
+# Opt in to native session auto-naming via /rename; may incur extra model calls/cost.
+# Disabled by default; no other default behavior changes.
+auto_session_name = false
 # Example custom preset: args = ['--config "${HOME}/.config/omp/telegram.yml" --model @default']
 
 [omp.environment]

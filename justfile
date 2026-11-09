@@ -45,7 +45,7 @@ smoke-omp binary:
         exit 1
     fi
     binary=$(realpath -- "$binary")
-    OMP_TELEGRAM_TEST_OMP="$binary" {{quote(just_executable())}} test -run '^TestRealOMP(Bridge|Migration|Ask)Compatibility$' -count=1 -v
+    OMP_TELEGRAM_TEST_OMP="$binary" {{quote(just_executable())}} test -run '^TestRealOMP(Bridge|Migration|Ask|AutoSessionName)Compatibility$' -count=1 -v
 
 # Run automated tests, race checks, and vet without starting Telegram polling.
 check:
