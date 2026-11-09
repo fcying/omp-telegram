@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -305,4 +306,34 @@ func TestTopicNameMultipleRequestsSettleIndependently(t *testing.T) {
 	requireTopicNameAvailability(t, s, "third", false)
 	requireStoreOK(t, s.ObserveTopicName(1, 2, 3, "fourth"))
 	requireTopicNameAvailability(t, s, "third", true)
+}
+
+func TestExplicitTopicNameSurvivesSchemaUpgradeAndReopen(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.ObserveTopicName(1, 2, 3, "existing title"))
+	_, err := s.DB.Exec("ALTER TABLE topic_names DROP COLUMN explicit; PRAGMA user_version=25")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	if title := topicNameState(t, s, 1, 2, 3); title != "existing title" {
+		t.Fatalf("schema upgrade changed the title: %q", title)
+	}
+	r, err := s.ReserveTopicName(1, 2, 3, "workspace")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.ReleaseTopicName(1, 2, 3, r))
+	r, err = s.ReserveExactTopicName(1, 2, 3, "Trading research")
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.ConfirmTopicName(1, 2, 3, r))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	_, err = s.ReserveTopicName(1, 2, 3, "workspace")
+	if !errors.Is(err, ErrTopicNameExplicit) {
+		t.Fatalf("reopened database allowed automatic overwrite: %v", err)
+	}
+	if title := topicNameState(t, s, 1, 2, 3); title != "Trading research" {
+		t.Fatalf("reopen changed the explicit title: %q", title)
+	}
+	_, err = s.ReserveTopicName(1, 2, 4, "workspace")
+	requireStoreOK(t, err)
 }

@@ -719,9 +719,11 @@ Worker teardown 使等待中的 binding-forget confirmation 失效, 但不提前
 
 `/name <title>` 通过控制通道调用原生 `set_session_name`, 可在任务活跃时执行, 不创建新的模型轮次, 不替换身份, 不更换工作目录, 不打断排队工作. 标题由 OMP 持久化, `/status` 读回. 它不重命名 Telegram topic. 仅未绑定 topic 中首次成功 `/new` 会尽力异步将 topic 标题设为工作目录 basename; 失败不撤销启动.
 
+`/title <title>` 是直接调用 Telegram 话题编辑 API 的 Bridge 命令, 独立于 OMP 及其 RPC/prompt 通道, 迁移输入锁定时也可执行. 它不启动或恢复 OMP, 不修改 session binding. 共享 Telegram client 对负 chat ID 且 thread ID 为 1 的 supergroup General 调用 `editGeneralForumTopic`, 不传 `message_thread_id`; 其他话题, 包括私聊中 ID 为 1 的 topic, 使用 `editForumTopic`. General 始终需要管理员身份及 `can_manage_topics`, 不适用话题创建者例外. 改名复用异步话题名预留及结算, 原样保留指定标题, 不截断也不添加重名后缀. 每个 worker 仅允许一次在途改名; 重叠的 `/title` 请求会被拒绝, 自动命名会跳过在途的手动改名. 显式请求确认后, 在结算事务中原子设置 `topic_names.explicit`, 即使期间已有更新的标题观察也会保留该优先级. 自动预留在自身事务内检查此标记并跳过话题, 因此启动完成, worker 重建及重启均不会覆盖已确认的显式标题. HTTP deadline 仍为 10 秒. 显式命令回执仅报告 API 接受, 失败或结果不确定, 不保证客户端同步; 其归属是 topic, 而非 OMP generation.
+
 Topic 自动命名在异步 API 调用前原子预留标题. 优先使用无后缀 basename; 同一 bot/chat 内名称精确冲突时, 仅为新 Topic 添加 ` [thread ID]`. 如果候选名称仍被占用, 递增数字后缀. UTF-16 截断保留完整后缀. `topic_names` 保存已知标题, 与逐请求的 `topic_name_reservations` 分开; 查重同时考虑两者. 预留跨重启保留, 并发 worker 串行分配标题. 授权收到的 `forum_topic_created` 和非空 `forum_topic_edited.name` 更新已知标题, 不作为模型输入, 也不释放在途请求的名称占用. 仅图标编辑不清空名称. 记录独立于 session binding, 不随 Session 历史删除. 不按 workspace 推测回填, 不声称掌握全部 Telegram Topic; 缺失的外部编辑/删除事件可能留下过时记录.
 
-每个 HTTP 请求在通知 actor 前结算自身预留, 因此 worker 优雅退出即使丢弃通知, 也会等待持久化结算完成. 明确拒绝仅释放该请求的占用; 结果不确定则保留, 不重放. 成功仅在没有更新的标题观察或预留时提交预留标题. 如果冲突事件使先后顺序不确定, 两个可能名称均保留占用, 直到后续标题事件到达. 停机及旧 generation 不发送改名提示. HTTP 效果与 SQLite 结算在崩溃或强制终止时并非原子操作.
+每个 HTTP 请求在通知 actor 前结算自身预留, 因此 worker 优雅退出即使丢弃通知, 也会等待持久化结算完成. 明确拒绝仅释放该请求的占用; 结果不确定则保留, 不重放. 成功仅在没有更新的标题观察或预留时提交预留标题. 如果冲突事件使先后顺序不确定, 两个可能名称均保留占用, 直到后续标题事件到达. 停机时不发送任何改名提示; 旧 session generation 不发送自动命名提示. HTTP 效果与 SQLite 结算在崩溃或强制终止时并非原子操作.
 
 | 导出入口 | 行为 |
 | --- | --- |
@@ -828,7 +830,7 @@ Status 字段投影见前文 progress 与最终回复章节. 详细 `/status` �
 | `session_favorites` | `(bot,chat,thread,workspace,session_id)` | 当前对话收藏的原生 session identity |
 | `omp_args_selection` | 单行预设索引和参数指纹 | 全局启动预设选择, 不保存原始参数 |
 | `interface_language` | 单行 `id=1`, 语言为 `en` 或 `zh` | 全局 Bridge 界面语言; 没有记录时使用英文 |
-| `topic_names` | `(bot,chat,thread)`; 已知标题和单调递增 revision | 持久化已观察标题并分配预留 token; 空标题 tombstone 防止 revision 复用 |
+| `topic_names` | `(bot,chat,thread)`; 已知标题, 单调递增 revision 及显式标题标记 | 持久化已观察标题并分配预留 token; 成功的显式改名阻止自动命名; 空标题 tombstone 防止 revision 复用 |
 | `topic_name_reservations` | `(bot,chat,thread,revision)`; 预留标题和在途/保留状态 | 逐请求名称占用; 标题事件保留在途请求, 匹配的结果仅结算自身占用 |
 | `inbox` | Update ID; typed update JSON, 状态, reply target, 创建/更新时间 | 去重和输入的持久化结算 |
 | `progress_messages` | `(inbox_id,message_id)`, chat, 退役标记及替代 outbox 范围 | Preview 身份及持久删除资格, 包括运行中任务的清理重试 |
@@ -841,6 +843,8 @@ Schema 版本 22 将原 inbox 单条 progress 关联迁入 `progress_messages`, 
 Schema 版本 24 将逐按钮一次性 claim 和尾片 reply-markup 状态与首片 header 编辑分别保存. 最小 follow-up 请求/tombstone metadata 记录 prompt 交付确定性, owner 及 session/binding 身份, 过期时间, bridge instance 和接受的 inbox 关联; 不维护第二份模型 transcript 或队列. 上一个 bridge instance 的未完成请求在重启后拒绝, 已消费/不确定工作不能作为普通输入重新执行.
 
 Schema 版本 25 增加 preview 退役和替代范围字段. 保留已有预览身份及 outbox 正文, 不推断缺失的替代边界. 无边界的终态预览必须有关联文本且所有关联输出成功交付才允许清理; 正式交付失败, 不确定或缺失时保留预览.
+
+Schema 版本 26 增加 `topic_names.explicit`. 显式改名成功时, 与匹配请求的结果在同一事务内设置该标记, 后续标题观察会保留它. 旧记录未保存标题来源, 默认保持 false; 旧的手动标题需要再次成功执行 `/title` 才能获得此保护.
 
 ### 输入接收与结算
 

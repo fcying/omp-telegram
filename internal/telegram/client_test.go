@@ -158,22 +158,55 @@ func TestDeleteMessage(t *testing.T) {
 }
 
 func TestEditForumTopic(t *testing.T) {
-	client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/editForumTopic" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		var fields map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
-			t.Error(err)
-			return
-		}
-		if string(fields["chat_id"]) != "-10" || string(fields["message_thread_id"]) != "8" || string(fields["name"]) != `"project"` {
-			t.Errorf("wrong topic edit fields: %s", fields)
-		}
-		fmt.Fprint(w, `{"ok":true,"result":true}`)
-	})
-	if err := client.EditForumTopic(context.Background(), -10, 8, "project"); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name, method string
+		chat, thread int64
+		code         int
+	}{
+		{name: "regular", method: "editForumTopic", chat: -10, thread: 8},
+		{name: "general", method: "editGeneralForumTopic", chat: -10, thread: 1},
+		{name: "private topic one", method: "editForumTopic", chat: 7, thread: 1},
+		{name: "general requires permissions", method: "editGeneralForumTopic", chat: -10, thread: 1, code: 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/bot123:secret-token/"+tc.method {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				var fields map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+					t.Error(err)
+					return
+				}
+				if string(fields["chat_id"]) != fmt.Sprint(tc.chat) || string(fields["name"]) != `"project"` {
+					t.Errorf("wrong topic edit fields: %s", fields)
+				}
+				if tc.method == "editGeneralForumTopic" {
+					if _, exists := fields["message_thread_id"]; exists {
+						t.Error("General API must not receive a thread ID")
+					}
+				} else if string(fields["message_thread_id"]) != fmt.Sprint(tc.thread) {
+					t.Errorf("wrong topic thread: %s", fields)
+				}
+				if tc.code != 0 {
+					w.WriteHeader(tc.code)
+					fmt.Fprintf(w, `{"ok":false,"error_code":%d,"description":"not enough rights to manage topics"}`, tc.code)
+					return
+				}
+				fmt.Fprint(w, `{"ok":true,"result":true}`)
+			})
+			err := client.EditForumTopic(context.Background(), tc.chat, tc.thread, "project")
+			if tc.code == 0 {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				info := ClassifyError(err)
+				if info.Code != tc.code || info.Uncertain {
+					t.Fatalf("permission rejection was not preserved: %+v", info)
+				}
+			}
+		})
 	}
 }
 

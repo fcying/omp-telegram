@@ -6,27 +6,46 @@ import (
 	"fmt"
 )
 
+var ErrTopicNameExplicit = errors.New("topic has an explicit title")
+
 // TopicNameReservation identifies one rename request, independently of known titles.
 type TopicNameReservation struct {
 	Name     string
 	Revision int64
+	Explicit bool
 }
 
 // ReserveTopicName atomically selects a title not known or reserved by another topic.
 func (s *Store) ReserveTopicName(bot, chat, thread int64, base string) (TopicNameReservation, error) {
+	return s.reserveTopicName(bot, chat, thread, base, true)
+}
+
+// ReserveExactTopicName reserves a user-supplied title without adding a suffix.
+func (s *Store) ReserveExactTopicName(bot, chat, thread int64, name string) (TopicNameReservation, error) {
+	return s.reserveTopicName(bot, chat, thread, name, false)
+}
+
+func (s *Store) reserveTopicName(bot, chat, thread int64, base string, unique bool) (TopicNameReservation, error) {
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return TopicNameReservation{}, err
 	}
 	defer tx.Rollback()
 
-	var r TopicNameReservation
-	err = tx.QueryRow("SELECT revision FROM topic_names WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&r.Revision)
+	r := TopicNameReservation{Explicit: !unique}
+	var explicit bool
+	err = tx.QueryRow("SELECT revision,explicit FROM topic_names WHERE bot=? AND chat=? AND thread=?", bot, chat, thread).Scan(&r.Revision, &explicit)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return TopicNameReservation{}, err
 	}
-	r.Name = truncateTopicName(base, 128)
-	for attempt := 1; ; attempt++ {
+	if unique && explicit {
+		return TopicNameReservation{}, ErrTopicNameExplicit
+	}
+	r.Name = base
+	if unique {
+		r.Name = truncateTopicName(base, 128)
+	}
+	for attempt := 1; unique; attempt++ {
 		var occupied bool
 		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM topic_names WHERE bot=? AND chat=? AND thread<>? AND name=?)
 OR EXISTS(SELECT 1 FROM topic_name_reservations WHERE bot=? AND chat=? AND thread<>? AND name=?)`, bot, chat, thread, r.Name, bot, chat, thread, r.Name).Scan(&occupied); err != nil {
@@ -94,6 +113,11 @@ WHERE r.bot=? AND r.chat=? AND r.thread=? AND r.name=? AND r.revision=? AND r.ac
 	}
 	if err != nil {
 		return err
+	}
+	if r.Explicit {
+		if _, err := tx.Exec("UPDATE topic_names SET explicit=1 WHERE bot=? AND chat=? AND thread=?", bot, chat, thread); err != nil {
+			return err
+		}
 	}
 	if revision == r.Revision {
 		if _, err := tx.Exec("UPDATE topic_names SET name=?,revision=revision+1 WHERE bot=? AND chat=? AND thread=?", r.Name, bot, chat, thread); err != nil {
