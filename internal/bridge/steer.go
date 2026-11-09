@@ -16,6 +16,14 @@ type steerRequest struct {
 	turn, clientID, admission   uint64
 }
 
+type deferredSteer struct {
+	input   incoming
+	prompt  string
+	owner   steerRequest
+	epoch   uint64
+	session string
+}
+
 type steerFence struct {
 	active, settled, terminalSeen bool
 	revision, admission           uint64
@@ -35,7 +43,7 @@ type steerProbeResult struct {
 }
 
 func (w *worker) pendingInputFull() bool {
-	return len(w.queue)+len(w.steers) >= w.b.cfg.QueueCapacity
+	return len(w.queue)+len(w.steers)+len(w.deferredSteers) >= w.b.cfg.QueueCapacity
 }
 
 func (w *worker) routePrompt(in incoming, text string) {
@@ -63,6 +71,19 @@ func (w *worker) steer(in incoming, text string) {
 		w.mark(in.id, "failed")
 		return
 	}
+	if w.steeringBlocked() || len(w.deferredSteers) != 0 {
+		catalog := client.CommandCatalog()
+		w.deferredSteers = append(w.deferredSteers, deferredSteer{
+			input: in, prompt: prompt, epoch: catalog.Epoch, session: w.sessionID,
+			owner: steerRequest{rootID: w.active, generation: w.binding.Generation, turn: w.turn, clientID: client.ID()},
+		})
+		return
+	}
+	w.submitSteer(in, prompt)
+}
+
+func (w *worker) submitSteer(in incoming, prompt string) {
+	client := w.client
 	id := client.ReserveRequestID()
 	if err := w.b.db.Submit(in.id, in.msg.MessageID); err != nil {
 		w.b.fail(err)
@@ -84,6 +105,66 @@ func (w *worker) steer(in incoming, text string) {
 	w.startOperation("steer", client, func(ctx context.Context) (json.RawMessage, error) {
 		return client.CallWithID(ctx, id, "prompt", map[string]any{"message": prompt, "streamingBehavior": "steer"})
 	}, w.active, "", id)
+}
+
+func (w *worker) steeringBlocked() bool {
+	// Reader-ahead events must reach the worker before guidance can cross the
+	// native Ask or terminal boundary, even when input is handled first.
+	return w.askBlocksSteering() || w.rpcOperationActive || len(w.rpcOperations) != 0 || w.controlOp == controlAbort || w.client.BufferedOutput()
+}
+
+func (w *worker) askBlocksSteering() bool {
+	if w.ask != nil || w.askSending != 0 {
+		return true
+	}
+	// A written UI response is not proof that native Ask has removed its
+	// cooperative steering listener. Wait for its tool_execution_end event.
+	for _, tool := range w.progress.ActiveTools {
+		if tool.Name == "ask" {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *worker) cancelDeferredSteers() {
+	for _, request := range w.deferredSteers {
+		w.mark(request.input.id, store.InboxCancelled)
+	}
+	w.deferredSteers = nil
+}
+
+func (w *worker) dispatchDeferredSteers() {
+	for len(w.deferredSteers) != 0 {
+		request := w.deferredSteers[0]
+		ownerCurrent := w.currentSteer(request.owner)
+		current := ownerCurrent
+		if current {
+			catalog := w.client.CommandCatalog()
+			current = w.sessionID == request.session && catalog.Epoch == request.epoch && catalog.SessionID == request.session
+		}
+		if current && w.steeringBlocked() {
+			return
+		}
+		w.deferredSteers[0] = deferredSteer{}
+		w.deferredSteers = w.deferredSteers[1:]
+		if len(w.deferredSteers) == 0 {
+			w.deferredSteers = nil
+		}
+		if !current {
+			w.mark(request.input.id, store.InboxCancelled)
+			if w.research.root && ownerCurrent {
+				// The owner survived, but its native session/epoch did not. No
+				// steer callback will wake settlement after this cancellation,
+				// and a replacement session cannot confirm the old root.
+				w.retireResearch(w.tr(i18n.Msg.AutoresearchSettlementCouldNotConfirmedTaskOutcomeUncertainWill))
+				return
+			}
+			continue
+		}
+		w.submitSteer(request.input, request.prompt)
+		return
+	}
 }
 
 func (w *worker) currentSteer(r steerRequest) bool {

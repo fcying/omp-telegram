@@ -243,9 +243,22 @@ func TestGitTimeoutResearchLongGitAndIndependentAccountLimit(t *testing.T) {
 			} else {
 				gate.builtin(t)
 			}
-			began := time.Now()
+			// agent_end starts a probe that session_settled invalidates. Hold
+			// native evidence until both events cross the actor boundary so the
+			// one-shot account hold and Git gate belong to the surviving probe.
+			nativeRPC(t, w, "fixture_autoresearch_metadata", map[string]any{"entriesMode": "hold"})
 			researchFinishNaturally(t, w, "research answer")
+			researchEventBarrier(t, w)
+			settlement := w.research.settlement.probe
+			if settlement == nil || w.research.roundOpen || w.replyStatus.pending != nil || gate.ready() {
+				t.Fatal("research did not isolate its final settlement before Git sampling")
+			}
+			began := time.Now()
+			nativeRPC(t, w, "fixture_autoresearch_release_entries", nil)
 			gitTimeoutUntil(t, w, 7*time.Second, gate.ready)
+			if w.research.settlement.probe != settlement {
+				t.Fatal("Git gate did not belong to the final research settlement")
+			}
 			if custom {
 				waitFixtureRPCTrace(t, trace, "research_control_waiting", "get_logout_accounts")
 				if elapsed := time.Since(began); elapsed < 4500*time.Millisecond || elapsed > 7*time.Second {

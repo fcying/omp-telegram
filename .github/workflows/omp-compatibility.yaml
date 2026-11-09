@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_version:
-        description: 'Candidate OMP version, e.g. 18.12.2 or v18.12.2; latest tracks the newest stable release'
+        description: 'Candidate OMP version, e.g. 18.18.1 or v18.18.1; latest tracks the newest stable release'
         required: true
         default: latest
         type: string
@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - track: baseline
-            version: '18.12.2'
+            version: '18.18.1'
           - track: candidate
             version: ${{ inputs.candidate_version || 'latest' }}
     steps:
@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           # Discover the asset URL from official release metadata, not a guessed URL.
-          # https://api.github.com/repos/can1357/oh-my-pi/releases/tags/v18.12.2
+          # https://api.github.com/repos/can1357/oh-my-pi/releases/tags/v18.18.1
           if [[ "$OMP_VERSION" == latest ]]; then
             endpoint=latest
           else

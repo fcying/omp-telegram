@@ -343,6 +343,8 @@ func realOMPUntil(t *testing.T, w *worker, provider *realOMPProvider, ready func
 	t.Helper()
 	timer := time.NewTimer(20 * time.Second)
 	defer timer.Stop()
+	tick := time.NewTicker(1500 * time.Millisecond)
+	defer tick.Stop()
 	for !ready() || w.replyStatus.pending != nil {
 		var events <-chan json.RawMessage
 		if w.client != nil {
@@ -358,6 +360,10 @@ func realOMPUntil(t *testing.T, w *worker, provider *realOMPProvider, ready func
 			w.operationReturned(result)
 		case result := <-w.sendResults:
 			w.preparedSend(result)
+		case result := <-w.steerFence.probeResults:
+			w.steeredQuiescenceFinished(result)
+		case <-tick.C:
+			w.steeredTick(time.Now())
 		case event, ok := <-events:
 			if !ok {
 				t.Fatal("native RPC stream closed before contract completion")
@@ -366,7 +372,7 @@ func realOMPUntil(t *testing.T, w *worker, provider *realOMPProvider, ready func
 		case <-w.ctx.Done():
 			t.Fatal("real OMP smoke context ended")
 		case <-timer.C:
-			t.Fatalf("real OMP contract timed out: provider_calls=%d active=%d rpc_active=%t", provider.count(), w.active, w.rpcOperationActive)
+			t.Fatalf("real OMP contract timed out: provider_calls=%d active=%d rpc_active=%t rpc_queued=%d deferred=%d ask=%t sending=%d native_ask=%t buffered=%t steers=%d terminal=%t settled=%t", provider.count(), w.active, w.rpcOperationActive, len(w.rpcOperations), len(w.deferredSteers), w.ask != nil, w.askSending, w.askBlocksSteering(), w.client != nil && w.client.BufferedOutput(), len(w.steers), w.steerFence.terminalSeen, w.steerFence.settled)
 		}
 		w.dispatch()
 	}

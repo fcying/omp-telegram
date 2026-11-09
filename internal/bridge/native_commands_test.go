@@ -37,6 +37,8 @@ func nativeUntil(t *testing.T, w *worker, ready func() bool) {
 	t.Helper()
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
+	tick := time.NewTicker(1500 * time.Millisecond)
+	defer tick.Stop()
 	for !ready() || w.replyStatus.pending != nil {
 		var events <-chan json.RawMessage
 		if w.client != nil {
@@ -47,6 +49,10 @@ func nativeUntil(t *testing.T, w *worker, ready func() bool) {
 			w.commandCatalogFinished(result)
 		case result := <-w.operations:
 			w.operationReturned(result)
+		case result := <-w.steerFence.probeResults:
+			w.steeredQuiescenceFinished(result)
+		case <-tick.C:
+			w.steeredTick(time.Now())
 		case raw, ok := <-events:
 			if !ok {
 				w.failed()

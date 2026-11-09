@@ -536,6 +536,8 @@ func TestMain(m *testing.M) {
 		rootPrompts := 0
 		uiReplies := 0
 		uiValue := ""
+		var uiResponses []map[string]any
+		askDialogEnabled := false
 		nativeMode := os.Getenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS")
 		var nativeCommands []map[string]any
 		var heldNativeDiscovery map[string]any
@@ -671,11 +673,39 @@ func TestMain(m *testing.M) {
 				continue
 			}
 			typ, _ := cmd["type"].(string)
+			startupUI := os.Getenv("OMP_TELEGRAM_FIXTURE_STARTUP_UI")
+			if startupUI != "" {
+				recordFixtureRPCTrace("startup_rpc", typ)
+			}
 			resp := map[string]any{"type": "response", "id": cmd["id"], "command": typ, "success": true}
 			if migrationFixture != nil && migrationFixture.command(cmd, resp, emit, &session, &sessionID, &modelID) {
 				continue
 			}
 			switch typ {
+			case "negotiate_protocol":
+				if startupUI == "" {
+					break
+				}
+				if startupUI != "plain" {
+					method := "confirm"
+					if startupUI == "select" {
+						method = "select"
+					}
+					emit(map[string]any{"type": "extension_ui_request", "id": "PRIVATE_STARTUP_UI_ID", "method": method,
+						"title": "PRIVATE_STARTUP_TITLE", "options": []string{"PRIVATE_STARTUP_OPTION"}, "default": "PRIVATE_STARTUP_DEFAULT", "value": "PRIVATE_STARTUP_VALUE", "secret": "PRIVATE_STARTUP_SECRET"})
+					if startupUI == "cancel" {
+						emit(map[string]any{"type": "extension_ui_request", "method": "cancel", "targetId": "PRIVATE_STARTUP_UI_ID"})
+					}
+				}
+				recordFixtureRPCTrace("startup_waiting", startupUI)
+				if startupUI == "reject" {
+					resp["success"], resp["error"] = false, "PRIVATE_STARTUP_REJECTION"
+					break
+				}
+				if startupUI == "disconnect" {
+					os.Exit(2)
+				}
+				continue
 			case "fixture_consumer_overflow":
 				for range 256 {
 					emit(map[string]any{"type": "message_update", "text": "PRIVATE_CONSUMER_RPC_PAYLOAD"})
@@ -713,6 +743,17 @@ func TestMain(m *testing.M) {
 					}
 					emit(heldFastAck)
 					heldFastAck = nil
+				}
+			case "set_ask_dialog":
+				recordFixtureRPCTrace(typ, string(scan.Bytes()))
+				if fixtureHoldsRPC(typ) {
+					continue
+				}
+				if fixtureRejectsRPC(typ) {
+					resp["success"], resp["error"] = false, "Unknown command: set_ask_dialog"
+				} else {
+					askDialogEnabled, _ = cmd["enabled"].(bool)
+					resp["data"] = map[string]any{"enabled": askDialogEnabled}
 				}
 			case "set_host_tools":
 				recordFixtureRPCTrace(typ, "")
@@ -881,6 +922,8 @@ func TestMain(m *testing.M) {
 			case "extension_ui_response":
 				uiReplies++
 				uiValue, _ = cmd["value"].(string)
+				uiResponses = append(uiResponses, cmd)
+				recordFixtureRPCTrace("extension_ui_response", string(scan.Bytes()))
 				continue
 			case "host_tool_result":
 				text := "attachment accepted"
@@ -906,6 +949,8 @@ func TestMain(m *testing.M) {
 					}
 				}
 				resp["data"] = map[string]any{"sessionId": sessionID, "sessionFile": session, "sessionName": sessionName, "model": map[string]any{"provider": modelProvider, "id": modelID, "headers": map[string]string{"Authorization": "SECRET"}}, "thinkingLevel": thinkingLevel, "fastModeEnabled": fastEnabled, "fastModeActive": fastActive, "systemPrompt": "PRIVATE", "fixtureRootPrompts": rootPrompts, "fixtureUIReplies": uiReplies, "fixtureUIValue": uiValue}
+				resp["data"].(map[string]any)["fixtureUIResponses"] = uiResponses
+				resp["data"].(map[string]any)["fixtureAskDialogEnabled"] = askDialogEnabled
 				if contextUsage != nil {
 					resp["data"].(map[string]any)["contextUsage"] = contextUsage
 				}
@@ -1203,7 +1248,9 @@ func TestMain(m *testing.M) {
 					}
 					resp["data"] = map[string]any{"agentInvoked": true}
 					if mode := os.Getenv("OMP_TELEGRAM_FIXTURE_PENDING_STEER"); mode != "" {
-						emit(map[string]any{"type": "agent_end", "isTerminal": false})
+						if mode != "hold" {
+							emit(map[string]any{"type": "agent_end", "isTerminal": false})
+						}
 						if mode == "executing" {
 							emit(map[string]any{"type": "agent_start"})
 						}
@@ -2524,6 +2571,62 @@ func TestPromptStopRPCOrderUnderDelayedAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestRunCancellationSettlesActiveAndPendingPrompts(t *testing.T) {
+	root := t.TempDir()
+	orderPath := filepath.Join(root, "rpc-order")
+	releasePath := filepath.Join(root, "release-prompt-ack")
+	t.Setenv("OMP_TELEGRAM_FIXTURE_RPC_ORDER", orderPath)
+	t.Setenv("OMP_TELEGRAM_FIXTURE_PROMPT_ACK_GATE", releasePath)
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	previous := http.DefaultTransport
+	fake := &fakeHTTP{updates: make(chan telegram.Update, 32)}
+	http.DefaultTransport = fake
+	defer func() { http.DefaultTransport = previous }()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	executable, err := os.Executable()
+	requireStoreOK(t, err)
+	cfg := config.Config{Token: "fake", AllowedUsers: []int64{7}, AllowedChats: []int64{-10}, WorkspaceRoot: t.TempDir(), OMP: executable, DataDir: root, MaxWorkers: 1, QueueCapacity: 4, OMPArgsFingerprint: strings.Repeat("a", 64)}
+	logs := testLogs(t)
+	go func() { done <- Run(ctx, cfg, db, logs, testAppVersion) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("normal Run cancellation returned an error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("daemon shutdown timed out")
+		}
+		var active, pending string
+		requireStoreOK(t, db.DB.QueryRow("SELECT state FROM inbox WHERE id=2").Scan(&active))
+		requireStoreOK(t, db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&pending))
+		if active != "uncertain" || pending != "cancelled" {
+			t.Errorf("shutdown input states = %s, %s; want uncertain, cancelled", active, pending)
+		}
+		binding, err := db.Binding(99, -10, 11)
+		requireStoreOK(t, err)
+		if !binding.Running || !binding.Interrupted {
+			t.Errorf("shutdown did not retain an interrupted running binding: %+v", binding)
+		}
+	}()
+	fake.updates <- update(1, 11, "/new "+t.TempDir())
+	waitBinding(t, db, 11)
+	fake.updates <- update(2, 11, "delayed-prompt-ack")
+	waitFor(t, func() bool {
+		data, err := os.ReadFile(orderPath)
+		return err == nil && string(data) == "prompt\n"
+	})
+	fake.updates <- update(3, 11, "/followup queued-at-shutdown")
+	waitFor(t, func() bool {
+		var state string
+		return db.DB.QueryRow("SELECT state FROM inbox WHERE id=3").Scan(&state) == nil && state == "pending"
+	})
+}
+
 func TestRuntimeReplacementDropsQueuedStaleRPC(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	staleAbortStarted := make(chan struct{}, 1)
@@ -3131,6 +3234,78 @@ func TestReplyCommitFailurePreservesUncommittedBody(t *testing.T) {
 				t.Fatal("failed round commit ended the research owner")
 			}
 		})
+	}
+}
+
+func TestBridgeFailPreservesUnexpectedErrorsDuringShutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		shutdown bool
+		err      error
+		want     bool
+	}{
+		{name: "live cancellation", err: context.Canceled, want: true},
+		{name: "shutdown cancellation", shutdown: true, err: context.Canceled},
+		{name: "wrapped shutdown cancellation", shutdown: true, err: fmt.Errorf("append replies: %w", context.Canceled)},
+		{name: "independent deadline", shutdown: true, err: context.DeadlineExceeded, want: true},
+		{name: "storage failure", shutdown: true, err: errors.New("storage failed"), want: true},
+		{name: "RPC failure", shutdown: true, err: errors.New("RPC transport failed"), want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			b := &Bridge{ctx: ctx, fatal: make(chan error, 1)}
+			if tc.shutdown {
+				cancel()
+			}
+			b.fail(tc.err)
+			select {
+			case err := <-b.fatal:
+				if !tc.want || err != tc.err {
+					t.Fatalf("fatal error = %v, want reported=%t, original=%v", err, tc.want, tc.err)
+				}
+			default:
+				if tc.want {
+					t.Fatalf("unexpected error was not reported: %v", tc.err)
+				}
+			}
+		})
+	}
+}
+
+func TestShutdownDuringAssistantAppendPreservesPendingReply(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	requireStoreOK(t, err)
+	defer db.Close()
+	requireStoreOK(t, db.Accept(10, []byte(`{}`)))
+	requireStoreOK(t, db.Mark(10, "submitted"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := testBridge(t, &Bridge{db: db, ctx: ctx, fatal: make(chan error, 1)})
+	w := testWorker(t, &worker{
+		b: b, key: target{chat: -10, thread: 11}, ctx: ctx, cancel: cancel,
+		taskState: taskState{active: 10, owner: 7, busy: true},
+	})
+	assistantMessage(t, w, "Committed reply.")
+	w.event([]byte(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Pending reply."}}`))
+	cancel()
+	// Model an event selected just as shutdown cancels its append transaction.
+	assistantMessage(t, w, "Pending reply.")
+	if queueState(t, w, 10) != "submitted" || w.stream.String() != "Pending reply." {
+		t.Fatal("cancelled append lost the uncommitted task or reply")
+	}
+	w.teardownWorker(false)
+	if queueState(t, w, 10) != "uncertain" {
+		t.Fatal("shutdown did not durably settle the interrupted task")
+	}
+	rows := researchReplies(t, w, 10)
+	if len(rows) != 3 || !strings.Contains(rows[0], "Committed reply.") || !strings.Contains(rows[1], "Pending reply.") || rows[2] == "" {
+		t.Fatalf("shutdown lost the committed body, pending reply, or interruption notice: %q", rows)
+	}
+	select {
+	case err := <-b.fatal:
+		t.Fatalf("normal shutdown reported a fatal error: %v", err)
+	default:
 	}
 }
 

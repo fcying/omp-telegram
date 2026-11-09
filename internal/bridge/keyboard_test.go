@@ -638,12 +638,12 @@ func TestFailedMenuCleanupDoesNotBlockWorker(t *testing.T) {
 	client := w.client
 	var choices []string
 	var messageIDs []int64
-	for _, id := range []string{"first-review", "second-review"} {
-		w.ui(rpcEvent{ID: id, Method: "select", Title: "Choose commit", Options: []string{id}})
-		_, rows := pickerView(t, f)
-		choices = append(choices, rows[0][0]["callback_data"].(string))
-		messageIDs = append(messageIDs, int64(f.messageCount()))
-	}
+	w.ui(rpcEvent{ID: "first-review", Method: "select", Title: "Choose commit", Options: []string{"first-review"}})
+	_, rows := pickerView(t, f)
+	choices = append(choices, rows[0][0]["callback_data"].(string))
+	messageIDs = append(messageIDs, int64(f.messageCount()))
+	secondShown := make(chan struct{})
+	f.sendResponses = map[int64][]fakeHTTPResponse{-10: {{status: 200, body: `{"ok":true,"result":{"message_id":500}}`, onClose: func() { close(secondShown) }}}}
 	gate := make(chan struct{})
 	f.keyboardClearGate = gate
 	transport := &failedMenuHTTP{
@@ -706,6 +706,14 @@ func TestFailedMenuCleanupDoesNotBlockWorker(t *testing.T) {
 	wait(transport.clearStarted, "failed menu did not queue keyboard cleanup")
 	// The first clear stays gated while a different menu is submitted and both
 	// consumed menus are replayed. Expiry receipts are visible to the user.
+	_, err := client.Call(w.ctx, "fixture_research_control_event", map[string]any{"event": map[string]any{
+		"type": "extension_ui_request", "id": "second-review", "method": "select", "title": "Choose commit", "options": []string{"second-review"},
+	}})
+	requireStoreOK(t, err)
+	wait(secondShown, "blocked keyboard cleanup prevented the next native menu")
+	_, rows = pickerView(t, f)
+	choices = append(choices, rows[0][0]["callback_data"].(string))
+	messageIDs = append(messageIDs, 500)
 	click(1)
 	click(0)
 	click(1)
@@ -1231,15 +1239,12 @@ func TestNativeUIPendingSelectionKeepsOriginalScope(t *testing.T) {
 }
 
 func TestNativeUISelectionReceiptDoesNotCrossScope(t *testing.T) {
-	for _, boundary := range []string{"turn", "generation", "agent", "pending"} {
+	for _, boundary := range []string{"turn", "generation", "agent"} {
 		t.Run(boundary, func(t *testing.T) {
 			w, f, _, _ := replyStatusWorker(t)
 			w.ui(rpcEvent{ID: "first-choice", Method: "select", Title: "Choose first", Options: []string{"First"}})
 			messageID := int64(f.messageCount())
 			_, rows := pickerView(t, f)
-			if boundary == "pending" {
-				w.ui(rpcEvent{ID: "parallel-choice", Method: "select", Title: "Choose parallel", Options: []string{"Parallel"}})
-			}
 			w.callback(&telegram.CallbackQuery{ID: "first-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
 			switch boundary {
 			case "turn":

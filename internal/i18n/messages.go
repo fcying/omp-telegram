@@ -37,11 +37,19 @@ type deliveryMessages struct {
 
 // Msg is the complete typed catalog. Each entry keeps both languages together.
 var Msg = struct {
-	Task     taskMessages
-	Session  sessionMessages
-	Queue    queueMessages
-	Language languageMessages
-	Delivery deliveryMessages
+	Task             taskMessages
+	Session          sessionMessages
+	Queue            queueMessages
+	Language         languageMessages
+	Delivery         deliveryMessages
+	AskCustom        Message
+	AskConfirm       Message
+	AskBack          Message
+	AskInput         Message
+	AskExpired       Message
+	AskTextRequired  Message
+	AskDisplayFailed Message
+	AskUnconfirmed   Message
 
 	Output                                                                    Message
 	ResultSummary                                                             Message
@@ -216,6 +224,9 @@ var Msg = struct {
 	FailedSaveStartupIntent                                                   Message
 	FailedSendConfirmationOperationCanceled                                   Message
 	FailedStartOmpStartupOutcomeUncertainUseCloseBefore                       Message
+	StartupTimeoutPendingConfirm                                              Message
+	StartupTimeoutPendingUI                                                   Message
+	StartupOutcomeUnconfirmedUseClose                                         Message
 	FailedUpdatePinnedSessions                                                Message
 	ChooseBindingDeletion                                                     Message
 	FormatLine                                                                Message
@@ -225,7 +236,6 @@ var Msg = struct {
 	HandoffRequested                                                          Message
 	HandoffResultCouldNotConfirmedInstanceClosedWillResume                    Message
 	Inbox                                                                     Message
-	InputDialogsNotSupportedCanceledProvideInformationNormalMessage           Message
 	InvalidWorkingDirectory                                                   Message
 	InvalidWorkingDirectoryExistingInstanceStillRunning                       Message
 	ListSavedBindingsBindingsOld                                              Message
@@ -513,6 +523,14 @@ var Msg = struct {
 	FollowupTextRequired                                                      Message
 	ActionUnavailable                                                         Message
 }{
+	AskCustom:            message("Custom answer", "自定义答案"),
+	AskConfirm:           message("Confirm selection", "确认选择"),
+	AskBack:              message("Back to options", "返回选项"),
+	AskInput:             message("Reply to this message with your answer. Use the Ask buttons to cancel or return to options when available.", "请回复此消息输入答案. 使用 Ask 按钮取消, 或在有返回选项按钮时返回."),
+	AskExpired:           message("This Ask input is unavailable or expired. No answer or prompt was submitted.", "此 Ask 输入已失效或不可用. 未提交答案或新任务."),
+	AskTextRequired:      message("Reply with nonempty text. This question has not been answered.", "请回复非空文本. 当前问题尚未回答."),
+	AskDisplayFailed:     message("Could not display the native question. The dialog was cancelled.", "无法显示原生问题. 已取消该对话."),
+	AskUnconfirmed:       message("The native dialog outcome is uncertain. The runtime was closed and the answer will not be replayed automatically.", "原生对话结果不确定. 已关闭 runtime, 不会自动重放答案."),
 	FollowupButton:       message("Follow-up", "后续输入"),
 	FollowupPrompt:       message("Reply with your follow-up message. It will be queued as a separate task without interrupting the current task. This input request expires in 10 minutes.", "请回复后续消息. 内容将作为独立任务排队, 不会打断当前任务. 此输入请求十分钟后过期."),
 	FollowupQueued:       message("Follow-up queued.", "后续消息已入队."),
@@ -723,6 +741,9 @@ var Msg = struct {
 	FailedSaveStartupIntent:                                 message("Failed to save the startup intent: %s", "无法保存启动意图: %s"),
 	FailedSendConfirmationOperationCanceled:                 message("Failed to send the confirmation. The operation was canceled.", "无法发送确认消息. 操作已取消."),
 	FailedStartOmpStartupOutcomeUncertainUseCloseBefore:     message("Failed to start omp. The startup outcome is uncertain; use /close before retrying.", "无法启动 omp. 启动结果不确定; 请先使用 /close 再重试."),
+	StartupTimeoutPendingConfirm:                            message("OMP startup timed out; an unanswered Extension confirmation request was detected. This Bridge does not support startup interactions.\nMake the Extension start without interaction, or move confirmation to a user command after startup.", "OMP 启动超时, 检测到未应答的 Extension 确认请求. 当前 Bridge 不支持启动阶段交互.\n请让 Extension 无需交互即可启动, 或将确认移至启动后的用户命令."),
+	StartupTimeoutPendingUI:                                 message("OMP startup timed out; an unanswered Extension interaction request was detected. This Bridge does not support startup interactions.\nMake the Extension start without interaction, or move interaction to a user command after startup.", "OMP 启动超时, 检测到未应答的 Extension 交互请求. 当前 Bridge 不支持启动阶段交互.\n请让 Extension 无需交互即可启动, 或将交互移至启动后的用户命令."),
+	StartupOutcomeUnconfirmedUseClose:                       message("The startup outcome is unconfirmed; use /close before retrying.", "启动结果未确认, 请先使用 /close 再重试."),
 	FailedUpdatePinnedSessions:                              message("Failed to update pinned sessions.", "更新置顶会话失败."),
 	ChooseBindingDeletion:                                   message("Delete saved binding for %s?\nBinding: remove only the binding; keep local session history.\nBinding+Session: permanently delete the associated OMP session and artifacts.\nDeleting the Session also removes other topics' bindings to the same Session.\nClosed/Released references do not block deletion. An in-use OMP runtime, active task, startup or migration does.\nWorkspace files will NOT be deleted.", "删除 %s 的已保存绑定?\nBinding: 只删除绑定, 保留本地会话历史.\nBinding+Session: 永久删除关联的 OMP 会话及 artifacts.\n删除 Session 会同时清理其他 Topic 对同一 Session 的绑定.\nClosed/Released 引用不阻止删除; OMP Runtime 正在使用, 有活跃任务, 正在启动或迁移时拒绝.\n不会删除工作目录文件."),
 	FormatLine:                                              message("Format: %s\n", "格式: %s\n"),
@@ -731,9 +752,8 @@ var Msg = struct {
 	HandoffFailedOutcomeUncertainInstanceClosedWillResumeOn: message("Handoff failed or its outcome is uncertain. The instance was closed and will resume on the next request.", "交接失败或结果不确定. 实例已关闭, 将在下次请求时恢复."),
 	HandoffRequested:                                        message("Handoff requested.", "已请求交接."),
 	HandoffResultCouldNotConfirmedInstanceClosedWillResume:  message("Handoff result could not be confirmed. The instance was closed and will resume on the next request.", "无法确认交接结果. 实例已关闭, 将在下次请求时恢复."),
-	Inbox: message("Inbox", "收件箱"),
-	InputDialogsNotSupportedCanceledProvideInformationNormalMessage: message("Input dialogs are not supported and have been canceled. Provide the information in a normal message.", "不支持输入对话框, 已取消. 请通过普通消息提供信息."),
-	InvalidWorkingDirectory:                                          message("Invalid working directory.", "工作目录无效."),
+	Inbox:                   message("Inbox", "收件箱"),
+	InvalidWorkingDirectory: message("Invalid working directory.", "工作目录无效."),
 	InvalidWorkingDirectoryExistingInstanceStillRunning:              message("Invalid working directory. The existing instance is still running.", "工作目录无效. 现有实例仍在运行."),
 	ListSavedBindingsBindingsOld:                                     message("List saved bindings: /bindings [old]", "列出已保存的绑定: /bindings [old]"),
 	MainChat:                                                         message("Main chat", "主聊天"),

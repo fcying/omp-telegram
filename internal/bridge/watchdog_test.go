@@ -141,6 +141,89 @@ func TestMissingTerminalRecoveryRetiresClientAndPreservesQueue(t *testing.T) {
 	}
 }
 
+func TestActiveAskBlocksWatchdogUntilNativeCancellation(t *testing.T) {
+	for _, method := range []string{"ask", "input", "editor"} {
+		t.Run(method, func(t *testing.T) {
+			w, _, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 4
+			command("/new " + t.TempDir())
+			command("missing-terminal")
+			w.dispatch()
+			drainWatchdogEvents(t, w)
+			active, client, binding, turn, root := w.active, w.client, w.binding, w.turn, w.rootRequestID
+			raw, err := client.Call(w.ctx, "get_state", nil)
+			idle, _, _ := rpcIdleState(raw)
+			if err != nil || !idle || w.awaitingContinuation || len(w.progress.ActiveTools) != 0 {
+				t.Fatalf("fixture did not enter idle without native work: idle=%v err=%v", idle, err)
+			}
+			w.event([]byte(`{"type":"extension_ui_request","id":"watchdog-ask","method":"` + method + `","title":"Choose a topic","questions":[{"id":"topic","question":"Choose a topic","options":[{"label":"Go"}]}]}`))
+			a := w.ask
+			if a == nil || a.cancel == nil {
+				t.Fatal("Ask did not begin asynchronous display")
+			}
+			if _, exists := w.confirms[a.token]; exists {
+				t.Fatal("Ask confirmation installed before display completion")
+			}
+			now := time.Now().Add(5 * time.Minute)
+			for _, phase := range []string{"rendering", "displayed"} {
+				if phase == "displayed" {
+					for a.cancel != nil {
+						w.operationReturned(waitOperation(t, w))
+					}
+					if w.confirms[a.token].action != "ask" {
+						t.Fatal("completed Ask display did not install confirmation")
+					}
+					command("watchdog guidance")
+					if len(w.deferredSteers) != 1 || queueState(t, w, 3) != "pending" {
+						t.Fatal("guidance did not defer behind active Ask")
+					}
+				}
+				w.lastActivity = now.Add(-stuckTaskQuietPeriod)
+				w.probeStuckTask(now)
+				w.idleProbeFinished(probeResultFor(w), now)
+				w.idleProbeFinished(probeResultFor(w), now.Add(stuckTaskQuietPeriod))
+				if w.client != client || w.active != active || w.ask != a || !w.busy ||
+					!sameBindingIdentity(w.binding, binding) || w.turn != turn || w.rootRequestID != root ||
+					queueState(t, w, active) != "submitted" || w.idleProbe.cancel != nil || !w.idleProbe.confirmed.IsZero() {
+					t.Fatalf("%s Ask wait was probed, revoked, or lost its original root", phase)
+				}
+				select {
+				case <-client.Done():
+					t.Fatalf("%s Ask wait retired its client", phase)
+				default:
+				}
+				now = now.Add(2 * stuckTaskQuietPeriod)
+			}
+			w.event([]byte(`{"type":"extension_ui_request","method":"cancel","targetId":"watchdog-ask"}`))
+			if w.ask != nil || len(w.deferredSteers) != 1 || !w.stuckTaskEligible() {
+				t.Fatal("deferred guidance alone blocked recovery after Ask cancellation")
+			}
+			for probe := range 2 {
+				w.probeStuckTask(now)
+				select {
+				case result := <-w.idleProbe.results:
+					w.idleProbeFinished(result, now)
+				case <-w.ctx.Done():
+					t.Fatal("idle probe did not return after Ask cancellation")
+				}
+				if probe == 0 && (w.active != active || w.idleProbe.confirmed.IsZero()) {
+					t.Fatal("first post-Ask idle observation did not retain and confirm root")
+				}
+				now = now.Add(stuckTaskQuietPeriod)
+			}
+			if queueState(t, w, active) != "uncertain" || w.client != nil || w.busy ||
+				len(w.deferredSteers) != 0 || queueState(t, w, 3) != "cancelled" {
+				t.Fatal("stuck root did not recover and revoke deferred guidance after Ask ended")
+			}
+			select {
+			case <-client.Done():
+			default:
+				t.Fatal("stuck runtime survived post-Ask recovery")
+			}
+		})
+	}
+}
+
 func TestNonTerminalAgentEndBlocksMissingCompletionWatchdog(t *testing.T) {
 	w, _, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 2

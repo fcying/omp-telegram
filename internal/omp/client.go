@@ -28,10 +28,41 @@ const (
 )
 
 var errQueueOverflow = errors.New("omp: RPC byte budget exceeded; execution state uncertain")
+var errAskDialogUnsupported = errors.New("omp: native Ask dialog unsupported")
 
-// byteBudget is shared by the reader and the event forwarder. Credits remain
-// held for an event until a receiver accepts it from the public channel.
-type byteBudget struct{ used atomic.Int64 }
+// byteBudget shares one occupancy snapshot between the reader and event forwarder.
+// Low bits hold frame/event credit until delivery; the high flag tracks bytes
+// read into bufio, including incomplete physical lines, without charging credit.
+const readAheadFlag int64 = 1 << 62
+
+type byteBudget struct{ state atomic.Int64 }
+
+func (b *byteBudget) usedBytes() int64 {
+	return b.state.Load() &^ readAheadFlag
+}
+
+func (b *byteBudget) setReadAhead(buffered bool) {
+	if buffered {
+		b.state.Or(readAheadFlag)
+	} else {
+		b.state.And(^readAheadFlag)
+	}
+}
+
+type readAheadReader struct {
+	stdout *os.File
+	budget *byteBudget
+}
+
+func (r *readAheadReader) Read(data []byte) (int, error) {
+	n, err := r.stdout.Read(data)
+	if n > 0 {
+		// ReadSlice can keep filling an incomplete line before returning any credit.
+		// Publish only after data arrives, so an idle blocking Read stays empty.
+		r.budget.setReadAhead(true)
+	}
+	return n, err
+}
 
 // reserve returns the exact occupancy observed by a failed reservation. The
 // forwarder may release credits immediately afterwards, so callers must retain it.
@@ -40,11 +71,12 @@ func (b *byteBudget) reserve(n int) (int64, bool) {
 		return 0, true
 	}
 	for {
-		used := b.used.Load()
+		state := b.state.Load()
+		used := state &^ readAheadFlag
 		if int64(n) > maxRPCBufferedBytes-used {
 			return used, false
 		}
-		if b.used.CompareAndSwap(used, used+int64(n)) {
+		if b.state.CompareAndSwap(state, state+int64(n)) {
 			return used, true
 		}
 	}
@@ -52,7 +84,8 @@ func (b *byteBudget) reserve(n int) (int64, bool) {
 
 func (b *byteBudget) release(n int) {
 	if b != nil && n != 0 {
-		b.used.Add(-int64(n))
+		// n never exceeds the byte credit, so subtraction preserves the flag.
+		b.state.Add(-int64(n))
 	}
 }
 
@@ -110,6 +143,7 @@ type Client struct {
 	resumeDiagnostics         *resumeModelDiagnostics
 	usedDefaultModelFallback  bool
 	protocolFailed            atomic.Bool
+	startupUI                 atomic.Pointer[startupUITracker]
 	events                    chan json.RawMessage
 	queuedEvents              chan json.RawMessage
 	bytes                     byteBudget
@@ -227,7 +261,7 @@ func startOnce(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client
 	}
 	clientID := nextClientID.Add(1)
 	args := make([]string, 0, 6+len(cfg.Args))
-	args = append(args, "--mode", "rpc")
+	args = append(args, "--mode", "rpc-ui")
 	if cfg.CWD != "" {
 		args = append(args, "--cwd", cfg.CWD)
 	}
@@ -279,6 +313,7 @@ func startOnce(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client
 	c.resumeDiagnostics = diagnostics
 	diagnostics = nil // The supervisor now owns the collector.
 	c.frameLimit.Store(maxFrame)
+	c.startupUI.Store(&startupUITracker{})
 	go c.readLoop()
 	go c.forwardEvents()
 	go c.supervise(ctx, waited)
@@ -287,19 +322,30 @@ func startOnce(ctx context.Context, cfg Config, rpcLogger *slog.Logger) (*Client
 	select {
 	case <-c.ready:
 	case <-c.stop:
-		return nil, c.startupFailure(startup)
+		return nil, c.finishStartupFailure(ctx, startup, "ready", c.failure())
 	case <-c.done:
-		return nil, c.startupFailure(startup)
+		return nil, c.finishStartupFailure(ctx, startup, "ready", c.failure())
 	case <-startup.Done():
-		c.fail(errors.New("omp: ready timeout or startup cancellation"))
-		c.Close()
-		return nil, c.failure()
+		return nil, c.finishStartupFailure(ctx, startup, "ready", startup.Err())
+	}
+	// Opt in before protocol negotiation: OMP accepts this side channel while
+	// session_start is running, whereas ordinary commands wait for startup.
+	data, askErr := c.Call(startup, "set_ask_dialog", map[string]any{"enabled": true})
+	if askErr == nil {
+		var dialog struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if json.Unmarshal(data, &dialog) != nil || dialog.Enabled == nil || !*dialog.Enabled {
+			askErr = errProtocol
+		}
+	}
+	if askErr != nil && !errors.Is(askErr, errAskDialogUnsupported) {
+		return nil, c.finishStartupFailure(ctx, startup, "set_ask_dialog", askErr)
 	}
 	if _, err = c.Call(startup, "negotiate_protocol", map[string]any{"protocolVersion": 2}); err != nil {
-		c.fail(errors.New("omp: protocol v2 negotiation failed"))
-		c.Close()
-		return nil, c.failure()
+		return nil, c.finishStartupFailure(ctx, startup, "negotiate_protocol", err)
 	}
+	c.discardStartupUI()
 	return c, nil
 }
 
@@ -335,8 +381,11 @@ func (c *Client) Stopping() bool {
 	}
 }
 
-// BufferedOutput includes partially read frames and events awaiting consumption.
-func (c *Client) BufferedOutput() bool { return c.bytes.used.Load() != 0 }
+// BufferedOutput atomically snapshots unread prefetched bytes, partial frames
+// and queued events, including transfers between those forms of occupancy.
+func (c *Client) BufferedOutput() bool {
+	return c.bytes.state.Load() != 0
+}
 
 // FrameLimit includes the newline delimiting a request frame.
 func (c *Client) FrameLimit() int { return int(c.frameLimit.Load()) }
@@ -351,6 +400,9 @@ func (c *Client) failure() error {
 }
 
 func (c *Client) fail(err error) {
+	if tracker := c.startupUI.Load(); tracker != nil {
+		tracker.finish()
+	}
 	c.failureStop.Store(true)
 	c.mu.Lock()
 	if c.err == nil {
@@ -361,6 +413,9 @@ func (c *Client) fail(err error) {
 }
 
 func (c *Client) transportEnded(err error) {
+	if tracker := c.startupUI.Load(); tracker != nil {
+		tracker.finish()
+	}
 	c.mu.Lock()
 	if !c.closeRequested.Load() && !c.failureStop.Load() && !c.contextCanceled.Load() {
 		c.transportEndedBeforeClose.Store(true)
@@ -460,7 +515,11 @@ func (c *Client) supervise(ctx context.Context, waited <-chan error) {
 		}
 	case <-ctx.Done():
 		c.contextCanceled.Store(true)
-		c.fail(&classifiedError{kind: "cancelled", err: errors.New("omp: process context canceled")})
+		if c.startupUI.Load() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			c.fail(context.DeadlineExceeded)
+		} else {
+			c.fail(&classifiedError{kind: "cancelled", err: errors.New("omp: process context canceled")})
+		}
 	case <-c.stop:
 	}
 	c.shutdownMu.Lock()
@@ -714,7 +773,7 @@ func (c *Client) queueOverflow(err error, details queueOverflowDetails) {
 			slog.String("rpc_event", overflowEventKind(details.eventKind)),
 			slog.Int("queued_events", details.queued),
 			slog.Int("queue_capacity", cap(c.queuedEvents)),
-			slog.Int64("buffered_bytes", c.bytes.used.Load()),
+			slog.Int64("buffered_bytes", c.bytes.usedBytes()),
 			slog.Int("buffer_limit_bytes", maxRPCBufferedBytes),
 			slog.Int("rejected_bytes", details.budget.requested),
 			slog.Int64("rejected_used_bytes", details.budget.used),
@@ -785,12 +844,17 @@ func (c *Client) readLoop() {
 	defer close(c.queuedEvents)
 	// After a fatal decode/queue error, keep draining until the supervisor reaps the group.
 	defer io.Copy(io.Discard, c.stdout)
-	reader := bufio.NewReaderSize(c.stdout, 64<<10)
+	reader := bufio.NewReaderSize(&readAheadReader{stdout: c.stdout, budget: &c.bytes}, 64<<10)
+	defer c.bytes.setReadAhead(false)
 	decoder := frameDecoder{physical: maxFrame, logical: maxLogical, budget: &c.bytes}
 	ready := false
 	var readFailure byteBudgetFailure
 	for {
 		data, err := readLineBudget(reader, decoder.physical, &c.bytes, &readFailure)
+		// Keep the read/prefetch flag until readLineBudget has reserved frame credit;
+		// publish new prefetch before any response/event credit can be released.
+		// Both handoffs overlap in one atomic state, so occupancy cannot disappear.
+		c.bytes.setReadAhead(reader.Buffered() != 0)
 		if err != nil {
 			c.bytes.release(cap(decoder.data))
 			if decoder.id != "" && !errors.Is(err, errQueueOverflow) {
@@ -910,7 +974,17 @@ func (c *Client) readLoop() {
 				c.receiveUsageResponse(env)
 				response := result{data: env.Data}
 				if !*env.Success {
-					response.err = &classifiedError{kind: "rejected", err: errors.New("omp: RPC command rejected")}
+					var rejection error
+					if env.Command == "set_ask_dialog" {
+						var reason string
+						if json.Unmarshal(env.Error, &reason) == nil && reason == "Unknown command: set_ask_dialog" {
+							rejection = errAskDialogUnsupported
+						}
+					}
+					if rejection == nil {
+						rejection = errors.New("omp: RPC command rejected")
+					}
+					response.err = &classifiedError{kind: "rejected", err: rejection}
 				}
 				r.result <- response
 				c.logLifecycle(env, "response_queued")
@@ -927,6 +1001,11 @@ func (c *Client) readLoop() {
 			// already left, it cannot safely affect a later bridge operation.
 			c.logLifecycle(env, "response_ignored")
 			continue
+		}
+		if env.Type == "extension_ui_request" {
+			if tracker := c.startupUI.Load(); tracker != nil {
+				tracker.observe(env.ID, frame)
+			}
 		}
 		if env.Type == "session_info_update" {
 			c.receiveCommandCatalogSession(frame)
@@ -948,7 +1027,7 @@ func (c *Client) readLoop() {
 			c.logLifecycle(env, "event_queued")
 		default:
 			details := queueOverflowDetails{reason: "event_slots", stage: "event_enqueue", eventKind: env.Type,
-				budget: byteBudgetFailure{used: c.bytes.used.Load(), requested: cap(frame)}, queued: len(c.queuedEvents)}
+				budget: byteBudgetFailure{used: c.bytes.usedBytes(), requested: cap(frame)}, queued: len(c.queuedEvents)}
 			c.bytes.release(cap(frame))
 			c.logLifecycle(env, "rejected")
 			c.queueOverflow(errors.New("omp: event queue overflow; execution state uncertain"), details)

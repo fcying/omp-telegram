@@ -47,7 +47,9 @@ func (w *worker) invalidateResearchSettlement() {
 }
 
 func (w *worker) probeResearchSettlement() {
-	if !w.research.root || !w.taskActive() || w.research.roundOpen || w.research.disablePending || w.client == nil || w.research.settlement.probe != nil || len(w.steers) != 0 {
+	// Deferred guidance still belongs to this root before native submission, so
+	// an older off snapshot cannot retire it or start another settlement probe.
+	if !w.research.root || !w.taskActive() || w.research.roundOpen || w.research.disablePending || w.client == nil || w.research.settlement.probe != nil || len(w.steers) != 0 || len(w.deferredSteers) != 0 {
 		return
 	}
 	client := w.client
@@ -126,7 +128,7 @@ func (w *worker) researchSettlementFinished(result operationResult) {
 		return
 	}
 	w.research.settlement.probe = nil
-	if !w.research.root || !w.taskActive() || w.research.disablePending || w.client != probe.client || w.binding.Generation != probe.generation || w.active != probe.root || w.turn != probe.turn || w.rootRequestID != probe.rootRequest || w.research.settlement.revision != probe.revision || w.steerFence.admission != probe.admission || w.research.roundOpen || len(w.steers) != 0 {
+	if !w.research.root || !w.taskActive() || w.research.disablePending || w.client != probe.client || w.binding.Generation != probe.generation || w.active != probe.root || w.turn != probe.turn || w.rootRequestID != probe.rootRequest || w.research.settlement.revision != probe.revision || w.steerFence.admission != probe.admission || w.research.roundOpen || len(w.steers) != 0 || len(w.deferredSteers) != 0 {
 		return
 	}
 	// Reader delivery and RPC results are separate actor inputs. Process queued
@@ -146,7 +148,7 @@ func (w *worker) researchSettlementFinished(result operationResult) {
 	}
 
 drained:
-	if w.client != probe.client || !w.research.root || w.active != probe.root || w.turn != probe.turn || w.binding.Generation != probe.generation || w.rootRequestID != probe.rootRequest || w.research.settlement.revision != probe.revision || w.steerFence.admission != probe.admission || w.research.roundOpen || len(w.steers) != 0 {
+	if w.client != probe.client || !w.research.root || w.active != probe.root || w.turn != probe.turn || w.binding.Generation != probe.generation || w.rootRequestID != probe.rootRequest || w.research.settlement.revision != probe.revision || w.steerFence.admission != probe.admission || w.research.roundOpen || len(w.steers) != 0 || len(w.deferredSteers) != 0 {
 		return
 	}
 	if probe.client.BufferedOutput() {

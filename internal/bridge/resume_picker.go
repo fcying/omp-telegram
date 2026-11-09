@@ -374,7 +374,7 @@ func (w *worker) bindingSessionSelected(sessionID string) bool {
 }
 
 func (w *worker) exportCurrentBusy(sessionID string) bool {
-	return w.bindingSessionSelected(sessionID) && (w.taskActive() || w.taskOrSessionBusy() || w.compacting || w.finishing || len(w.queue) != 0)
+	return w.bindingSessionSelected(sessionID) && (w.taskActive() || w.taskOrSessionBusy() || w.compacting || w.finishing || len(w.queue) != 0 || w.hasRuntimeConfirmation())
 }
 
 func (w *worker) beginExport(session omp.SessionSummary, format, workspace string, generation int64) {

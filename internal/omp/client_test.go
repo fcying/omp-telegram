@@ -58,6 +58,7 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "--mode" {
 		fixtureResumeModelStart()
 		fixtureDiscoveryStart()
+		fixtureRPCUIStart()
 		if os.Getenv("OMP_TEST_DISCOVERY_WAIT_READY") == "1" {
 			fixtureDiscoveryWrite("waiting", "ready")
 			_, _ = io.Copy(io.Discard, os.Stdin)
@@ -82,6 +83,9 @@ func TestMain(m *testing.M) {
 				os.Exit(1)
 			}
 			fixtureDiscoveryRecord(command)
+			if fixtureRPCUICommand(command) {
+				continue
+			}
 			if fixtureResumeModelCommand(command) {
 				continue
 			}
@@ -140,15 +144,29 @@ func TestMain(m *testing.M) {
 				fmt.Printf("{\"type\":\"response\",\"command\":\"malformed\",\"id\":%q,\"error\":%q}\n", command["id"], rpcSensitiveCanary)
 			case "peer":
 				fmt.Println(`{"type":"response","id":"peer-secret","command":"peer","success":true}`)
+			case "prefetched_events":
+				fmt.Fprint(os.Stdout, "{\"type\":\"agent_start\"}\n{\"type\":\"extension_ui_request\",\"id\":\"next-dialog\",\"method\":\"ask\",\"questions\":[]}\n")
+			case "partial_physical_line":
+				fmt.Fprint(os.Stdout, `{"type":"extension_ui_request","id":"fragment-dialog","method":"ask","questions":[`)
+			case "release_partial_physical_line":
+				fmt.Fprint(os.Stdout, "]}\n")
+			case "partial_physical_line_eof":
+				_ = os.Stdout.Close()
+				_, _ = io.Copy(io.Discard, os.Stdin)
+				os.Exit(0)
 			case "overflow":
 				for range 200 {
 					fmt.Println(`{"type":"agent_start"}`)
 				}
 			case "byte_overflow":
-				frame := []byte(`{"type":"agent_start","padding":"` + strings.Repeat("x", maxFrame-64) + `"}` + "\n")
-				for range 66 {
-					_, _ = os.Stdout.Write(frame)
-				}
+				// The logical reservation fits alone; an undelivered event must
+				// exhaust the shared budget before the event-slot limit is reached.
+				const margin = 4 << 10
+				frame := []byte(`{"type":"agent_start","padding":"` + strings.Repeat("x", 2*margin) + `"}` + "\n")
+				_, _ = os.Stdout.Write(frame)
+				length := maxRPCBufferedBytes - margin
+				count := (length + chunkPayload - 1) / chunkPayload
+				fmt.Println(string(chunkFrame("byte-budget", 0, count, length, []byte("{"))))
 			default:
 				reply := map[string]any{"type": "response", "id": command["id"], "command": command["type"], "success": true, "data": map[string]any{"accepted": true, "private": rpcSensitiveCanary}}
 				encoded, _ := json.Marshal(reply)
@@ -1142,14 +1160,66 @@ func TestConsumerPhaseRestorationAndRedaction(t *testing.T) {
 func TestPhysicalReadBudgetFailureRetainsPreReleaseSnapshot(t *testing.T) {
 	var budget byteBudget
 	initial := int64(maxRPCBufferedBytes - 24)
-	budget.used.Store(initial)
+	if _, ok := budget.reserve(int(initial)); !ok {
+		t.Fatal("cannot reserve initial byte credit")
+	}
 	var failure byteBudgetFailure
 	reader := bufio.NewReaderSize(strings.NewReader(strings.Repeat("x", 40)+"\n"), 16)
 	if data, err := readLineBudget(reader, 1024, &budget, &failure); data != nil || err != errQueueOverflow {
 		t.Fatalf("physical read did not retain overflow sentinel: data=%v err=%v", data, err)
 	}
-	if failure.used != initial+16 || failure.requested != 16 || budget.used.Load() != initial {
-		t.Fatalf("failure snapshot lost partial-frame credit: failure=%+v current=%d", failure, budget.used.Load())
+	if failure.used != initial+16 || failure.requested != 16 || budget.usedBytes() != initial {
+		t.Fatalf("failure snapshot lost partial-frame credit: failure=%+v current=%d", failure, budget.usedBytes())
+	}
+}
+
+func TestReadAheadFlagPreservesFrameBudget(t *testing.T) {
+	for _, prefetched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prefetched=%t", prefetched), func(t *testing.T) {
+			c := &Client{}
+			wire := "{\"type\":\"extension_ui_request\",\"id\":\"next-dialog\",\"method\":\"ask\",\"questions\":[]}\n"
+			initial := maxRPCBufferedBytes - len(wire)
+			if _, ok := c.bytes.reserve(initial); !ok {
+				t.Fatal("cannot reserve boundary credit")
+			}
+			c.bytes.setReadAhead(prefetched)
+			var failure byteBudgetFailure
+			frame, err := readLineBudget(bufio.NewReader(strings.NewReader(wire)), maxFrame, &c.bytes, &failure)
+			if err != nil {
+				t.Fatalf("prefetch flag consumed available frame budget: %v (%+v)", err, failure)
+			}
+			var event envelope
+			if json.Unmarshal(frame, &event) != nil || event.Type != "extension_ui_request" || string(frame) != strings.TrimSuffix(wire, "\n") {
+				t.Fatal("budget-boundary native dialog was corrupted")
+			}
+			if used, ok := c.bytes.reserve(1); ok || used != maxRPCBufferedBytes {
+				t.Fatalf("full budget reservation returned used=%d ok=%t", used, ok)
+			}
+			if c.bytes.usedBytes() != maxRPCBufferedBytes || !c.BufferedOutput() {
+				t.Fatal("full frame credit was not visible to the consumer")
+			}
+			c.bytes.release(cap(frame))
+			c.bytes.release(initial)
+			if c.bytes.usedBytes() != 0 || c.BufferedOutput() != prefetched {
+				t.Fatal("credit release corrupted prefetch-only occupancy")
+			}
+			c.bytes.setReadAhead(false)
+			if c.BufferedOutput() {
+				t.Fatal("clearing prefetch left permanent buffered occupancy")
+			}
+			if used, ok := c.bytes.reserve(maxRPCBufferedBytes); !ok || used != 0 {
+				t.Fatalf("handoff corrupted reusable frame budget: used=%d ok=%t", used, ok)
+			}
+			c.bytes.setReadAhead(true)
+			c.bytes.setReadAhead(false)
+			if c.bytes.usedBytes() != maxRPCBufferedBytes || !c.BufferedOutput() {
+				t.Fatal("prefetch flag update destroyed frame credit")
+			}
+			c.bytes.release(maxRPCBufferedBytes)
+			if c.BufferedOutput() {
+				t.Fatal("reused frame budget retained occupancy after release")
+			}
+		})
 	}
 }
 
@@ -1187,7 +1257,9 @@ func TestReadLoopOverflowDiagnosticsAtInfo(t *testing.T) {
 			defer reader.Close()
 			defer writer.Close()
 			c := &Client{log: logger, stdout: reader, queuedEvents: make(chan json.RawMessage, 1), ready: make(chan struct{}), stop: make(chan struct{}), readDone: make(chan struct{})}
-			c.bytes.used.Store(test.initial)
+			if _, ok := c.bytes.reserve(int(test.initial)); !ok {
+				t.Fatal("cannot reserve initial byte credit")
+			}
 			previous := c.BeginConsumerPhase("callback")
 			defer c.EndConsumerPhase(previous)
 			go c.readLoop()
@@ -1195,6 +1267,9 @@ func TestReadLoopOverflowDiagnosticsAtInfo(t *testing.T) {
 			for _, frame := range test.frames {
 				input = append(input, frame...)
 			}
+			// A fatal frame leaves unread data, so diagnostics must mask the
+			// packed prefetch flag while retaining the exact byte snapshot.
+			input = append(input, []byte("{\"type\":\"agent_end\"}\n")...)
 			if _, err := writer.Write(input); err != nil {
 				t.Fatal(err)
 			}
@@ -1203,6 +1278,9 @@ func TestReadLoopOverflowDiagnosticsAtInfo(t *testing.T) {
 			case <-c.readDone:
 			case <-time.After(5 * time.Second):
 				t.Fatal("overflow reader did not finish")
+			}
+			if c.bytes.usedBytes() != test.current || c.BufferedOutput() != (test.current != 0) {
+				t.Fatal("terminal reader left stale prefetch occupancy or lost byte credit")
 			}
 			if err := c.failure(); ClassifyError(err) != "queue_overflow" || !c.protocolFailed.Load() || (test.reason == "byte_budget" && !errors.Is(err, errQueueOverflow)) {
 				t.Fatalf("overflow classification changed: %v", err)
@@ -1267,7 +1345,7 @@ func TestForwarderBlockedDurationClearsAfterDeliveryAndLogsOverflow(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("forwarder did not deliver event")
 	}
-	for c.forwardBlockedAt.Load() != 0 || c.bytes.used.Load() != 0 {
+	for c.forwardBlockedAt.Load() != 0 || c.bytes.usedBytes() != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("delivery did not clear wait state and release credit")
 		}
@@ -1285,7 +1363,7 @@ func TestForwarderBlockedDurationClearsAfterDeliveryAndLogsOverflow(t *testing.T
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(5 * time.Millisecond)
-	details := queueOverflowDetails{reason: "event_slots", stage: "event_enqueue", eventKind: rpcSensitiveCanary, budget: byteBudgetFailure{used: c.bytes.used.Load(), requested: cap(frame)}}
+	details := queueOverflowDetails{reason: "event_slots", stage: "event_enqueue", eventKind: rpcSensitiveCanary, budget: byteBudgetFailure{used: c.bytes.usedBytes(), requested: cap(frame)}}
 	c.queueOverflow(errQueueOverflow, details)
 	c.queueOverflow(errQueueOverflow, details)
 	var record map[string]any

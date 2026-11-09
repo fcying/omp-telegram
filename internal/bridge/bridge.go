@@ -212,6 +212,7 @@ type taskState struct {
 	owner                 int64
 	awaitingContinuation  bool
 	busy                  bool
+	uiStopped             bool
 	activeInputKind       queuedInputKind
 }
 
@@ -285,12 +286,16 @@ type worker struct {
 	taskState
 	turn                uint64
 	steers              map[string]steerRequest
+	deferredSteers      []deferredSteer
 	steerFence          steerFence
 	activeAttachmentDir string
 	rootRequestID       string
 	nativeCatalog       nativeCommandCatalog
 	research            autoresearchState
 	nativeControl       *nativeControlRequest
+	ask                 *askRequest
+	uiSeen              map[string]struct{}
+	askSending          int
 	argsApply           *argsApplyRequest
 	argsResuming        bool
 	resumeFailed        bool
@@ -489,6 +494,8 @@ type rpcEvent struct {
 	Message               json.RawMessage              `json:"message"`
 	Text                  string                       `json:"text"`
 	Options               []string                     `json:"options"`
+	Questions             []askQuestion                `json:"questions"`
+	Secret                bool                         `json:"secret"`
 	AgentInvoked          *bool                        `json:"agentInvoked"`
 	IsTerminal            *bool                        `json:"isTerminal"`
 	Success               bool                         `json:"success"`
@@ -1176,6 +1183,11 @@ func (b *Bridge) deleteProgressMessage(ctx context.Context, message store.Progre
 }
 
 func (b *Bridge) fail(err error) {
+	// In-flight worker persistence can observe daemon cancellation before its
+	// actor exits. That expected shutdown must not race Run's nil return.
+	if b.ctx != nil && b.ctx.Err() != nil && errors.Is(err, b.ctx.Err()) {
+		return
+	}
 	select {
 	case b.fatal <- err:
 	default:
@@ -1310,6 +1322,8 @@ func (w *worker) taskActive() bool { return w.active != 0 }
 func (w *worker) taskRunning() bool { return w.taskActive() && w.busy }
 
 func (w *worker) beginTask(q queued) {
+	w.cancelDeferredSteers()
+	w.endAsk(true)
 	w.resetSub2apiUsage()
 	w.rotatePreview(0)
 	w.cancelProgressNative()
@@ -1325,6 +1339,8 @@ func (w *worker) beginTask(q queued) {
 }
 
 func (w *worker) clearTask() {
+	w.cancelDeferredSteers()
+	w.endAsk(true)
 	w.cancelProgressNative()
 	w.resetReplyStatus()
 	w.uiSelection = nativeSelectionReceipt{}
@@ -1377,7 +1393,7 @@ func (w *worker) sessionControlBusy() bool {
 }
 
 func (w *worker) canDispatch() bool {
-	return !w.resumeFailed && !w.steerFence.active && !w.sessionControlBusy() && len(w.queue) != 0
+	return !w.resumeFailed && !w.steerFence.active && !w.sessionControlBusy() && w.ask == nil && w.askSending == 0 && len(w.queue) != 0
 }
 
 func (w *worker) canReleaseRuntime() bool {
@@ -1394,7 +1410,7 @@ func (w *worker) lifecycleIdle() bool {
 		!w.restoring && !w.runtimeResuming && !w.taskActive() &&
 		!w.taskOrSessionBusy() && !w.controlInProgress() &&
 		!w.compacting && !w.finishing && !w.previewBusy &&
-		!w.awaitingContinuation && w.exportingSession == ""
+		!w.awaitingContinuation && w.exportingSession == "" && w.ask == nil && w.askSending == 0 && len(w.deferredSteers) == 0
 }
 
 func (w *worker) canEvict() bool {
@@ -1413,6 +1429,9 @@ func (w *worker) canEvict() bool {
 }
 
 func (w *worker) hasRuntimeConfirmation() bool {
+	if w.ask != nil || w.askSending != 0 || len(w.deferredSteers) != 0 {
+		return true
+	}
 	for _, c := range w.confirms {
 		switch c.action {
 		case "model", "thinking", "ui", "new", "autoresearch_clear":
@@ -1464,6 +1483,12 @@ func (w *worker) beginRuntimeStart() {
 
 func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 	defer w.beginConsumerPhase("runtime", "runtime_started").end()
+	if w.client != client {
+		w.cancelDeferredSteers()
+		w.endAsk(false)
+		w.uiSeen = nil
+		w.uiStopped = false
+	}
 	w.b.registerCommandMenuWorker(w)
 	w.client = client
 	w.launchArgs = args
@@ -1478,7 +1503,11 @@ func (w *worker) runtimeStarted(client *omp.Client, args []string) {
 }
 
 func (w *worker) runtimeStopped() {
+	w.cancelDeferredSteers()
 	defer w.beginConsumerPhase("runtime", "runtime_stopped").end()
+	w.endAsk(false)
+	w.uiSeen = nil
+	w.uiStopped = false
 	w.uiSelection = nativeSelectionReceipt{}
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
@@ -2046,13 +2075,15 @@ func (w *worker) operationFinished(result operationResult) {
 		w.finishMenuOrSay(messageID, message)
 	case "abort":
 		if result.err != nil || result.cancelled {
-			if uncertainOperationOutcome(result.err, result.cancelled) {
+			// Stop already revoked Ask input; a rejected abort cannot leave it waiting.
+			if w.ask != nil || uncertainOperationOutcome(result.err, result.cancelled) {
 				w.releaseRuntimeWithReason(true, "failure")
 				if w.active != 0 {
 					w.finishUncertain(w.tr(i18n.Msg.AbortOutcomeUncertainActiveTaskWillNotReplayedAutomatically))
 				}
 			}
 			w.endControlOperation()
+			w.uiStopped = false
 			w.say(w.tr(i18n.Msg.AbortRequestFailed))
 		} else {
 			w.completeAbort(true, result.message)
@@ -2065,7 +2096,7 @@ func (w *worker) operationFinished(result operationResult) {
 				break
 			}
 		}
-		pending = pending || len(w.hostRequests) != 0 || w.client.BufferedOutput()
+		pending = pending || w.ask != nil || w.askSending != 0 || len(w.hostRequests) != 0 || w.client.BufferedOutput()
 		if result.err == nil && !result.cancelled && idle && settled && !pending && !w.taskActive() && !w.taskOrSessionBusy() && !w.compacting {
 			w.completeAbort(false, w.tr(i18n.Msg.NoActiveTaskQueuedPromptsCleared))
 		} else {
@@ -2313,6 +2344,8 @@ func (w *worker) stop() {
 	if !w.consumeFinalAction() {
 		return
 	}
+	w.cancelDeferredSteers()
+	w.pauseAsk()
 	w.cancelFollowupInputs()
 	w.cancelArgsApply(true)
 	if w.migrationLocked() {
@@ -2349,6 +2382,8 @@ func (w *worker) stop() {
 }
 
 func (w *worker) stopActiveTask() {
+	w.cancelDeferredSteers()
+	w.pauseAsk()
 	w.cancelFollowupInputs()
 	w.cancelArgsApply(true)
 	if w.nativeControl != nil {
@@ -2400,6 +2435,7 @@ func (w *worker) completeAbort(retire bool, notice string) {
 		w.completeSessionOperation()
 	}
 	w.endControlOperation()
+	w.uiStopped = false
 	if retire {
 		if w.taskActive() {
 			if !w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion)) {
@@ -2510,6 +2546,9 @@ func (w *worker) dispatchRPCOperation() {
 func (w *worker) operationReturned(result operationResult) {
 	defer w.beginConsumerPhase("operation", "operation_returned").end()
 	defer w.withFinalAction(result.finalAction)()
+	if w.askOperationFinished(result) {
+		return
+	}
 	if w.followupPromptFinished(result) {
 		return
 	}
@@ -2838,6 +2877,10 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	}
 	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, ResumeModelFallback: true, Args: launchArgs, Environment: w.b.cfg.OMPEnvironment}, w.b.rpcLog)
 	if e != nil {
+		reason := omp.ClassifyError(e)
+		if !errors.Is(w.ctx.Err(), context.Canceled) && reason != "cancelled" {
+			w.log.Error("runtime startup failed", "event", "runtime_start_failed", "reason", reason, "generation", w.conversationGeneration())
+		}
 		if reserved {
 			<-w.b.slots
 		}
@@ -2853,13 +2896,7 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 			w.sessionRuntimeStarting.Store(false)
 			w.sessionRuntimeActive.Store(false)
 		}
-		if w.runtimeResuming {
-			return w.tr(i18n.Msg.FailedResumeReleasedOMPSessionNoPromptSubmitted)
-		}
-		if resume {
-			return w.tr(i18n.Msg.FailedResumeOmpStartupOutcomeUncertainUseCloseBefore)
-		}
-		return w.tr(i18n.Msg.FailedStartOmpStartupOutcomeUncertainUseCloseBefore)
+		return w.startupFailureMessage(reason, resume)
 	}
 	w.runtimeStarted(c, launchArgs)
 	defer w.beginConsumerPhase("runtime", "initialize_runtime").end()
@@ -2972,6 +3009,30 @@ func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, 
 	return ""
 }
 
+func (w *worker) startupFailureMessage(reason string, resume bool) string {
+	var hint string
+	switch reason {
+	case "startup_timeout_pending_confirm":
+		hint = w.tr(i18n.Msg.StartupTimeoutPendingConfirm)
+	case "startup_timeout_pending_ui":
+		hint = w.tr(i18n.Msg.StartupTimeoutPendingUI)
+	}
+	if w.runtimeResuming {
+		message := w.tr(i18n.Msg.FailedResumeReleasedOMPSessionNoPromptSubmitted)
+		if hint != "" {
+			return hint + "\n" + message
+		}
+		return message
+	}
+	if hint != "" {
+		return hint + "\n" + w.tr(i18n.Msg.StartupOutcomeUnconfirmedUseClose)
+	}
+	if resume {
+		return w.tr(i18n.Msg.FailedResumeOmpStartupOutcomeUncertainUseCloseBefore)
+	}
+	return w.tr(i18n.Msg.FailedStartOmpStartupOutcomeUncertainUseCloseBefore)
+}
+
 func (w *worker) announceDefaultModelFallback(client *omp.Client) {
 	if !client.UsedDefaultModelFallback() || w.modelFallbackNoticeID == client.ID() {
 		return
@@ -3010,6 +3071,9 @@ func (w *worker) handle(in incoming) {
 	w.flushReplyStatus()
 	w.statusReleaseClientID = 0
 	w.touchLogicalActivity()
+	if in.callback == nil && w.routeAskInput(&in) {
+		return
+	}
 	if in.callback == nil && w.routeFollowupInput(&in) {
 		return
 	}
@@ -3369,6 +3433,7 @@ func promptInlineCount(message string, images []media.Image, limit int) (int, bo
 
 func (w *worker) dispatch() {
 	defer w.beginConsumerPhase("dispatch", "dispatch").end()
+	w.dispatchDeferredSteers()
 	if !w.canDispatch() {
 		return
 	}
@@ -4065,6 +4130,9 @@ func (w *worker) event(raw []byte) {
 		w.commandCatalogUpdated()
 	case "session_info_update":
 		w.uiSelection = nativeSelectionReceipt{}
+		if w.ask != nil && !w.askScope(w.ask) {
+			w.endAsk(false)
+		}
 		w.progressNativeSessionChanged()
 		// The reader invalidates the catalog before publishing session changes.
 		w.syncCommandMenu()
@@ -4890,6 +4958,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
+	if c.action == "ask" {
+		return w.askCallback(ctx, q, token, index, c)
+	}
 	if action := c.finalAction; action != nil && !action.finished {
 		if err := w.b.db.CheckFinalActionReservation(ctx, action.inboxID); err != nil {
 			action.finished = true
@@ -5330,6 +5401,20 @@ func (w *worker) ui(e rpcEvent) {
 		return
 	}
 	switch e.Method {
+	case "ask", "editor", "input", "confirm", "select":
+		admitted := w.admitUI(e, client)
+		if !admitted {
+			return
+		}
+	}
+	w.applyUI(e, client)
+}
+
+// applyUI handles admitted requests and native cancellation without readmission.
+func (w *worker) applyUI(e rpcEvent, client *omp.Client) {
+	switch e.Method {
+	case "ask", "editor", "input":
+		w.beginAsk(e)
 	case "confirm", "select":
 		var msg string
 		_ = json.Unmarshal(e.Message, &msg)
@@ -5359,11 +5444,10 @@ func (w *worker) ui(e rpcEvent) {
 			c.uiSelected = previous.text
 		}
 		w.showUISelectPage(c, 0, messageID)
-	case "input", "editor":
-		w.uiSelection = nativeSelectionReceipt{}
-		w.cancelUI(confirmation{uiID: e.ID, uiClientID: client.ID()})
-		w.say(w.tr(i18n.Msg.InputDialogsNotSupportedCanceledProvideInformationNormalMessage))
 	case "cancel":
+		if w.ask != nil && w.ask.id == e.TargetID {
+			w.endAsk(false)
+		}
 		w.uiSelection = nativeSelectionReceipt{}
 		for token, c := range w.confirms {
 			if c.action == "ui" && c.uiID != "" && c.uiID == e.TargetID {
@@ -5392,6 +5476,7 @@ func (w *worker) dropConfirmation(token string, c confirmation) {
 }
 
 func (w *worker) clearConfirmations() {
+	w.endAsk(true)
 	w.uiSelection = nativeSelectionReceipt{}
 	for token, c := range w.confirms {
 		w.dropConfirmation(token, c)
@@ -5399,6 +5484,7 @@ func (w *worker) clearConfirmations() {
 }
 
 func (w *worker) clearTaskConfirmations() {
+	w.endAsk(true)
 	w.uiSelection = nativeSelectionReceipt{}
 	for token, c := range w.confirms {
 		if c.action == "queue" || c.action == "resume" || c.action == "export" || c.action == "session_delete" {
@@ -5409,6 +5495,7 @@ func (w *worker) clearTaskConfirmations() {
 }
 
 func (w *worker) clearRuntimeConfirmations() {
+	w.endAsk(true)
 	for token, c := range w.confirms {
 		if c.action == "resume" {
 			continue
