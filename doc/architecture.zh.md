@@ -163,7 +163,7 @@ Linux 上通过 [`startProcess`](../internal/omp/process_linux.go) 启动的原�
 
 [`Client`](../internal/omp/client.go) 拥有 OMP 进程组, 连续 stdout reader, 串行 stdin 写入, pending request ID 和异步事件转发器. 启动验证 `ready` 的传输限制并协商公开 RPC v2. `Call` 在写入前注册关联, 等待命令 acknowledgment, 而非 agent 完成. 响应 ID 和命令名必须匹配; 无关联/畸形响应按失败关闭处理, 已放弃 ID 的迟到响应直接丢弃, 不重新解释为事件. 文本 steering 还要求请求关联的 `prompt_result` 和 settlement 支持.
 
-进程保持 Bridge 持有的 `--mode rpc-ui`. `ready` 后先尝试 `set_ask_dialog enabled:true`, 再进行普通 v2 协商. 只有请求关联正确的 `success:false` 且错误字符串精确为 `Unknown command: set_ask_dialog`, 才允许在同一进程继续使用原生 `select`/`editor` 代替组合对话. 其他拒绝, 畸形成功, 超时, 断连, 无关联或命令不匹配响应均关闭进程; 它们不能证明版本较旧, 也不允许切换到普通 `rpc`. 公开 RPC v2 协商仍为必需. 原生对话路径已通过 OMP 18.18.1 实机验证.
+进程保持 Bridge 持有的 `--mode rpc-ui`. `ready` 后先为基于 questions 的扩展 `ui.askDialog` 尝试 `set_ask_dialog enabled:true`, 再进行普通 v2 协商; 这与原生 HTML 表单独立. 只有请求关联正确的 `success:false` 且错误字符串精确为 `Unknown command: set_ask_dialog`, 才允许在同一进程继续使用通用 `select`/`input`/`editor` 代替扩展组合对话. 其他拒绝, 畸形成功, 超时, 断连, 无关联或命令不匹配响应均关闭进程; 它们不能证明版本较旧, 也不允许切换到普通 `rpc`. 公开 RPC v2 协商仍为必需, 但不能仅凭这一点推定兼容. 兼容目标仅为最新稳定版 OMP.
 
 启动仍是同步流程: worker 仅在 `Start` 完成协商后接管 UI 事件. 不支持在接管前阻塞 `session_start` 的对话; 协商超时后启动失败, Telegram 不会出现可操作的对话. Bridge 不自动回答. 连接后的无 root UI 不会仅因没有活动任务而拒绝.
 
@@ -272,13 +272,21 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ### 原生对话与 session operation
 
-[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理组合 `ask` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
+从 OMP 18.18.3 起, 原生 `ask` 工具接收 `{html}`, 不再使用 `questions[]`. 表单由 OMP 解析. RPC 没有 `formDialog` 时 (包括 OMP 18.18.6), 它逐字段发出通用 `select`/`input`/`editor` 请求; checkbox 字段通过多次 `select` 收集. Bridge 复用通用 RPC UI, 不解析 HTML 或另建表单渲染器. 每个答案通过 `extension_ui_response` 回应对应请求, 不新增 prompt 或 steer; 完成归属仍为原 root/client/turn.
+
+[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理基于 questions 的扩展 `method:"ask"` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
+
+通用 `input`/`editor` 请求保留原始文字. `placeholder` 作为提示展示; `prefill` 与有界 literal 展示分开保存, 包括显式为空的编辑器默认值. **提交空值** 与 **使用完整默认值** callback 受 owner 和 interaction 围栏保护, 发送 `value:""` 或原始 prefill, 不发送 `cancelled:true`; 取消仍是独立响应. 消息回复必须实际包含文字, 因而贴纸, 语音或位置等纯非文字回复不能悄悄提交空字段. 必填/类型/pattern 校验归 OMP 所有, 它可在拒绝后用新 request ID 重问同一字段. 扩展组合 Ask 自定义答案继续裁剪首尾空白并要求非空.
+
+当前原生 RPC select envelope 不传递本地 `initialIndex` 或 checkbox 勾选状态元数据. Bridge 无法从字符串选项重建这些标记或整张表单的布局/图片; 仅返回原始选项标签, 由原生映射到值. 通用扩展对象选项的 description 目前不展示; 原生 HTML 回退发送字符串选项.
 
 活跃的 Ask/文字对话在显示确认前后均排除卡死任务恢复, 即使原生报告 idle 且没有 active tool. 对话结束后恢复原有 watchdog 策略; 只有暂存指导不算等待用户.
 
 原生 cancel 使匹配 token 失效. Teardown 先移除失效 token, 再进行有界键盘清理. 菜单 receipt 记录用户选择, 不是操作成功; confirm/select 写入失败按保守策略退役 runtime.
 
 连续的原生 `select` 仅在相同活动 root, turn, client 和 generation 内复用前一个已完成菜单, 中间不能跨模型 run/消息或 session 变化. 后续选择处于 pending, 翻页, 取消或失效状态时, 之前的选择仍在菜单文字预算内保持可见. 被复用的 Telegram 消息已不存在时, 重新发送可用菜单; 其他编辑失败不重发交付状态不明的菜单. Pending 菜单保留创建时的 scope, 包括 root/turn 为零的情况, 完成时不能借用后来的 root. 并发请求会取消, 不修改当前菜单或原有回执. 取消, 任务结算和 runtime teardown 清除可复用回执缓存, 不移除已显示的历史选择; 原有单次 token, 消息绑定和原生 response 处理保持不变.
+
+Extensions 保留独立的 questions-based `ui.askDialog` 协议和 `set_ask_dialog` opt-in. RPC `method:"ask"` 承载这些组合对话, 不是原生工具的 `{html}` schema 或 HTML `formDialog`. 以下组合对话行为适用于这一扩展 UI 路径.
 
 组合 Ask 保留不可变的 client/generation/session/catalog-epoch/root/turn/request 身份和可变的 question/interaction epoch. 逐题编辑一条主消息, 选项分页不改变标签, 最后一题完成后才按原问题顺序提交全部答案. 单选直接推进; 多选切换勾选并要求确认, 包括明确确认的空集合. 多选自定义文字补充已选选项. 进入/退出文字输入或切题时撤销旧 token 和提示身份. 每次文字输入单独发送定向 ForceReply 提示, 带不透明且由 bot 发出的 `[ask:...]` marker. 返回的消息 ID 及当前 token/owner/对话必须同时匹配. 一条早到回复可以等待显示回执确认精确 ID; 取消时结算该 pending inbox, 不重放. Marker 识别过期/重启后的提示, 不持久化另一份对话副本. 普通文本和 queued followup 不取消 Ask, 也不进入答案路由.
 
@@ -604,7 +612,7 @@ Clear 要求实例空闲, 队列为空, 没有未解决引导, 并取得绑定�
 
 [`config.go`](../config.go) 内嵌 Extension. 启用时, [`prepareMigrationExtension`](../internal/config/migration_extension.go) 在 `<storage.data_dir>/.bridge-extensions/` 中以内容寻址文件名原子释放 `.ts` 文件, 使用私有目录/文件权限, 拒绝缓存符号链接. 使用与 worker workspace 无关的绝对路径, 内容版本化使另一个二进制或 `--check` 不会替换现有 runtime 使用的代码. 配置加载器向每个解析后的预设追加独立的 `-e` 和路径 argv, 再计算参数指纹. 普通启动, 惰性/显式 resume, 迁移恢复和原生发现复用这些有效预设. 不重写用户参数或 OMP 配置文件. 缓存是 bridge 拥有的生成资源, 不是 workspace 或 session 历史; 仅安装二进制即可使用.
 
-原生迁移兼容已验证 OMP 18.18.1; 不能仅凭支持 RPC v2 就推定其他版本兼容. 可选的 [`TestRealOMPMigrationCompatibility`](../internal/config/migration_integration_test.go) 实跑内嵌 Extension, handoff 被拒绝后的预算清理, 严格 journal/实时上下文验证, 非默认模型跨进程恢复, configured thinking `auto` 和 Fast `false`. 新增或变化的初始化记录在语义验证前必须安全拒绝, 不应只为通过升级而扩大 metadata 白名单. 该测试不覆盖 Fast 已启用的 provider 或生产 provider 行为.
+原生迁移针对最新稳定版 OMP 探测; 不能仅凭支持 RPC v2 就推定兼容. 可选的 [`TestRealOMPMigrationCompatibility`](../internal/config/migration_integration_test.go) 实跑内嵌 Extension, handoff 被拒绝后的预算清理, 严格 journal/实时上下文验证, 非默认模型跨进程恢复, configured thinking `auto` 和 Fast `false`. 新增或变化的初始化记录在语义验证前必须安全拒绝, 不应只为通过升级而扩大 metadata 白名单. 该测试不覆盖 Fast 已启用的 provider 或生产 provider 行为.
 
 Worker 首先检查精确源身份, 原生已静止状态, 空 bridge 队列及没有竞争控制, 冻结 provider/model, configured thinking 和 fast-mode 设置. `PrepareMigration` 用 CAS 核对源并排斥待定启动/迁移, 不修改源 binding 或 `running` 标记. 持久阶段为 `prepared`, `handoff`, `initialize`, `verify`; 未解决失败保留阶段及有界错误分类. 每个有副作用步骤之前先持久化阶段. Handoff deadline 为 180 秒, 其他迁移 RPC 阶段分别有界.
 
@@ -729,7 +737,7 @@ Worker teardown 使等待中的 binding-forget confirmation 失效, 但不提前
 
 自动命名提交 operation 返回前禁止空闲回收 runtime, 包括取消结果的交接窗口. 不等待原生后台标题生成完成.
 
-真实 OMP compatibility smoke 必须在 **18.18.1** baseline 验证原生 name revision 保护, 确保延迟的自动生成不会覆盖稍后的手动命名, 包括受控 input hook 延迟 builtin admission 前的取消. 仅 bridge state 检查或 prompt ACK 不能证明此保护成立.
+真实 OMP compatibility smoke 必须针对最新稳定版验证原生 name revision 保护, 确保延迟的自动生成不会覆盖稍后的手动命名, 包括受控 input hook 延迟 builtin admission 前的取消. 仅 bridge state 检查或 prompt ACK 不能证明此保护成立.
 
 `/title <title>` 是直接调用 Telegram 话题编辑 API 的 Bridge 命令, 独立于 OMP 及其 RPC/prompt 通道, 迁移输入锁定时也可执行. 它不启动或恢复 OMP, 不修改 session binding. 共享 Telegram client 对负 chat ID 且 thread ID 为 1 的 supergroup General 调用 `editGeneralForumTopic`, 不传 `message_thread_id`; 其他话题, 包括私聊中 ID 为 1 的 topic, 使用 `editForumTopic`. General 始终需要管理员身份及 `can_manage_topics`, 不适用话题创建者例外. 改名复用异步话题名预留及结算, 原样保留指定标题, 不截断也不添加重名后缀. 每个 worker 仅允许一次在途改名; 重叠的 `/title` 请求会被拒绝, 自动命名会跳过在途的手动改名. 显式请求确认后, 在结算事务中原子设置 `topic_names.explicit`, 即使期间已有更新的标题观察也会保留该优先级. 自动预留在自身事务内检查此标记并跳过话题, 因此启动完成, worker 重建及重启均不会覆盖已确认的显式标题. HTTP deadline 仍为 10 秒. 显式命令回执仅报告 API 接受, 失败或结果不确定, 不保证客户端同步; 其归属是 topic, 而非 OMP generation.
 
@@ -1042,21 +1050,21 @@ Assistant 正文断言独立读取持久化的 `outbox.text`, 不解析可选状
 
 所有启动真实 OMP 的测试, smoke 和诊断, 包括手动命令及临时脚本, 都必须显式传入 `--session-dir`, 值为专用临时测试目录内的绝对路径. 仅使用临时工作目录不能隔离 session. 禁止回退到用户默认 session store; 无法建立隔离时必须停止. 隔离 profile, workspace, 数据库及子进程环境; 可能修改可写 agent 状态时使用临时 agent 目录. 删除临时目录前先停止所有测试所属 OMP 进程; 仅为诊断有意保留产物. 访问真实用户 session 必须得到用户明确授权, 这些规则不允许删除现有历史, 也不改变正常 bridge session 持久化.
 
-显式验证某个已安装的 OMP 版本:
+使用明确选择的 OMP 可执行文件诊断兼容性:
 
 ```sh
 just smoke-omp /absolute/path/to/omp
 ```
 
-Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行真实兼容测试. 未设置该变量时这些测试均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员选择新版 OMP 前的可选检查, 不是普通用户升级 OMP 的必需步骤.
+Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 不使用测试缓存运行真实兼容测试. 未设置该变量时这些测试均跳过, 普通测试不依赖已安装 OMP. 测试报告所选可执行文件的真实版本, 并遵循上述隔离规则. 不需要生产 provider 凭据或线上 Telegram 交付. 这是开发和维护人员的可选诊断, 不是普通用户升级 OMP 的必需步骤; 选择旧可执行文件不代表它成为受支持的兼容目标.
 
 [`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) 使用真实 worker 和 RPC client, 对接确定性的本地 OpenAI-compatible HTTP/SSE provider. 检查启动/catalog 和 host-tool 注册, prompt 接受与任务完成的区别, root 暂停期间的 fast 控制, 排队最终回复归属及后续请求实际携带的 `service_tier=priority`. 原生 `telegram_send` 调用/结果必须为原 topic 入队不可变 workspace 快照, 不宣称已交付. Stop 必须退役旧 runtime 并取消排队任务; 惰性 resume 必须保留 session 身份和原生上下文, 不重放任务. 已有迁移兼容测试继续独立检查原生 Extension/journal. 两者都不证明生产 provider 或线上 Bot API 兼容.
 
-[`TestRealOMPAskCompatibility`](../internal/bridge/ask_real_integration_test.go) 沿用相同隔离和本地 provider 模式, 执行真实原生 `ask` 工具调用. 组合多题的单选/多选/自定义答案, 以及明确选择的 `select`/`editor` 回退, 必须产生原 turn 的工具结果和最终回复, 且只有一条用户输入, 不新增 prompt/steer. 原生 Ask 等待期间的 Stop 必须退役 runtime, 取消 root 和 queued followup, 使旧按钮失效, 且不发起后续 provider 请求.
+[`TestRealOMPAskCompatibility`](../internal/bridge/ask_real_integration_test.go) 沿用相同隔离和本地 provider 模式, 执行真实原生 `{html}` `ask` 工具调用. 表单选项和文本字段经 OMP 通用 `select`/`input`/`editor` RPC 回退传递, 必须产生原 turn 的工具结果和最终回复, 且只有一条用户输入, 不新增 prompt/steer. 覆盖原始空白/换行, 显式空值, 可见 placeholder/prefill, 原样提交默认值, 原生必填/数字/pattern 重问和过期默认值按钮. 原生 Ask 等待期间的 Stop 必须退役 runtime, 取消 root 和 queued followup, 使旧按钮失效, 且不发起后续 provider 请求. 基于 questions 的扩展 `method:"ask"` 仍是独立 UI 协议, 不是需要模拟的旧版原生工具 schema.
 
 [`TestRealOMPAutoSessionNameCompatibility`](../internal/bridge/auto_session_name_real_test.go) 使用独立本地标题模型, 检查原生后台 `/rename`, 手动命名优先级, session 切换/abort 隔离, ACP 持久化标题及恢复后的对话身份. 显式临时 `--session-dir` 与隔离的原生 cwd bucket 一致, 因为 ACP 列举不遍历任意自定义 session 目录.
 
-独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 支持手动和每周运行. 官方 standalone 资产下载到 runner 临时目录, 按 release 提供的 SHA-256 摘要校验, 并记录解析后的 release tag. 基线固定为 18.18.1; 候选默认为最新正式 release, 也可显式指定 tag. 两个矩阵结果独立可见, 候选失败不取消基线. 不改变发布 CI, 不安装或重启生产 daemon.
+独立的 [OMP 兼容性工作流](../.github/workflows/omp-compatibility.yaml) 在 Linux amd64 每日北京时间 08:00 (00:00 UTC) 及手动运行, 仅针对最新稳定版 OMP. 每次运行只获取一次官方 `releases/latest` metadata, 从同一份 metadata 读取 standalone 资产 URL 下载到 runner 临时目录, 并按 release 提供的 SHA-256 摘要校验. 日志和 job summary 记录解析后的 tag, 资产 URL 与摘要. 不设 baseline, 版本矩阵或手动版本参数; smoke 返回非零时直接使 job 失败, 在 GitHub Actions 显示红灯, 不吞掉错误. 不新增外部通知, 不改变发布 CI, 不安装或重启生产 daemon.
 
 确定性本地 provider 可验证原生 RPC/model-tool 交互, 不能证明生产 provider 兼容性. 注入 Telegram update 或模拟 callback 验证的是 bridge 处理, 不是手机端输入, 按钮交互或真实 Bot API 交付. 后者必须具备真实 Telegram 凭据并进行用户客户端操作才能声明验证. Parent-death/process-group 测试不能证明任意后代都被 containment. 本文不保留逐次修复的 smoke 转录, 历史运行也不代表当前部署认证.
 

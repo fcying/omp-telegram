@@ -24,6 +24,8 @@ type askRequest struct {
 	catalogEpoch       uint64
 	user               int64
 	id, method         string
+	placeholder        string
+	prefill            *string
 	questions          []askQuestion
 	answers            []askAnswer
 	question           int
@@ -139,7 +141,7 @@ func (w *worker) beginAsk(e rpcEvent) {
 	}
 	a := &askRequest{client: client, generation: w.binding.Generation, session: w.sessionID,
 		active: w.active, turn: w.turn, user: w.owner, id: e.ID, method: e.Method,
-		questions: e.Questions, catalogEpoch: catalog.Epoch}
+		questions: e.Questions, catalogEpoch: catalog.Epoch, placeholder: e.Placeholder, prefill: e.Prefill}
 	if a.user == 0 || e.Secret {
 		w.sendAskResponse(a, map[string]any{"cancelled": true})
 		return
@@ -248,6 +250,11 @@ func (w *worker) renderAsk(a *askRequest) {
 	if a.input {
 		if a.method == "ask" {
 			add(w.tr(i18n.Msg.AskBack), "back")
+		} else {
+			add(w.tr(i18n.Msg.AskEmpty), "empty")
+			if a.method == "editor" && a.prefill != nil {
+				add(w.tr(i18n.Msg.AskDefault), "default")
+			}
 		}
 	} else {
 		start := a.page * uiSelectPageSize
@@ -287,10 +294,23 @@ func (w *worker) renderAsk(a *askRequest) {
 	add(w.tr(i18n.Msg.Cancel), "cancel")
 	var prompt string
 	if a.input {
+		questionLimit := 1000
+		if a.method != "ask" {
+			questionLimit = 500
+		}
+		detail := clipUTF16(question.Question, questionLimit)
+		if a.method != "ask" {
+			if a.placeholder != "" {
+				detail += "\n\n" + w.tr(i18n.Msg.AskPlaceholder) + "\n" + clipUTF16(a.placeholder, 500)
+			}
+			if a.method == "editor" && a.prefill != nil {
+				detail += "\n\n" + w.tr(i18n.Msg.AskPrefill) + "\n" + clipUTF16(*a.prefill, 500)
+			}
+		}
 		a.inputToken = rand.Text()
 		// Force a fenced literal block so question Markdown cannot expand or add mentions.
 		prompt = "[" + w.tr(i18n.Msg.AskInput) + "](tg://user?id=" + strconv.FormatInt(a.user, 10) + ")" +
-			progressToolLiteral(clipUTF16(question.Question, 1000)+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
+			progressToolLiteral(detail+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
 	}
 	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token}
 	text = clipUTF16(text, 3700)
@@ -387,6 +407,19 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 	case "cancel":
 		w.endAsk(true)
 		return callbackDone
+	case "empty", "default":
+		if a.input && (a.method == "input" || a.method == "editor") {
+			if action == "default" {
+				if a.method != "editor" || a.prefill == nil {
+					return callbackDone
+				}
+				a.custom = *a.prefill
+			} else {
+				a.custom = ""
+			}
+			w.advanceAsk(a)
+		}
+		return callbackDone
 	case "back":
 		if a.input && a.method == "ask" {
 			a.input = false
@@ -471,14 +504,14 @@ func (w *worker) routeAskInput(in *incoming) bool {
 	if !marked && !currentID {
 		return false
 	}
-	text := strings.TrimSpace(message.Text)
+	text := message.Text
 	if len(message.Photo) == 0 && message.Document == nil && message.From != nil &&
 		message.Chat.ID == w.key.chat && message.MessageThreadID == w.key.thread &&
 		reply.From != nil && reply.From.ID == w.b.bot.ID && reply.Chat.ID == w.key.chat {
-		command, _, foreign := parseSlashInvocation(text, w.b.bot.Username)
+		command, _, foreign := parseSlashInvocation(strings.TrimSpace(text), w.b.bot.Username)
 		researchOff := false
 		if command == "/autoresearch" {
-			args, research := autoresearchArguments(text, w.b.bot.Username)
+			args, research := autoresearchArguments(strings.TrimSpace(text), w.b.bot.Username)
 			researchOff = research && args == "off"
 		}
 		// Commands retain normal routing even when the Ask prompt is stale or still sending.
@@ -502,6 +535,9 @@ func (w *worker) routeAskInput(in *incoming) bool {
 		w.say(w.tr(i18n.Msg.AskExpired))
 		w.mark(in.id, store.InboxCancelled)
 		return true
+	}
+	if a.method == "ask" {
+		text = strings.TrimSpace(text)
 	}
 	if text == "" || len(message.Photo) != 0 || message.Document != nil {
 		w.say(w.tr(i18n.Msg.AskTextRequired))

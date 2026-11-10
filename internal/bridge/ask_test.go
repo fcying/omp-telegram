@@ -366,7 +366,7 @@ func TestAskFallbackEditorDoesNotAutoacceptApproval(t *testing.T) {
 	prompt := askTestPrompt(t, f)
 	askTestReply(t, w, 200, 7, 11, "  Elixir  ", prompt)
 	responses := askTestState(t, w)
-	if len(responses) != 2 || responses[0].Value != "Other (type your own)" || responses[1].ID != "fallback-editor" || responses[1].Value != "Elixir" {
+	if len(responses) != 2 || responses[0].Value != "Other (type your own)" || responses[1].ID != "fallback-editor" || responses[1].Value != "  Elixir  " {
 		t.Fatalf("fallback responses = %+v", responses)
 	}
 	askTestEvent(t, w, map[string]any{"id": "approval", "method": "confirm", "title": "Approve dangerous operation?"})
@@ -465,6 +465,122 @@ func TestAskEditorRejectsSecretInput(t *testing.T) {
 	responses := askTestState(t, w)
 	if w.ask != nil || len(responses) != 1 || responses[0].ID != "secret" || !responses[0].Cancelled {
 		t.Fatalf("secret input did not fail closed: %+v", responses)
+	}
+}
+
+func TestAskNativeInputPreservesRawTextAndRepeatedQuestions(t *testing.T) {
+	for _, method := range []string{"input", "editor"} {
+		t.Run(method, func(t *testing.T) {
+			w, f, trace := askTestWorker(t)
+			root, turn, client := w.rootRequestID, w.turn, w.client
+			traceStart := len(fixtureRPCTrace(trace))
+			values := []string{"  not-a-number\n\t ", " \n\t ", "  42  "}
+			var previous *telegram.Message
+			for index, value := range values {
+				id := method + strings.Repeat("-retry", index)
+				askTestEvent(t, w, map[string]any{"id": id, "method": method, "title": "Age (number required)"})
+				if previous != nil {
+					askTestReply(t, w, int64(220+index), 7, 11, "stale-answer", previous)
+					if w.ask == nil || len(askTestState(t, w)) != index {
+						t.Fatal("previous field reply resolved the repeated native question")
+					}
+				}
+				previous = askTestPrompt(t, f)
+				askTestReply(t, w, int64(200+index), 7, 11, value, previous)
+				responses := askTestState(t, w)
+				if len(responses) != index+1 || responses[index].ID != id || responses[index].Cancelled || responses[index].Value != value {
+					t.Fatalf("native validation input was changed or rejected: %+v", responses)
+				}
+			}
+			if w.ask != nil || w.rootRequestID != root || w.turn != turn || w.client != client || w.active != 100 || !w.busy {
+				t.Fatal("native text changed root ownership")
+			}
+			for _, entry := range fixtureRPCTrace(trace)[traceStart:] {
+				if entry.kind == "prompt" || entry.kind == "steer" {
+					t.Fatalf("native answer became model input: %+v", entry)
+				}
+			}
+		})
+	}
+}
+
+func TestAskNativeEmptyDefaultAndCancelStayDistinct(t *testing.T) {
+	for _, method := range []string{"input", "editor"} {
+		t.Run(method, func(t *testing.T) {
+			w, f, _ := askTestWorker(t)
+			askTestEvent(t, w, map[string]any{"id": "empty", "method": method, "title": "Optional value", "placeholder": "hint, not a default"})
+			_, rows := pickerView(t, f)
+			for _, row := range rows {
+				for _, button := range row {
+					if strings.HasSuffix(button["callback_data"].(string), ":default") {
+						t.Fatal("placeholder was offered as an editor default")
+					}
+				}
+			}
+			button := askTestButton(t, f, "Submit empty")
+			askTestCallback(w, 8, button)
+			if w.ask == nil || len(askTestState(t, w)) != 0 {
+				t.Fatal("unauthorized user submitted an empty native value")
+			}
+			askTestClick(t, w, f, "Submit empty")
+			responses := askTestState(t, w)
+			if len(responses) != 1 || responses[0].ID != "empty" || responses[0].Cancelled || responses[0].Value != "" {
+				t.Fatalf("explicit empty value = %+v", responses)
+			}
+			askTestEvent(t, w, map[string]any{"id": "cancel", "method": method, "title": "Optional value"})
+			askTestCallback(w, 7, button)
+			if w.ask == nil || len(askTestState(t, w)) != 1 {
+				t.Fatal("stale empty-value control answered the next field")
+			}
+			askTestClick(t, w, f, "Cancel")
+			responses = askTestState(t, w)
+			if len(responses) != 2 || responses[1].ID != "cancel" || !responses[1].Cancelled {
+				t.Fatalf("cancel became an empty answer: %+v", responses)
+			}
+		})
+	}
+	for name, prefill := range map[string]string{"empty": "", "literal": "  <b>default</b>\n\t ", "clipped": strings.Repeat("原值 ` [other](tg://user?id=8)\n", 100)} {
+		t.Run("default-"+name, func(t *testing.T) {
+			w, f, _ := askTestWorker(t)
+			askTestEvent(t, w, map[string]any{"id": "default", "method": "editor", "title": "Edit value", "prefill": prefill})
+			button := askTestButton(t, f, "Use default")
+			askTestCallback(w, 8, button)
+			if w.ask == nil || len(askTestState(t, w)) != 0 {
+				t.Fatal("unauthorized user accepted the native default")
+			}
+			askTestClick(t, w, f, "Use default")
+			askTestCallback(w, 7, button)
+			responses := askTestState(t, w)
+			if len(responses) != 1 || responses[0].ID != "default" || responses[0].Cancelled || responses[0].Value != prefill {
+				t.Fatalf("default was clipped, trimmed, cancelled or sent twice: %+v", responses)
+			}
+		})
+	}
+}
+
+func TestAskNativeHintsStayLiteralAndBounded(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	placeholder := "````\n[Other](tg://user?id=8) <b>hint</b>\n" + strings.Repeat("`", 1000)
+	prefill := "  <script>default</script>\n" + strings.Repeat("default ", 1000)
+	askTestEvent(t, w, map[string]any{"id": "literal-native", "method": "editor", "title": "Edit value", "placeholder": placeholder, "prefill": prefill})
+	prompt := askTestPrompt(t, f)
+	if strings.Count(prompt.Text, `<a href="tg://user?id=`) != 1 || !strings.Contains(prompt.Text, `<a href="tg://user?id=7">`) {
+		t.Fatal("native hint or default changed the ForceReply owner")
+	}
+	_, body, found := strings.Cut(prompt.Text, "<pre>")
+	body, _, closed := strings.Cut(body, "</pre>")
+	literal := html.UnescapeString(body)
+	if !found || !closed || !strings.Contains(literal, "[Other](tg://user?id=8) <b>hint</b>") ||
+		!strings.Contains(literal, "  <script>default</script>\n") || strings.Contains(body, "<b>") ||
+		strings.Contains(body, "<script>") || len(prompt.Text) > telegram.MaxMessageUTF16 {
+		t.Fatal("native hint or default escaped its bounded literal preview")
+	}
+	if len(askTestState(t, w)) != 0 {
+		t.Fatal("displaying a default automatically answered the native question")
+	}
+	askTestClick(t, w, f, "Use default")
+	if responses := askTestState(t, w); len(responses) != 1 || responses[0].Value != prefill {
+		t.Fatalf("preview replaced the original default: %+v", responses)
 	}
 }
 
@@ -1574,6 +1690,43 @@ func TestCurrentExportWaitsForNativeInteraction(t *testing.T) {
 			responses := askTestState(t, w)
 			if len(responses) != 1 || responses[0].ID != "pending" || responses[0].Cancelled {
 				t.Fatalf("rejected export cancelled or replaced the native decision: %+v", responses)
+			}
+		})
+	}
+}
+
+func TestAskNativeNonTextRepliesRequireExplicitEmptyControl(t *testing.T) {
+	for _, method := range []string{"input", "editor"} {
+		t.Run(method, func(t *testing.T) {
+			w, f, _ := askTestWorker(t)
+			askTestEvent(t, w, map[string]any{"id": "optional", "method": method, "title": "Optional value"})
+			prompt, err := json.Marshal(askTestPrompt(t, f))
+			requireStoreOK(t, err)
+			for index, media := range []string{
+				`"sticker":{"file_id":"sticker","file_unique_id":"unique","type":"regular","width":128,"height":128,"is_animated":false,"is_video":false}`,
+				`"voice":{"file_id":"voice","file_unique_id":"unique","duration":1}`,
+			} {
+				raw := []byte(`{"update_id":200,"message":{"message_id":200,"from":{"id":7},"chat":{"id":-10},"message_thread_id":11,` + media + `,"reply_to_message":` + string(prompt) + `}}`)
+				var event telegram.Update
+				requireStoreOK(t, json.Unmarshal(raw, &event))
+				event.UpdateID, event.Message.MessageID = int64(200+index), int64(200+index)
+				raw, err = json.Marshal(event)
+				requireStoreOK(t, err)
+				requireStoreOK(t, w.b.db.Accept(event.UpdateID, raw))
+				w.handle(incoming{id: event.UpdateID, msg: event.Message})
+				w.dispatch()
+				researchBarrier(t, w)
+				if w.ask == nil || len(askTestState(t, w)) != 0 || queueState(t, w, event.UpdateID) != "cancelled" {
+					t.Fatal("unsupported media was submitted as an empty native value")
+				}
+			}
+			button := askTestButton(t, f, "Submit empty")
+			askTestCallback(w, 7, button)
+			askTestCallback(w, 7, button)
+			researchBarrier(t, w)
+			responses := askTestState(t, w)
+			if len(responses) != 1 || responses[0].ID != "optional" || responses[0].Cancelled || responses[0].Value != "" {
+				t.Fatalf("explicit empty control did not submit exactly once: %+v", responses)
 			}
 		})
 	}
