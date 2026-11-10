@@ -18,12 +18,10 @@ Each ordinary private chat or topic has its own OMP session. Different conversat
 ## Requirements
 
 - Linux on amd64 or arm64.
-- OMP 18.18.1 or a current version supporting RPC protocol v2, `rpc-ui`, and combined Ask dialogs, plus its runtime, such as Bun. Older OMP versions are not compatibility targets. Configure models and authentication for the same user that will run this service.
+- The latest stable OMP release, plus its runtime, such as Bun. Only the latest stable release is a compatibility target; RPC protocol v2 support alone does not establish compatibility. Configure models and authentication for the same user that will run this service.
 - Git is needed only for OMP's native autoresearch workflows.
 - Network access to Telegram and your model provider.
 - A Telegram bot. Ordinary private chats, private-chat topics, and group topics are supported; groups without a topic are not.
-
-Tested with OMP 18.17.0. See the [architecture document](doc/architecture.md) for verification scenarios and limitations.
 
 Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
@@ -319,14 +317,23 @@ In a group topic, `/export` sends the session file into that topic, not a privat
 
 The bridge uses OMP's `rpc-ui` mode without changing its enabled tools or approval policy. If native `ask` is enabled in OMP, ask the agent to use it, for example: "Use Ask to let me choose between Programming, Investing, and Languages."
 
+Native `ask` takes an HTML form as `{html}` since OMP 18.18.3, not the old `questions[]` tool schema. In RPC without `formDialog` (including OMP 18.18.6), OMP presents each field through generic `select`/`input`/`editor` requests; checkbox fields use repeated selections. The bridge handles those requests, not the HTML, and does not provide a separate form renderer. Use the displayed options and reply to the exact text-entry prompt.
+
+Text-field replies preserve whitespace and newlines. **Use default** accepts the native editor's prefilled value; **Submit empty** sends an empty string without cancelling. Placeholders are hints, not defaults. OMP validates required fields, numbers and patterns and may ask for the same field again. Long hints/defaults are clipped only for display; accepting a default sends its original value. The native RPC fallback does not provide whole-form layouts, images or initial checkbox-selection markers.
+
+Extensions independently retain questions-based `ui.askDialog` and the `set_ask_dialog` opt-in, delivered as RPC `method:"ask"`. For these combined extension dialogs:
+
 - Questions appear one at a time in one message. Single-choice buttons advance immediately; multi-choice buttons toggle selections, then **Confirm selection** submits them. An explicitly confirmed empty multi-selection is allowed.
-- **Custom answer** opens a separate reply prompt. Reply to that exact message with nonempty text. Multi-choice answers can include both selected options and custom text.
+- **Custom answer** opens a separate reply prompt. Reply to that exact message with nonempty text; these combined-dialog custom answers are trimmed. Multi-choice answers can include both selected options and custom text.
+
+For both native forms and extension dialogs:
+
 - Ordinary guidance sent while a task waits for Ask is buffered, then forwarded to that same running task after the dialog/tool finishes. It does not answer or cancel Ask, and is not a separate followup. Buffered guidance shares the queue limit; if the original task ends, is stopped, or its session/runtime is replaced before dispatch, it is cancelled without replay. Resend it explicitly if needed. Controls such as `/stop` are not held behind it.
-- **Back to options** cancels only text entry. **Cancel** cancels the native dialog; **Stop** stops the task. OMP owns timeout/default-answer behavior. Old buttons and reply prompts cannot answer a replacement question or session.
+- **Back to options**, when offered by a combined dialog, cancels only text entry. **Cancel** cancels the native interaction; **Stop** stops the task. OMP owns timeout/default-answer behavior. Old buttons and reply prompts cannot answer a replacement question or session.
 - Bridge commands such as `/stop` and the native `/autoresearch off` control keep their normal effects even when replying to an expired or still-delivering Ask prompt. Commands addressed to another bot are ignored, never used as answers.
 - Only the task's originating user can answer. One native interaction (Ask, selection, confirmation, or text input) is active per conversation; additional concurrent requests are cancelled without replacing its menu. After answering, the next dialog may briefly wait for the previous response delivery to settle. Duplicate request IDs never reopen dialogs or replay answers. Answers continue the existing task, never create a new prompt, and are not replayed after failure or restart.
 
-Combined dialogs are enabled automatically when OMP supports the opt-in. An explicit unsupported-command response keeps `rpc-ui` and uses native selection/plain-text entry instead; other negotiation failures abort startup. Sensitive inputs marked secret and arbitrary terminal editors are not supported.
+Combined extension dialogs are enabled automatically when OMP supports the opt-in; this does not enable HTML `formDialog`. An explicit unsupported-command response keeps `rpc-ui` and uses generic selection/plain-text entry instead; other negotiation failures abort startup. Sensitive inputs marked secret and arbitrary terminal editors are not supported.
 
 Dialogs that block OMP startup before connection are not supported: startup times out and fails, with no actionable Telegram question or buttons. If an unanswered confirmation or other RPC dialog is detected at timeout, Telegram reports the detection, not a proven cause. Configure the extension for noninteractive startup or move its question to a user-invoked command; follow any `/close` instruction before retrying. The bridge never automatically answers startup dialogs. See [native dialog implementation](doc/architecture.md#native-dialogs-and-session-operations).
 

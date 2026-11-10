@@ -47,6 +47,10 @@ var Msg = struct {
 	AskConfirm       Message
 	AskBack          Message
 	AskInput         Message
+	AskEmpty         Message
+	AskDefault       Message
+	AskPlaceholder   Message
+	AskPrefill       Message
 	AskExpired       Message
 	AskTextRequired  Message
 	AskDisplayFailed Message
@@ -535,8 +539,12 @@ var Msg = struct {
 	AskConfirm:           message("Confirm selection", "确认选择"),
 	AskBack:              message("Back to options", "返回选项"),
 	AskInput:             message("Reply to this message with your answer. Use the Ask buttons to cancel or return to options when available.", "请回复此消息输入答案. 使用 Ask 按钮取消, 或在有返回选项按钮时返回."),
+	AskEmpty:             message("Submit empty", "提交空值"),
+	AskDefault:           message("Use default", "使用完整默认值"),
+	AskPlaceholder:       message("Placeholder preview (hint only, not a default):", "占位提示预览 (仅提示, 非默认值):"),
+	AskPrefill:           message("Default preview (button submits the full original value):", "默认值预览 (按钮提交完整原值):"),
 	AskExpired:           message("This Ask input is unavailable or expired. No answer or prompt was submitted.", "此 Ask 输入已失效或不可用. 未提交答案或新任务."),
-	AskTextRequired:      message("Reply with nonempty text. This question has not been answered.", "请回复非空文本. 当前问题尚未回答."),
+	AskTextRequired:      message("Reply with text, or use the empty-value button when available. This question has not been answered.", "请回复文本, 或在有提交空值按钮时使用该按钮. 当前问题尚未回答."),
 	AskDisplayFailed:     message("Could not display the native question. The dialog was cancelled.", "无法显示原生问题. 已取消该对话."),
 	AskUnconfirmed:       message("The native dialog outcome is uncertain. The runtime was closed and the answer will not be replayed automatically.", "原生对话结果不确定. 已关闭 runtime, 不会自动重放答案."),
 	FollowupButton:       message("Follow-up", "后续输入"),

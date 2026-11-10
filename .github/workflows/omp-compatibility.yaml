@@ -2,14 +2,8 @@ name: OMP compatibility probes
 
 on:
   workflow_dispatch:
-    inputs:
-      candidate_version:
-        description: 'Candidate OMP version, e.g. 18.18.1 or v18.18.1; latest tracks the newest stable release'
-        required: true
-        default: latest
-        type: string
   schedule:
-    - cron: '23 4 * * 1'
+    - cron: '0 0 * * *'
 
 permissions:
   contents: read
@@ -20,17 +14,9 @@ defaults:
 
 jobs:
   compatibility:
-    name: ${{ matrix.track }} (OMP ${{ matrix.version }})
+    name: Latest stable OMP
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - track: baseline
-            version: '18.18.1'
-          - track: candidate
-            version: ${{ inputs.candidate_version || 'latest' }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
@@ -56,23 +42,16 @@ jobs:
 
       - name: Download official OMP standalone into temporary storage
         env:
-          OMP_VERSION: ${{ matrix.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Discover the asset URL from official release metadata, not a guessed URL.
-          # https://api.github.com/repos/can1357/oh-my-pi/releases/tags/v18.18.1
-          if [[ "$OMP_VERSION" == latest ]]; then
-            endpoint=latest
-          else
-            tag="v${OMP_VERSION#v}"
-            endpoint="tags/$(jq -rn --arg tag "$tag" '$tag | @uri')"
-          fi
+          # https://api.github.com/repos/can1357/oh-my-pi/releases/latest
           tool_dir="$RUNNER_TEMP/omp-compatibility-tools"
           curl --fail --silent --show-error --location \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/can1357/oh-my-pi/releases/$endpoint" \
+            https://api.github.com/repos/can1357/oh-my-pi/releases/latest \
             --output "$tool_dir/omp-release.json"
           resolved_tag=$(jq -er '.tag_name' "$tool_dir/omp-release.json")
           asset_url=$(jq -er '.assets[] | select(.name == "omp-linux-x64") | .browser_download_url' "$tool_dir/omp-release.json")
@@ -82,8 +61,8 @@ jobs:
           printf '%s  %s\n' "${digest#sha256:}" "$tool_dir/omp" | sha256sum --check --strict
           chmod 755 "$tool_dir/omp"
           printf 'OMP release: %s\nAsset: %s\nDigest: %s\n' "$resolved_tag" "$asset_url" "$digest"
-          printf '### %s\n\nOMP: `%s`\n\nAsset: %s\n\nDigest: `%s`\n' \
-            '${{ matrix.track }}' "$resolved_tag" "$asset_url" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          printf '### Latest stable OMP\n\nOMP: `%s`\n\nAsset: %s\n\nDigest: `%s`\n' \
+            "$resolved_tag" "$asset_url" "$digest" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run real OMP compatibility smoke
         run: just smoke-omp "$RUNNER_TEMP/omp-compatibility-tools/omp"

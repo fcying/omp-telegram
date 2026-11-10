@@ -503,6 +503,8 @@ type rpcEvent struct {
 	Options               []string                     `json:"options"`
 	Questions             []askQuestion                `json:"questions"`
 	Secret                bool                         `json:"secret"`
+	Placeholder           string                       `json:"placeholder"`
+	Prefill               *string                      `json:"prefill"`
 	AgentInvoked          *bool                        `json:"agentInvoked"`
 	IsTerminal            *bool                        `json:"isTerminal"`
 	Success               bool                         `json:"success"`
