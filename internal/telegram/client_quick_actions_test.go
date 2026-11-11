@@ -82,12 +82,18 @@ func TestSendRejectsConflictingReplyMarkupBeforeHTTP(t *testing.T) {
 		attempts.Add(1)
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42}}`)
 	})
-	message, err := client.Send(context.Background(), -10, 8, "prompt", SendOptions{
-		Keyboard:   &Keyboard{InlineKeyboard: [][]Button{{{Text: "Action", CallbackData: "opaque"}}}},
-		ForceReply: &ForceReply{ForceReply: true},
-	})
-	if err == nil || DeliveryUncertain(err) || message.MessageID != 0 || attempts.Load() != 0 {
-		t.Fatalf("conflicting markup send=%+v err=%v requests=%d", message, err, attempts.Load())
+	keyboard := &Keyboard{InlineKeyboard: [][]Button{{{Text: "Action", CallbackData: "opaque"}}}}
+	force := &ForceReply{ForceReply: true}
+	remove := &ReplyKeyboardRemove{RemoveKeyboard: true}
+	for _, options := range []SendOptions{
+		{Keyboard: keyboard, ForceReply: force},
+		{Keyboard: keyboard, RemoveKeyboard: remove},
+		{ForceReply: force, RemoveKeyboard: remove},
+	} {
+		message, err := client.Send(context.Background(), -10, 8, "prompt", options)
+		if err == nil || DeliveryUncertain(err) || message.MessageID != 0 || attempts.Load() != 0 {
+			t.Fatalf("conflicting markup send=%+v err=%v requests=%d", message, err, attempts.Load())
+		}
 	}
 }
 

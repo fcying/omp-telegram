@@ -593,14 +593,14 @@ func TestForceReplyCleanupLogsOnlySafeFailureMetadata(t *testing.T) {
 				if tc.code == 0 {
 					return nil, errors.New("SECRET_TRANSPORT https://api.telegram.org/botSECRET_TOKEN/")
 				}
-				body := `{"ok":true,"result":true}`
+				body := `{"ok":true,"result":{"message_id":9463}}`
 				if tc.code != http.StatusOK {
-					body = `{"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted SECRET_RESPONSE_BODY"}`
+					body = `{"ok":false,"error_code":400,"description":"Bad Request: cannot send receipt SECRET_RESPONSE_BODY"}`
 				}
 				return &http.Response{StatusCode: tc.code, Header: make(http.Header), Request: r, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})
 			defer func() { http.DefaultTransport = previous }()
-			w.queueForceReplyCleanup(9462)
+			w.queueForceReplyCleanup(9462, 7)
 			w.background.Wait()
 			record := capturedEvent(t, capture, "force_reply_cleanup_failed")
 			if tc.code == http.StatusOK {

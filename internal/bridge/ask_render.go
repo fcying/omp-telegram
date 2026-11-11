@@ -24,8 +24,8 @@ func askLiteral(text string, budget int) string {
 	}
 	for {
 		literal := progressToolLiteral(text)
-		// Inline code trims edge spaces and adjacent backticks can merge delimiters.
-		if strings.TrimSpace(text) != text || strings.HasPrefix(text, "`") || strings.HasSuffix(text, "`") {
+		// Edge spaces and backticks need fences; long inline delimiters can open blocks.
+		if strings.TrimSpace(text) != text || strings.HasPrefix(text, "`") || strings.HasSuffix(text, "`") || strings.Contains(text, "``") {
 			marker := "```"
 			for strings.Contains(text, marker) {
 				marker += "`"

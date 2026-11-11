@@ -33,6 +33,7 @@ type askRequest struct {
 	messageID, inputID int64
 	token, inputToken  string
 	input              bool
+	inlineInput        bool
 	selected           map[int]bool
 	custom             string
 	page               int
@@ -167,6 +168,7 @@ func (w *worker) beginAsk(e rpcEvent) {
 		a.selected = make(map[int]bool)
 		a.answers = make([]askAnswer, 0, len(a.questions))
 	}
+	a.inlineInput = e.Method != "ask" && w.inlineForceReplyUser(a.user)
 	w.ask = a
 	if e.Method == "editor" || e.Method == "input" {
 		a.input = true
@@ -191,6 +193,14 @@ func (w *worker) sendAskResponse(a *askRequest, fields map[string]any) {
 	}()
 }
 
+func (w *worker) closeAskInput(a *askRequest, messageID int64) {
+	if a.inlineInput {
+		w.queueInlineInputReceipt(messageID, "")
+		return
+	}
+	w.queueForceReplyCleanup(messageID, a.user)
+}
+
 func (w *worker) invalidateAskInteraction(a *askRequest) {
 	a.deferredUI = nil
 	if a.pendingInput != nil {
@@ -200,7 +210,7 @@ func (w *worker) invalidateAskInteraction(a *askRequest) {
 	a.epoch++
 	delete(w.confirms, a.token)
 	a.token = ""
-	w.queueForceReplyCleanup(a.inputID)
+	w.closeAskInput(a, a.inputID)
 	a.inputID, a.inputToken = 0, ""
 	if a.cancel != nil {
 		a.cancel()
@@ -244,7 +254,9 @@ func (w *worker) cancelAskInteraction(a *askRequest) {
 		}
 	}
 	w.invalidateAskInteraction(a)
-	w.queueKeyboardCleanup(a.messageID)
+	if !a.inlineInput {
+		w.queueKeyboardCleanup(a.messageID)
+	}
 	if receipt != "" && a.cancelledEpoch == 0 {
 		w.queueAskReceipt(a.messageID, receipt)
 	}
@@ -265,7 +277,10 @@ func (w *worker) renderAsk(a *askRequest) {
 	if a.custom != "" {
 		footer = "**" + w.tr(i18n.Msg.AskCustom) + "**\n" + askLiteral(a.custom, 1400)
 	}
-	text := w.askQuestionTextBudget(question, start, end, footer, 3700, false)
+	text := ""
+	if !a.inlineInput {
+		text = w.askQuestionTextBudget(question, start, end, footer, 3700, false)
+	}
 	keyboard := &telegram.Keyboard{}
 	add := func(label, action string) {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: a.token + ":" + action}})
@@ -306,44 +321,76 @@ func (w *worker) renderAsk(a *askRequest) {
 	add(w.tr(i18n.Msg.Cancel), "cancel")
 	var prompt string
 	if a.input {
-		questionLimit := 1000
-		if a.method != "ask" {
-			questionLimit = 500
-		}
-		detail := clipUTF16(question.Question, questionLimit)
-		if a.method != "ask" {
+		a.inputToken = rand.Text()
+		if a.inlineInput {
 			if a.placeholder != "" {
-				detail += "\n\n" + w.tr(i18n.Msg.AskPlaceholder) + "\n" + clipUTF16(a.placeholder, 500)
+				footer = "**" + w.tr(i18n.Msg.AskPlaceholder) + "**\n" + progressToolLiteral(clipUTF16(a.placeholder, 500)+"\n")
 			}
 			if a.method == "editor" && a.prefill != nil {
-				detail += "\n\n" + w.tr(i18n.Msg.AskPrefill) + "\n" + clipUTF16(*a.prefill, 500)
+				if footer != "" {
+					footer += "\n\n"
+				}
+				footer += "**" + w.tr(i18n.Msg.AskPrefill) + "**\n" + progressToolLiteral(clipUTF16(*a.prefill, 500)+"\n")
 			}
+			text = w.askQuestionTextBudget(question, start, end, footer, 3700, false) + "\n" + askMarkerPrefix + a.inputToken + "]"
+			keyboard.ForceReply = true
+		} else {
+			questionLimit := 1000
+			if a.method != "ask" {
+				questionLimit = 500
+			}
+			detail := clipUTF16(question.Question, questionLimit)
+			if a.method != "ask" {
+				if a.placeholder != "" {
+					detail += "\n\n" + w.tr(i18n.Msg.AskPlaceholder) + "\n" + clipUTF16(a.placeholder, 500)
+				}
+				if a.method == "editor" && a.prefill != nil {
+					detail += "\n\n" + w.tr(i18n.Msg.AskPrefill) + "\n" + clipUTF16(*a.prefill, 500)
+				}
+			}
+			// Keep question Markdown from introducing extra selective mentions.
+			prompt = "[" + w.tr(i18n.Msg.AskInput) + "](tg://user?id=" + strconv.FormatInt(a.user, 10) + ")" +
+				progressToolLiteral(detail+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
 		}
-		a.inputToken = rand.Text()
-		// Force a fenced literal block so question Markdown cannot expand or add mentions.
-		prompt = "[" + w.tr(i18n.Msg.AskInput) + "](tg://user?id=" + strconv.FormatInt(a.user, 10) + ")" +
-			progressToolLiteral(detail+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
 	}
 	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token}
-	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	interactionCtx, cancel := context.WithCancel(w.ctx)
 	a.cancel = cancel
 	tg, key, results, workerCtx := w.b.tg, w.key, w.operations, w.ctx
+	var previous <-chan struct{}
+	var next chan struct{}
+	if a.input {
+		previous, next = w.orderForceReply()
+	}
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
 		defer cancel()
+		if next != nil {
+			defer close(next)
+			if previous != nil {
+				<-previous
+			}
+		}
+		ctx, displayCancel := context.WithTimeout(interactionCtx, 10*time.Second)
+		defer displayCancel()
 		var err error
 		if result.messageID == 0 {
 			var message telegram.Message
-			message, err = tg.Send(ctx, key.chat, key.thread, text, telegram.SendOptions{Keyboard: keyboard})
+			if a.inlineInput {
+				message, err = w.sendForceReply(ctx, text, telegram.SendOptions{Keyboard: keyboard}, a.user)
+				result.inputID = message.MessageID
+			} else {
+				message, err = tg.Send(ctx, key.chat, key.thread, text, telegram.SendOptions{Keyboard: keyboard})
+			}
 			result.messageID = message.MessageID
 		} else {
 			err = tg.Edit(ctx, key.chat, result.messageID, text, keyboard)
 		}
 		if err == nil && prompt != "" {
 			var message telegram.Message
-			message, err = tg.Send(ctx, key.chat, key.thread, prompt, telegram.SendOptions{
-				ForceReply: &telegram.ForceReply{ForceReply: true, Selective: true}, ReplyToMessageID: result.messageID})
+			message, err = w.sendForceReply(ctx, prompt, telegram.SendOptions{
+				ForceReply: &telegram.ForceReply{ForceReply: true, Selective: true}, ReplyToMessageID: result.messageID}, a.user)
 			result.inputID = message.MessageID
 		}
 		select {
@@ -354,7 +401,7 @@ func (w *worker) renderAsk(a *askRequest) {
 			_ = tg.ClearKeyboard(cleanupCtx, key.chat, result.messageID)
 		}
 		if workerCtx.Err() != nil {
-			w.queueForceReplyCleanup(result.inputID)
+			w.closeAskInput(a, result.inputID)
 		}
 	}()
 }
@@ -390,12 +437,14 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 		display := result.meta.(askDisplay)
 		a := display.request
 		if w.ask != a || !w.askScope(a) || a.epoch != display.epoch {
-			w.queueForceReplyCleanup(display.inputID)
+			w.closeAskInput(a, display.inputID)
 			if a.cancelledEpoch != 0 && a.cancelledEpoch == display.epoch {
 				a.cancelledEpoch = 0
 				w.queueAskReceipt(display.messageID, a.cancelledText)
 			} else {
-				w.queueKeyboardCleanup(display.messageID)
+				if !a.inlineInput {
+					w.queueKeyboardCleanup(display.messageID)
+				}
 			}
 			return true
 		}
@@ -494,11 +543,16 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 func (w *worker) advanceAsk(a *askRequest) {
 	// Freeze this question before the mutable request advances to another message.
 	question := a.questions[a.question]
-	text := w.askQuestionText(question, 0, len(question.Options), w.askAnswerFooter(a))
+	text := ""
+	if !a.inlineInput {
+		text = w.askQuestionText(question, 0, len(question.Options), w.askAnswerFooter(a))
+	}
 	messageID := a.messageID
 	w.invalidateAskInteraction(a)
 	a.messageID = 0
-	w.queueAskReceipt(messageID, text)
+	if !a.inlineInput {
+		w.queueAskReceipt(messageID, text)
+	}
 	if a.method != "ask" {
 		w.endAsk(false)
 		w.sendAskResponse(a, map[string]any{"value": a.custom})

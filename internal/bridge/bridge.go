@@ -303,6 +303,9 @@ type worker struct {
 	uiSeen                      map[string]struct{}
 	askSending                  int
 	followupInputs              map[string]followupInput
+	forceReplyMu                sync.Mutex
+	forceReplyTail              chan struct{}
+	forceReplyPrompts           map[int64]int64
 	argsApply                   *argsApplyRequest
 	argsResuming                bool
 	resumeFailed                bool
@@ -5023,6 +5026,9 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	defer w.beginConsumerPhase("callback", "callback").end()
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
+	if w.handleFollowupCancel(ctx, q) {
+		return callbackDone
+	}
 	token, index, ok := strings.Cut(q.Data, ":")
 	c, exists := w.confirms[token]
 	if exists && c.user == q.From.ID {
@@ -5385,20 +5391,95 @@ func (w *worker) clearKeyboardRequest(messageID int64) {
 	_ = w.b.tg.ClearKeyboard(ctx, w.key.chat, messageID)
 }
 
-func (w *worker) queueForceReplyCleanup(messageID int64) {
+// Inline ForceReply has no selective targeting; use it only in the owner's private chat.
+func (w *worker) inlineForceReplyUser(user int64) bool {
+	return user > 0 && w.key.chat == user
+}
+
+// Clearing this message's inline keyboard cannot dismiss a newer input message.
+func (w *worker) queueInlineInputReceipt(messageID int64, text string) {
 	if messageID == 0 {
 		return
 	}
-	tg, logger, chat, thread := w.b.tg, w.b.telegramLog, w.key.chat, w.key.thread
+	tg, logger, key := w.b.tg, w.b.telegramLog, w.key
 	w.background.Add(1)
 	go func() {
 		defer w.background.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		err := tg.Delete(ctx, chat, messageID)
+		var err error
+		if text == "" {
+			err = tg.ClearKeyboard(ctx, key.chat, messageID)
+		} else {
+			err = tg.Edit(ctx, key.chat, messageID, text, &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}})
+		}
 		if err != nil {
-			logTelegramFailure(logger, slog.LevelWarn, "force_reply_cleanup_failed", "ForceReply prompt cleanup failed", err,
-				slog.Int64("chat_id", chat), slog.Int64("thread_id", thread), slog.Int64("message_id", messageID))
+			logTelegramFailure(logger, slog.LevelWarn, "force_reply_cleanup_failed", "Inline input completion failed", err,
+				slog.Int64("chat_id", key.chat), slog.Int64("thread_id", key.thread), slog.Int64("message_id", messageID))
+		}
+	}()
+}
+
+// Reserve ordering before launching prompt/receipt delivery.
+func (w *worker) orderForceReply() (<-chan struct{}, chan struct{}) {
+	w.forceReplyMu.Lock()
+	defer w.forceReplyMu.Unlock()
+	previous := w.forceReplyTail
+	next := make(chan struct{})
+	w.forceReplyTail = next
+	return previous, next
+}
+
+// Only ordered delivery jobs access forceReplyPrompts.
+func (w *worker) sendForceReply(ctx context.Context, text string, options telegram.SendOptions, user int64) (telegram.Message, error) {
+	message, err := w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, options)
+	if message.MessageID != 0 {
+		if w.forceReplyPrompts == nil {
+			w.forceReplyPrompts = make(map[int64]int64)
+		}
+		w.forceReplyPrompts[user] = message.MessageID
+	}
+	return message, err
+}
+
+func (w *worker) queueForceReplyCleanup(messageID, user int64) {
+	w.queueForceReplyReceipt(messageID, user, w.tr(i18n.Msg.TextInputClosed), false)
+}
+
+func (w *worker) queueForceReplyReceipt(messageID, user int64, text string, always bool) {
+	if messageID == 0 {
+		return
+	}
+	previous, next := w.orderForceReply()
+	tg, logger, key := w.b.tg, w.b.telegramLog, w.key
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		defer close(next)
+		if previous != nil {
+			<-previous
+		}
+		current, known := w.forceReplyPrompts[user]
+		if known && current != messageID && !always {
+			return
+		}
+		options := telegram.SendOptions{ReplyToMessageID: messageID}
+		if !known || current == messageID {
+			options.RemoveKeyboard = &telegram.ReplyKeyboardRemove{RemoveKeyboard: true, Selective: true}
+		}
+		// The explicit mention preserves selective targeting after reply fallback.
+		text = "[" + text + "](tg://user?id=" + strconv.FormatInt(user, 10) + ")"
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := tg.Send(ctx, key.chat, key.thread, text, options)
+		if err != nil {
+			logTelegramFailure(logger, slog.LevelWarn, "force_reply_cleanup_failed", "ForceReply completion receipt failed", err,
+				slog.Int64("chat_id", key.chat), slog.Int64("thread_id", key.thread), slog.Int64("message_id", messageID))
+		} else if options.RemoveKeyboard != nil {
+			if w.forceReplyPrompts == nil {
+				w.forceReplyPrompts = make(map[int64]int64)
+			}
+			w.forceReplyPrompts[user] = 0
 		}
 	}()
 }
@@ -5409,9 +5490,11 @@ func (w *worker) drainForceReplyResults() {
 		case result := <-w.operations:
 			switch result.kind {
 			case "ask_display":
-				w.queueForceReplyCleanup(result.meta.(askDisplay).inputID)
+				result := result.meta.(askDisplay)
+				w.closeAskInput(result.request, result.inputID)
 			case "followup_prompt":
-				w.queueForceReplyCleanup(result.meta.(followupPromptResult).messageID)
+				result := result.meta.(followupPromptResult)
+				w.finishFollowupPrompt(result.messageID, result.user, result.token, result.inline, "")
 			}
 		default:
 			return

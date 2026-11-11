@@ -82,6 +82,21 @@ func (s *Store) CancelFollowupRequests(bot, chat, thread int64) error {
 	return err
 }
 
+// CancelFollowupRequest revokes only this pending or delivered input, never queued work.
+func (s *Store) CancelFollowupRequest(r FollowupRequest) (bool, error) {
+	result, err := s.DB.Exec(`UPDATE followup_requests SET state='cancelled'
+WHERE token=? AND instance=? AND prompt_id=? AND user=? AND bot=? AND chat=? AND thread=?
+AND generation=? AND workspace=? AND session=? AND state IN ('pending','delivered') AND expires_at>?
+AND EXISTS(SELECT 1 FROM bindings WHERE bot=? AND chat=? AND thread=? AND generation=? AND workspace=? AND session=? AND running=1)`,
+		r.Token, r.Instance, r.PromptID, r.User, r.Bot, r.Chat, r.Thread, r.Generation, r.Workspace, r.Session, time.Now().Unix(),
+		r.Bot, r.Chat, r.Thread, r.Generation, r.Workspace, r.Session)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
 // ConsumeFollowupRequest claims exactly one pending inbox admission. Leaving its
 // inbox pending lets the existing worker Submit and crash cancellation own the
 // normal queue lifecycle; the durable consumed token prevents any replay.

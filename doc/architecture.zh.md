@@ -276,7 +276,10 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 [`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理基于 questions 的扩展 `method:"ask"` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
 
-通用 `input`/`editor` 请求保留原始文字. `placeholder` 作为提示展示; `prefill` 与有界 literal 展示分开保存, 包括显式为空的编辑器默认值. **提交空值** 与 **使用完整默认值** callback 受 owner 和 interaction 围栏保护, 发送 `value:""` 或原始 prefill, 不发送 `cancelled:true`; 取消仍是独立响应. 本地提交将 **本次提交** 及实际 literal 值追加到原问题主消息, 不写入 ForceReply 提示. 空字符串在字面值展示之外使用零字符状态, 避免与实际输入的标记文本混淆. 取消和 Stop 不追加提交记录. 消息回复必须实际包含文字, 因而贴纸, 语音或位置等纯非文字回复不能悄悄提交空字段. 必填/类型/pattern 校验归 OMP 所有, 它可在拒绝后用新 request ID 重问同一字段; 先前提交仍是本地动作记录, 不代表校验成功. 扩展组合 Ask 自定义答案继续裁剪首尾空白并要求非空.
+通用 `input`/`editor` 请求保留原始文字. `placeholder` 作为提示展示; `prefill` 与有界 literal 展示分开保存, 包括显式为空的编辑器默认值. **提交空值** 与 **使用完整默认值** callback 受 owner 和 interaction 围栏保护, 发送 `value:""` 或原始 prefill, 不发送 `cancelled:true`; 取消仍是独立响应. 在 owner 的私聊 (`chat == user > 0`) 中, `askRequest.inlineInput` 选择单条问题, inline keyboard 带 `force_reply:true`; 提示说明及末尾 `[ask:...]` marker 均属于该问题, `inputID == messageID`. 接受后保留问题正文并清除键盘, 不回显提交值. 群聊保留独立定向 ForceReply 输入, 在主问题追加 **本次提交** 回执, 空字符串使用独立的零字符状态. 消息回复必须实际包含文字, 贴纸, 语音或位置等纯非文字回复不能悄悄提交空字段. 必填/类型/pattern 校验归 OMP 所有, 它可在拒绝后用新 request ID 重问. 扩展组合 Ask 自定义答案继续裁剪首尾空白并要求非空, 保持现有独立提示流程.
+
+私聊文字问题沿用既有标题预算, 在 renderer footer 为 placeholder 和默认值预览分别保留空间. 每项预览独立截断到 500 UTF-16 units, 并编码为独立 fenced literal, 长标题不能占用其预算, 预览中的反引号也不能吞掉后续字段或末尾回复 marker. 截断仅影响展示; **使用完整默认值** 仍提交完整原始 prefill.
+标题 literal 包含连续反引号时, 使用长于展示内容反引号序列的独占行围栏, 避免块解析吞掉标题或重新解释后续预览.
 
 按钮使用全局一致的选项编号. 待选问题正文通常省略重复的标签列表, 展示当前页可用的编号说明/preview, 以及问题和页码. 超过共用按钮限制 100 个 UTF-16 单位的标签保留在正文中, 编码后的标签空间优先于可选说明预留. 判断使用空白规范化后的按钮文字, 多选时计入占两个单位的 checkbox 标记; 能放入按钮的标签不重复展示. 过长标签仍受整条消息预算限制. 原生 `select` 按原始选项索引读取可选的 `optionDetails[i].description`. 编号, 展示截断和 literal 转义不改变 RPC 选项值, 答案或默认值. 原生 select 完成后在原主消息保留当前问题, 选项及本地选择. 完成时考虑全部选项, 优先为问题, 历史和答案预留空间, 再展示可选说明. 编码后的标签按实际字节扣减预算, 放不下全部选项时显示省略标记. 当前原生 RPC select envelope 不传递本地 `initialIndex` 或 checkbox 勾选状态元数据. Bridge 无法从字符串选项重建这些标记或整张表单的布局/图片; 仅返回原始选项标签, 由原生映射到值. 多次 checkbox select 只记录逐次动作, 不推断最终勾选集合, 也不将 "Done" 等标签识别为协议标记; 原生 HTML 回退发送字符串选项.
 
@@ -292,9 +295,11 @@ Extensions 保留独立的 questions-based `ui.askDialog` 协议和 `set_ask_dia
 
 异步 display job 在启动前捕获不可变的已渲染 snapshot, 目标 message ID 及 question/interaction epoch; 不从可能已推进的 dialog 指针读取内容来渲染. Display result 必须匹配捕获的身份与 epoch, 才能发布消息/提示状态. 最终本地回执使用独立的 `ask_receipt` operation result 和原 message ID, 不依赖可变对话生命周期或 RPC response 结算. 因而即使答案响应已完成或后续问题已开始, 回执编辑仍可结束, 不会借用后题内容或完成后题. 问题/选项文字, description, preview 和回执 literal 仅在 Telegram 展示时限长; UI 写入失败不变成原生答案失败.
 
-Ask 与 Follow-up 共用 [`bridge.go`](../internal/bridge/bridge.go) 的 `queueForceReplyCleanup`. 它只删除 bot 发出的独立输入提示, 不删除原问题或用户回复, 使用纳入跟踪的后台任务和独立五秒 deadline. 清理受 Telegram 删除限制约束, 尽力执行, 不结算, 改变或重放原生工作. 组合对话和原生 `input`/`editor` 的 Ask 输入 ID 归属于捕获的 display epoch; 失效和迟到 display result 只回收该输入 ID. Shutdown 在等待后台任务前清理已缓冲的 `ask_display`/`followup_prompt` result, 在途发送也会在 worker context 结束时安排清理. Ask 提示 ID 不持久化, 不在重启后恢复.
+Actor 在调度时持有交互取消 context. Ask 的十秒显示网络 deadline 仅在有序发送链等待结束后启动, 排队投递不消耗该预算. 失效时取消同一个交互 context, 无论网络投递是否已经开始; 后台 job 不替换 actor 的取消句柄.
 
-提示删除失败时, 在 `telegram` component 记录 `WARN` 事件 `force_reply_cleanup_failed`, 包含 `chat_id`, `thread_id`, `message_id`, 安全分类 `reason`/`uncertain` 及可用时的 `api_code`. 不记录原始 Telegram 错误, 凭据或消息正文. 成功删除保持静默; 没有该事件不能证明已执行清理或客户端已清除回复界面.
+紧凑私聊文字输入及 Follow-up 使用 [`bridge.go`](../internal/bridge/bridge.go) 的 `queueInlineInputReceipt`: 在受跟踪且独立的五秒 context 下, 按消息 ID 清除键盘, 或编辑正文并传入空 inline keyboard. 不发送收尾消息, 不删除历史. 捕获的 display/request 身份决定收尾路径, 包括迟到结果及 shutdown; 清除旧消息不能清除新消息的 inline keyboard. 群聊输入及扩展组合对话保留 `queueForceReplyCleanup`/`queueForceReplyReceipt`, 发送定向 `ReplyKeyboardRemove` 回执. `orderForceReply` 在启动前预留初始提示及旧式回执的发送顺序; 只有这些有序 job 访问每用户最新提示 ID. 旧收尾跳过失效提示, 已打开新输入时入队确认仍发送但不移除 Reply. UI 收尾尽力执行, 不持久化重放, 不结算, 改变或重放原生工作. Shutdown 在等待后台任务前处理已缓冲的 `ask_display`/`followup_prompt` result; 在途发送也会在 worker context 结束时安排收尾. Ask 提示 ID 不持久化, 不在重启后恢复.
+
+收尾回执失败时, 在 `telegram` component 记录 `WARN` 事件 `force_reply_cleanup_failed`, 包含 `chat_id`, `thread_id`, 原提示 `message_id`, 安全分类 `reason`/`uncertain` 及可用时的 `api_code`. 不记录原始 Telegram 错误, 凭据或消息正文. 成功发送保持静默; 没有该事件不能证明已执行收尾或客户端已清除回复界面.
 
 取消扩展组合 Ask 时, 捕获当前问题和展示长度内的全部选项快照, footer 标记为已取消, 不作为答案. 立即撤销 token 并安排键盘清理; 回执编辑独立于 RPC 取消. 当前 display 仍在途时, 用其捕获的 epoch 限定结果返回后的一次最终取消编辑, 包括首次发送迟到返回消息 ID 的情况. 因而旧渲染不能覆盖取消留痕, 也不能借用替换后对话的内容; 之前已确认题目的回执保持不变.
 
@@ -334,15 +339,17 @@ Progress 同一行显示 `Stop | Follow-up`, `off` 时两者都不发送. Stop �
 
 迁移预检期间拦截的 Stop/Close 也取消待处理 Follow-up 请求, 即使尚未建立持久化 migration 记录.
 
-Worker 按 token 维护 map, 仅跟踪待处理 Follow-up 输入的用户, 提示 ID, generation 和过期时间. 持久化接受成功后立即移除条目并安排删除提示, 不等待排队任务执行. 同用户替换及取消只回收各自提示; 现有 worker 过期 tick 清理到期或 binding 围栏失效的条目, 不轮询数据库. 空/非文本/满队列及未授权/错误消息回复保留有效提示. Send 完成后重新检查持久化请求, 因而取消, 被替换, 过期, 不确定或旧 binding 的结果只回收自身已交付的消息. 原任务自然完成及空闲 runtime 释放保留有效请求; 完整对话 teardown 则取消请求. UI 清理不移除用于拒绝迟到输入的持久化 metadata, 崩溃后不扫描 Telegram 历史.
+Worker 按 token 维护 map, 跟踪待处理 Follow-up 输入的用户, 提示 ID, generation, 过期时间及捕获的 inline 输入模式. 私聊提示使用带 **取消** 的 inline ForceReply 键盘; 持久化接受后, 在原提示编辑已入队状态并清空键盘. 其他 chat 保留独立入队确认. 接受后在排队任务执行前移除跟踪条目. 替换, 取消及过期 tick 清除旧输入, 不删除提示或轮询数据库. 空/非文本/满队列及未授权/错误消息回复保留有效输入. Send 完成后重新检查持久化请求, 陈旧结果不能恢复请求或清除新输入. 原任务自然完成及空闲 runtime 释放保留有效请求; 完整对话 teardown 则取消请求. UI 失败不撤销接受, 不重放工作; 持久化拒绝 metadata 保留, 崩溃后不扫描 Telegram 历史.
+
+私聊取消 callback 使用 `followup_cancel:` token, 核验 bot, owner, chat/thread, instance, binding 及消息身份. Send acknowledgment 返回前, bot 发出的末尾 marker 证明对应请求; 返回后必须匹配已存 prompt ID. `CancelFollowupRequest` 在当前 binding 及过期围栏下原子地只修改 pending/delivered 状态, 不修改已消费工作. 迟到发送可记录已取消提示的 ID, 不能提升其状态. 对已消费或不确定请求, 经身份核验的 callback 只能清除该消息的键盘, 不移除排队任务. Send result 和跟踪条目捕获 inline 模式; 旧 instance 记录保持旧收尾路径. 不需要修改数据库 schema.
 
 Follow-up 历史与消息清理共用 `storage.database_retention_days`. 每批最多删除 1000 条到期时间同时早于保留 cutoff 且不晚于当前时间的请求, 包括未回复的过期 pending/delivered 提示, 但保留关联 pending/submitted inbox 的记录. 现有 schema 24 数据库也安装 expiry 索引. 删除后仍可通过当前 Bot 的合法 marker 拒绝迟到输入; 若既无保留的 prompt 身份也无可识别 marker, 就无法与普通引用区分.
 
 Marker 回退仅接受非空正文末尾独立完整的 `[followup:token]` 行, 该行不能有额外前后缀. 不再搜索任意正文子串, 也不匹配翻译后的提示文案. 已知 prompt ID 仍独立于文本回退识别回复.
 
-Telegram send options 只能携带 inline keyboard 或 selective ForceReply 之一. `EditKeyboard` 使用 `editMessageReplyMarkup`; 原 reply fallback, 鉴权和 not-modified 处理保持不变.
+Telegram 文字发送选项最多允许一个 markup 对象: `Keyboard` 新增官方 inline `force_reply` 字段, 独立定向 `ForceReply` 与 `ReplyKeyboardRemove` 仍为其他互斥选项. Inline ForceReply 没有 selective 字段, 因而紧凑流程仅用于 owner 的私聊. 编辑键盘时不能切换该字段; 通用文字请求在首次发送时启用, 完成时移除整副键盘. 扩展组合 Ask 保持原有定向自定义输入流程. `EditKeyboard` 使用 `editMessageReplyMarkup`; reply fallback 和 not-modified 处理保持不变.
 
-ForceReply 提示通过 `tg://user?id=...` 链接显式 mention 目标用户. Selective 定向不能依赖原始 reply target: Favorite 可从 bot 消息启动任务, reply fallback 也可能移除该 target.
+旧式定向提示及收尾回执通过 `tg://user?id=...` 链接显式 mention 目标用户. Selective 定向不能依赖原始 reply target: Favorite 可从 bot 消息启动任务, reply fallback 也可能移除该 target. 紧凑原生文字问题不需要定向 mention, 因为私聊身份已与 owner 匹配.
 
 ### 尽力而为的 progress
 
