@@ -44,6 +44,14 @@ func askTestWorker(t *testing.T) (*worker, *fakeHTTP, string) {
 	return w, f, trace
 }
 
+func privateAskTestWorker(t *testing.T) (*worker, *fakeHTTP, string) {
+	t.Helper()
+	w, f, trace := askTestWorker(t)
+	w.key.chat, w.binding.Chat = 7, 7
+	requireStoreOK(t, w.b.db.Save(w.binding))
+	return w, f, trace
+}
+
 func askTestEvent(t *testing.T, w *worker, event map[string]any) {
 	t.Helper()
 	event["type"] = "extension_ui_request"
@@ -138,7 +146,7 @@ func askTestClick(t *testing.T, w *worker, f *fakeHTTP, label string) {
 	askTestCallback(w, 7, askTestButton(t, f, label))
 	researchBarrier(t, w)
 	askTestSettle(t, w)
-	if a != nil && a.messageID != messageID {
+	if a != nil && a.messageID != messageID && !a.inlineInput {
 		askTestReceipt(t, w, f, messageID)
 	}
 }
@@ -150,7 +158,8 @@ func askTestPrompt(t *testing.T, f *fakeHTTP) *telegram.Message {
 	for i := len(f.messages) - 1; i >= 0; i-- {
 		text, _ := f.messages[i]["text"].(string)
 		if strings.Contains(text, "[ask:") {
-			return &telegram.Message{MessageID: int64(i + 1), Text: text, From: &telegram.User{ID: 99, IsBot: true}, Chat: telegram.Chat{ID: -10}, MessageThreadID: 11}
+			return &telegram.Message{MessageID: int64(i + 1), Text: text, From: &telegram.User{ID: 99, IsBot: true},
+				Chat: telegram.Chat{ID: int64(f.messages[i]["chat_id"].(float64))}, MessageThreadID: 11}
 		}
 	}
 	t.Fatal("question-specific Ask reply prompt missing")
@@ -166,6 +175,7 @@ func askTestReply(t *testing.T, w *worker, id, user, thread int64, text string, 
 	}
 	u := update(id, thread, text)
 	u.Message.From.ID = user
+	u.Message.Chat.ID = w.key.chat
 	u.Message.ReplyToMessage = prompt
 	raw, err := json.Marshal(u)
 	requireStoreOK(t, err)
@@ -176,7 +186,7 @@ func askTestReply(t *testing.T, w *worker, id, user, thread int64, text string, 
 		researchBarrier(t, w)
 	}
 	askTestSettle(t, w)
-	if a != nil && a.messageID != messageID {
+	if a != nil && a.messageID != messageID && !a.inlineInput {
 		askTestReceipt(t, w, http.DefaultTransport.(*fakeHTTP), messageID)
 	}
 }
@@ -359,7 +369,7 @@ func TestAskAllowsEmptyMultiAndMultiCustom(t *testing.T) {
 	askTestClick(t, w, f, "Other")
 	prompt := askTestPrompt(t, f)
 	askTestReply(t, w, 200, 7, 11, "Analytics", prompt)
-	waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), prompt.MessageID) })
+	waitFor(t, func() bool { return f.forceReplyClosed(prompt.MessageID) })
 	askTestClick(t, w, f, "Done")
 	responses := askTestState(t, w)
 	if len(responses) != 1 || len(responses[0].Answers) != 2 {
@@ -394,8 +404,8 @@ func TestAskTextRequiresCurrentBotPromptAndOwner(t *testing.T) {
 		if w.ask == nil || len(askTestState(t, w)) != 0 {
 			t.Fatalf("invalid text %d resolved Ask", i)
 		}
-		if slices.Contains(f.deletedMessageIDs(), prompt.MessageID) {
-			t.Fatal("invalid reply deleted the active input prompt")
+		if f.forceReplyClosed(prompt.MessageID) {
+			t.Fatal("invalid reply closed the active text input")
 		}
 	}
 	askTestCallback(w, 7, staleButton)
@@ -404,7 +414,10 @@ func TestAskTextRequiresCurrentBotPromptAndOwner(t *testing.T) {
 		t.Fatal("old keyboard answered the custom text question")
 	}
 	askTestReply(t, w, 220, 7, 11, "accepted-canary", prompt)
-	waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), prompt.MessageID) })
+	waitFor(t, func() bool { return f.forceReplyClosed(prompt.MessageID) })
+	if slices.Contains(f.deletedMessageIDs(), prompt.MessageID) {
+		t.Fatal("accepted answer lost its quoted input prompt")
+	}
 	responses := askTestState(t, w)
 	if len(responses) != 1 || responses[0].Answers[0].Custom != "accepted-canary" {
 		t.Fatalf("valid answer = %+v", responses)
@@ -501,7 +514,7 @@ func TestAskCancellationAndNativeTimeoutInvalidateReplies(t *testing.T) {
 			if w.ask != nil {
 				t.Fatal("cancelled native Ask remained active")
 			}
-			waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), prompt.MessageID) })
+			waitFor(t, func() bool { return f.forceReplyClosed(prompt.MessageID) })
 			askTestCallback(w, 7, stale)
 			askTestReply(t, w, 200, 7, 11, "late-answer", prompt)
 			responses := askTestState(t, w)
@@ -597,7 +610,7 @@ func TestAskLifecycleRetiresButtonsAndText(t *testing.T) {
 				researchBarrier(t, w)
 			}
 			nativeUntil(t, w, func() bool { return w.askSending == 0 })
-			waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), prompt.MessageID) })
+			waitFor(t, func() bool { return f.forceReplyClosed(prompt.MessageID) })
 			if queueState(t, w, 210) != "cancelled" || len(w.deferredSteers) != 0 || researchTraceCount(trace, "prompt", "retired-root guidance") != 0 {
 				t.Fatal("lifecycle boundary retained or dispatched old-root guidance")
 			}
@@ -662,9 +675,9 @@ func TestAskNativeInputPreservesRawTextAndRepeatedQuestions(t *testing.T) {
 				previous = askTestPrompt(t, f)
 				messageID := w.ask.messageID
 				askTestReply(t, w, int64(200+index), 7, 11, value, previous)
-				waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), previous.MessageID) })
-				if slices.Contains(f.deletedMessageIDs(), messageID) {
-					t.Fatal("input cleanup deleted the original question instead of its reply prompt")
+				waitFor(t, func() bool { return f.forceReplyClosed(previous.MessageID) })
+				if slices.Contains(f.deletedMessageIDs(), messageID) || slices.Contains(f.deletedMessageIDs(), previous.MessageID) {
+					t.Fatal("text completion deleted its original question or quoted prompt")
 				}
 				receipt := askTestReceipt(t, w, f, messageID)
 				if !strings.Contains(html.UnescapeString(receipt), value) || !strings.Contains(receipt, "<b>Submitted</b>") {
@@ -1199,7 +1212,7 @@ func TestAskBackRevokesCustomPrompt(t *testing.T) {
 	askTestClick(t, w, f, "Other")
 	prompt := askTestPrompt(t, f)
 	askTestClick(t, w, f, "Back")
-	waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), prompt.MessageID) })
+	waitFor(t, func() bool { return f.forceReplyClosed(prompt.MessageID) })
 	askTestReply(t, w, 200, 7, 11, "old-custom-answer", prompt)
 	if w.ask == nil || len(askTestState(t, w)) != 0 {
 		t.Fatal("revoked prompt advanced the current question")
@@ -1937,7 +1950,7 @@ func TestAskNativeNonTextRepliesRequireExplicitEmptyControl(t *testing.T) {
 	}
 }
 
-func TestAskLateInputPromptIsDeletedWithoutAffectingReplacement(t *testing.T) {
+func TestAskLateInputCompletionPreservesReplacement(t *testing.T) {
 	for _, boundary := range []string{"cancel", "shutdown"} {
 		t.Run(boundary, func(t *testing.T) {
 			w, f, _ := askTestWorker(t)
@@ -1965,7 +1978,9 @@ func TestAskLateInputPromptIsDeletedWithoutAffectingReplacement(t *testing.T) {
 				w.cancel()
 			} else {
 				askTestEvent(t, w, map[string]any{"method": "cancel", "targetId": "old-input"})
-				askTestEvent(t, w, map[string]any{"id": "replacement-input", "method": "editor", "title": "New question?"})
+				nativeRPC(t, w, "fixture_research_control_event", map[string]any{"event": map[string]any{
+					"type": "extension_ui_request", "id": "replacement-input", "method": "editor", "title": "New question?"}})
+				researchBarrier(t, w)
 			}
 			a := w.ask
 			close(release)
@@ -1973,20 +1988,195 @@ func TestAskLateInputPromptIsDeletedWithoutAffectingReplacement(t *testing.T) {
 			if boundary == "cancel" {
 				w.operationReturned(waitOperation(t, w))
 			}
-			waitFor(t, func() bool { return slices.Contains(f.deletedMessageIDs(), 500) })
-			if slices.Contains(f.deletedMessageIDs(), messageID) {
-				t.Fatal("late input cleanup deleted its original question")
+			if boundary == "cancel" {
+				askTestSettle(t, w)
+			}
+			previous, next := w.orderForceReply()
+			if previous != nil {
+				<-previous
+			}
+			close(next)
+			if slices.Contains(f.deletedMessageIDs(), messageID) || slices.Contains(f.deletedMessageIDs(), 500) {
+				t.Fatal("late text completion deleted question history")
 			}
 			if boundary == "shutdown" {
 				return
 			}
-			if w.ask != a || slices.Contains(f.deletedMessageIDs(), a.inputID) {
-				t.Fatal("old input cleanup retired or deleted the replacement prompt")
+			if w.ask != a || f.forceReplyClosed(a.inputID) {
+				t.Fatal("old text completion cleared the replacement input")
 			}
 			askTestReply(t, w, 200, 7, 11, "new answer", askTestPrompt(t, f))
 			responses := askTestState(t, w)
 			if len(responses) != 1 || responses[0].ID != "replacement-input" || responses[0].Value != "new answer" || responses[0].Cancelled {
 				t.Fatalf("late input cleanup changed the replacement answer: %+v", responses)
+			}
+		})
+	}
+}
+
+func TestAskDisplayDeadlineStartsAfterOrderingWait(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	_, gate := w.orderForceReply()
+	released := false
+	defer func() {
+		if !released {
+			close(gate)
+		}
+	}()
+	w.ui(rpcEvent{ID: "queued-editor", Method: "editor", Title: "Queued question"})
+	// Exceed the display timeout while an earlier delivery owns the send lane.
+	time.Sleep(11 * time.Second)
+	close(gate)
+	released = true
+	askTestSettle(t, w)
+	if w.ask == nil {
+		t.Fatal("ordering wait cancelled the native question before display")
+	}
+	askTestReply(t, w, 200, 7, 11, "answer after delivery backlog", askTestPrompt(t, f))
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].ID != "queued-editor" || responses[0].Cancelled || responses[0].Value != "answer after delivery backlog" {
+		t.Fatalf("queued question lost its answer: %+v", responses)
+	}
+}
+
+func TestPrivateAskKeepsOneQuestionAndDistinctAnswers(t *testing.T) {
+	w, f, trace := privateAskTestWorker(t)
+	for n, action := range []string{"reply", "empty", "default", "cancel"} {
+		id := "private-" + action
+		askTestEvent(t, w, map[string]any{"id": id, "method": "editor", "title": "Private question", "prefill": "  default value  ", "placeholder": "input hint"})
+		a := w.ask
+		prompt := askTestPrompt(t, f)
+		if a.inputID != a.messageID || prompt.MessageID != a.messageID || !strings.Contains(prompt.Text, "input hint") || !strings.Contains(prompt.Text, "default value") {
+			t.Fatal("private question lost its reply identity or native input hints")
+		}
+		f.mu.Lock()
+		markup, _ := f.messages[len(f.messages)-1]["reply_markup"].(map[string]any)
+		force := markup["force_reply"] == true
+		f.mu.Unlock()
+		if !force {
+			t.Fatal("private question did not enable automatic Reply")
+		}
+		switch action {
+		case "reply":
+			askTestReply(t, w, 200, 7, 11, "  raw answer  ", prompt)
+		case "empty":
+			askTestClick(t, w, f, "Submit empty")
+		case "default":
+			askTestClick(t, w, f, "Use default")
+		case "cancel":
+			askTestClick(t, w, f, "Cancel")
+		}
+		waitFor(t, func() bool { return f.inlineInputClosed(prompt.MessageID) })
+		responses := askTestState(t, w)
+		if len(responses) != n+1 || responses[n].ID != id || responses[n].Cancelled != (action == "cancel") {
+			t.Fatalf("private native interaction outcome = %+v", responses)
+		}
+		want := ""
+		if action == "reply" {
+			want = "  raw answer  "
+		} else if action == "default" {
+			want = "  default value  "
+		}
+		if responses[n].Value != want {
+			t.Fatalf("private answer changed: %q, want %q", responses[n].Value, want)
+		}
+		if f.messageCount() != n+1 || len(f.deletedMessageIDs()) != 0 {
+			t.Fatal("private Ask added a duplicate prompt, submission receipt or deletion")
+		}
+	}
+	if researchTraceCount(trace, "prompt", "wait") != 1 || researchTraceCount(trace, "prompt", "raw answer") != 0 || len(w.queue) != 0 || len(w.steers) != 0 {
+		t.Fatal("private native answers became ordinary model work")
+	}
+}
+
+func TestPrivateAskLateDisplayCannotClearReplacement(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	f.mu.Lock()
+	f.sendResponses = map[int64][]fakeHTTPResponse{7: {{status: 200, body: `{"ok":true,"result":{"message_id":500}}`,
+		onClose: func() { close(entered); <-release }}}}
+	f.mu.Unlock()
+	w.ui(rpcEvent{ID: "old-private-editor", Method: "editor", Title: "Old question"})
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("inline question did not reach its delayed acknowledgment")
+	}
+	w.endAsk(false)
+	w.ui(rpcEvent{ID: "new-private-editor", Method: "editor", Title: "New question"})
+	a := w.ask
+	close(release)
+	released = true
+	askTestSettle(t, w)
+	waitFor(t, func() bool { return f.inlineInputClosed(500) })
+	if w.ask != a || f.inlineInputClosed(a.inputID) {
+		t.Fatal("late inline cleanup cleared the replacement question")
+	}
+	askTestReply(t, w, 200, 7, 11, "replacement answer", askTestPrompt(t, f))
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].ID != "new-private-editor" || responses[0].Cancelled || responses[0].Value != "replacement answer" {
+		t.Fatalf("replacement question lost its native answer: %+v", responses)
+	}
+}
+
+func TestPrivateAskLongTitleKeepsInputPreviews(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	hintPrefix := "[Other](tg://user?id=8) <b>hint</b>"
+	defaultPrefix := "  <script>default</script>\n"
+	placeholder := hintPrefix + strings.Repeat("`", 1200)
+	prefill := defaultPrefix + strings.Repeat("原始默认值", 1000)
+	before := f.messageCount()
+	askTestEvent(t, w, map[string]any{"id": "long-private-editor", "method": "editor",
+		"title": strings.Repeat("长问题标题", 300), "placeholder": placeholder, "prefill": prefill})
+	prompt := askTestPrompt(t, f)
+	visible := html.UnescapeString(prompt.Text)
+	if !strings.Contains(visible, hintPrefix) || !strings.Contains(visible, defaultPrefix) {
+		t.Fatalf("long question hid preview: hint=%t default=%t", strings.Contains(visible, hintPrefix), strings.Contains(visible, defaultPrefix))
+	}
+	if strings.Contains(prompt.Text, `href="tg://user?id=8"`) || strings.Contains(prompt.Text, "<script>") || len(prompt.Text) > telegram.MaxMessageUTF16 {
+		t.Fatal("private input previews escaped their bounded literal display")
+	}
+	lastLine := prompt.Text[strings.LastIndexByte(prompt.Text, '\n')+1:]
+	if lastLine != askMarkerPrefix+w.ask.inputToken+"]" || f.messageCount() != before+1 {
+		t.Fatal("input previews changed the reply marker or added a separate prompt")
+	}
+	askTestClick(t, w, f, "Use default")
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].Cancelled || responses[0].Value != prefill {
+		t.Fatalf("display clipping changed the submitted default: %+v", responses)
+	}
+}
+
+func TestPrivateAskBacktickTitleKeepsLiteralBoundaries(t *testing.T) {
+	for _, title := range []string{"Which ``command`` should be used?", "Which ```command``` should be used?"} {
+		t.Run(title, func(t *testing.T) {
+			w, f, _ := privateAskTestWorker(t)
+			hint := "Hint [Other](tg://user?id=8)"
+			prefill := "  [Default](tg://user?id=9) <b>value</b>\n"
+			askTestEvent(t, w, map[string]any{"id": "backtick-title", "method": "editor",
+				"title": title, "placeholder": hint, "prefill": prefill})
+			prompt := askTestPrompt(t, f)
+			visible := html.UnescapeString(prompt.Text)
+			if !strings.Contains(visible, title) || !strings.Contains(visible, hint) || !strings.Contains(visible, prefill) {
+				t.Fatal("backtick title hid the question or input previews")
+			}
+			if strings.Contains(prompt.Text, `href="tg://user?id=8"`) || strings.Contains(prompt.Text, `href="tg://user?id=9"`) || strings.Contains(prompt.Text, "<b>value</b>") {
+				t.Fatal("input previews escaped their literal boundaries")
+			}
+			lastLine := prompt.Text[strings.LastIndexByte(prompt.Text, '\n')+1:]
+			if lastLine != askMarkerPrefix+w.ask.inputToken+"]" {
+				t.Fatal("backtick title absorbed the reply marker")
+			}
+			askTestClick(t, w, f, "Use default")
+			responses := askTestState(t, w)
+			if len(responses) != 1 || responses[0].Cancelled || responses[0].Value != prefill {
+				t.Fatalf("literal rendering changed the submitted default: %+v", responses)
 			}
 		})
 	}

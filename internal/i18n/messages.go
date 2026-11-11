@@ -539,6 +539,7 @@ var Msg = struct {
 	FollowupQueued                                                            Message
 	FollowupExpired                                                           Message
 	FollowupTextRequired                                                      Message
+	TextInputClosed                                                           Message
 	ActionUnavailable                                                         Message
 }{
 	AskCustom:            message("Custom answer", "自定义答案"),
@@ -564,6 +565,7 @@ var Msg = struct {
 	FollowupQueued:       message("Follow-up queued.", "后续消息已入队."),
 	FollowupExpired:      message("This follow-up input request is unavailable or expired. No message was submitted. Open a new Follow-up request or use /followup <message>.", "此后续输入请求已失效或过期. 未提交消息. 请重新点击后续输入或使用 /followup <消息>."),
 	FollowupTextRequired: message("Reply with nonempty text to queue a follow-up. This request has not been consumed.", "请回复非空文本以加入后续任务队列. 此请求尚未消费."),
+	TextInputClosed:      message("Text input closed.", "文字输入已结束."),
 	ActionUnavailable:    message("This shortcut is unavailable or expired. No command was submitted. Use the command directly or an unused button on a completed reply.", "此快捷操作不可用或已过期. 未提交命令. 请直接发送命令, 或使用已完成回复中尚未使用的按钮."),
 	Task: taskMessages{
 		SubmissionUncertain: message("Root submission could not be confirmed while steering. The task outcome is uncertain and will not be replayed automatically.", "引导期间无法确认初始提交. 任务结果不确定, 不会自动重放."),

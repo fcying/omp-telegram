@@ -108,6 +108,7 @@ type Button struct {
 
 type Keyboard struct {
 	InlineKeyboard [][]Button `json:"inline_keyboard"`
+	ForceReply     bool       `json:"force_reply,omitempty"`
 }
 
 type ForceReply struct {
@@ -116,10 +117,16 @@ type ForceReply struct {
 	InputFieldPlaceholder string `json:"input_field_placeholder,omitempty"`
 }
 
+type ReplyKeyboardRemove struct {
+	RemoveKeyboard bool `json:"remove_keyboard"`
+	Selective      bool `json:"selective,omitempty"`
+}
+
 type SendOptions struct {
 	ReplyToMessageID int64
 	Keyboard         *Keyboard
 	ForceReply       *ForceReply
+	RemoveKeyboard   *ReplyKeyboardRemove
 }
 
 type BotCommand struct {
@@ -343,6 +350,8 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 			fields["reply_markup"] = options.Keyboard
 		} else if options.ForceReply != nil {
 			fields["reply_markup"] = options.ForceReply
+		} else if options.RemoveKeyboard != nil {
+			fields["reply_markup"] = options.RemoveKeyboard
 		}
 		var message Message
 		err := c.call(ctx, "sendMessage", fields, &message, false)
@@ -413,8 +422,18 @@ func parseEntitiesError(err error) bool {
 }
 
 func sendWithReplyFallback(logger *slog.Logger, chatID, threadID int64, options SendOptions, send func(SendOptions) (Message, error)) (Message, error) {
-	if options.Keyboard != nil && options.ForceReply != nil {
-		return Message{}, deliveryFailure(errors.New("inline keyboard and ForceReply are mutually exclusive"), false)
+	markups := 0
+	if options.Keyboard != nil {
+		markups++
+	}
+	if options.ForceReply != nil {
+		markups++
+	}
+	if options.RemoveKeyboard != nil {
+		markups++
+	}
+	if markups > 1 {
+		return Message{}, deliveryFailure(errors.New("reply markup options are mutually exclusive"), false)
 	}
 	message, err := send(options)
 	if err == nil || options.ReplyToMessageID == 0 || !replyRejected(err) {
