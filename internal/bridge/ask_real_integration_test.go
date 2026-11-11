@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -94,11 +95,43 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 					t.Fatal("native Ask escaped the original root or invoked extra model work while collecting fields")
 				}
 			}
+			// RPC response settlement may precede the best-effort Telegram edit.
+			receipt := func(messageID int64, footer string, contains ...string) string {
+				until(func() bool {
+					fake.mu.Lock()
+					defer fake.mu.Unlock()
+					for i := len(fake.messages) - 1; i >= 0; i-- {
+						message := fake.messages[i]
+						if message["chat_id"] == float64(w.key.chat) && message["message_id"] == float64(messageID) {
+							text, _ := message["text"].(string)
+							if !strings.Contains(text, footer) {
+								return false
+							}
+							for _, want := range contains {
+								if !strings.Contains(html.UnescapeString(text), want) {
+									return false
+								}
+							}
+							var keyboard telegram.Keyboard
+							raw, err := json.Marshal(message["reply_markup"])
+							return err == nil && json.Unmarshal(raw, &keyboard) == nil && len(keyboard.InlineKeyboard) == 0
+						}
+					}
+					return false
+				})
+				text := assertFinishedMenu(t, fake, int(messageID), footer)
+				for _, want := range contains {
+					if !strings.Contains(html.UnescapeString(text), want) {
+						t.Fatalf("original question %d lost %q in receipt: %q", messageID, want, text)
+					}
+				}
+				return text
+			}
 			selectField := func(title, previousID string) confirmation {
 				var current confirmation
 				until(func() bool {
 					for _, c := range w.confirms {
-						if c.action == "ui" && c.method == "select" && c.uiID != previousID && strings.Contains(c.uiTitle, title) {
+						if c.action == "ui" && c.method == "select" && c.uiID != previousID && strings.Contains(c.uiQuestion.Question, title) {
 							current = c
 							return true
 						}
@@ -113,7 +146,11 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 					return w.ask != nil && w.ask.method == method && w.ask.cancel == nil && w.ask.inputID != 0 && strings.Contains(w.ask.questions[0].Question, title)
 				})
 				assertRoot()
-				return askTestPrompt(t, fake)
+				prompt := askTestPrompt(t, fake)
+				if w.ask.messageID == 0 || w.ask.messageID == prompt.MessageID {
+					t.Fatal("native field did not retain an independent main question message")
+				}
+				return prompt
 			}
 			// Capture the actual delivered callback envelope before its token expires.
 			button := func(label string) *telegram.CallbackQuery {
@@ -135,9 +172,38 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 				w.handle(incoming{id: id, msg: u.Message})
 				w.dispatch()
 			}
+			submitted := func(action func(), value string) {
+				messageID, question := w.ask.messageID, w.ask.questions[0].Question
+				action()
+				text := receipt(messageID, "<b>Submitted</b>", question)
+				_, actual, _ := strings.Cut(html.UnescapeString(text), "<b>Submitted</b>")
+				if value == "" {
+					if strings.Contains(actual, "<code>") || strings.Contains(actual, "<pre>") {
+						t.Fatalf("empty submission was rendered as literal user text: %q", actual)
+					}
+					return
+				}
+				if !strings.Contains(actual, value) {
+					t.Fatalf("original question %d submission = %q, want exact raw value %q", messageID, actual, value)
+				}
+			}
+			submitReply := func(id int64, text string, prompt *telegram.Message) {
+				submitted(func() { reply(id, text, prompt) }, text)
+			}
+			submitButton := func(label, value string) {
+				submitted(func() { w.callback(button(label)) }, value)
+			}
 			topic := selectField("Which topic?", "")
 			w.callback(button("Programming"))
+			topicReceipt := receipt(topic.messageID, "<b>Your choice</b>", "Which topic?", "1. Programming", "2. Investing", "3. Languages")
+			_, localChoice, _ := strings.Cut(topicReceipt, "<b>Your choice</b>")
+			if !strings.Contains(localChoice, "Programming") {
+				t.Fatalf("native select receipt lost its local choice: %q", topicReceipt)
+			}
 			features := selectField("Which features?", topic.uiID)
+			if features.messageID != topic.messageID {
+				t.Fatal("sequential native select replaced its original menu message")
+			}
 			if scenario == "guidance" {
 				stale := button("Auth")
 				token, _, _ := strings.Cut(stale.Data, ":")
@@ -174,33 +240,38 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 			}
 			// Checkbox rows are separate native select calls, not a bridge-owned form.
 			w.callback(button("Search"))
+			featuresReceipt := receipt(features.messageID, "<b>Your choice</b>", "Which features?", "Search")
+			_, localChoice, _ = strings.Cut(featuresReceipt, "<b>Your choice</b>")
+			if !strings.Contains(localChoice, "Search") {
+				t.Fatalf("checkbox receipt lost its individual action: %q", featuresReceipt)
+			}
 			features = selectField("Which features?", features.uiID)
 			w.callback(button("Auth"))
 			features = selectField("Which features?", features.uiID)
 			w.callback(button("Done selecting"))
 			selectField("Which language?", features.uiID)
 			w.callback(button("Other (type your own)"))
-			reply(200, "  Elixir  ", inputField("input", "Which language?"))
+			submitReply(200, "  Elixir  ", inputField("input", "Which language?"))
 			rationale := inputField("input", "Why this choice?")
 			text, _ := pickerView(t, fake)
 			if !strings.Contains(text+rationale.Text, "Explain briefly") {
 				t.Fatal("native input placeholder was not shown to the user")
 			}
-			reply(201, "  Keep the original root  ", rationale)
-			reply(202, "  First line\nSecond line  ", inputField("editor", "Implementation notes?"))
+			submitReply(201, "  Keep the original root  ", rationale)
+			submitReply(202, "  First line\nSecond line  ", inputField("editor", "Implementation notes?"))
 			inputField("input", "Optional note?")
-			w.callback(button("Submit empty"))
+			submitButton("Submit empty", "")
 			saved := inputField("editor", "Saved draft?")
 			text, _ = pickerView(t, fake)
 			if !strings.Contains(text+saved.Text, "Saved draft\nSecond line") {
 				t.Fatal("native editor prefill was not shown to the user")
 			}
-			w.callback(button("Use default"))
+			submitButton("Use default", "  Saved draft\nSecond line  ")
 			inputField("editor", "Empty notes?")
-			w.callback(button("Submit empty"))
+			submitButton("Submit empty", "")
 			inputField("editor", "How many?")
 			oldQuantity, oldDefault := w.ask.id, button("Use default")
-			w.callback(button("Submit empty"))
+			submitButton("Submit empty", "")
 			inputField("editor", "How many?")
 			if w.ask.id == oldQuantity {
 				t.Fatal("required empty value did not reach native validation and re-open the field")
@@ -210,20 +281,20 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 			if w.ask != quantity {
 				t.Fatal("a stale default button answered the replacement field")
 			}
-			reply(203, "10", askTestPrompt(t, fake))
+			submitReply(203, "10", askTestPrompt(t, fake))
 			inputField("editor", "How many?")
 			if w.ask.id == quantity.id {
 				t.Fatal("out-of-range value did not reach native validation")
 			}
-			reply(204, " 4 ", askTestPrompt(t, fake))
+			submitReply(204, " 4 ", askTestPrompt(t, fake))
 			code := inputField("input", "Reference code?")
 			codeID := w.ask.id
-			reply(205, " OK ", code)
+			submitReply(205, " OK ", code)
 			inputField("input", "Reference code?")
 			if w.ask.id == codeID {
 				t.Fatal("pattern validation did not see the exact untrimmed answer")
 			}
-			reply(206, "OK", askTestPrompt(t, fake))
+			submitReply(206, "OK", askTestPrompt(t, fake))
 			if scenario == "guidance" {
 				until(func() bool {
 					return queueState(t, w, 100) == "done" || len(w.deferredSteers) == 0 && len(w.steers) != 0 && !w.rpcOperationActive

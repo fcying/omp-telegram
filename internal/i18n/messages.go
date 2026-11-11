@@ -51,6 +51,12 @@ var Msg = struct {
 	AskDefault       Message
 	AskPlaceholder   Message
 	AskPrefill       Message
+	AskQuestion      Message
+	AskOptions       Message
+	AskChoice        Message
+	AskSubmission    Message
+	AskEmptyValue    Message
+	AskNoSelection   Message
 	AskExpired       Message
 	AskTextRequired  Message
 	AskDisplayFailed Message
@@ -543,6 +549,12 @@ var Msg = struct {
 	AskDefault:           message("Use default", "使用完整默认值"),
 	AskPlaceholder:       message("Placeholder preview (hint only, not a default):", "占位提示预览 (仅提示, 非默认值):"),
 	AskPrefill:           message("Default preview (button submits the full original value):", "默认值预览 (按钮提交完整原值):"),
+	AskQuestion:          message("Question", "问题"),
+	AskOptions:           message("Options", "选项"),
+	AskChoice:            message("Your choice", "你的选择"),
+	AskSubmission:        message("Submitted", "本次提交"),
+	AskEmptyValue:        message("Empty string (0 characters)", "空字符串 (0 个字符)"),
+	AskNoSelection:       message("(none)", "(未选择)"),
 	AskExpired:           message("This Ask input is unavailable or expired. No answer or prompt was submitted.", "此 Ask 输入已失效或不可用. 未提交答案或新任务."),
 	AskTextRequired:      message("Reply with text, or use the empty-value button when available. This question has not been answered.", "请回复文本, 或在有提交空值按钮时使用该按钮. 当前问题尚未回答."),
 	AskDisplayFailed:     message("Could not display the native question. The dialog was cancelled.", "无法显示原生问题. 已取消该对话."),

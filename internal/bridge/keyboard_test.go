@@ -365,10 +365,15 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 	click(7, next)
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/3") || len(rows) != uiSelectPageSize+1 {
+	if !strings.Contains(text, "Page 2/3") || len(rows) != uiSelectPageSize+1 || rows[0][0]["text"] != "11. "+options[10] {
 		t.Fatalf("middle commit page = %q; %v", text, rows)
 	}
 	requirePickerFooter(t, rows, "Previous", "Next", "Cancel")
+	for _, option := range options {
+		if strings.Contains(text, option) {
+			t.Fatalf("pending menu repeated a button label in its body: %q", text)
+		}
+	}
 	click(7, first)
 	if _, exists := w.confirms[strings.SplitN(first, ":", 2)[0]]; exists {
 		t.Fatal("old commit page retained an actionable token")
@@ -385,7 +390,7 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	}
 	click(7, rows[uiSelectPageSize][1]["callback_data"].(string))
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 3/3") || len(rows) != 3 || rows[0][0]["text"] != options[20] {
+	if !strings.Contains(text, "Page 3/3") || len(rows) != 3 || rows[0][0]["text"] != "21. "+options[20] {
 		t.Fatalf("last commit page = %q; %v", text, rows)
 	}
 	requirePickerFooter(t, rows, "Previous", "Cancel")
@@ -858,11 +863,11 @@ func TestNativeUISelectionDisplaysResult(t *testing.T) {
 			click(data)
 			text, rows := pickerView(t, f)
 			if cancel {
-				if !strings.Contains(text, "review") {
+				if !strings.Contains(text, "review") || !strings.Contains(text, options[uiSelectPageSize]) || strings.Contains(text, "Your choice") {
 					t.Fatalf("cancelled review lost its operation context: %q", text)
 				}
-			} else if !strings.Contains(text, options[uiSelectPageSize]) || strings.Contains(text, "Select commit to review") || strings.Contains(text, "Page ") {
-				t.Fatalf("completed review does not identify the selected commit: %q", text)
+			} else if !strings.Contains(text, "Select commit to review") || !strings.Contains(text, "Options") || !strings.Contains(text, options[uiSelectPageSize]) || !strings.Contains(text, "Your choice") || strings.LastIndex(text, options[uiSelectPageSize]) < strings.Index(text, "Your choice") {
+				t.Fatalf("completed review lost its question, options, or chosen answer: %q", text)
 			}
 			if len(rows) != 0 || len(w.confirms) != 0 {
 				t.Fatal("completed review retained actionable choices")
@@ -877,6 +882,47 @@ func TestNativeUISelectionDisplaysResult(t *testing.T) {
 			after, _ := pickerView(t, f)
 			if after != text {
 				t.Fatal("a consumed callback changed the displayed review result")
+			}
+		})
+	}
+}
+
+func TestNativeUICompletedSelectionRetainsDisplayableOptions(t *testing.T) {
+	for _, count := range []int{25, 100, 400} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			w.owner = 7
+			options := make([]string, count)
+			for index := range options {
+				options[index] = fmt.Sprintf("opt-%03d", index)
+			}
+			w.ui(rpcEvent{ID: "all-options", Method: "select", Title: "Review all options", Options: options})
+			messageID := int64(f.messageCount())
+			click := func(data string) {
+				w.callback(&telegram.CallbackQuery{ID: "all-options", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+			}
+			selected := count - 4
+			for page := 0; page < selected/uiSelectPageSize; page++ {
+				click(askTestButton(t, f, "Next"))
+			}
+			_, rows := pickerView(t, f)
+			click(rows[selected%uiSelectPageSize][0]["callback_data"].(string))
+			text := assertFinishedMenu(t, f, int(messageID), "Your choice")
+			body, answer, _ := strings.Cut(text, "<b>Your choice</b>")
+			if !strings.Contains(answer, askOptionLabel(selected, options[selected])) {
+				t.Fatalf("completed menu lost its selected value: %q", text)
+			}
+			if count == 400 {
+				if !strings.Contains(body, "...") {
+					t.Fatal("oversized options did not indicate display truncation")
+				}
+				return
+			}
+			for index, option := range options {
+				if !strings.Contains(body, askOptionLabel(index, option)) {
+					t.Fatalf("completed menu omitted displayable option %d: %q", index+1, body)
+				}
 			}
 		})
 	}
@@ -954,7 +1000,7 @@ func TestNativeUISequentialSelectionInvalidationPreservesReceipt(t *testing.T) {
 				_, rows := pickerView(t, f)
 				firstChoice := rows[0][0]["callback_data"].(string)
 				click(firstChoice)
-				receipt := assertFinishedMenu(t, f, int(messageID), "Selected: "+first)
+				assertFinishedMenu(t, f, int(messageID), "Your choice")
 				options := make([]string, uiSelectPageSize+1)
 				for i := range options {
 					options[i] = fmt.Sprintf("commit %02d", i)
@@ -965,7 +1011,7 @@ func TestNativeUISequentialSelectionInvalidationPreservesReceipt(t *testing.T) {
 				}
 				w.event(raw)
 				text, rows := pickerView(t, f)
-				if !strings.Contains(text, receipt) || !strings.Contains(text, "Choose commit") {
+				if !strings.Contains(text, first) || !strings.Contains(text, "Choose review mode") || !strings.Contains(text, "Choose commit") {
 					t.Errorf("pending selection hid the completed choice: %q", text)
 				}
 				stale := rows[0][0]["callback_data"].(string)
@@ -973,7 +1019,7 @@ func TestNativeUISequentialSelectionInvalidationPreservesReceipt(t *testing.T) {
 				if paginate {
 					click(rows[uiSelectPageSize][0]["callback_data"].(string))
 					text, rows = pickerView(t, f)
-					if !strings.Contains(text, receipt) || !strings.Contains(text, "Page 2/2") {
+					if !strings.Contains(text, first) || !strings.Contains(text, "Choose review mode") || !strings.Contains(text, "Page 2/2") {
 						t.Errorf("pagination hid the completed choice: %q", text)
 					}
 					if _, exists := w.confirms[strings.SplitN(stale, ":", 2)[0]]; exists {
@@ -991,7 +1037,7 @@ func TestNativeUISequentialSelectionInvalidationPreservesReceipt(t *testing.T) {
 				}
 				waitKeyboardClears(t, f, int(messageID))
 				text, _ = pickerView(t, f)
-				if !strings.Contains(text, receipt) {
+				if !strings.Contains(text, first) || !strings.Contains(text, "Choose review mode") {
 					t.Errorf("invalidating the second selection erased the completed choice: %q", text)
 				}
 				click(firstChoice)
@@ -1432,5 +1478,89 @@ func TestNativeUIExportRejectionTerminatesOriginalMenu(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNativeUISelectionDetailsAndRawValue(t *testing.T) {
+	value := "[x] " + strings.Repeat("完整选项", 45)
+	for _, scenario := range []struct {
+		name    string
+		details []askOption
+		shown   bool
+	}{
+		{name: "missing"},
+		{name: "aligned", details: []askOption{{Description: "Option explanation"}, {Description: "Done explanation"}}, shown: true},
+		{name: "partial", details: []askOption{{Description: "Option explanation"}}, shown: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new " + t.TempDir())
+			w.owner = 7
+			raw, err := json.Marshal(map[string]any{
+				"type": "extension_ui_request", "id": "native-details", "method": "select",
+				"title": "Choose an action", "options": []string{value, "Done"}, "optionDetails": scenario.details,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.event(raw)
+			text, rows := pickerView(t, f)
+			if !strings.Contains(text, "Choose an action") || !strings.Contains(text, "1. "+value) || rows[1][0]["text"] != "2. Done" {
+				t.Fatalf("pending menu lost its question or overflow label: %q; %v", text, rows)
+			}
+			if strings.Contains(text, "Option explanation") != scenario.shown {
+				t.Fatalf("native option details were omitted or associated with another value: %q", text)
+			}
+			button := rows[0][0]["text"].(string)
+			if !strings.HasPrefix(button, "1. [x] ") || strings.Contains(button, value) {
+				t.Fatalf("long native button was not display-only truncated: %q", button)
+			}
+			messageID := int64(f.messageCount())
+			w.callback(&telegram.CallbackQuery{ID: "native-details", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
+			text = assertFinishedMenu(t, f, int(messageID), "Your choice")
+			_, answer, ok := strings.Cut(text, "Your choice")
+			if !ok || !strings.Contains(answer, "1. "+value) || strings.Contains(answer, "Done") || !strings.Contains(text, "Choose an action") || !strings.Contains(text, "Done") {
+				t.Fatalf("native receipt inferred a checkbox set or lost the actual choice: %q", text)
+			}
+			result, err := w.call("get_state", nil)
+			var state struct {
+				Replies int    `json:"fixtureUIReplies"`
+				Value   string `json:"fixtureUIValue"`
+			}
+			if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 1 || state.Value != value {
+				t.Fatalf("native display truncation changed the submitted value: %+v, %v", state, err)
+			}
+		})
+	}
+}
+
+func TestNativeUISelectionKeepsHistoryAndFooterWithinBudget(t *testing.T) {
+	w, f, _, _ := replyStatusWorker(t)
+	w.ui(rpcEvent{ID: "first-choice", Method: "select", Title: "Prior question", Options: []string{"Previous choice"}})
+	messageID := int64(f.messageCount())
+	click := func(data string) {
+		w.callback(&telegram.CallbackQuery{ID: "budget-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+	}
+	_, rows := pickerView(t, f)
+	click(rows[0][0]["callback_data"].(string))
+	options := make([]string, uiSelectPageSize)
+	details := make([]askOption, len(options))
+	options[0] = "Actual selected value"
+	for i := range options {
+		if i != 0 {
+			options[i] = fmt.Sprintf("Option %d %s", i+1, strings.Repeat("long label ", 200))
+		}
+		details[i] = askOption{Description: strings.Repeat("```literal```\n", 100)}
+	}
+	w.ui(rpcEvent{ID: "next-choice", Method: "select", Title: "Current question " + strings.Repeat("context ", 1000), Options: options, OptionDetails: details})
+	_, rows = pickerView(t, f)
+	click(rows[0][0]["callback_data"].(string))
+	text := assertFinishedMenu(t, f, int(messageID), "Your choice")
+	_, answer, ok := strings.Cut(text, "Your choice")
+	if !ok || !strings.Contains(answer, options[0]) || !strings.Contains(text, "Prior question") || !strings.Contains(text, "Previous choice") || !strings.Contains(text, "Current question") || !strings.Contains(text, "Option 10") {
+		t.Fatalf("large native receipt dropped history, current options, or answer: %q", text)
+	}
+	if strings.Count(text, "<pre>") != strings.Count(text, "</pre>") || strings.Count(text, "<code>") != strings.Count(text, "</code>") {
+		t.Fatalf("large native receipt cut a literal span: %q", text)
 	}
 }

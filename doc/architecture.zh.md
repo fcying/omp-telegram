@@ -276,19 +276,23 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 [`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理基于 questions 的扩展 `method:"ask"` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
 
-通用 `input`/`editor` 请求保留原始文字. `placeholder` 作为提示展示; `prefill` 与有界 literal 展示分开保存, 包括显式为空的编辑器默认值. **提交空值** 与 **使用完整默认值** callback 受 owner 和 interaction 围栏保护, 发送 `value:""` 或原始 prefill, 不发送 `cancelled:true`; 取消仍是独立响应. 消息回复必须实际包含文字, 因而贴纸, 语音或位置等纯非文字回复不能悄悄提交空字段. 必填/类型/pattern 校验归 OMP 所有, 它可在拒绝后用新 request ID 重问同一字段. 扩展组合 Ask 自定义答案继续裁剪首尾空白并要求非空.
+通用 `input`/`editor` 请求保留原始文字. `placeholder` 作为提示展示; `prefill` 与有界 literal 展示分开保存, 包括显式为空的编辑器默认值. **提交空值** 与 **使用完整默认值** callback 受 owner 和 interaction 围栏保护, 发送 `value:""` 或原始 prefill, 不发送 `cancelled:true`; 取消仍是独立响应. 本地提交将 **本次提交** 及实际 literal 值追加到原问题主消息, 不写入 ForceReply 提示. 空字符串在字面值展示之外使用零字符状态, 避免与实际输入的标记文本混淆. 取消和 Stop 不追加提交记录. 消息回复必须实际包含文字, 因而贴纸, 语音或位置等纯非文字回复不能悄悄提交空字段. 必填/类型/pattern 校验归 OMP 所有, 它可在拒绝后用新 request ID 重问同一字段; 先前提交仍是本地动作记录, 不代表校验成功. 扩展组合 Ask 自定义答案继续裁剪首尾空白并要求非空.
 
-当前原生 RPC select envelope 不传递本地 `initialIndex` 或 checkbox 勾选状态元数据. Bridge 无法从字符串选项重建这些标记或整张表单的布局/图片; 仅返回原始选项标签, 由原生映射到值. 通用扩展对象选项的 description 目前不展示; 原生 HTML 回退发送字符串选项.
+按钮使用全局一致的选项编号. 待选问题正文通常省略重复的标签列表, 展示当前页可用的编号说明/preview, 以及问题和页码. 超过共用按钮限制 100 个 UTF-16 单位的标签保留在正文中, 编码后的标签空间优先于可选说明预留. 判断使用空白规范化后的按钮文字, 多选时计入占两个单位的 checkbox 标记; 能放入按钮的标签不重复展示. 过长标签仍受整条消息预算限制. 原生 `select` 按原始选项索引读取可选的 `optionDetails[i].description`. 编号, 展示截断和 literal 转义不改变 RPC 选项值, 答案或默认值. 原生 select 完成后在原主消息保留当前问题, 选项及本地选择. 完成时考虑全部选项, 优先为问题, 历史和答案预留空间, 再展示可选说明. 编码后的标签按实际字节扣减预算, 放不下全部选项时显示省略标记. 当前原生 RPC select envelope 不传递本地 `initialIndex` 或 checkbox 勾选状态元数据. Bridge 无法从字符串选项重建这些标记或整张表单的布局/图片; 仅返回原始选项标签, 由原生映射到值. 多次 checkbox select 只记录逐次动作, 不推断最终勾选集合, 也不将 "Done" 等标签识别为协议标记; 原生 HTML 回退发送字符串选项.
 
 活跃的 Ask/文字对话在显示确认前后均排除卡死任务恢复, 即使原生报告 idle 且没有 active tool. 对话结束后恢复原有 watchdog 策略; 只有暂存指导不算等待用户.
 
-原生 cancel 使匹配 token 失效. Teardown 先移除失效 token, 再进行有界键盘清理. 菜单 receipt 记录用户选择, 不是操作成功; confirm/select 写入失败按保守策略退役 runtime.
+原生 cancel 使匹配 token 失效. Teardown 先移除失效 token, 再进行有界键盘清理. 菜单 receipt 记录用户选择, 不是操作成功; confirm/select RPC response 写入失败按保守策略退役 runtime. Telegram 回执编辑是尽力而为的 UI, 不是业务 acknowledgment: 成功或失败均不改变原生响应, 不重放答案.
 
 连续的原生 `select` 仅在相同活动 root, turn, client 和 generation 内复用前一个已完成菜单, 中间不能跨模型 run/消息或 session 变化. 后续选择处于 pending, 翻页, 取消或失效状态时, 之前的选择仍在菜单文字预算内保持可见. 被复用的 Telegram 消息已不存在时, 重新发送可用菜单; 其他编辑失败不重发交付状态不明的菜单. Pending 菜单保留创建时的 scope, 包括 root/turn 为零的情况, 完成时不能借用后来的 root. 并发请求会取消, 不修改当前菜单或原有回执. 取消, 任务结算和 runtime teardown 清除可复用回执缓存, 不移除已显示的历史选择; 原有单次 token, 消息绑定和原生 response 处理保持不变.
 
 Extensions 保留独立的 questions-based `ui.askDialog` 协议和 `set_ask_dialog` opt-in. RPC `method:"ask"` 承载这些组合对话, 不是原生工具的 `{html}` schema 或 HTML `formDialog`. 以下组合对话行为适用于这一扩展 UI 路径.
 
-组合 Ask 保留不可变的 client/generation/session/catalog-epoch/root/turn/request 身份和可变的 question/interaction epoch. 逐题编辑一条主消息, 选项分页不改变标签, 最后一题完成后才按原问题顺序提交全部答案. 单选直接推进; 多选切换勾选并要求确认, 包括明确确认的空集合. 多选自定义文字补充已选选项. 进入/退出文字输入或切题时撤销旧 token 和提示身份. 每次文字输入单独发送定向 ForceReply 提示, 带不透明且由 bot 发出的 `[ask:...]` marker. 返回的消息 ID 及当前 token/owner/对话必须同时匹配. 一条早到回复可以等待显示回执确认精确 ID; 取消时结算该 pending inbox, 不重放. Marker 识别过期/重启后的提示, 不持久化另一份对话副本. 普通文本和 queued followup 不取消 Ask, 也不进入答案路由.
+组合 Ask 保留不可变的 client/generation/session/catalog-epoch/root/turn/request 身份和可变的 question/interaction epoch. 每题使用独立主消息; 下一题打开后, 已确认的本地选择仍保留在该题原消息中. 选项跨页保持全局编号, 不改变 RPC 标签. 最后一题完成后才按原问题顺序一次性提交全部答案. 单选直接推进; 多选切换勾选并要求确认, 包括明确确认的空集合. 多选自定义文字补充已选选项. 进入/退出文字输入或切题时撤销旧 token 和提示身份. 每次文字输入单独发送定向 ForceReply 提示, 带不透明且由 bot 发出的 `[ask:...]` marker. 返回的消息 ID 及当前 token/owner/对话必须同时匹配. 一条早到回复可以等待显示回执确认精确 ID; 取消时结算该 pending inbox, 不重放. Marker 识别过期/重启后的提示, 不持久化另一份对话副本. 普通文本和 queued followup 不取消 Ask, 也不进入答案路由.
+
+异步 display job 在启动前捕获不可变的已渲染 snapshot, 目标 message ID 及 question/interaction epoch; 不从可能已推进的 dialog 指针读取内容来渲染. Display result 必须匹配捕获的身份与 epoch, 才能发布消息/提示状态. 最终本地回执使用独立的 `ask_receipt` operation result 和原 message ID, 不依赖可变对话生命周期或 RPC response 结算. 因而即使答案响应已完成或后续问题已开始, 回执编辑仍可结束, 不会借用后题内容或完成后题. 问题/选项文字, description, preview 和回执 literal 仅在 Telegram 展示时限长; UI 写入失败不变成原生答案失败.
+
+取消扩展组合 Ask 时, 捕获当前问题和展示长度内的全部选项快照, footer 标记为已取消, 不作为答案. 立即撤销 token 并安排键盘清理; 回执编辑独立于 RPC 取消. 当前 display 仍在途时, 用其捕获的 epoch 限定结果返回后的一次最终取消编辑, 包括首次发送迟到返回消息 ID 的情况. 因而旧渲染不能覆盖取消留痕, 也不能借用替换后对话的内容; 之前已确认题目的回执保持不变.
 
 [`steer.go`](../internal/bridge/steer.go) 在 Ask/文字对话, response 写入或原生 `ask` 工具活跃时, 按 FIFO 暂存本应作为 steer 的输入. Inbox 保持 pending, 与普通排队任务和 in-flight steer 共用容量. 每条绑定原 root/client/generation/turn 及已绑定的原生 session/catalog epoch, 不变成独立 followup. 派发重新校验身份, 等待 UI 结算和 `tool_execution_end`, 且要求 RPC lane 空闲及无原生输出缓冲. `BufferedOutput` 同时包含 reader 尚未分帧的 `bufio` 预读和 frame/event byte credit, 已发布的旧 tool end 不能遮蔽已预读的后继对话帧. 随后由原有 steer 提交流程负责接纳与完成. Stop, runtime/session 替换和 root 完成取消未发送指导; 最终回复在异步 metadata 采样前取消这些输入. 不覆盖 OMP interrupt 策略, 不重放不确定输入, 控制命令仍走原有路径.
 
@@ -1016,7 +1020,7 @@ Actor handler 与高风险同步 store/Telegram helper 仅在 span 至少耗时�
 
 ### 验证边界
 
-最低 Go 工具链为 Go 1.27.3, 由 [go.mod](../go.mod) 指定. CI 和 `just fmt` 从该模块文件选择版本. 使用仓库 [justfile](../justfile):
+最低 Go 工具链为 Go 1.27.4, 由 [go.mod](../go.mod) 指定. CI 和 `just fmt` 从该模块文件选择版本. 使用仓库 [justfile](../justfile):
 
 | 命令 | 效果 |
 | --- | --- |

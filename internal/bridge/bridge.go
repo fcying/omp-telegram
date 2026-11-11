@@ -160,7 +160,8 @@ type confirmation struct {
 	finalAction                     *finalActionDispatch
 	action, uiID, method            string
 	uiTitle                         string
-	uiSelected                      string
+	uiHistory                       string
+	uiQuestion                      askQuestion
 	uiClientID                      uint64
 	workspace                       string
 	exportFormat                    string
@@ -501,6 +502,7 @@ type rpcEvent struct {
 	Message               json.RawMessage              `json:"message"`
 	Text                  string                       `json:"text"`
 	Options               []string                     `json:"options"`
+	OptionDetails         []askOption                  `json:"optionDetails"`
 	Questions             []askQuestion                `json:"questions"`
 	Secret                bool                         `json:"secret"`
 	Placeholder           string                       `json:"placeholder"`
@@ -5240,6 +5242,10 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 
 // Menu completion records the user's choice, not the operation's success.
 func (w *worker) finishConfirmation(c confirmation, index int) {
+	if c.uiSelectMenu {
+		w.finishNativeSelection(c, index)
+		return
+	}
 	cancelled := index != 0
 	if c.method == "select" {
 		cancelled = index == len(c.options)
@@ -5263,22 +5269,44 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 		}
 	}
 	text = truncateUTF8(text, 3700)
-	previous := truncateUTF8(c.uiSelected, max(0, 3699-len(text)))
-	if previous != "" {
-		text = previous + "\n" + text
+	w.finishMenu(c.messageID, text)
+}
+
+func (w *worker) nativeSelectionText(c confirmation, footer string, completed bool) string {
+	history := ""
+	if c.uiHistory != "" {
+		history = askLiteral(c.uiHistory, 600) + "\n\n"
 	}
-	finished := w.finishMenu(c.messageID, text)
-	if c.uiSelectMenu && finished && !cancelled && c.active != 0 && c.turn != 0 &&
-		c.active == w.active && c.turn == w.turn {
-		for _, pending := range w.confirms {
-			if pending.action == "ui" {
-				return
-			}
+	start, end := 0, len(c.options)
+	if !completed {
+		start = c.page * uiSelectPageSize
+		end = min(start+uiSelectPageSize, len(c.options))
+	}
+	return history + w.askQuestionTextBudget(c.uiQuestion, start, end, footer, 3700-len(history), completed)
+}
+
+func (w *worker) finishNativeSelection(c confirmation, index int) {
+	cancelled := index == len(c.options)
+	footer := askLiteral(w.tr(i18n.Msg.Cancel), 1500)
+	if !cancelled {
+		footer = "**" + w.tr(i18n.Msg.AskChoice) + "**\n" + askLiteral(askOptionLabel(index, c.options[index]), 1400)
+	}
+	finished := w.finishMenu(c.messageID, w.nativeSelectionText(c, footer, true))
+	if !finished || cancelled || c.active == 0 || c.turn == 0 || c.active != w.active || c.turn != w.turn {
+		return
+	}
+	for _, pending := range w.confirms {
+		if pending.action == "ui" {
+			return
 		}
-		w.uiSelection = nativeSelectionReceipt{
-			messageID: c.messageID, text: text, clientID: c.uiClientID,
-			generation: c.generation, active: c.active, turn: c.turn,
-		}
+	}
+	summary := truncateUTF8(menuText(c.uiQuestion.Question, 100)+": "+askOptionLabel(index, menuText(c.options[index], 180)), 600)
+	if c.uiHistory != "" {
+		summary += "\n\n" + truncateUTF8(c.uiHistory, max(0, 1200-len(summary)-2))
+	}
+	w.uiSelection = nativeSelectionReceipt{
+		messageID: c.messageID, text: summary, clientID: c.uiClientID,
+		generation: c.generation, active: c.active, turn: c.turn,
 	}
 }
 
@@ -5430,19 +5458,16 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 		return false
 	}
 	token := hex.EncodeToString(random[:])
-	text := c.uiTitle
+	footer := ""
 	if pages > 1 {
-		text += w.tr(i18n.Msg.Page, page+1, pages)
+		footer = askLiteral(strings.TrimSpace(w.tr(i18n.Msg.Page, page+1, pages)), 1500)
 	}
-	text = truncateUTF8(text, 3700)
-	previous := truncateUTF8(c.uiSelected, max(0, 3699-len(text)))
-	if previous != "" {
-		text = previous + "\n" + text
-	}
+	c.page = page
+	text := w.nativeSelectionText(c, footer, false)
 	keyboard := &telegram.Keyboard{}
 	start, end := page*uiSelectPageSize, min((page+1)*uiSelectPageSize, len(c.options))
 	for i := start; i < end; i++ {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: c.options[i], CallbackData: fmt.Sprintf("%s:%d", token, i)}})
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: menuText(askOptionLabel(i, c.options[i]), askOptionButtonLimit), CallbackData: fmt.Sprintf("%s:%d", token, i)}})
 	}
 	var navigation []telegram.Button
 	if page > 0 {
@@ -5518,16 +5543,22 @@ func (w *worker) applyUI(e rpcEvent, client *omp.Client) {
 		}
 		c.user, c.generation, c.uiSelectMenu = w.owner, w.binding.Generation, true
 		c.active, c.turn = w.active, w.turn
-		parts := split(e.Title+"\n"+msg, 3700)
-		c.uiTitle = w.tr(i18n.Msg.ChooseOption)
-		if len(parts) != 0 {
-			c.uiTitle = parts[0]
+		c.uiQuestion.Question = strings.TrimSpace(e.Title + "\n" + msg)
+		if c.uiQuestion.Question == "" {
+			c.uiQuestion.Question = w.tr(i18n.Msg.ChooseOption)
+		}
+		c.uiQuestion.Options = make([]askOption, len(e.Options))
+		for i, option := range e.Options {
+			c.uiQuestion.Options[i].Label = option
+			if i < len(e.OptionDetails) {
+				c.uiQuestion.Options[i].Description = e.OptionDetails[i].Description
+			}
 		}
 		messageID := int64(0)
 		if w.taskActive() && previous.messageID != 0 && previous.clientID == client.ID() &&
 			previous.generation == w.binding.Generation && previous.active == w.active && previous.turn == w.turn {
 			messageID = previous.messageID
-			c.uiSelected = previous.text
+			c.uiHistory = previous.text
 		}
 		w.showUISelectPage(c, 0, messageID)
 	case "cancel":

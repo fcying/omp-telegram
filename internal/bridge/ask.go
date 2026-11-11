@@ -39,6 +39,8 @@ type askRequest struct {
 	cancel             context.CancelFunc
 	pendingInput       *incoming
 	deferredUI         *rpcEvent
+	cancelledText      string
+	cancelledEpoch     uint64
 }
 
 type askQuestion struct {
@@ -211,8 +213,7 @@ func (w *worker) endAsk(sendCancel bool) {
 		return
 	}
 	w.ask = nil
-	w.invalidateAskInteraction(a)
-	w.queueKeyboardCleanup(a.messageID)
+	w.cancelAskInteraction(a)
 	if sendCancel && w.client == a.client {
 		w.sendAskResponse(a, map[string]any{"cancelled": true})
 	}
@@ -227,8 +228,25 @@ func (w *worker) pauseAsk() {
 	if w.ask == nil {
 		return
 	}
-	w.invalidateAskInteraction(w.ask)
-	w.queueKeyboardCleanup(w.ask.messageID)
+	w.cancelAskInteraction(w.ask)
+}
+
+func (w *worker) cancelAskInteraction(a *askRequest) {
+	receipt := ""
+	if a.method == "ask" && a.cancelledText == "" && a.question < len(a.questions) && (a.messageID != 0 || a.cancel != nil) {
+		question := a.questions[a.question]
+		receipt = w.askQuestionText(question, 0, len(question.Options), "**"+w.tr(i18n.Msg.Canceled)+"**")
+		a.cancelledText = receipt
+		if a.cancel != nil {
+			// The in-flight display must return before its final cancellation edit.
+			a.cancelledEpoch = a.epoch
+		}
+	}
+	w.invalidateAskInteraction(a)
+	w.queueKeyboardCleanup(a.messageID)
+	if receipt != "" && a.cancelledEpoch == 0 {
+		w.queueAskReceipt(a.messageID, receipt)
+	}
 }
 
 func (w *worker) renderAsk(a *askRequest) {
@@ -239,10 +257,14 @@ func (w *worker) renderAsk(a *askRequest) {
 	}
 	a.token = rand.Text()
 	question := a.questions[a.question]
-	text := fmt.Sprintf("Ask · %d/%d\n%s", a.question+1, len(a.questions), question.Question)
-	if question.Header != "" {
-		text += "\n" + question.Header
+	question.Header = fmt.Sprintf("Ask · %d/%d\n%s", a.question+1, len(a.questions), question.Header)
+	start := a.page * uiSelectPageSize
+	end := min(start+uiSelectPageSize, len(question.Options))
+	footer := ""
+	if a.custom != "" {
+		footer = "**" + w.tr(i18n.Msg.AskCustom) + "**\n" + askLiteral(a.custom, 1400)
 	}
+	text := w.askQuestionTextBudget(question, start, end, footer, 3700, false)
 	keyboard := &telegram.Keyboard{}
 	add := func(label, action string) {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: a.token + ":" + action}})
@@ -257,11 +279,9 @@ func (w *worker) renderAsk(a *askRequest) {
 			}
 		}
 	} else {
-		start := a.page * uiSelectPageSize
-		end := min(start+uiSelectPageSize, len(question.Options))
 		for index := start; index < end; index++ {
 			option := question.Options[index]
-			label := option.Label
+			label := askOptionLabel(index, option.Label)
 			if question.Multi {
 				if a.selected[index] {
 					label = "☑ " + label
@@ -269,22 +289,13 @@ func (w *worker) renderAsk(a *askRequest) {
 					label = "☐ " + label
 				}
 			}
-			add(menuText(label, 100), strconv.Itoa(index))
-			if option.Description != "" {
-				text += "\n" + option.Label + ": " + option.Description
-			}
-			if option.Preview != "" {
-				text += "\n" + option.Preview
-			}
+			add(menuText(label, askOptionButtonLimit), strconv.Itoa(index))
 		}
 		if start > 0 {
 			add(w.tr(i18n.Msg.Previous), "previous")
 		}
 		if end < len(question.Options) {
 			add(w.tr(i18n.Msg.Next), "next")
-		}
-		if a.custom != "" {
-			text += "\n" + w.tr(i18n.Msg.AskCustom) + ": " + a.custom
 		}
 		add(w.tr(i18n.Msg.AskCustom), "custom")
 		if question.Multi {
@@ -313,7 +324,6 @@ func (w *worker) renderAsk(a *askRequest) {
 			progressToolLiteral(detail+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
 	}
 	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token}
-	text = clipUTF16(text, 3700)
 	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 	a.cancel = cancel
 	tg, key, results, workerCtx := w.b.tg, w.key, w.operations, w.ctx
@@ -347,6 +357,11 @@ func (w *worker) renderAsk(a *askRequest) {
 
 func (w *worker) askOperationFinished(result operationResult) bool {
 	switch result.kind {
+	case "ask_receipt":
+		if result.err != nil {
+			w.queueKeyboardCleanup(result.meta.(int64))
+		}
+		return true
 	case "ask_response":
 		w.askSending--
 		a := result.meta.(*askRequest)
@@ -371,7 +386,12 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 		display := result.meta.(askDisplay)
 		a := display.request
 		if w.ask != a || !w.askScope(a) || a.epoch != display.epoch {
-			w.queueKeyboardCleanup(display.messageID)
+			if a.cancelledEpoch != 0 && a.cancelledEpoch == display.epoch {
+				a.cancelledEpoch = 0
+				w.queueAskReceipt(display.messageID, a.cancelledText)
+			} else {
+				w.queueKeyboardCleanup(display.messageID)
+			}
 			return true
 		}
 		a.cancel = nil
@@ -467,12 +487,18 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 }
 
 func (w *worker) advanceAsk(a *askRequest) {
+	// Freeze this question before the mutable request advances to another message.
+	question := a.questions[a.question]
+	text := w.askQuestionText(question, 0, len(question.Options), w.askAnswerFooter(a))
+	messageID := a.messageID
+	w.invalidateAskInteraction(a)
+	a.messageID = 0
+	w.queueAskReceipt(messageID, text)
 	if a.method != "ask" {
 		w.endAsk(false)
 		w.sendAskResponse(a, map[string]any{"value": a.custom})
 		return
 	}
-	question := a.questions[a.question]
 	answer := askAnswer{ID: question.ID, SelectedOptions: []string{}, CustomInput: a.custom}
 	for index, option := range question.Options {
 		if a.selected[index] {
@@ -489,6 +515,26 @@ func (w *worker) advanceAsk(a *askRequest) {
 	}
 	w.endAsk(false)
 	w.sendAskResponse(a, map[string]any{"answers": a.answers})
+}
+
+// Telegram receipts are display-only and cannot settle or replay native work.
+func (w *worker) queueAskReceipt(messageID int64, text string) {
+	if messageID == 0 {
+		return
+	}
+	tg, key, results, workerCtx := w.b.tg, w.key, w.operations, w.ctx
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		ctx, cancel := context.WithTimeout(workerCtx, 5*time.Second)
+		defer cancel()
+		keyboard := &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}}
+		err := tg.Edit(ctx, key.chat, messageID, text, keyboard)
+		select {
+		case results <- operationResult{kind: "ask_receipt", err: err, meta: messageID}:
+		case <-workerCtx.Done():
+		}
+	}()
 }
 
 func (w *worker) routeAskInput(in *incoming) bool {

@@ -93,20 +93,41 @@ func askTestCallback(w *worker, user int64, data string) {
 
 func askTestButton(t *testing.T, f *fakeHTTP, label string) string {
 	t.Helper()
-	_, rows := pickerView(t, f)
-	for _, row := range rows {
-		for _, button := range row {
-			if text, _ := button["text"].(string); strings.Contains(strings.ToLower(text), strings.ToLower(label)) {
-				return button["callback_data"].(string)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := make(map[int64]bool)
+	for i := len(f.messages) - 1; i >= 0; i-- {
+		message := f.messages[i]
+		id := int64(i + 1)
+		if target, ok := message["message_id"].(float64); ok {
+			id = int64(target)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		markup, _ := message["reply_markup"].(map[string]any)
+		rows, _ := markup["inline_keyboard"].([]any)
+		for _, row := range rows {
+			for _, raw := range row.([]any) {
+				button := raw.(map[string]any)
+				if text, _ := button["text"].(string); strings.Contains(strings.ToLower(text), strings.ToLower(label)) {
+					return button["callback_data"].(string)
+				}
 			}
 		}
 	}
-	t.Fatalf("Ask button containing %q missing: %v", label, rows)
+	t.Fatalf("Ask button containing %q missing", label)
 	return ""
 }
 
 func askTestClick(t *testing.T, w *worker, f *fakeHTTP, label string) {
 	t.Helper()
+	a := w.ask
+	var messageID int64
+	if a != nil {
+		messageID = a.messageID
+	}
 	if w.ask != nil && label == "Other" {
 		label = "Custom answer"
 	}
@@ -116,6 +137,9 @@ func askTestClick(t *testing.T, w *worker, f *fakeHTTP, label string) {
 	askTestCallback(w, 7, askTestButton(t, f, label))
 	researchBarrier(t, w)
 	askTestSettle(t, w)
+	if a != nil && a.messageID != messageID {
+		askTestReceipt(t, w, f, messageID)
+	}
 }
 
 func askTestPrompt(t *testing.T, f *fakeHTTP) *telegram.Message {
@@ -134,6 +158,11 @@ func askTestPrompt(t *testing.T, f *fakeHTTP) *telegram.Message {
 
 func askTestReply(t *testing.T, w *worker, id, user, thread int64, text string, prompt *telegram.Message) {
 	t.Helper()
+	a := w.ask
+	var messageID int64
+	if a != nil {
+		messageID = a.messageID
+	}
 	u := update(id, thread, text)
 	u.Message.From.ID = user
 	u.Message.ReplyToMessage = prompt
@@ -146,6 +175,113 @@ func askTestReply(t *testing.T, w *worker, id, user, thread int64, text string, 
 		researchBarrier(t, w)
 	}
 	askTestSettle(t, w)
+	if a != nil && a.messageID != messageID {
+		askTestReceipt(t, w, http.DefaultTransport.(*fakeHTTP), messageID)
+	}
+}
+
+func askTestReceipt(t *testing.T, w *worker, f *fakeHTTP, messageID int64) string {
+	t.Helper()
+	nativeUntil(t, w, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for i := len(f.messages) - 1; i >= 0; i-- {
+			message := f.messages[i]
+			if message["message_id"] != float64(messageID) {
+				continue
+			}
+			markup, _ := message["reply_markup"].(map[string]any)
+			rows, ok := markup["inline_keyboard"].([]any)
+			return ok && len(rows) == 0
+		}
+		return false
+	})
+	return settingsMenuResult(t, f, int(messageID))
+}
+
+func askTestResponseOperation(t *testing.T, w *worker) operationResult {
+	t.Helper()
+	for {
+		result := waitOperation(t, w)
+		if result.kind != "ask_receipt" {
+			return result
+		}
+		w.operationReturned(result)
+	}
+}
+
+func TestAskPendingBodyShowsDetailsWithoutRepeatingButtons(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	askTestOpen(t, w, "compact", map[string]any{
+		"id": "approach", "question": "Choose an approach", "options": []map[string]string{
+			{"label": "Alpha"},
+			{"label": "Beta", "description": "Second option details", "preview": "Preview line"},
+		},
+	})
+	messageID := w.ask.messageID
+	body, rows := pickerView(t, f)
+	if strings.Contains(body, "Alpha") || strings.Contains(body, "Beta") || !strings.Contains(body, "Choose an approach") ||
+		!strings.Contains(body, "2. Second option details\nPreview line") || rows[0][0]["text"] != "1. Alpha" || rows[1][0]["text"] != "2. Beta" {
+		t.Fatalf("pending question duplicated buttons or lost indexed details: %q; %v", body, rows)
+	}
+	askTestClick(t, w, f, "Alpha")
+	body = askTestReceipt(t, w, f, messageID)
+	if !strings.Contains(body, "1. Alpha") || !strings.Contains(body, "2. Beta") || !strings.Contains(body, "Your choice") {
+		t.Fatalf("completed question lost its option history: %q", body)
+	}
+}
+
+func TestAskPendingOverflowLabelsRemainIdentifiable(t *testing.T) {
+	for _, scenario := range []struct {
+		name, method, prefix string
+		multi, overflow      bool
+	}{
+		{"native-ascii", "select", strings.Repeat("shared-prefix-", 9), false, true},
+		{"native-unicode", "select", strings.Repeat("公共前缀", 30), false, true},
+		{"native-exact-limit", "select", strings.Repeat("😀", 45), false, false},
+		{"extension-single", "ask", strings.Repeat("shared-prefix-", 9), false, true},
+		{"extension-multi-marker", "ask", strings.Repeat("😀", 45), true, true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			w, f, _ := askTestWorker(t)
+			first, second := scenario.prefix+"CHOICEA", scenario.prefix+"CHOICEB"
+			event := map[string]any{"id": "overflow", "method": scenario.method, "title": "Choose destination", "options": []string{first, second, "Short"}}
+			if scenario.method == "ask" {
+				event["questions"] = []map[string]any{{"id": "destination", "question": "Choose destination", "multi": scenario.multi,
+					"options": []map[string]string{{"label": first}, {"label": second}, {"label": "Short"}}}}
+			}
+			askTestEvent(t, w, event)
+			body, rows := pickerView(t, f)
+			body = html.UnescapeString(body)
+			if strings.Contains(body, askOptionLabel(0, first)) != scenario.overflow || strings.Contains(body, askOptionLabel(1, second)) != scenario.overflow || strings.Contains(body, "Short") {
+				t.Fatalf("pending body hid overflow choices or duplicated fitting labels: %q", body)
+			}
+			button := rows[1][0]["text"].(string)
+			if strings.Contains(button, "CHOICEB") == scenario.overflow {
+				t.Fatalf("fixture did not exercise its intended button limit: %q", button)
+			}
+			askTestCallback(w, 7, rows[1][0]["callback_data"].(string))
+			askTestSettle(t, w)
+			if scenario.multi {
+				body, _ = pickerView(t, f)
+				if !strings.Contains(html.UnescapeString(body), second) {
+					t.Fatal("checked marker hid the overflow label")
+				}
+				askTestClick(t, w, f, "Confirm selection")
+			}
+			responses := askTestState(t, w)
+			if len(responses) != 1 {
+				t.Fatalf("overflow choice submitted multiple native answers: %+v", responses)
+			}
+			if scenario.method == "select" {
+				if responses[0].Value != second {
+					t.Fatalf("overflow display changed the raw native value: %+v", responses)
+				}
+			} else if len(responses[0].Answers) != 1 || len(responses[0].Answers[0].Selected) != 1 || responses[0].Answers[0].Selected[0] != second {
+				t.Fatalf("overflow display changed the raw extension value: %+v", responses)
+			}
+		})
+	}
 }
 
 func TestAskCombinedAnswersStayInOriginalTurn(t *testing.T) {
@@ -155,19 +291,42 @@ func TestAskCombinedAnswersStayInOriginalTurn(t *testing.T) {
 		askTestQuestion("topic", "Which topic?", false, "Programming", "Investing"),
 		askTestQuestion("features", "Which features?", true, "Auth", "Billing", "Search"),
 		askTestQuestion("language", "Which language?", false, "Go", "Rust"))
+	topicID := w.ask.messageID
 	askTestClick(t, w, f, "Programming")
+	featuresID := w.ask.messageID
+	if featuresID == topicID {
+		t.Fatal("next extension question overwrote the first question")
+	}
+	topicReceipt := askTestReceipt(t, w, f, topicID)
+	if !strings.Contains(topicReceipt, "Which topic?") || !strings.Contains(topicReceipt, "2. Investing") ||
+		!strings.Contains(topicReceipt, "<b>Your choice</b>\n<code>1. Programming</code>") {
+		t.Fatalf("first question lost its options or submitted choice: %q", topicReceipt)
+	}
 	if responses := askTestState(t, w); len(responses) != 0 {
 		t.Fatalf("partial Ask submitted: %+v", responses)
 	}
 	askTestClick(t, w, f, "Search")
 	askTestClick(t, w, f, "Auth")
 	askTestClick(t, w, f, "Done")
+	languageID := w.ask.messageID
+	if languageID == featuresID || languageID == topicID {
+		t.Fatal("third extension question reused a previous question message")
+	}
+	featuresReceipt := askTestReceipt(t, w, f, featuresID)
+	_, selected, _ := strings.Cut(featuresReceipt, "<b>Your choice</b>")
+	if !strings.Contains(featuresReceipt, "2. Billing") || !strings.Contains(selected, "1. Auth\n3. Search") || strings.Contains(selected, "Billing") {
+		t.Fatalf("confirmed multi-choice receipt differs from final selections: %q", featuresReceipt)
+	}
 	askTestClick(t, w, f, "Other")
 	prompt := askTestPrompt(t, f)
 	if !strings.Contains(prompt.Text, "Which language?") {
 		t.Fatalf("reply prompt lost its question: %q", prompt.Text)
 	}
 	askTestReply(t, w, 200, 7, 11, "  Elixir  ", prompt)
+	languageReceipt := askTestReceipt(t, w, f, languageID)
+	if !strings.Contains(languageReceipt, "Which language?") || !strings.Contains(languageReceipt, "Custom answer: Elixir") {
+		t.Fatalf("custom answer was not retained on its original question: %q", languageReceipt)
+	}
 	responses := askTestState(t, w)
 	if len(responses) != 1 || responses[0].ID != "combined" || len(responses[0].Answers) != 3 {
 		t.Fatalf("combined Ask response = %+v", responses)
@@ -474,7 +633,7 @@ func TestAskNativeInputPreservesRawTextAndRepeatedQuestions(t *testing.T) {
 			w, f, trace := askTestWorker(t)
 			root, turn, client := w.rootRequestID, w.turn, w.client
 			traceStart := len(fixtureRPCTrace(trace))
-			values := []string{"  not-a-number\n\t ", " \n\t ", "  42  "}
+			values := []string{"  not-a-number\n\t ", " \n\t ", "  42  ", "`literal`", "  <b>raw</b>  "}
 			var previous *telegram.Message
 			for index, value := range values {
 				id := method + strings.Repeat("-retry", index)
@@ -486,7 +645,12 @@ func TestAskNativeInputPreservesRawTextAndRepeatedQuestions(t *testing.T) {
 					}
 				}
 				previous = askTestPrompt(t, f)
+				messageID := w.ask.messageID
 				askTestReply(t, w, int64(200+index), 7, 11, value, previous)
+				receipt := askTestReceipt(t, w, f, messageID)
+				if !strings.Contains(html.UnescapeString(receipt), value) || !strings.Contains(receipt, "<b>Submitted</b>") {
+					t.Fatalf("main question lost its raw submission: %q", receipt)
+				}
 				responses := askTestState(t, w)
 				if len(responses) != index+1 || responses[index].ID != id || responses[index].Cancelled || responses[index].Value != value {
 					t.Fatalf("native validation input was changed or rejected: %+v", responses)
@@ -522,10 +686,16 @@ func TestAskNativeEmptyDefaultAndCancelStayDistinct(t *testing.T) {
 			if w.ask == nil || len(askTestState(t, w)) != 0 {
 				t.Fatal("unauthorized user submitted an empty native value")
 			}
+			messageID := w.ask.messageID
 			askTestClick(t, w, f, "Submit empty")
 			responses := askTestState(t, w)
 			if len(responses) != 1 || responses[0].ID != "empty" || responses[0].Cancelled || responses[0].Value != "" {
 				t.Fatalf("explicit empty value = %+v", responses)
+			}
+			receipt := askTestReceipt(t, w, f, messageID)
+			_, value, _ := strings.Cut(receipt, "<b>Submitted</b>")
+			if strings.Contains(value, "<code>") || strings.Contains(value, "<pre>") || strings.Contains(value, "hint, not a default") {
+				t.Fatalf("empty-value status was rendered as user text or a placeholder: %q", receipt)
 			}
 			askTestEvent(t, w, map[string]any{"id": "cancel", "method": method, "title": "Optional value"})
 			askTestCallback(w, 7, button)
@@ -536,6 +706,18 @@ func TestAskNativeEmptyDefaultAndCancelStayDistinct(t *testing.T) {
 			responses = askTestState(t, w)
 			if len(responses) != 2 || responses[1].ID != "cancel" || !responses[1].Cancelled {
 				t.Fatalf("cancel became an empty answer: %+v", responses)
+			}
+			askTestEvent(t, w, map[string]any{"id": "literal-empty", "method": method, "title": "Optional value"})
+			literalID := w.ask.messageID
+			askTestReply(t, w, 200, 7, 11, "(empty)", askTestPrompt(t, f))
+			literal := askTestReceipt(t, w, f, literalID)
+			_, literalValue, _ := strings.Cut(literal, "<b>Submitted</b>")
+			if literalValue == value || !strings.Contains(literalValue, "<code>(empty)</code>") {
+				t.Fatalf("literal user text is indistinguishable from an empty string: %q; %q", receipt, literal)
+			}
+			responses = askTestState(t, w)
+			if len(responses) != 3 || responses[2].Value != "(empty)" || responses[2].Cancelled {
+				t.Fatalf("literal empty label changed the native answer: %+v", responses)
 			}
 		})
 	}
@@ -617,6 +799,12 @@ func TestAskLateDisplayResultCannotRetireNewInteraction(t *testing.T) {
 			close(release)
 			released = true
 			w.operationReturned(waitOperation(t, w))
+			if !failed {
+				text := askTestReceipt(t, w, f, 500)
+				if !strings.Contains(text, "Old question?") || !strings.Contains(text, "1. Go") || !strings.Contains(text, "Canceled") || strings.Contains(text, "New question?") {
+					t.Fatalf("late initial display lost its cancelled question: %q", text)
+				}
+			}
 			if w.client != client || w.ask == nil {
 				t.Fatal("late old display result retired a current interaction")
 			}
@@ -769,7 +957,7 @@ func TestAskOrdinaryInputWaitsForResponseAndNativeToolEnd(t *testing.T) {
 			}
 			askTestClick(t, w, f, "Confirm selection")
 			askTestCallback(w, 7, askTestButton(t, f, "Rust"))
-			result := waitOperation(t, w)
+			result := askTestResponseOperation(t, w)
 			if result.kind != "ask_response" || result.err != nil || w.ask != nil || w.askSending != 1 {
 				t.Fatalf("expected unapplied Ask send result, got %s: %v", result.kind, result.err)
 			}
@@ -1058,7 +1246,7 @@ func TestAskLateResponseFailureCannotRetireReplacementRuntime(t *testing.T) {
 	choice := askTestButton(t, f, "Go")
 	oldClient.Close()
 	askTestCallback(w, 7, choice)
-	response := waitOperation(t, w)
+	response := askTestResponseOperation(t, w)
 	if response.kind != "ask_response" || response.err == nil {
 		t.Fatalf("closed native send did not produce a response failure: %s, %v", response.kind, response.err)
 	}
@@ -1373,16 +1561,16 @@ func TestNativeUIWaitsForAskResponseSettlement(t *testing.T) {
 			w, f, _ := askTestWorker(t)
 			askTestOpen(t, w, "answered", askTestQuestion("topic", "Topic?", false, "Go"))
 			askTestCallback(w, 7, askTestButton(t, f, "Go"))
-			response := waitOperation(t, w)
+			response := askTestResponseOperation(t, w)
 			if response.kind != "ask_response" || response.err != nil {
 				t.Fatal("first answer was not successfully written")
 			}
 			next := rpcEvent{ID: "next", Method: method, Title: "Next decision", Options: []string{"Allow", "Deny"},
 				Questions: []askQuestion{{ID: "next-question", Question: "Continue?", Options: []askOption{{Label: "Allow"}}}}}
-			before := f.messageCount()
 			w.ui(next)
 			w.ui(next)
-			if w.ask == nil || w.askSending != 1 || f.messageCount() != before {
+			if w.ask == nil || w.ask.id != next.ID || w.ask.deferredUI == nil || w.askSending != 1 ||
+				f.has(11, next.Title) || f.has(11, next.Questions[0].Question) {
 				t.Fatal("next question was cancelled, duplicated or shown before write settlement")
 			}
 			w.operationReturned(response)
@@ -1420,12 +1608,11 @@ func TestNativeUIDeferredQuestionIsInvalidated(t *testing.T) {
 			w, f, _ := askTestWorker(t)
 			askTestOpen(t, w, "answered", askTestQuestion("topic", "Topic?", false, "Go"))
 			askTestCallback(w, 7, askTestButton(t, f, "Go"))
-			response := waitOperation(t, w)
+			response := askTestResponseOperation(t, w)
 			if response.kind != "ask_response" || response.err != nil {
 				t.Fatal("fixture did not retain the successful response result")
 			}
 			w.ui(rpcEvent{ID: "next", Method: "select", Title: "Next decision", Options: []string{"Allow"}})
-			before := f.messageCount()
 			switch boundary {
 			case "write-failure":
 				// Inject an uncertain write result after the next request has arrived.
@@ -1438,7 +1625,7 @@ func TestNativeUIDeferredQuestionIsInvalidated(t *testing.T) {
 				w.releaseRuntime(true)
 			}
 			w.operationReturned(response)
-			if w.ask != nil || f.messageCount() != before {
+			if w.ask != nil || f.has(11, "Next decision") {
 				t.Fatal("invalidated deferred question was displayed by the late result")
 			}
 			if boundary == "write-failure" && (w.client != nil || queueState(t, w, 100) != "uncertain") {
@@ -1452,15 +1639,14 @@ func TestNativeUIStopRevokesDeferredQuestion(t *testing.T) {
 	w, f, _ := askTestWorker(t)
 	askTestOpen(t, w, "answered", askTestQuestion("topic", "Topic?", false, "Go"))
 	askTestCallback(w, 7, askTestButton(t, f, "Go"))
-	response := waitOperation(t, w)
+	response := askTestResponseOperation(t, w)
 	if response.kind != "ask_response" || response.err != nil {
 		t.Fatal("fixture did not retain the successful response result")
 	}
 	w.ui(rpcEvent{ID: "next", Method: "select", Title: "Next decision", Options: []string{"Allow"}})
-	before := f.messageCount()
 	nativeInput(t, w, 200, "/stop", false)
 	w.operationReturned(response)
-	if f.messageCount() != before {
+	if f.has(11, "Next decision") {
 		t.Fatal("completed write reopened a question after Stop revoked it")
 	}
 	drainControlOperations(t, w)
@@ -1477,7 +1663,7 @@ func TestNativeUIStopBeforeNextQuestion(t *testing.T) {
 				w, f, _ := askTestWorker(t)
 				askTestOpen(t, w, "answered", askTestQuestion("topic", "Topic?", false, "Go"))
 				askTestCallback(w, 7, askTestButton(t, f, "Go"))
-				response := waitOperation(t, w)
+				response := askTestResponseOperation(t, w)
 				if response.kind != "ask_response" || response.err != nil {
 					t.Fatal("fixture did not retain the successful response result")
 				}
@@ -1486,7 +1672,6 @@ func TestNativeUIStopBeforeNextQuestion(t *testing.T) {
 				} else {
 					w.stopActiveTask()
 				}
-				before := f.messageCount()
 				if write == "before-ui" {
 					w.operationReturned(response)
 				}
@@ -1495,7 +1680,7 @@ func TestNativeUIStopBeforeNextQuestion(t *testing.T) {
 					w.operationReturned(response)
 				}
 				responses := askTestState(t, w)
-				if w.controlOp != controlAbort || w.active != 100 || w.ask != nil || f.messageCount() != before {
+				if w.controlOp != controlAbort || w.active != 100 || w.ask != nil || f.has(11, "Next decision") {
 					t.Fatal("Stop reopened a question or lost its pending abort/root")
 				}
 				if len(responses) != 2 || responses[0].ID != "answered" || responses[0].Cancelled ||
@@ -1671,7 +1856,7 @@ func TestCurrentExportWaitsForNativeInteraction(t *testing.T) {
 				askTestOpen(t, w, "pending", askTestQuestion("decision", "Continue?", false, "Allow"))
 				if phase == "response" {
 					askTestCallback(w, 7, askTestButton(t, f, "Allow"))
-					held = waitOperation(t, w)
+					held = askTestResponseOperation(t, w)
 					if held.kind != "ask_response" || held.err != nil {
 						t.Fatal("fixture did not retain a successful answer write")
 					}
