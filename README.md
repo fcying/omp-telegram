@@ -42,7 +42,7 @@ Development builds are published as the [Development build](https://github.com/f
 
 ### Build from source
 
-Requires Go 1.27.3 or later (see [go.mod](go.mod)) and [just](https://github.com/casey/just):
+Requires Go 1.27.4 or later (see [go.mod](go.mod)) and [just](https://github.com/casey/just):
 
 ```sh
 git clone https://github.com/fcying/omp-telegram.git
@@ -319,12 +319,15 @@ The bridge uses OMP's `rpc-ui` mode without changing its enabled tools or approv
 
 Native `ask` takes an HTML form as `{html}` since OMP 18.18.3, not the old `questions[]` tool schema. In RPC without `formDialog` (including OMP 18.18.6), OMP presents each field through generic `select`/`input`/`editor` requests; checkbox fields use repeated selections. The bridge handles those requests, not the HTML, and does not provide a separate form renderer. Use the displayed options and reply to the exact text-entry prompt.
 
-Text-field replies preserve whitespace and newlines. **Use default** accepts the native editor's prefilled value; **Submit empty** sends an empty string without cancelling. Placeholders are hints, not defaults. OMP validates required fields, numbers and patterns and may ask for the same field again. Long hints/defaults are clipped only for display; accepting a default sends its original value. The native RPC fallback does not provide whole-form layouts, images or initial checkbox-selection markers.
+While a question is open, numbered buttons show the options; the body keeps the question, page indicator and available numbered descriptions/previews. Labels shortened in buttons also appear in the body within the display budget; fitting labels are not repeated. The bridge's 100-UTF-16-unit button limit does not guarantee client visibility: narrow Telegram clients may still truncate fitting labels. After a native selection, the original main message retains the question, all options that fit (including other pages) and that local choice; a subsequent native select may reuse the same menu with earlier action summaries. Checkbox fallback records individual selections only, not a final checked set, and does not treat labels such as "Done" specially.
+
+Text-field replies preserve whitespace and newlines. **Use default** accepts the native editor's prefilled value; **Submit empty** sends an empty string without cancelling. The original main question message, not the separate reply prompt, retains **Submitted** with the actual value. An empty submission shows the status "Empty string (0 characters)" outside the literal value display, distinct from typed text such as `(empty)`. This records a local submission, not successful native validation; OMP validates required fields, numbers and patterns and may ask for the same field again. Cancel and Stop do not add a submission. Placeholders are hints, not defaults. Long questions, options, hints and receipts are clipped only for display; RPC answers and defaults keep their original values. These UI updates are best-effort, independent of native answer delivery. The native RPC fallback does not provide whole-form layouts, images or initial checkbox-selection markers.
 
 Extensions independently retain questions-based `ui.askDialog` and the `set_ask_dialog` opt-in, delivered as RPC `method:"ask"`. For these combined extension dialogs:
 
-- Questions appear one at a time in one message. Single-choice buttons advance immediately; multi-choice buttons toggle selections, then **Confirm selection** submits them. An explicitly confirmed empty multi-selection is allowed.
+- Each question has its own independent main message. Confirmed local choices remain with that question instead of being replaced by the next one. Single-choice buttons advance immediately; multi-choice buttons toggle selections, then **Confirm selection** submits them. An explicitly confirmed empty multi-selection is allowed. All answers are sent together exactly once after the final question.
 - **Custom answer** opens a separate reply prompt. Reply to that exact message with nonempty text; these combined-dialog custom answers are trimmed. Multi-choice answers can include both selected options and custom text.
+- Cancel, Stop and native cancellation keep the current question and all displayable options in its original message with a cancelled status, not an answer. Earlier confirmed choices remain unchanged; unconfirmed selections are not submitted.
 
 For both native forms and extension dialogs:
 
