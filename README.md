@@ -333,6 +333,7 @@ For both native forms and extension dialogs:
 
 - Ordinary guidance sent while a task waits for Ask is buffered, then forwarded to that same running task after the dialog/tool finishes. It does not answer or cancel Ask, and is not a separate followup. Buffered guidance shares the queue limit; if the original task ends, is stopped, or its session/runtime is replaced before dispatch, it is cancelled without replay. Resend it explicitly if needed. Controls such as `/stop` are not held behind it.
 - **Back to options**, when offered by a combined dialog, cancels only text entry. **Cancel** cancels the native interaction; **Stop** stops the task. OMP owns timeout/default-answer behavior. Old buttons and reply prompts cannot answer a replacement question or session.
+- The separate Ask text-entry prompt is temporary and is deleted best-effort after submission, **Back to options** or cancellation; the main question, submission receipt and your answer remain. If an obsolete prompt remains (including from an earlier run or beyond Telegram's 48-hour deletion limit), delete that prompt manually.
 - Bridge commands such as `/stop` and the native `/autoresearch off` control keep their normal effects even when replying to an expired or still-delivering Ask prompt. Commands addressed to another bot are ignored, never used as answers.
 - Only the task's originating user can answer. One native interaction (Ask, selection, confirmation, or text input) is active per conversation; additional concurrent requests are cancelled without replacing its menu. After answering, the next dialog may briefly wait for the previous response delivery to settle. Duplicate request IDs never reopen dialogs or replay answers. Answers continue the existing task, never create a new prompt, and are not replayed after failure or restart.
 
@@ -371,6 +372,8 @@ Completed assistant messages are sent immediately, even with progress off. With 
 ### Follow-up input
 
 Click **Follow-up**, then reply to the bot's ForceReply prompt with nonempty text. Only the clicking user's reply to that particular prompt in the same chat/topic is accepted, as a separate queued task just like `/followup <message>`. Opening the prompt does not pause the running task. After acceptance, the bot confirms that the follow-up was queued; a full queue or empty/nontext reply does not consume the request or report success, so you can retry while it is valid.
+
+Like [Ask text-entry prompts](#native-ask-questions), this ForceReply prompt is temporary: after text is accepted, or the request is cancelled, replaced or expires, the bridge deletes it best-effort. Cleanup does not wait for the queued task to finish and never deletes your message or the task's progress/final replies.
 
 Requests expire after ten minutes. Clicking again replaces your previous request in that conversation. Natural completion keeps it valid if the session is unchanged; Stop, Close, session replacement and service restart invalidate unfinished requests. Replies to stale, unauthorized or uncertain-delivery prompts are rejected, including commands: send a command as a new message instead. A valid prompt accepts recognized Bridge commands with their normal effects. Other ordinary text keeps its usual prompt/steer behavior. ForceReply presentation depends on the Telegram client; there is no inline text-entry widget.
 

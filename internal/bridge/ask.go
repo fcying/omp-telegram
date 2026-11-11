@@ -200,6 +200,7 @@ func (w *worker) invalidateAskInteraction(a *askRequest) {
 	a.epoch++
 	delete(w.confirms, a.token)
 	a.token = ""
+	w.queueForceReplyCleanup(a.inputID)
 	a.inputID, a.inputToken = 0, ""
 	if a.cancel != nil {
 		a.cancel()
@@ -352,6 +353,9 @@ func (w *worker) renderAsk(a *askRequest) {
 			defer cleanupCancel()
 			_ = tg.ClearKeyboard(cleanupCtx, key.chat, result.messageID)
 		}
+		if workerCtx.Err() != nil {
+			w.queueForceReplyCleanup(result.inputID)
+		}
 	}()
 }
 
@@ -386,6 +390,7 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 		display := result.meta.(askDisplay)
 		a := display.request
 		if w.ask != a || !w.askScope(a) || a.epoch != display.epoch {
+			w.queueForceReplyCleanup(display.inputID)
 			if a.cancelledEpoch != 0 && a.cancelledEpoch == display.epoch {
 				a.cancelledEpoch = 0
 				w.queueAskReceipt(display.messageID, a.cancelledText)

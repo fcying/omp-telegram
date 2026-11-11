@@ -302,6 +302,7 @@ type worker struct {
 	ask                         *askRequest
 	uiSeen                      map[string]struct{}
 	askSending                  int
+	followupInputs              map[string]followupInput
 	argsApply                   *argsApplyRequest
 	argsResuming                bool
 	resumeFailed                bool
@@ -1702,6 +1703,7 @@ func (w *worker) run() {
 	w.initResumePicker()
 	defer func() {
 		w.cancel()
+		w.drainForceReplyResults()
 		w.background.Wait()
 		w.drainPreviewResults()
 		w.drainMigrationResults()
@@ -5383,6 +5385,40 @@ func (w *worker) clearKeyboardRequest(messageID int64) {
 	_ = w.b.tg.ClearKeyboard(ctx, w.key.chat, messageID)
 }
 
+func (w *worker) queueForceReplyCleanup(messageID int64) {
+	if messageID == 0 {
+		return
+	}
+	tg, logger, chat, thread := w.b.tg, w.b.telegramLog, w.key.chat, w.key.thread
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := tg.Delete(ctx, chat, messageID)
+		if err != nil {
+			logTelegramFailure(logger, slog.LevelWarn, "force_reply_cleanup_failed", "ForceReply prompt cleanup failed", err,
+				slog.Int64("chat_id", chat), slog.Int64("thread_id", thread), slog.Int64("message_id", messageID))
+		}
+	}()
+}
+
+func (w *worker) drainForceReplyResults() {
+	for {
+		select {
+		case result := <-w.operations:
+			switch result.kind {
+			case "ask_display":
+				w.queueForceReplyCleanup(result.meta.(askDisplay).inputID)
+			case "followup_prompt":
+				w.queueForceReplyCleanup(result.meta.(followupPromptResult).messageID)
+			}
+		default:
+			return
+		}
+	}
+}
+
 func (w *worker) queueKeyboardCleanup(messageID int64) {
 	if messageID == 0 || w.ctx.Err() != nil {
 		return
@@ -5594,6 +5630,9 @@ func (w *worker) dropConfirmation(token string, c confirmation) {
 
 func (w *worker) clearConfirmations() {
 	w.endAsk(true)
+	if len(w.followupInputs) != 0 {
+		w.cancelFollowupInputs()
+	}
 	w.uiSelection = nativeSelectionReceipt{}
 	for token, c := range w.confirms {
 		w.dropConfirmation(token, c)
@@ -5633,6 +5672,7 @@ func (w *worker) expire(now time.Time) {
 			}
 		}
 	}
+	w.expireFollowupInputs(now)
 	w.expireAlbums(now)
 }
 func split(s string, limit int) []string {
