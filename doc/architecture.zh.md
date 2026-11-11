@@ -292,6 +292,10 @@ Extensions 保留独立的 questions-based `ui.askDialog` 协议和 `set_ask_dia
 
 异步 display job 在启动前捕获不可变的已渲染 snapshot, 目标 message ID 及 question/interaction epoch; 不从可能已推进的 dialog 指针读取内容来渲染. Display result 必须匹配捕获的身份与 epoch, 才能发布消息/提示状态. 最终本地回执使用独立的 `ask_receipt` operation result 和原 message ID, 不依赖可变对话生命周期或 RPC response 结算. 因而即使答案响应已完成或后续问题已开始, 回执编辑仍可结束, 不会借用后题内容或完成后题. 问题/选项文字, description, preview 和回执 literal 仅在 Telegram 展示时限长; UI 写入失败不变成原生答案失败.
 
+Ask 与 Follow-up 共用 [`bridge.go`](../internal/bridge/bridge.go) 的 `queueForceReplyCleanup`. 它只删除 bot 发出的独立输入提示, 不删除原问题或用户回复, 使用纳入跟踪的后台任务和独立五秒 deadline. 清理受 Telegram 删除限制约束, 尽力执行, 不结算, 改变或重放原生工作. 组合对话和原生 `input`/`editor` 的 Ask 输入 ID 归属于捕获的 display epoch; 失效和迟到 display result 只回收该输入 ID. Shutdown 在等待后台任务前清理已缓冲的 `ask_display`/`followup_prompt` result, 在途发送也会在 worker context 结束时安排清理. Ask 提示 ID 不持久化, 不在重启后恢复.
+
+提示删除失败时, 在 `telegram` component 记录 `WARN` 事件 `force_reply_cleanup_failed`, 包含 `chat_id`, `thread_id`, `message_id`, 安全分类 `reason`/`uncertain` 及可用时的 `api_code`. 不记录原始 Telegram 错误, 凭据或消息正文. 成功删除保持静默; 没有该事件不能证明已执行清理或客户端已清除回复界面.
+
 取消扩展组合 Ask 时, 捕获当前问题和展示长度内的全部选项快照, footer 标记为已取消, 不作为答案. 立即撤销 token 并安排键盘清理; 回执编辑独立于 RPC 取消. 当前 display 仍在途时, 用其捕获的 epoch 限定结果返回后的一次最终取消编辑, 包括首次发送迟到返回消息 ID 的情况. 因而旧渲染不能覆盖取消留痕, 也不能借用替换后对话的内容; 之前已确认题目的回执保持不变.
 
 [`steer.go`](../internal/bridge/steer.go) 在 Ask/文字对话, response 写入或原生 `ask` 工具活跃时, 按 FIFO 暂存本应作为 steer 的输入. Inbox 保持 pending, 与普通排队任务和 in-flight steer 共用容量. 每条绑定原 root/client/generation/turn 及已绑定的原生 session/catalog epoch, 不变成独立 followup. 派发重新校验身份, 等待 UI 结算和 `tool_execution_end`, 且要求 RPC lane 空闲及无原生输出缓冲. `BufferedOutput` 同时包含 reader 尚未分帧的 `bufio` 预读和 frame/event byte credit, 已发布的旧 tool end 不能遮蔽已预读的后继对话帧. 随后由原有 steer 提交流程负责接纳与完成. Stop, runtime/session 替换和 root 完成取消未发送指导; 最终回复在异步 metadata 采样前取消这些输入. 不覆盖 OMP interrupt 策略, 不重放不确定输入, 控制命令仍走原有路径.
@@ -329,6 +333,8 @@ Progress 同一行显示 `Stop | Follow-up`, `off` 时两者都不发送. Stop �
 自然完成后, binding/session 稳定时已发输入请求仍有效; 提交不绑定旧 active turn. Stop/Close 取消请求, new/resume 改变 binding 后请求失效. 空/非文本输入及现有 worker queue 已满不会消费请求或谎报入队成功. 接受时先按原 inbox ID 原子关联请求, 再追加现有队列; 接受后中断遵循现有 uncertain/cancelled inbox 恢复, 不重放为普通输入. 只有有效请求的已知 Bridge slash 回复才维持普通命令处理, 并只剥离 bridge ForceReply 上下文. 当前 Bot 的合法 marker 识别出的失效或缺记录提示, 连控制命令也拒绝. 其他有效文字独立排队, 不 steer, 不引用 ForceReply prompt. 快捷按钮同样保留原 callback inbox ID 和真实点击者身份; 严格 bridge/native dispatch 不把未知 slash 变成 prompt/steer.
 
 迁移预检期间拦截的 Stop/Close 也取消待处理 Follow-up 请求, 即使尚未建立持久化 migration 记录.
+
+Worker 按 token 维护 map, 仅跟踪待处理 Follow-up 输入的用户, 提示 ID, generation 和过期时间. 持久化接受成功后立即移除条目并安排删除提示, 不等待排队任务执行. 同用户替换及取消只回收各自提示; 现有 worker 过期 tick 清理到期或 binding 围栏失效的条目, 不轮询数据库. 空/非文本/满队列及未授权/错误消息回复保留有效提示. Send 完成后重新检查持久化请求, 因而取消, 被替换, 过期, 不确定或旧 binding 的结果只回收自身已交付的消息. 原任务自然完成及空闲 runtime 释放保留有效请求; 完整对话 teardown 则取消请求. UI 清理不移除用于拒绝迟到输入的持久化 metadata, 崩溃后不扫描 Telegram 历史.
 
 Follow-up 历史与消息清理共用 `storage.database_retention_days`. 每批最多删除 1000 条到期时间同时早于保留 cutoff 且不晚于当前时间的请求, 包括未回复的过期 pending/delivered 提示, 但保留关联 pending/submitted inbox 的记录. 现有 schema 24 数据库也安装 expiry 索引. 删除后仍可通过当前 Bot 的合法 marker 拒绝迟到输入; 若既无保留的 prompt 身份也无可识别 marker, 就无法与普通引用区分.
 

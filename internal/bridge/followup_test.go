@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ func persistTestFollowup(t *testing.T, w *worker, token string) store.FollowupRe
 	requireStoreOK(t, w.b.db.FinishFollowupPrompt(r.Token, r.Instance, 900, true))
 	r, err := w.b.db.FollowupRequest(r.Token)
 	requireStoreOK(t, err)
+	w.rememberFollowupInput(r)
 	return r
 }
 
@@ -70,7 +72,7 @@ func TestFollowupQueuesWithoutSteeringAndSurvivesNaturalSettlement(t *testing.T)
 }
 
 func TestFollowupActiveTaskReplyIsIndependentQueue(t *testing.T) {
-	w, _, command := setupWorkspaceWorker(t)
+	w, fake, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 4
 	queueReady(t, w, command)
 	command("missing-terminal")
@@ -82,10 +84,11 @@ func TestFollowupActiveTaskReplyIsIndependentQueue(t *testing.T) {
 	if len(w.queue) != 1 || len(w.steers) != 0 || w.active != root || w.turn != turn || !w.taskRunning() {
 		t.Fatalf("follow-up interrupted or steered root: queue=%+v steers=%+v", w.queue, w.steers)
 	}
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), r.PromptID) })
 }
 
 func TestFollowupEmptyAttachmentAndFullQueueDoNotConsume(t *testing.T) {
-	w, _, command := setupWorkspaceWorker(t)
+	w, fake, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 2
 	queueReady(t, w, command)
 	r := persistTestFollowup(t, w, "retry-input")
@@ -107,18 +110,22 @@ func TestFollowupEmptyAttachmentAndFullQueueDoNotConsume(t *testing.T) {
 		if got.State != "delivered" {
 			t.Fatalf("%s consumed request: %+v", reason, got)
 		}
+		if slices.Contains(fake.deletedMessageIDs(), r.PromptID) {
+			t.Fatalf("%s retired the retryable ForceReply prompt", reason)
+		}
 	}
 	w.b.cfg.QueueCapacity = 2
 	in := followupTestIncoming(t, w, r, 105, "valid retry")
 	if !w.routeFollowupInput(&in) || len(w.queue) != 1 {
 		t.Fatal("valid retry was not accepted")
 	}
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), r.PromptID) })
 }
 
 func TestFollowupInvalidRepliesNeverReachOrdinaryRouting(t *testing.T) {
 	for _, reason := range []string{"expired", "owner", "chat", "topic", "bot", "pending", "uncertain", "cancelled", "restart", "binding", "message-id", "marker-omitted"} {
 		t.Run(reason, func(t *testing.T) {
-			w, _, _ := setupWorkspaceWorker(t)
+			w, fake, _ := setupWorkspaceWorker(t)
 			r := persistTestFollowup(t, w, reason)
 			in := followupTestIncoming(t, w, r, 100, "must never become ordinary input")
 			var err error
@@ -157,12 +164,17 @@ func TestFollowupInvalidRepliesNeverReachOrdinaryRouting(t *testing.T) {
 			if state != "cancelled" {
 				t.Fatalf("invalid reply state = %s", state)
 			}
+			if reason == "owner" || reason == "chat" || reason == "topic" || reason == "bot" || reason == "message-id" {
+				if slices.Contains(fake.deletedMessageIDs(), r.PromptID) {
+					t.Fatal("invalid sender or reply target deleted a valid prompt")
+				}
+			}
 		})
 	}
 }
 
 func TestFollowupKnownCommandsKeepPrecedenceAndStripOnlyBridgeQuote(t *testing.T) {
-	w, _, command := setupWorkspaceWorker(t)
+	w, fake, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 2
 	queueReady(t, w, command)
 	r := persistTestFollowup(t, w, "commands")
@@ -178,6 +190,7 @@ func TestFollowupKnownCommandsKeepPrecedenceAndStripOnlyBridgeQuote(t *testing.T
 	if got.State != "cancelled" || len(w.queue) != 0 {
 		t.Fatalf("explicit stop did not cancel pending request and queue: %+v", got)
 	}
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), r.PromptID) })
 	ordinary := followupTestIncoming(t, w, r, 102, "/status")
 	ordinary.msg.ReplyToMessage.MessageID = 901
 	ordinary.msg.ReplyToMessage.Text = "a real user quotation"
@@ -264,11 +277,12 @@ func TestFollowupPromptIsPersistedAsyncForceReplyAndStopTokenSurvives(t *testing
 }
 
 func TestFollowupSendUncertaintyAndCancelledCompletionAreRejected(t *testing.T) {
-	w, _, _ := setupWorkspaceWorker(t)
+	w, fake, _ := setupWorkspaceWorker(t)
 	r := persistTestFollowup(t, w, "uncertain-result")
 	_, err := w.b.db.DB.Exec(`UPDATE followup_requests SET state='pending',prompt_id=0`)
 	requireStoreOK(t, err)
 	w.operationReturned(operationResult{kind: "followup_prompt", err: errors.New("transport lost"), meta: followupPromptResult{token: r.Token, instance: r.Instance, messageID: 901}})
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), 901) })
 	in := followupTestIncoming(t, w, r, 100, "do not guess delivery")
 	if !w.routeFollowupInput(&in) || len(w.queue) != 0 {
 		t.Fatal("send-uncertain prompt reply fell through")
@@ -276,6 +290,7 @@ func TestFollowupSendUncertaintyAndCancelledCompletionAreRejected(t *testing.T) 
 	_, err = w.b.db.DB.Exec(`UPDATE followup_requests SET state='cancelled'`)
 	requireStoreOK(t, err)
 	w.operationReturned(operationResult{kind: "followup_prompt", meta: followupPromptResult{token: r.Token, instance: r.Instance, messageID: 902}})
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), 902) })
 	got, err := w.b.db.FollowupPrompt(r.Bot, r.Chat, 902)
 	requireStoreOK(t, err)
 	if got.State != "cancelled" {
@@ -400,8 +415,8 @@ func TestFollowupCallbackChecksOwnerTaskAndConversation(t *testing.T) {
 }
 
 func TestFollowupRepeatedClickReplacesPriorRequestWithoutConsumingStop(t *testing.T) {
-	w, _, _ := setupWorkspaceWorker(t)
-	persistTestFollowup(t, w, "replaced-click")
+	w, fake, _ := setupWorkspaceWorker(t)
+	old := persistTestFollowup(t, w, "replaced-click")
 	w.active, w.owner, w.busy, w.turn = 2, 7, true, 1
 	t.Cleanup(func() { w.active = 0; w.busy = false })
 	c := confirmation{action: "stop", generation: w.binding.Generation, active: 2, turn: 1, user: 7, messageID: 90}
@@ -418,6 +433,14 @@ func TestFollowupRepeatedClickReplacesPriorRequestWithoutConsumingStop(t *testin
 		requireStoreOK(t, w.b.db.DB.QueryRow(`SELECT token FROM followup_requests WHERE state='delivered'`).Scan(&currentToken))
 		current, err := w.b.db.FollowupRequest(currentToken)
 		requireStoreOK(t, err)
+		expectedOldID := old.PromptID
+		if n != 0 {
+			expectedOldID = previous.PromptID
+		}
+		waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), expectedOldID) })
+		if slices.Contains(fake.deletedMessageIDs(), current.PromptID) {
+			t.Fatal("replacement deleted the new ForceReply prompt")
+		}
 		if n == 1 {
 			old, err := w.b.db.FollowupRequest(previous.Token)
 			requireStoreOK(t, err)
@@ -553,5 +576,91 @@ func TestFollowupUnrecognizedMarkersPreserveReplyContext(t *testing.T) {
 				t.Fatal("unrecognized marker swallowed input or removed reply context")
 			}
 		})
+	}
+}
+
+func TestFollowupExpiryOnlyDeletesFinishedPrompts(t *testing.T) {
+	w, fake, _ := setupWorkspaceWorker(t)
+	first := persistTestFollowup(t, w, "expires-first")
+	second := first
+	second.Token, second.User, second.PromptID = "expires-later", 8, 901
+	second.ExpiresAt += 60
+	requireStoreOK(t, w.b.db.CreateFollowupRequest(second))
+	requireStoreOK(t, w.b.db.FinishFollowupPrompt(second.Token, second.Instance, second.PromptID, true))
+	w.rememberFollowupInput(second)
+	w.expire(time.Unix(first.ExpiresAt-1, 0))
+	if slices.Contains(fake.deletedMessageIDs(), first.PromptID) || slices.Contains(fake.deletedMessageIDs(), second.PromptID) {
+		t.Fatal("expiry cleanup deleted a still-valid prompt")
+	}
+	w.expire(time.Unix(first.ExpiresAt, 0))
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), first.PromptID) })
+	if slices.Contains(fake.deletedMessageIDs(), second.PromptID) {
+		t.Fatal("expiry cleanup deleted another user's valid prompt")
+	}
+	w.expire(time.Unix(second.ExpiresAt, 0))
+	waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), second.PromptID) })
+	if len(w.queue) != 0 || w.client != nil {
+		t.Fatal("expiry cleanup submitted model work")
+	}
+}
+
+func TestFollowupLatePromptCannotReviveInvalidatedInput(t *testing.T) {
+	for _, boundary := range []string{"cancel", "replace", "expire", "generation"} {
+		t.Run(boundary, func(t *testing.T) {
+			w, fake, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 2
+			queueReady(t, w, command)
+			r := persistTestFollowup(t, w, "late-prompt")
+			_, err := w.b.db.DB.Exec(`UPDATE followup_requests SET state='pending',prompt_id=0 WHERE token=?`, r.Token)
+			requireStoreOK(t, err)
+			r.PromptID = 0
+			w.rememberFollowupInput(r)
+			var replacement store.FollowupRequest
+			switch boundary {
+			case "cancel":
+				w.cancelFollowupInputs()
+			case "replace":
+				replacement = persistTestFollowup(t, w, "replacement")
+			case "expire":
+				_, err = w.b.db.DB.Exec(`UPDATE followup_requests SET expires_at=0 WHERE token=?`, r.Token)
+				requireStoreOK(t, err)
+			case "generation":
+				w.binding.Generation++
+			}
+			w.operationReturned(operationResult{kind: "followup_prompt", meta: followupPromptResult{token: r.Token, instance: r.Instance, messageID: 901}})
+			waitFor(t, func() bool { return slices.Contains(fake.deletedMessageIDs(), 901) })
+			if boundary == "replace" {
+				if slices.Contains(fake.deletedMessageIDs(), replacement.PromptID) {
+					t.Fatal("late cleanup deleted its replacement")
+				}
+				in := followupTestIncoming(t, w, replacement, 100, "replacement survives")
+				w.handle(in)
+				if len(w.queue) != 1 || w.queue[0].text != "replacement survives" {
+					t.Fatal("late send completion invalidated the replacement request")
+				}
+			} else if len(w.queue) != 0 {
+				t.Fatal("late prompt cleanup queued input")
+			}
+		})
+	}
+}
+
+func TestForceReplyBufferedSendIsDeletedAtWorkerShutdown(t *testing.T) {
+	w, fake, _ := setupWorkspaceWorker(t)
+	persistTestFollowup(t, w, "previous")
+	w.active, w.activeReplyTo, w.owner, w.busy, w.turn = 2, 50, 7, true, 1
+	c := confirmation{action: "stop", generation: w.binding.Generation, active: w.active, turn: w.turn, user: 7, messageID: 90}
+	q := &telegram.CallbackQuery{ID: "click", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: 90, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}}
+	w.handleProgressFollowup(w.ctx, q, "stop-token", "followup", c)
+	result := waitOperation(t, w)
+	id := result.meta.(followupPromptResult).messageID
+	w.operations <- result
+	w.active, w.busy = 0, false
+	w.teardownWorker(true)
+	w.cancel()
+	w.drainForceReplyResults()
+	w.background.Wait()
+	if id == 0 || !slices.Contains(fake.deletedMessageIDs(), id) {
+		t.Fatal("shutdown left a delivered ForceReply prompt without an actor receipt")
 	}
 }

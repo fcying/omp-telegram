@@ -574,3 +574,53 @@ func TestMediaPreparationLogsWrappedTelegramTimeout(t *testing.T) {
 		t.Fatal("media timeout log exposed transport diagnostics")
 	}
 }
+
+func TestForceReplyCleanupLogsOnlySafeFailureMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason string
+		code         int
+		uncertain    bool
+	}{
+		{"success", "", http.StatusOK, false},
+		{"rejected", "api_bad_request", http.StatusBadRequest, false},
+		{"transport", "transport_failed", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := &logCapture{}
+			w, _ := setupLoggingWorker(t, capture, "json")
+			previous := http.DefaultTransport
+			http.DefaultTransport = logTestTransport(func(r *http.Request) (*http.Response, error) {
+				if tc.code == 0 {
+					return nil, errors.New("SECRET_TRANSPORT https://api.telegram.org/botSECRET_TOKEN/")
+				}
+				body := `{"ok":true,"result":true}`
+				if tc.code != http.StatusOK {
+					body = `{"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted SECRET_RESPONSE_BODY"}`
+				}
+				return &http.Response{StatusCode: tc.code, Header: make(http.Header), Request: r, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})
+			defer func() { http.DefaultTransport = previous }()
+			w.queueForceReplyCleanup(9462)
+			w.background.Wait()
+			record := capturedEvent(t, capture, "force_reply_cleanup_failed")
+			if tc.code == http.StatusOK {
+				if record != nil {
+					t.Fatalf("successful cleanup logged a failure: %+v", record)
+				}
+				return
+			}
+			if record["component"] != "telegram" || record["level"] != "WARN" || record["reason"] != tc.reason || record["uncertain"] != tc.uncertain {
+				t.Fatalf("cleanup failure classification = %+v", record)
+			}
+			if record["chat_id"] != float64(w.key.chat) || record["thread_id"] != float64(w.key.thread) || record["message_id"] != float64(9462) {
+				t.Fatalf("cleanup failure lost prompt identity: %+v", record)
+			}
+			if tc.code != 0 && record["api_code"] != float64(tc.code) {
+				t.Fatalf("cleanup failure lost the API code: %+v", record)
+			}
+			if strings.Contains(capture.String(), "SECRET") || strings.Contains(capture.String(), "api.telegram.org") {
+				t.Fatal("cleanup failure log exposed credentials or raw diagnostics")
+			}
+		})
+	}
+}

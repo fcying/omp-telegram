@@ -22,6 +22,39 @@ type followupPromptResult struct {
 	messageID       int64
 }
 
+type followupInput struct {
+	user, messageID, expiresAt, generation int64
+}
+
+func (w *worker) rememberFollowupInput(r store.FollowupRequest) {
+	for token, input := range w.followupInputs {
+		if token != r.Token && input.user == r.User {
+			delete(w.followupInputs, token)
+			w.queueForceReplyCleanup(input.messageID)
+		}
+	}
+	if w.followupInputs == nil {
+		w.followupInputs = make(map[string]followupInput)
+	}
+	w.followupInputs[r.Token] = followupInput{user: r.User, messageID: r.PromptID, expiresAt: r.ExpiresAt, generation: r.Generation}
+}
+
+func (w *worker) expireFollowupInputs(now time.Time) {
+	for token, input := range w.followupInputs {
+		if now.Unix() >= input.expiresAt || !w.binding.Running || input.generation != w.binding.Generation {
+			delete(w.followupInputs, token)
+			w.queueForceReplyCleanup(input.messageID)
+		}
+	}
+}
+
+func (w *worker) followupInputValid(r store.FollowupRequest, now time.Time) bool {
+	return r.State == "delivered" && r.PromptID > 0 &&
+		r.Instance == w.b.quickActionInstance() && now.Unix() < r.ExpiresAt &&
+		w.binding.Running && r.Generation == w.binding.Generation &&
+		r.Session == w.binding.Session && r.Workspace == w.binding.Workspace
+}
+
 func (b *Bridge) quickActionInstance() string {
 	b.quickActionsOnce.Do(func() { b.quickActionsInstance = rand.Text() })
 	return b.quickActionsInstance
@@ -83,6 +116,7 @@ func (w *worker) handleProgressFollowup(ctx context.Context, q *telegram.Callbac
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionUnavailable))
 		return true
 	}
+	w.rememberFollowupInput(r)
 	// The root reply may target a bot message when a favorite started the task.
 	// Mention the user explicitly so selective ForceReply also survives reply fallback.
 	prompt := "[" + w.tr(i18n.Msg.FollowupPrompt) + "](tg://user?id=" + strconv.FormatInt(q.From.ID, 10) + ")\n" + followupMarker(r.Token)
@@ -99,6 +133,9 @@ func (w *worker) handleProgressFollowup(ctx context.Context, q *telegram.Callbac
 		case results <- result:
 		case <-workerCtx.Done():
 		}
+		if workerCtx.Err() != nil {
+			w.queueForceReplyCleanup(message.MessageID)
+		}
 	}()
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.Received))
 	return true
@@ -114,15 +151,34 @@ func (w *worker) followupPromptFinished(result operationResult) bool {
 	if !ok {
 		return true
 	}
-	if err := w.b.db.FinishFollowupPrompt(r.token, r.instance, r.messageID, result.err == nil); err != nil {
+	err := w.b.db.FinishFollowupPrompt(r.token, r.instance, r.messageID, result.err == nil)
+	if err != nil {
+		delete(w.followupInputs, r.token)
+		w.queueForceReplyCleanup(r.messageID)
 		w.followupPersistenceFailed(err)
+		return true
 	}
+	request, err := w.b.db.FollowupRequest(r.token)
+	valid := err == nil && w.followupInputValid(request, time.Now())
+	if !valid {
+		delete(w.followupInputs, r.token)
+		w.queueForceReplyCleanup(r.messageID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			w.followupPersistenceFailed(err)
+		}
+		return true
+	}
+	w.rememberFollowupInput(request)
 	return true
 }
 
 func (w *worker) cancelFollowupInputs() {
 	if err := w.b.db.CancelFollowupRequests(w.b.bot.ID, w.key.chat, w.key.thread); err != nil {
 		w.followupPersistenceFailed(err)
+	}
+	for token, input := range w.followupInputs {
+		delete(w.followupInputs, token)
+		w.queueForceReplyCleanup(input.messageID)
 	}
 }
 
@@ -168,6 +224,8 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 		return true
 	}
 	if r.State == "consumed" && r.InboxID == in.id {
+		delete(w.followupInputs, r.Token)
+		w.queueForceReplyCleanup(r.PromptID)
 		for _, queued := range w.queue {
 			if queued.id == in.id {
 				return true
@@ -178,9 +236,12 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 		}
 		return true
 	}
-	if r.State != "delivered" || r.PromptID <= 0 || reply.MessageID != r.PromptID ||
-		r.Instance != w.b.quickActionInstance() || time.Now().Unix() >= r.ExpiresAt ||
-		!w.binding.Running || r.Generation != w.binding.Generation || r.Session != w.binding.Session || r.Workspace != w.binding.Workspace {
+	valid := w.followupInputValid(r, time.Now())
+	if !valid || reply.MessageID != r.PromptID {
+		if !valid {
+			delete(w.followupInputs, r.Token)
+			w.queueForceReplyCleanup(r.PromptID)
+		}
 		w.say(w.tr(i18n.Msg.FollowupExpired))
 		w.mark(in.id, store.InboxCancelled)
 		return true
@@ -215,6 +276,8 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 	}
 	// Runtime restoration may change the binding. Recheck before durable claim.
 	if r.Generation != w.binding.Generation || r.Session != w.binding.Session || r.Workspace != w.binding.Workspace {
+		delete(w.followupInputs, r.Token)
+		w.queueForceReplyCleanup(r.PromptID)
 		w.say(w.tr(i18n.Msg.FollowupExpired))
 		w.mark(in.id, store.InboxCancelled)
 		return true
@@ -229,6 +292,8 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 		w.mark(in.id, store.InboxCancelled)
 		return true
 	}
+	delete(w.followupInputs, r.Token)
+	w.queueForceReplyCleanup(r.PromptID)
 	stripFollowupQuote(in)
 	w.queue = append(w.queue, queued{id: in.id, user: message.From.ID, replyTo: message.MessageID, text: text, displayText: text})
 	w.say(w.tr(i18n.Msg.FollowupQueued))
