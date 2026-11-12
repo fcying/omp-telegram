@@ -2,10 +2,13 @@ package bridge
 
 import (
 	"encoding/json"
+	"fmt"
+	"html"
 	"strings"
 	"testing"
 
 	"omp-telegram/internal/i18n"
+	"omp-telegram/internal/omp"
 	"omp-telegram/internal/telegram"
 )
 
@@ -79,17 +82,18 @@ func TestModelPickerUsesCycleRolesAndOwner(t *testing.T) {
 	command("/new " + t.TempDir())
 	original := w.binding
 	command("/model")
-	buttons := resumeButtons(t, f)
-	if len(buttons) != 5 {
-		t.Fatalf("model picker choices = %v, want four cycle roles and cancel", buttons)
+	_, rows := pickerView(t, f)
+	if len(rows) != 2 || len(rows[0]) != 4 || len(rows[1]) != 1 || rows[1][0]["text"] != "Cancel" {
+		t.Fatalf("model picker rows = %v, want four cycle roles and separate cancel", rows)
 	}
+	buttons := pickerButtons(t, f)
 	for i, role := range []string{"smol", "default", "slow", "free"} {
-		if !strings.Contains(buttons[i]["text"].(string), role) {
-			t.Fatalf("choice %d does not show cycle role %q: %v", i, role, buttons[i])
+		if buttons[i]["text"] != fmt.Sprint(i+1) || !f.has(11, role) {
+			t.Fatalf("choice %d lost its body role %q or numeric button: %v", i, role, buttons[i])
 		}
 	}
-	if buttons[1]["text"] != "* default - fixture/safe:medium" {
-		t.Fatalf("current model role button = %+v", buttons[1])
+	if !f.has(11, "* default - fixture/safe:medium") {
+		t.Fatal("current model role was not shown in the body")
 	}
 	if !f.has(11, "fixture/safe") {
 		t.Fatal("picker omitted the actual current model")
@@ -135,7 +139,7 @@ func TestModelPickerRejectsUnavailableSelection(t *testing.T) {
 			w, f, command := setupWorkspaceWorker(t)
 			command("/new " + t.TempDir())
 			command("/model")
-			data := resumeButtons(t, f)[0]["callback_data"].(string)
+			data := pickerButtons(t, f)[0]["callback_data"].(string)
 			messageID := f.messageCount()
 			switch scenario {
 			case "generation":
@@ -182,7 +186,7 @@ func TestModelPickerCancelAndCleanupFailure(t *testing.T) {
 			w, f, command := setupWorkspaceWorker(t)
 			command("/new " + t.TempDir())
 			command("/model")
-			buttons := resumeButtons(t, f)
+			buttons := pickerButtons(t, f)
 			messageID := f.messageCount()
 			index, want := len(buttons)-1, "safe"
 			if scenario == "cleanup-failure" {
@@ -234,7 +238,7 @@ func TestSettingsMenusReportUnconfirmedResults(t *testing.T) {
 			command("/new " + t.TempDir())
 			command(scenario.command)
 			messageID := f.messageCount()
-			data := resumeButtons(t, f)[0]["callback_data"].(string)
+			data := pickerButtons(t, f)[0]["callback_data"].(string)
 			w.callback(&telegram.CallbackQuery{ID: "unconfirmed-setting", From: telegram.User{ID: 7}, Data: data})
 			result := waitOperation(t, w)
 			result.kind, result.data, result.cancelled = scenario.kind, scenario.data, scenario.cancelled
@@ -259,7 +263,7 @@ func TestStaleSettingsResultCannotEditNewMenu(t *testing.T) {
 	oldID := int64(f.messageCount())
 	oldGeneration, oldClient := w.binding.Generation, w.client.ID()
 	command("/new " + t.TempDir())
-	clickKeyboard(w, 7, resumeButtons(t, f)[0]["callback_data"].(string))
+	clickKeyboard(w, 7, pickerButtons(t, f)[0]["callback_data"].(string))
 	command("/thinking")
 	before, rows := pickerView(t, f)
 	w.operationReturned(operationResult{
@@ -287,12 +291,12 @@ func TestConsumedModelMenusFinishOnRuntimeInterruption(t *testing.T) {
 			before, client := w.binding, w.client
 			command(scenario.menu)
 			messageID := f.messageCount()
-			data := resumeButtons(t, f)[0]["callback_data"].(string)
+			data := pickerButtons(t, f)[0]["callback_data"].(string)
 			var replacement string
 			if scenario.replace {
 				// Arm the normal /new confirmation before holding the settings result.
 				command("/new " + t.TempDir())
-				replacement = resumeButtons(t, f)[0]["callback_data"].(string)
+				replacement = pickerButtons(t, f)[0]["callback_data"].(string)
 			}
 			w.callback(&telegram.CallbackQuery{ID: "interrupt-setting", From: telegram.User{ID: 7}, Data: data})
 			state := waitOperation(t, w)
@@ -341,11 +345,11 @@ func TestConsumedModelMenusFinishOnRuntimeInterruption(t *testing.T) {
 			command("/model")
 			current, currentClient := w.binding, w.client
 			text, keyboard := pickerView(t, f)
-			button := resumeButtons(t, f)[0]["callback_data"].(string)
+			button := pickerButtons(t, f)[0]["callback_data"].(string)
 			w.operationReturned(stale)
 			clickKeyboard(w, 7, data)
 			after, afterKeyboard := pickerView(t, f)
-			if after != text || len(afterKeyboard) != len(keyboard) || resumeButtons(t, f)[0]["callback_data"].(string) != button || len(w.confirms) != 1 || w.client != currentClient || !sameBindingIdentity(w.binding, current) {
+			if after != text || len(afterKeyboard) != len(keyboard) || pickerButtons(t, f)[0]["callback_data"].(string) != button || len(w.confirms) != 1 || w.client != currentClient || !sameBindingIdentity(w.binding, current) {
 				t.Fatal("old settings result changed the replacement runtime or current menu")
 			}
 			assertPickerModel(t, w, "fixture", "safe")
@@ -361,8 +365,8 @@ func TestChineseModelPickerPreservesNativeRolesAndIdentity(t *testing.T) {
 	command("/new " + t.TempDir())
 	w.b.setLanguage(i18n.Chinese)
 	command("/model")
-	buttons := resumeButtons(t, f)
-	if len(buttons) != 5 || buttons[1]["text"] != "* default - fixture/safe:medium" {
+	buttons := pickerButtons(t, f)
+	if len(buttons) != 5 || buttons[1]["text"] != "2" || !f.has(11, "* default - fixture/safe:medium") {
 		t.Fatalf("translated picker changed native role data: %v", buttons)
 	}
 	if buttons[4]["text"] != i18n.Text(i18n.Chinese, i18n.Msg.Cancel) || !f.has(11, i18n.Text(i18n.Chinese, i18n.Msg.ChooseOMPCycleRoleCurrentModel, "fixture/safe")) {
@@ -382,7 +386,16 @@ func TestChineseThinkingPickerKeepsProtocolOptions(t *testing.T) {
 	command("/new " + t.TempDir())
 	w.b.setLanguage(i18n.Chinese)
 	command("/thinking")
-	buttons := resumeButtons(t, f)
+	_, rows := pickerView(t, f)
+	if len(rows) != len(thinkingLevels)+1 {
+		t.Fatalf("thinking picker rows = %v, want one short label per row", rows)
+	}
+	for _, row := range rows {
+		if len(row) != 1 {
+			t.Fatalf("thinking picker grouped short labels: %v", rows)
+		}
+	}
+	buttons := pickerButtons(t, f)
 	if len(buttons) != len(thinkingLevels)+1 || buttons[4]["text"] != i18n.Text(i18n.Chinese, i18n.Msg.High) {
 		t.Fatalf("thinking picker did not translate its labels: %v", buttons)
 	}
@@ -457,7 +470,7 @@ func TestSettingsMenusPublishOneCompletion(t *testing.T) {
 				command("/new " + t.TempDir())
 				deliverReplies(t, w)
 				command(selection.command)
-				buttons := resumeButtons(t, f)
+				buttons := pickerButtons(t, f)
 				messageID := f.messageCount()
 				var before int
 				requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&before))
@@ -508,5 +521,32 @@ func TestSettingsMenusPublishOneCompletion(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestModelMenuContentPagesKeepOriginalRole(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	before := w.binding
+	first := "fixture/" + strings.Repeat("long **selector** ", 50)
+	second := "fixture/" + strings.Repeat("other <selector> ", 50)
+	w.showModelPickerReady(7, omp.Model{}, []omp.ModelRole{{Role: "smol", Selector: first}, {Role: "slow", Selector: second}})
+	body, rows := pickerView(t, f)
+	if !strings.Contains(html.UnescapeString(body), first) || rows[0][0]["text"] != "1" || !strings.Contains(body, "Page 1/2") {
+		t.Fatalf("first model page lost its full role: %q; %v", body, rows)
+	}
+	stale := rows[0][0]["callback_data"].(string)
+	clickKeyboard(w, 7, askTestButton(t, f, "Next"))
+	body, rows = pickerView(t, f)
+	if !strings.Contains(html.UnescapeString(body), second) || strings.Contains(body, "<selector>") || rows[0][0]["text"] != "2" {
+		t.Fatalf("second model page lost its full literal role: %q; %v", body, rows)
+	}
+	assertPickerModel(t, w, "fixture", "safe")
+	clickKeyboard(w, 7, stale)
+	assertPickerModel(t, w, "fixture", "safe")
+	clickKeyboard(w, 7, rows[0][0]["callback_data"].(string))
+	assertPickerModel(t, w, "fixture", "deep")
+	if !sameBindingIdentity(before, w.binding) {
+		t.Fatal("paged model selection replaced the session")
 	}
 }

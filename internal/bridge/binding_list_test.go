@@ -53,12 +53,17 @@ func bindingButton(t *testing.T, f *fakeHTTP, label string) string {
 
 func bindingEntryButton(t *testing.T, f *fakeHTTP, thread int64) string {
 	t.Helper()
+	text, _ := pickerView(t, f)
 	marker := fmt.Sprintf(" · #%d · ", thread)
-	for _, button := range resumeButtons(t, f) {
-		label, _ := button["text"].(string)
-		data, _ := button["callback_data"].(string)
-		if strings.Contains(label, marker) && data != "" {
-			return data
+	index := 0
+	for _, line := range strings.Split(text, "\n") {
+		var number int
+		line = strings.TrimPrefix(strings.TrimPrefix(line, "<pre>"), "<code>")
+		if _, err := fmt.Sscanf(strings.TrimLeft(line, "`"), "%d. ", &number); err == nil {
+			index = number
+		}
+		if strings.Contains(line, marker) && index != 0 {
+			return bindingButton(t, f, fmt.Sprintf("Delete %d", index))
 		}
 	}
 	t.Fatalf("no selectable binding for topic %d", thread)
@@ -119,18 +124,19 @@ func TestBindingListRendersStatesAndDeletionButtons(t *testing.T) {
 	if len(keyboard.InlineKeyboard) != len(entries)+1 {
 		t.Fatalf("binding list did not render one row per entry: %+v", keyboard.InlineKeyboard)
 	}
+	text, _ := message["text"].(string)
 	titles := []string{"1. * current · #11", "2. open · #55", "3. Closed task · #22", "4. resume · #33", "5. pending · #44"}
 	details := []string{"📖 · - · /current", "📖 · - · /open", "📕 · 4d · /closed", "⏳ · 7m · /resume", "⏳ · - · /pending"}
 	for i := range titles {
 		row := keyboard.InlineKeyboard[i]
-		if len(row) != 1 || !strings.Contains(row[0].Text, titles[i]) || !strings.Contains(row[0].Text, details[i]) {
+		if len(row) != 1 || !strings.Contains(text, titles[i]) || !strings.Contains(text, details[i]) {
 			t.Fatalf("binding %d did not combine its identity, logical state, age and workspace: %+v", i+1, row)
 		}
 		if i == 1 || i == 2 {
-			if row[0].CallbackData == "" || row[0].Disabled != nil {
+			if row[0].Text != fmt.Sprintf("Delete %d", i+1) || row[0].Style != "danger" || row[0].CallbackData == "" || row[0].Disabled != nil {
 				t.Fatalf("binding %d is not selectable: %+v", i+1, row)
 			}
-		} else if row[0].Disabled == nil || row[0].CallbackData != "" {
+		} else if row[0].Text != fmt.Sprint(i+1) || row[0].Disabled == nil || row[0].CallbackData != "" {
 			t.Fatalf("binding %d should not offer deletion: %+v", i+1, row)
 		}
 	}
@@ -173,18 +179,18 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 		"4. recent50 · #50", "5. old30 · #30", "6. unknown40 · #40",
 		"7. unknown41 · #41", "8. unknown42 · #42", "9. unknown43 · #43", "10. unknown44 · #44",
 	}
-	if text != "Saved bindings\nPage 1/2" || len(rows) != 11 {
+	if !strings.HasPrefix(text, "Saved bindings\nPage 1/2") || len(rows) != 11 {
 		t.Fatalf("first page = %q, rows = %+v", text, rows)
 	}
 	for i, title := range titles {
-		if !strings.HasPrefix(rows[i][0]["text"].(string), title+" · ") {
+		if !strings.Contains(text, title+" · ") {
 			t.Fatalf("binding %d title = %+v, want prefix %q", i+1, rows[i], title)
 		}
 	}
 	messageID := int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: bindingButton(t, fake, "Next")})
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "future60 · #60 · 📕 · - · /future60") {
+	if !strings.HasPrefix(text, "Saved bindings\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, "future60 · #60 · 📕 · - · /future60") {
 		t.Fatalf("second page = %q, rows = %+v", text, rows)
 	}
 	w.showBindings(7, true, 0)
@@ -194,18 +200,18 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 		"4. recent50 · #50", "5. unknown40 · #40", "6. unknown41 · #41",
 		"7. unknown42 · #42", "8. unknown43 · #43", "9. unknown44 · #44", "10. future60 · #60",
 	}
-	if text != "Saved bindings (oldest first)\nPage 1/2" || len(rows) != 11 {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/2") || len(rows) != 11 {
 		t.Fatalf("oldest-first page = %q, rows = %+v", text, rows)
 	}
 	for i, title := range oldTitles {
-		if !strings.HasPrefix(rows[i][0]["text"].(string), title+" · ") {
+		if !strings.Contains(text, title+" · ") {
 			t.Fatalf("oldest-first binding %d title = %+v, want prefix %q", i+1, rows[i], title)
 		}
 	}
 	messageID = int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "old-next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: bindingButton(t, fake, "Next")})
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "pending · #7 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, "pending · #7 · ") {
 		t.Fatalf("oldest-first second page = %q, rows = %+v", text, rows)
 	}
 }
@@ -245,14 +251,14 @@ func TestBindingsOldPrioritizesClosedThenOldOpen(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindings(7, true, 0)
 	want := []int64{30, 31, 11, 32, 33, 20, 21, 22, 23, 24, 5, 6, 7}
-	for start := 0; start < len(want); start += bindingPageSize {
-		_, rows := pickerView(t, fake)
-		end := min(start+bindingPageSize, len(want))
+	for start := 0; start < len(want); start += uiSelectPageSize {
+		text, rows := pickerView(t, fake)
+		end := min(start+uiSelectPageSize, len(want))
 		if len(rows) != end-start+1 {
 			t.Fatalf("page at %d has wrong entry count: %+v", start, rows)
 		}
 		for i, thread := range want[start:end] {
-			if !strings.Contains(rows[i][0]["text"].(string), fmt.Sprintf(" · #%d · ", thread)) {
+			if !strings.Contains(text, fmt.Sprintf("%d. ", start+i+1)) || !strings.Contains(text, fmt.Sprintf(" · #%d · ", thread)) {
 				t.Fatalf("entry %d = %q, want topic %d", start+i, rows[i][0]["text"], thread)
 			}
 		}
@@ -277,7 +283,7 @@ func TestBindingsOldCommandSortsWithoutChangingDefault(t *testing.T) {
 	send(update(1, 11, "/bindings old"))
 	waitInputDone(t, db, 1)
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "old · #22 · ") || !strings.Contains(rows[1][0]["text"].(string), "recent · #33 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || len(rows) != 3 || !strings.Contains(text, "old · #22 · ") || !strings.Contains(text, "recent · #33 · ") {
 		t.Fatalf("oldest-first command = %q, rows = %+v", text, rows)
 	}
 	send(update(2, 11, "/bindings old extra"))
@@ -286,14 +292,14 @@ func TestBindingsOldCommandSortsWithoutChangingDefault(t *testing.T) {
 	send(update(3, 11, "/bindings"))
 	waitInputDone(t, db, 3)
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings\nPage 1/1" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "recent · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), "old · #22 · ") {
+	if !strings.HasPrefix(text, "Saved bindings\nPage 1/1") || len(rows) != 3 || !strings.Contains(text, "recent · #33 · ") || !strings.Contains(text, "old · #22 · ") {
 		t.Fatalf("default bindings command = %q, rows = %+v", text, rows)
 	}
 }
 
 func TestBindingNavigationSharesFooterRow(t *testing.T) {
 	w, fake := newBindingTestWorker(t, nil)
-	entries := make([]store.BindingListEntry, 2*bindingPageSize+1)
+	entries := make([]store.BindingListEntry, 2*uiSelectPageSize+1)
 	for i := range entries {
 		entries[i].Binding = &store.Binding{Bot: 99, Chat: -10, Thread: int64(i + 20), Generation: 1}
 	}
@@ -302,7 +308,7 @@ func TestBindingNavigationSharesFooterRow(t *testing.T) {
 	checkFooter := func(page string, rowCount int, labels ...string) {
 		t.Helper()
 		text, rows := pickerView(t, fake)
-		if text != "Saved bindings\n"+page || len(rows) != rowCount {
+		if !strings.HasPrefix(text, "Saved bindings\n"+page) || len(rows) != rowCount {
 			t.Fatalf("page = %q, rows = %+v", text, rows)
 		}
 		footer := rows[len(rows)-1]
@@ -336,7 +342,8 @@ func TestBindingListDisablesCurrentClosedDelete(t *testing.T) {
 	entries := []store.BindingListEntry{{Binding: &store.Binding{Bot: 99, Chat: -10, Thread: 11, Workspace: "/current", SessionID: "current-session", Generation: 7}}}
 	w.showBindingsPage(confirmation{bindings: entries, user: 7}, 0, 0)
 	buttons := resumeButtons(t, fake)
-	if len(buttons) != 2 || !strings.Contains(buttons[0]["text"].(string), "* current · #11 · 📕 · - · /current") {
+	text, _ := pickerView(t, fake)
+	if len(buttons) != 2 || buttons[0]["text"] != "1" || !strings.Contains(text, "* current · #11 · 📕 · - · /current") {
 		t.Fatalf("current closed buttons = %+v", buttons)
 	}
 	if _, ok := buttons[0]["callback_data"]; ok {
@@ -354,8 +361,8 @@ func TestBindingListKeepsTopicVisibleWithLongName(t *testing.T) {
 		SessionName: strings.Repeat("a", 100),
 	}
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{entry}, user: 7}, 0, 0)
-	_, rows := pickerView(t, fake)
-	if len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "... · #43062 · 📕 · - · /project/omp-telegram") || rows[0][0]["callback_data"] == nil {
+	text, rows := pickerView(t, fake)
+	if len(rows) != 2 || !strings.Contains(text, entry.SessionName+" · #43062 · 📕 · - · /project/omp-telegram") || rows[0][0]["text"] != "Delete 1" || rows[0][0]["callback_data"] == nil {
 		t.Fatalf("long title obscured topic or delete action: %+v", rows)
 	}
 }
@@ -388,8 +395,8 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.b.cfg.OMP = binary
 	w.showBindings(7, false, 0)
-	_, rows := pickerView(t, fake)
-	if len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), filepath.Base(workspace)+" · #22 · ") || !strings.Contains(rows[1][0]["text"].(string), filepath.Base(workspace)+" · #33 · ") {
+	text, rows := pickerView(t, fake)
+	if len(rows) != 3 || !strings.Contains(text, filepath.Base(workspace)+" · #22 · ") || !strings.Contains(text, filepath.Base(workspace)+" · #33 · ") {
 		t.Fatalf("initial recent order = %+v", rows)
 	}
 	var result bindingNamesResult
@@ -400,13 +407,13 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	}
 	w.bindingNamesLoaded(result)
 	w.background.Wait()
-	_, rows = pickerView(t, fake)
-	if len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "Zzz session · #22 · ") || !strings.Contains(rows[1][0]["text"].(string), "Aaa session · #33 · ") || rows[0][0]["callback_data"] == nil || rows[1][0]["callback_data"] == nil {
+	text, rows = pickerView(t, fake)
+	if len(rows) != 3 || !strings.Contains(text, "Zzz session · #22 · ") || !strings.Contains(text, "Aaa session · #33 · ") || rows[0][0]["callback_data"] == nil || rows[1][0]["callback_data"] == nil {
 		t.Fatalf("native titles reordered bindings: %+v", rows)
 	}
 	w.showBindings(7, true, 0)
-	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || !strings.Contains(rows[0][0]["text"].(string), filepath.Base(workspace)+" · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), filepath.Base(workspace)+" · #22 · ") {
+	text, rows = pickerView(t, fake)
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, filepath.Base(workspace)+" · #33 · ") || !strings.Contains(text, filepath.Base(workspace)+" · #22 · ") {
 		t.Fatalf("initial oldest-first order = %q, rows = %+v", text, rows)
 	}
 	select {
@@ -418,7 +425,7 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.cancel()
 	w.background.Wait()
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || !strings.Contains(rows[0][0]["text"].(string), "Aaa session · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), "Zzz session · #22 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, "Aaa session · #33 · ") || !strings.Contains(text, "Zzz session · #22 · ") {
 		t.Fatalf("native titles reordered oldest-first bindings: %q, rows = %+v", text, rows)
 	}
 }
@@ -426,7 +433,7 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 func TestBindingCallbacksUseSentMessageID(t *testing.T) {
 	t.Run("next", func(t *testing.T) {
 		w, fake := newBindingTestWorker(t, nil)
-		entries := make([]store.BindingListEntry, bindingPageSize+1)
+		entries := make([]store.BindingListEntry, uiSelectPageSize+1)
 		for i := range entries {
 			entries[i].Binding = &store.Binding{Bot: 99, Chat: -10, Thread: int64(20 + i), Generation: int64(i + 1), Running: true}
 		}
@@ -441,7 +448,7 @@ func TestBindingCallbacksUseSentMessageID(t *testing.T) {
 			t.Fatalf("next confirmation = %+v, want page 1 and message %d", c, messageID)
 		}
 		text, rows := pickerView(t, fake)
-		if text != "Saved bindings\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), "unknown · #30 · 📖 · - · unknown") || rows[0][0]["callback_data"] == nil {
+		if !strings.HasPrefix(text, "Saved bindings\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, "unknown · #30 · 📖 · - · unknown") || rows[0][0]["callback_data"] == nil {
 			t.Fatalf("last page lost binding title action: text=%q rows=%+v", text, rows)
 		}
 	})
@@ -561,7 +568,7 @@ func TestBindingsOldKeepsOrderAfterDeletingClosedEntry(t *testing.T) {
 		t.Fatalf("old binding still present: %v", err)
 	}
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 3 || !strings.Contains(rows[0][0]["text"].(string), "middle · #33 · ") || !strings.Contains(rows[1][0]["text"].(string), "recent · #44 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || len(rows) != 3 || !strings.Contains(text, "middle · #33 · ") || !strings.Contains(text, "recent · #44 · ") {
 		t.Fatalf("oldest-first list after deletion = %q, rows = %+v", text, rows)
 	}
 }
@@ -586,7 +593,7 @@ func TestBindingDeletionRefreshesSourcePage(t *testing.T) {
 			}
 			defer db.Close()
 			now := time.Now().Unix()
-			for i := range 2*bindingPageSize + 1 {
+			for i := range 2*uiSelectPageSize + 1 {
 				if err := db.Save(store.Binding{Bot: 99, Chat: -10, Thread: int64(20 + i), Workspace: "/binding", Generation: 1, LastUsedAt: now - int64(i+1)*60}); err != nil {
 					t.Fatal(err)
 				}
@@ -612,7 +619,7 @@ func TestBindingDeletionRefreshesSourcePage(t *testing.T) {
 			if tc.old {
 				header += " (oldest first)"
 			}
-			if text != header+"\nPage 2/2" || len(rows) != 11 || !strings.Contains(rows[0][0]["text"].(string), fmt.Sprintf(" · #%d · ", tc.first)) {
+			if !strings.HasPrefix(text, header+"\nPage 2/2") || len(rows) != 11 || !strings.Contains(text, fmt.Sprintf(" · #%d · ", tc.first)) {
 				t.Fatalf("refreshed page = %q, rows = %+v", text, rows)
 			}
 			w.cancel()
@@ -638,7 +645,14 @@ func TestBindingDeleteTitleTargetsMatchingEntry(t *testing.T) {
 	w, fake := newBindingTestWorker(t, db)
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{{Binding: &first}, {Binding: &second, SessionName: "\t" + strings.ReplaceAll(name, " ", "\x00\n") + "\t"}}, user: 7}, 0, 0)
 	listMessageID := int64(fake.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "select-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingEntryButton(t, fake, second.Thread)})
+	for {
+		c := onlyBindingConfirmation(t, w)
+		if c.uiPages[c.page].end > 1 {
+			break
+		}
+		w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingButton(t, fake, "Next")})
+	}
+	w.callback(&telegram.CallbackQuery{ID: "select-second", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: listMessageID}, Data: bindingButton(t, fake, "Delete 2")})
 	confirm := onlyBindingConfirmation(t, w)
 	if confirm.deleteThread != second.Thread {
 		t.Fatalf("second title selected topic %d", confirm.deleteThread)
@@ -852,5 +866,58 @@ func TestQueuePreviewLocalizesOnlyBridgeFallbacks(t *testing.T) {
 		if got := queueTaskText("zh", q); got != want {
 			t.Fatalf("user queue text was translated: got %q, want %q", got, want)
 		}
+	}
+}
+
+func TestBindingBodyPreservesLongLiteralNameAndWorkspaceAcrossPages(t *testing.T) {
+	w, fake := newBindingTestWorker(t, nil)
+	name := strings.Repeat("长😀`[name](https://example.test)\n", 90)
+	workspace := "/" + strings.Repeat("目录/```segment/", 90) + "end"
+	entry := store.BindingListEntry{Binding: &store.Binding{Bot: 99, Chat: -10, Thread: 22, Workspace: workspace, Generation: 1}, SessionName: name}
+	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{entry}, user: 7}, 999, 0)
+	c := onlyBindingConfirmation(t, w)
+	if len(c.uiPages) < 2 || c.page != len(c.uiPages)-1 {
+		t.Fatalf("long binding did not paginate and clamp: page=%d count=%d", c.page, len(c.uiPages))
+	}
+	for c.page > 0 {
+		w.callback(&telegram.CallbackQuery{ID: "previous", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Previous")})
+		c = onlyBindingConfirmation(t, w)
+	}
+	var complete strings.Builder
+	for {
+		c = onlyBindingConfirmation(t, w)
+		text, rows := pickerView(t, fake)
+		part := c.uiPages[c.page]
+		if !strings.Contains(text, telegram.ConvertMarkdown(askLiteral(part.text, 3*len(part.text)+16))) || rows[0][0]["text"] != "Delete 1" || rows[0][0]["style"] != "danger" {
+			t.Fatalf("continued binding lost literal content or global action: text=%q rows=%+v", text, rows)
+		}
+		complete.WriteString(strings.TrimPrefix(part.text, "1. "))
+		if c.page+1 == len(c.uiPages) {
+			break
+		}
+		w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: bindingButton(t, fake, "Next")})
+	}
+	if got, want := complete.String(), name+" · #22 · 📕 · - · "+workspace; got != want {
+		t.Fatalf("binding content was clipped or changed: got %q want %q", got, want)
+	}
+}
+
+func TestBindingNameRefreshRebuildsContentPagesAndClamps(t *testing.T) {
+	w, fake := newBindingTestWorker(t, nil)
+	entry := store.BindingListEntry{Binding: &store.Binding{Bot: 99, Chat: -10, Thread: 22, SessionID: "named", Workspace: "/workspace", Generation: 1}, SessionName: "short"}
+	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{entry}, user: 7}, 0, 0)
+	longName := strings.Repeat("session😀", 500)
+	w.bindingNamesLoaded(bindingNamesResult{names: map[string]string{"named": longName}})
+	c := onlyBindingConfirmation(t, w)
+	if len(c.uiPages) < 2 || c.bindings[0].SessionName != longName {
+		t.Fatal("name expansion did not rebuild binding pages")
+	}
+	data := bindingButton(t, fake, "Next")
+	w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: data})
+	w.bindingNamesLoaded(bindingNamesResult{names: map[string]string{"named": "short again"}})
+	c = onlyBindingConfirmation(t, w)
+	text, rows := pickerView(t, fake)
+	if c.page != 0 || len(c.uiPages) != 1 || !strings.Contains(text, "short again · #22") || rows[0][0]["text"] != "Delete 1" {
+		t.Fatalf("name contraction did not rebuild and clamp: page=%d text=%q rows=%+v", c.page, text, rows)
 	}
 }

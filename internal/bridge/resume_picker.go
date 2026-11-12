@@ -21,8 +21,6 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-const resumePageSize = 10
-
 type resumeListResult struct {
 	finalAction               *finalActionDispatch
 	request                   uint64
@@ -552,11 +550,47 @@ func (w *worker) exportFinished(result exportResult) {
 	w.log.Info("session export queued", "event", "session_export", "format", result.format, "session_id", result.sessionID, "result", "done")
 }
 
+func (w *worker) resumeSessionPages(c confirmation) []selectionPage {
+	options := make([]askOption, len(c.sessions))
+	for i, session := range c.sessions {
+		title := session.Title
+		if strings.TrimSpace(title) == "" {
+			title = w.tr(i18n.Msg.Untitled)
+		}
+		var detail strings.Builder
+		if w.bindingSessionSelected(session.ID) {
+			detail.WriteString("* ")
+		}
+		detail.WriteString(title)
+		if c.action == "resume" {
+			if sessionIsPinned(session, c.pinnedSessions) {
+				detail.WriteString(w.tr(i18n.Msg.Pinned))
+			}
+			if _, inUseElsewhere := w.b.sessionDeleteStatus(w, session.ID); inUseElsewhere {
+				detail.WriteString(w.tr(i18n.Msg.UseElsewhere))
+			}
+		}
+		if updated, err := time.Parse(time.RFC3339Nano, session.UpdatedAt); err == nil {
+			fmt.Fprintf(&detail, " | %s", updated.UTC().Format("2006-01-02 15:04 UTC"))
+		}
+		detail.WriteString(w.tr(i18n.Msg.ID, session.ID))
+		fmt.Fprintf(&detail, "%s: %s", w.tr(i18n.Msg.Workspace), c.workspace)
+		options[i] = askOption{Label: detail.String()}
+	}
+	return selectionPages(options)
+}
+
 func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 	if c.finalAction == nil {
 		c.finalAction = w.finalAction
 	}
-	pages := (len(c.sessions) + resumePageSize - 1) / resumePageSize
+	if c.action != "export" {
+		c.action = "resume"
+	}
+	if c.uiPages == nil {
+		c.uiPages = w.resumeSessionPages(c)
+	}
+	pages := len(c.uiPages)
 	if page < 0 || page >= pages {
 		return
 	}
@@ -566,23 +600,22 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		return
 	}
 	token := hex.EncodeToString(random[:])
-	if c.action != "export" {
-		c.action = "resume"
-	}
+	current := c.uiPages[page]
 	c.method, c.page = "select", page
 	c.expires = time.Now().Add(2 * time.Minute)
 	c.options = nil
 	c.pickerOptions = nil
-	start, end := page*resumePageSize, min((page+1)*resumePageSize, len(c.sessions))
+	start, end := current.start, current.end
 	var text strings.Builder
 	heading := w.tr(i18n.Msg.SavedOmpSessions)
 	if c.action == "export" {
 		heading = w.tr(i18n.Msg.ExportOmpSession)
 	}
-	text.WriteString(w.tr(i18n.Msg.PageWorkspace, heading, page+1, pages, menuText(c.workspace, 512)))
+	text.WriteString(heading + w.tr(i18n.Msg.Page, page+1, pages) + "\n\n")
 	if c.action == "export" {
 		text.WriteString(w.tr(i18n.Msg.FormatLine, strings.ToUpper(c.exportFormat)))
 	}
+	text.WriteString(askLiteral(current.text, 3*len(current.text)+16))
 	keyboard := &telegram.Keyboard{}
 	add := func(label string, option resumePickerOption) telegram.Button {
 		index := len(c.options)
@@ -590,44 +623,20 @@ func (w *worker) showResumePage(c confirmation, page int, messageID int64) {
 		c.pickerOptions = append(c.pickerOptions, option)
 		return telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, index)}
 	}
-	for i, session := range c.sessions[start:end] {
-		title := menuText(session.Title, 40)
-		if title == "" {
-			title = w.tr(i18n.Msg.Untitled)
-		}
-		currentMarker := ""
-		if w.bindingSessionSelected(session.ID) {
-			currentMarker = "* "
-		}
-		pinnedMarker := ""
-		if c.action == "resume" && sessionIsPinned(session, c.pinnedSessions) {
-			pinnedMarker = w.tr(i18n.Msg.Pinned)
-		}
-		inUseElsewhereMarker := ""
-		if c.action == "resume" {
-			_, inUseElsewhere := w.b.sessionDeleteStatus(w, session.ID)
-			if inUseElsewhere {
-				inUseElsewhereMarker = w.tr(i18n.Msg.UseElsewhere)
-			}
-		}
-		sessionIndex := start + i
-		fmt.Fprintf(&text, "%d. %s%s%s%s", sessionIndex+1, currentMarker, title, pinnedMarker, inUseElsewhereMarker)
-		if updated, err := time.Parse(time.RFC3339Nano, session.UpdatedAt); err == nil {
-			fmt.Fprintf(&text, " | %s", updated.UTC().Format("2006-01-02 15:04 UTC"))
-		}
-		text.WriteString(w.tr(i18n.Msg.ID, session.ID))
-		selectLabel := menuText(title, 20)
+	for sessionIndex := start; sessionIndex < end; sessionIndex++ {
+		session := c.sessions[sessionIndex]
+		selectLabel := fmt.Sprint(sessionIndex + 1)
 		if c.action == "export" {
-			selectLabel = w.tr(i18n.Msg.Export)
+			selectLabel = fmt.Sprintf("%s %d", w.tr(i18n.Msg.Export), sessionIndex+1)
 		}
-		row := []telegram.Button{add(fmt.Sprintf("%d. %s", sessionIndex+1, selectLabel), resumePickerOption{session: sessionIndex, action: "select"})}
+		row := []telegram.Button{add(selectLabel, resumePickerOption{session: sessionIndex, action: "select"})}
 		if c.action == "resume" {
 			pinLabel := w.tr(i18n.Msg.Pin)
 			if sessionIsPinned(session, c.pinnedSessions) {
 				pinLabel = w.tr(i18n.Msg.Unpin)
 			}
-			row = append(row, add(pinLabel, resumePickerOption{session: sessionIndex, action: "toggle_pin"}))
-			deleteButton := add(w.tr(i18n.Msg.Delete), resumePickerOption{session: sessionIndex, action: "delete"})
+			row = append(row, add(fmt.Sprintf("%s %d", pinLabel, sessionIndex+1), resumePickerOption{session: sessionIndex, action: "toggle_pin"}))
+			deleteButton := add(fmt.Sprintf("%s %d", w.tr(i18n.Msg.Delete), sessionIndex+1), resumePickerOption{session: sessionIndex, action: "delete"})
 			deleteButton.Style = "danger"
 			row = append(row, deleteButton)
 		}
@@ -819,6 +828,7 @@ func (w *worker) togglePinnedSession(c confirmation, sessionIndex int, messageID
 	}
 	c.sessions = append([]omp.SessionSummary(nil), base...)
 	sortPinnedSessions(c.sessions, c.pinnedSessions)
+	c.uiPages = nil
 	w.showResumePage(c, 0, messageID)
 }
 

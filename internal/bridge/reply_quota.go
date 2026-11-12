@@ -91,7 +91,12 @@ func (q quotaSample) appendTo(result *strings.Builder, now time.Time) {
 					result.WriteString(strconv.FormatInt(hours, 10))
 					result.WriteByte('h')
 				} else if days == 0 {
-					result.WriteString("<1h")
+					minutes := int64(left / time.Minute)
+					if minutes < 1 {
+						minutes = 1
+					}
+					result.WriteString(strconv.FormatInt(minutes, 10))
+					result.WriteByte('m')
 				}
 			}
 			result.WriteByte(')')

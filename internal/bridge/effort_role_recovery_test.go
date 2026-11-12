@@ -19,18 +19,17 @@ func TestEffortInvalidOutputDoesNotDisableRoleSwitch(t *testing.T) {
 			if client == nil || w.configuredThinking != "" {
 				t.Fatal("startup did not retain a usable runtime with unknown configured thinking")
 			}
-			for _, role := range []struct{ name, model string }{{"slow", "deep"}, {"smol", "quick"}} {
+			for _, role := range []struct{ name, model, button string }{{"slow", "deep", "3"}, {"smol", "quick", "1"}} {
 				command("/model")
 				var data string
-				for _, button := range resumeButtons(t, f) {
-					label := strings.TrimPrefix(button["text"].(string), "* ")
-					if strings.HasPrefix(label, role.name+" - ") {
+				for _, button := range pickerButtons(t, f) {
+					if button["text"] == role.button {
 						data = button["callback_data"].(string)
 						break
 					}
 				}
 				if data == "" {
-					t.Fatalf("role %s not available", role.name)
+					t.Fatalf("role %s button not available", role.name)
 				}
 				messageID := f.messageCount()
 				clickKeyboard(w, 7, data)

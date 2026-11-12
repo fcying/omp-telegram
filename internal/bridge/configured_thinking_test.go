@@ -79,10 +79,13 @@ func TestConfiguredThinkingEventsOverrideEffectiveSnapshots(t *testing.T) {
 }
 
 func TestConfiguredThinkingResyncsModelRolesAndThinkingSelection(t *testing.T) {
-	for _, scenario := range []struct{ name, initial, command, choice, symbol string }{
-		{"role auto", "low", "/model", "slow", "⟳"},
-		{"role manual", "auto", "/model", "smol", "◔"},
-		{"thinking manual", "auto", "/thinking", "max", "◒"},
+	for _, scenario := range []struct {
+		name, initial, command, symbol string
+		index                          int
+	}{
+		{"role auto", "low", "/model", "⟳", 2},
+		{"role manual", "auto", "/model", "◔", 0},
+		{"thinking manual", "auto", "/thinking", "◒", 6},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Setenv("OMP_TELEGRAM_FIXTURE_CONFIGURED_THINKING", scenario.initial)
@@ -91,17 +94,7 @@ func TestConfiguredThinkingResyncsModelRolesAndThinkingSelection(t *testing.T) {
 			w.b.cfg.QueueCapacity = 1
 			command("/new " + t.TempDir())
 			command(scenario.command)
-			var selected string
-			for _, button := range resumeButtons(t, f) {
-				label := button["text"].(string)
-				if label == scenario.choice || strings.HasPrefix(label, scenario.choice+" - ") {
-					selected = button["callback_data"].(string)
-					break
-				}
-			}
-			if selected == "" {
-				t.Fatal("configured choice was not available")
-			}
+			selected := pickerButtons(t, f)[scenario.index]["callback_data"].(string)
 			clickKeyboard(w, 7, selected)
 			command("missing-terminal")
 			w.dispatch()

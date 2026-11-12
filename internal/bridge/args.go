@@ -149,23 +149,6 @@ func (b *Bridge) argsPresetSelectionMessage(language i18n.Language, index int) s
 	return i18n.Text(language, i18n.Msg.ArgumentPresetSelected, index)
 }
 
-const argsMenuPageSize = 10
-
-func argsMenuButtonLabel(language i18n.Language, preset, current int, labels []string) string {
-	labelName := i18n.Text(language, i18n.Msg.Preset, preset)
-	if len(labels) > 0 {
-		labelName = labels[preset-1]
-	}
-	currentMarker := ""
-	if preset == current {
-		currentMarker = "* "
-	}
-	if len(labels) > 0 {
-		return menuText(fmt.Sprintf("%d: %s%s", preset, currentMarker, labelName), 61)
-	}
-	return menuText(currentMarker+labelName, 61)
-}
-
 type argsApplyRequest struct {
 	finalAction *finalActionDispatch
 	clientID    uint64
@@ -351,21 +334,34 @@ func (w *worker) handleArgsCommand(arg string, user int64) {
 
 func (w *worker) showArgsMenuPage(c confirmation, page int) {
 	current, count, labels := w.b.argsMenuSnapshot()
-	pages := (count + argsMenuPageSize - 1) / argsMenuPageSize
+	entries := make([]askOption, count)
+	for i := range entries {
+		label := w.tr(i18n.Msg.Preset, i+1)
+		if len(labels) > 0 {
+			label = labels[i]
+		}
+		if i+1 == current {
+			label = "* " + label
+		}
+		entries[i].Label = label
+	}
+	c.uiPages = selectionPages(entries)
+	pages := len(c.uiPages)
 	if page < 0 || page >= pages {
 		return
 	}
-	start := page * argsMenuPageSize
-	end := min(start+argsMenuPageSize, count)
-	choices := end - start
+	currentPage := c.uiPages[page]
+	choices := currentPage.end - currentPage.start
 	c.action, c.method = "args", "select"
 	c.argsPage, c.argsChoiceCount = page, choices
 	c.options = make([]string, 0, choices+2)
 	options := make([]string, 0, choices+3)
-	for offset := range choices {
-		preset := start + offset + 1
-		label := argsMenuButtonLabel(w.b.language(), preset, current, labels)
-		c.options = append(c.options, label)
+	for index := currentPage.start; index < currentPage.end; index++ {
+		label := strconv.Itoa(index + 1)
+		if index+1 == current {
+			label = "* " + label
+		}
+		c.options = append(c.options, entries[index].Label)
 		options = append(options, label)
 	}
 	if page > 0 {
@@ -381,6 +377,7 @@ func (w *worker) showArgsMenuPage(c confirmation, page int) {
 	if pages > 1 {
 		title += w.tr(i18n.Msg.Page, page+1, pages)
 	}
+	title += "\n\n" + askLiteral(currentPage.text, 3*len(currentPage.text)+16)
 	w.confirm(c, title, options)
 }
 
@@ -406,6 +403,6 @@ func (w *worker) selectArgsFromMenu(c confirmation, index int) {
 		w.showArgsMenuPage(c, nextPage)
 		return
 	}
-	preset := c.argsPage*argsMenuPageSize + index + 1
+	preset := c.uiPages[c.argsPage].start + index + 1
 	w.applyArgsPreset(preset, c.messageID)
 }

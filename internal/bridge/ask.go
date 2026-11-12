@@ -37,6 +37,7 @@ type askRequest struct {
 	selected           map[int]bool
 	custom             string
 	page               int
+	pages              []selectionPage
 	cancel             context.CancelFunc
 	pendingInput       *incoming
 	deferredUI         *rpcEvent
@@ -271,15 +272,29 @@ func (w *worker) renderAsk(a *askRequest) {
 	a.token = rand.Text()
 	question := a.questions[a.question]
 	question.Header = fmt.Sprintf("Ask · %d/%d\n%s", a.question+1, len(a.questions), question.Header)
-	start := a.page * uiSelectPageSize
-	end := min(start+uiSelectPageSize, len(question.Options))
+	start, end := 0, 0
+	if !a.input {
+		if len(a.pages) == 0 {
+			a.pages = selectionPages(question.Options)
+		}
+		page := a.pages[a.page]
+		start, end = page.start, page.end
+	}
 	footer := ""
 	if a.custom != "" {
-		footer = "**" + w.tr(i18n.Msg.AskCustom) + "**\n" + askLiteral(a.custom, 1400)
+		budget := 1400
+		if !a.input {
+			budget = 500
+		}
+		footer = "**" + w.tr(i18n.Msg.AskCustom) + "**\n" + askLiteral(a.custom, budget)
 	}
 	text := ""
 	if !a.inlineInput {
-		text = w.askQuestionTextBudget(question, start, end, footer, 3700, false)
+		if a.input {
+			text = w.askQuestionTextBudget(question, 0, 0, footer, 3700, false)
+		} else {
+			text = w.selectionPageText(question, a.pages[a.page], a.page, len(a.pages), "", footer)
+		}
 	}
 	keyboard := &telegram.Keyboard{}
 	add := func(label, action string) {
@@ -296,8 +311,7 @@ func (w *worker) renderAsk(a *askRequest) {
 		}
 	} else {
 		for index := start; index < end; index++ {
-			option := question.Options[index]
-			label := askOptionLabel(index, option.Label)
+			label := strconv.Itoa(index + 1)
 			if question.Multi {
 				if a.selected[index] {
 					label = "☑ " + label
@@ -305,12 +319,12 @@ func (w *worker) renderAsk(a *askRequest) {
 					label = "☐ " + label
 				}
 			}
-			add(menuText(label, askOptionButtonLimit), strconv.Itoa(index))
+			appendSelectionButton(keyboard, index-start, telegram.Button{Text: label, CallbackData: a.token + ":" + strconv.Itoa(index)})
 		}
-		if start > 0 {
+		if a.page > 0 {
 			add(w.tr(i18n.Msg.Previous), "previous")
 		}
-		if end < len(question.Options) {
+		if a.page+1 < len(a.pages) {
 			add(w.tr(i18n.Msg.Next), "next")
 		}
 		add(w.tr(i18n.Msg.AskCustom), "custom")
@@ -516,7 +530,7 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 		if action == "next" {
 			page = a.page + 1
 		}
-		if page >= 0 && page*uiSelectPageSize < len(question.Options) {
+		if page >= 0 && page < len(a.pages) {
 			a.page = page
 			w.renderAsk(a)
 		}
@@ -526,7 +540,8 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 		}
 	default:
 		index, err := strconv.Atoi(action)
-		if err != nil || index < a.page*uiSelectPageSize || index >= min((a.page+1)*uiSelectPageSize, len(question.Options)) {
+		page := a.pages[a.page]
+		if err != nil || index < page.start || index >= page.end {
 			return callbackDone
 		}
 		if question.Multi {
@@ -566,6 +581,7 @@ func (w *worker) advanceAsk(a *askRequest) {
 	}
 	a.answers = append(a.answers, answer)
 	a.question++
+	a.pages = nil
 	if a.question < len(a.questions) {
 		clear(a.selected)
 		a.custom, a.page, a.input = "", 0, false

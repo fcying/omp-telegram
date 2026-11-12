@@ -6,12 +6,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/omp"
@@ -24,11 +24,6 @@ type bindingNamesResult struct {
 	generation int64
 	names      map[string]string
 }
-
-const (
-	bindingPageSize = 10
-	queuePageSize   = 10
-)
 
 func (w *worker) conversationGeneration() int64 {
 	if w.startIntent != nil {
@@ -76,7 +71,6 @@ func (w *worker) showBindings(user int64, oldestFirst bool, page int) {
 	}
 	w.sortBindings(entries, oldestFirst)
 	generation := w.conversationGeneration()
-	page = max(0, min(page, (len(entries)-1)/bindingPageSize))
 	w.showBindingsPage(confirmation{action: "bindings", method: "list", user: user, bindings: entries, generation: generation, epoch: epoch, bindingsOld: oldestFirst}, page, 0)
 	w.lookupBindingNames(entries, generation)
 }
@@ -254,10 +248,41 @@ func bindingSessionName(language i18n.Language, entry store.BindingListEntry, li
 
 func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 	defer w.beginConsumerPhase("telegram", "show_bindings_page").end()
-	pages := (len(c.bindings) + bindingPageSize - 1) / bindingPageSize
-	if page < 0 || page >= pages {
-		return
+	options := make([]askOption, len(c.bindings))
+	now := time.Now().Unix()
+	for index, entry := range c.bindings {
+		current := entry.Binding != nil && entry.Binding.Chat == w.key.chat && entry.Binding.Thread == w.key.thread
+		if entry.Intent != nil && entry.Binding == nil {
+			current = entry.Intent.Chat == w.key.chat && entry.Intent.Thread == w.key.thread
+		}
+		marker := ""
+		if current {
+			marker = "* "
+		}
+		topic := w.tr(i18n.Msg.MainChat)
+		if thread := bindingThread(entry); thread != 0 {
+			topic = fmt.Sprintf("#%d", thread)
+		}
+		status := "📕"
+		if entry.Intent != nil {
+			status = "⏳"
+		} else if entry.Binding != nil && entry.Binding.Running {
+			status = "📖"
+		}
+		workspace := bindingWorkspace(entry)
+		if workspace == "" {
+			workspace = w.tr(i18n.Msg.Unknown)
+		}
+		name := entry.SessionName
+		if strings.TrimSpace(name) == "" {
+			name = bindingSessionName(w.b.language(), entry, 0)
+		}
+		options[index].Label = fmt.Sprintf("%s%s · %s · %s · %s · %s", marker, name, topic, status, formatBindingAge(bindingLastUsedAt(entry), now), workspace)
 	}
+	c.uiPages = selectionPages(options)
+	pages := len(c.uiPages)
+	page = max(0, min(page, pages-1))
+	currentPage := c.uiPages[page]
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		w.say(w.tr(i18n.Msg.CannotCreateBindingListMenu))
@@ -267,14 +292,15 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 	c.action, c.method, c.page = "bindings", "list", page
 	c.expires = time.Now().Add(2 * time.Minute)
 	c.options = nil
-	start, end := page*bindingPageSize, min((page+1)*bindingPageSize, len(c.bindings))
+	start, end := currentPage.start, currentPage.end
 	var text strings.Builder
-	now := time.Now().Unix()
-	home, _ := os.UserHomeDir()
 	if c.bindingsOld {
 		text.WriteString(w.tr(i18n.Msg.SavedBindingsOldestFirstPage, page+1, pages))
 	} else {
 		text.WriteString(w.tr(i18n.Msg.SavedBindingsPage, page+1, pages))
+	}
+	if currentPage.text != "" {
+		text.WriteString("\n\n" + askLiteral(currentPage.text, 3*len(currentPage.text)+16))
 	}
 	keyboard := &telegram.Keyboard{}
 	button := func(label, action string) telegram.Button {
@@ -288,33 +314,10 @@ func (w *worker) showBindingsPage(c confirmation, page int, messageID int64) {
 		if entry.Intent != nil && entry.Binding == nil {
 			current = entry.Intent.Chat == w.key.chat && entry.Intent.Thread == w.key.thread
 		}
-		marker := ""
-		if current {
-			marker = "* "
-		}
-		topic := w.tr(i18n.Msg.MainChat)
-		if thread := bindingThread(entry); thread != 0 {
-			topic = fmt.Sprintf("#%d", thread)
-		}
-		age := formatBindingAge(bindingLastUsedAt(entry), now)
-		var status string
-		if entry.Intent != nil {
-			status = "⏳"
-		} else if entry.Binding != nil && entry.Binding.Running {
-			status = "📖"
-		} else {
-			status = "📕"
-		}
-		workspace := w.tr(i18n.Msg.Unknown)
-		if path := bindingWorkspace(entry); path != "" {
-			workspace = statusWorkspace(path, home)
-		}
-		label := menuText(fmt.Sprintf("%d. %s%s · %s · %s · %s · %s", index+1, marker, bindingSessionName(w.b.language(), entry, 32), topic, status, age, workspace), 256)
-		entryButton := telegram.Button{Text: label}
+		entryButton := telegram.Button{Text: strconv.Itoa(index + 1)}
 		if bindingCanDelete(entry, current) {
-			optionIndex := len(c.options)
-			c.options = append(c.options, "delete:"+strconv.Itoa(index))
-			entryButton.CallbackData = fmt.Sprintf("%s:%d", token, optionIndex)
+			entryButton = button(fmt.Sprintf("%s %d", w.tr(i18n.Msg.Delete), index+1), "delete:"+strconv.Itoa(index))
+			entryButton.Style = "danger"
 		} else {
 			entryButton.Disabled = &telegram.DisabledButton{}
 		}
@@ -354,17 +357,34 @@ func (w *worker) showQueue(user int64) {
 	w.showQueuePage(confirmation{action: "queue", user: user}, 0, 0)
 }
 
+// Keep metadata line breaks literal while retaining the 80 UTF-16-unit preview.
+func queuePreview(text string) string {
+	text = strings.TrimSpace(text)
+	units := 0
+	for index, r := range text {
+		n := utf16.RuneLen(r)
+		if n < 0 {
+			n = 1
+		}
+		if units+n > 80 {
+			return text[:index] + "..."
+		}
+		units += n
+	}
+	return text
+}
+
 func queueTaskText(language i18n.Language, q queued) string {
 	if q.preparing {
 		if q.album {
-			if text := menuText(q.displayText, 80); text != "" {
+			if text := queuePreview(q.displayText); text != "" {
 				return text
 			}
 			return i18n.Text(language, i18n.Msg.QueuedAlbum)
 		}
 		return i18n.Text(language, i18n.Msg.PreparingAttachment)
 	}
-	if text := menuText(q.displayText, 80); text != "" {
+	if text := queuePreview(q.displayText); text != "" {
 		return text
 	}
 	if q.album {
@@ -373,7 +393,7 @@ func queueTaskText(language i18n.Language, q queued) string {
 	if q.directory != "" {
 		return i18n.Text(language, i18n.Msg.QueuedAttachment)
 	}
-	if text := menuText(q.text, 80); text != "" {
+	if text := queuePreview(q.text); text != "" {
 		return text
 	}
 	return i18n.Text(language, i18n.Msg.QueuedTask)
@@ -381,16 +401,14 @@ func queueTaskText(language i18n.Language, q queued) string {
 
 func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 	defer w.beginConsumerPhase("telegram", "show_queue_page").end()
-	pages := (len(w.queue) + queuePageSize - 1) / queuePageSize
-	if pages == 0 {
-		pages = 1
+	options := make([]askOption, len(w.queue))
+	for index, q := range w.queue {
+		options[index].Label = queueTaskText(w.b.language(), q)
 	}
-	if page < 0 {
-		page = 0
-	}
-	if page >= pages {
-		page = pages - 1
-	}
+	c.uiPages = selectionPages(options)
+	pages := len(c.uiPages)
+	page = max(0, min(page, pages-1))
+	currentPage := c.uiPages[page]
 	var token string
 	if len(w.queue) != 0 {
 		var random [12]byte
@@ -405,7 +423,7 @@ func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 		c.generation = w.conversationGeneration()
 		c.options = nil
 	}
-	start, end := page*queuePageSize, min((page+1)*queuePageSize, len(w.queue))
+	start, end := currentPage.start, currentPage.end
 	running := w.tr(i18n.Msg.No)
 	if w.taskRunning() {
 		running = w.tr(i18n.Msg.Yes)
@@ -415,15 +433,13 @@ func (w *worker) showQueuePage(c confirmation, page int, messageID int64) {
 	var keyboard *telegram.Keyboard
 	if len(w.queue) != 0 {
 		text.WriteString(w.tr(i18n.Msg.Page, page+1, pages))
+		text.WriteString("\n\n" + askLiteral(currentPage.text, 3*len(currentPage.text)+16))
 		keyboard = &telegram.Keyboard{}
 		for i, q := range w.queue[start:end] {
-			if i == 0 {
-				text.WriteString("\n")
-			}
-			label := menuText(fmt.Sprintf("%d. %s", start+i+1, queueTaskText(w.b.language(), q)), 128)
+			index := start + i + 1
 			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{
-				{Text: label, Disabled: &telegram.DisabledButton{}},
-				{Text: w.tr(i18n.Msg.Cancel), CallbackData: fmt.Sprintf("%s:cancel:%d", token, q.id), Style: "danger"},
+				{Text: strconv.Itoa(index), Disabled: &telegram.DisabledButton{}},
+				{Text: fmt.Sprintf("%s %d", w.tr(i18n.Msg.Cancel), index), CallbackData: fmt.Sprintf("%s:cancel:%d", token, q.id), Style: "danger"},
 			})
 		}
 		navigation := []telegram.Button{}

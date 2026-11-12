@@ -162,7 +162,7 @@ func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 	waitBinding(t, db, 22)
 	waitFor(t, func() bool { return fake.has(22, "omp is ready.") })
 	now := time.Now().Unix()
-	for i := range bindingPageSize {
+	for i := range uiSelectPageSize {
 		if err := db.Save(store.Binding{Bot: 99, Chat: -10, Thread: int64(30 + i), Workspace: "/older", Generation: 1, LastUsedAt: now - int64(i+1)*3600}); err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +172,7 @@ func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 	listID, data := waitBindingAction(t, fake, before, "Saved bindings (oldest first)\nPage 1/2", "Next")
 	sendBindingCallback(t, db, send, 3, listID, data)
 	text, rows := pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 2/2" || len(rows) != 2 || !strings.Contains(rows[0][0]["text"].(string), " · #22 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, " · #22 · ") {
 		t.Fatalf("open binding last page = %q, rows = %+v", text, rows)
 	}
 	sendBindingCallback(t, db, send, 4, listID, rows[0][0]["callback_data"].(string))
@@ -181,7 +181,7 @@ func TestBindingDeleteOpenClampsLastPage(t *testing.T) {
 	waitFor(t, func() bool { _, err := db.Binding(99, -10, 22); return errors.Is(err, sql.ErrNoRows) })
 	waitFor(t, func() bool { return fake.has(11, "Saved bindings (oldest first)\nPage 1/1") })
 	text, rows = pickerView(t, fake)
-	if text != "Saved bindings (oldest first)\nPage 1/1" || len(rows) != 11 || !strings.Contains(rows[0][0]["text"].(string), "older · #39 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || len(rows) != 11 || !strings.Contains(text, "older · #39 · ") {
 		t.Fatalf("open binding refreshed page = %q, rows = %+v", text, rows)
 	}
 }

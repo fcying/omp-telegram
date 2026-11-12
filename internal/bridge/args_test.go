@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"omp-telegram/internal/config"
+	"omp-telegram/internal/i18n"
 	"omp-telegram/internal/media"
 	"omp-telegram/internal/store"
 	"omp-telegram/internal/telegram"
@@ -132,8 +134,8 @@ func TestIdleArgsSwitchResumesSameSessionAndLeavesPeersAlone(t *testing.T) {
 			peerClient, peerBefore := peer.client, peer.binding
 			if menu {
 				command("/args")
-				_, rows := pickerView(t, f)
-				clickKeyboard(w, 7, rows[1][0]["callback_data"].(string))
+				buttons := pickerButtons(t, f)
+				clickKeyboard(w, 7, buttons[1]["callback_data"].(string))
 				drainControlOperations(t, w)
 			} else {
 				command("/args 2")
@@ -180,14 +182,14 @@ func TestArgsMenuRejectsSelectionIfConversationBecameBusy(t *testing.T) {
 	persistTestSelection(t, w.b, 1)
 	command("/new " + t.TempDir())
 	command("/args")
-	_, rows := pickerView(t, f)
+	buttons := pickerButtons(t, f)
 	oldClient, before := w.client, w.binding
 	command("task after opening menu")
 	w.dispatch()
 	if !w.taskActive() {
 		t.Fatal("fixture did not become busy after opening the menu")
 	}
-	clickKeyboard(w, 7, rows[1][0]["callback_data"].(string))
+	clickKeyboard(w, 7, buttons[1]["callback_data"].(string))
 	drainControlOperations(t, w)
 	requireArgsSelection(t, w.b, 1)
 	requireArgsBinding(t, w, before)
@@ -383,9 +385,10 @@ func TestArgsCommandMenuFallsBackToPresetNumbersAndPersistsSelection(t *testing.
 	second := "private-args-canary-two"
 	configureTestArgPresets(w.b, [][]string{{"--model", first}, {"--model", second}}, strings.Repeat("a", 64), 1)
 	command("/args")
-	text, rows := pickerView(t, f)
-	if !strings.Contains(text, "Current OMP argument preset: 1") || len(rows) != 3 || rows[0][0]["text"] != "* Preset 1" || rows[1][0]["text"] != "Preset 2" || rows[2][0]["text"] != "Cancel" {
-		t.Fatalf("preset menu = %q, %v", text, rows)
+	text, _ := pickerView(t, f)
+	buttons := pickerButtons(t, f)
+	if !strings.Contains(text, "Current OMP argument preset: 1") || !strings.Contains(text, "1. * Preset 1") || !strings.Contains(text, "2. Preset 2") || len(buttons) != 3 || buttons[0]["text"] != "* 1" || buttons[1]["text"] != "2" || buttons[2]["text"] != "Cancel" {
+		t.Fatalf("preset menu = %q, %v", text, buttons)
 	}
 	messageID := int64(f.messageCount())
 	var outboxBefore int
@@ -395,7 +398,7 @@ func TestArgsCommandMenuFallsBackToPresetNumbersAndPersistsSelection(t *testing.
 	w.callback(&telegram.CallbackQuery{
 		ID: "args-menu", From: telegram.User{ID: 7},
 		Message: &telegram.Message{MessageID: messageID, MessageThreadID: w.key.thread, Chat: telegram.Chat{ID: w.key.chat}},
-		Data:    rows[1][0]["callback_data"].(string),
+		Data:    buttons[1]["callback_data"].(string),
 	})
 	if index, _ := w.b.argsPresetSelection(); index != 2 {
 		t.Fatalf("selected preset = %d, want 2", index)
@@ -425,9 +428,10 @@ func TestArgsCommandMenuUsesConfiguredLabels(t *testing.T) {
 	configureTestArgPresets(w.b, [][]string{{"--profile", first}, {"--profile", second}}, strings.Repeat("d", 64), 1)
 	w.b.cfg.OMPArgsLabels = []string{"Plus", "Pro"}
 	command("/args")
-	text, rows := pickerView(t, f)
-	if !strings.Contains(text, "Current OMP argument preset: 1") || len(rows) != 3 || rows[0][0]["text"] != "1: * Plus" || rows[1][0]["text"] != "2: Pro" || rows[2][0]["text"] != "Cancel" {
-		t.Fatalf("labeled preset menu = %q, %v", text, rows)
+	text, _ := pickerView(t, f)
+	buttons := pickerButtons(t, f)
+	if !strings.Contains(text, "Current OMP argument preset: 1") || !strings.Contains(text, "1. * Plus") || !strings.Contains(text, "2. Pro") || len(buttons) != 3 || buttons[0]["text"] != "* 1" || buttons[1]["text"] != "2" || buttons[2]["text"] != "Cancel" {
+		t.Fatalf("labeled preset menu = %q, %v", text, buttons)
 	}
 	if strings.Contains(text, first) || strings.Contains(text, second) {
 		t.Fatalf("raw argv appeared despite configured labels: %q", text)
@@ -440,7 +444,7 @@ func TestArgsCommandMenuUsesConfiguredLabels(t *testing.T) {
 	w.callback(&telegram.CallbackQuery{
 		ID: "args-labeled", From: telegram.User{ID: 7},
 		Message: &telegram.Message{MessageID: messageID, MessageThreadID: w.key.thread, Chat: telegram.Chat{ID: w.key.chat}},
-		Data:    rows[1][0]["callback_data"].(string),
+		Data:    buttons[1]["callback_data"].(string),
 	})
 	requireFinishedSessionPicker(t, f, messageID, "Selected OMP argument preset 2: Pro.")
 	var outboxAfter int
@@ -460,23 +464,6 @@ func TestArgsCommandMenuUsesConfiguredLabels(t *testing.T) {
 	}
 }
 
-func TestArgsMenuKeepsCurrentMarkerBeforeLongLabel(t *testing.T) {
-	w, f, command := setupWorkspaceWorker(t)
-	configureTestArgPresets(w.b, [][]string{{"--model", "first"}, {"--model", "second"}}, strings.Repeat("d", 64), 1)
-	w.b.cfg.OMPArgsLabels = []string{strings.Repeat("😀", 100), "Second"}
-	command("/args")
-	text, rows := pickerView(t, f)
-	if !strings.Contains(text, "Asterisk marks the current preset.") || len(rows) != 3 {
-		t.Fatalf("long-label menu = %q, %v", text, rows)
-	}
-	if got := rows[0][0]["text"].(string); !strings.HasPrefix(got, "1: * ") || utf16Length(got) > 64 {
-		t.Fatalf("current marker was lost or button is too long: %q (%d UTF-16 units)", got, utf16Length(got))
-	}
-	if rows[1][0]["text"] != "2: Second" || rows[2][0]["text"] != "Cancel" {
-		t.Fatalf("noncurrent label changed: %v", rows)
-	}
-}
-
 func TestArgsCommandMenuUsesPresetNumbersWhenLabelsMismatch(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	first := "private-args-canary-one"
@@ -484,9 +471,10 @@ func TestArgsCommandMenuUsesPresetNumbersWhenLabelsMismatch(t *testing.T) {
 	configureTestArgPresets(w.b, [][]string{{"--model", first}, {"--model", second}}, strings.Repeat("e", 64), 1)
 	w.b.cfg.OMPArgsLabels = []string{"Only one label"}
 	command("/args")
-	text, rows := pickerView(t, f)
-	if len(rows) != 3 || rows[0][0]["text"] != "* Preset 1" || rows[1][0]["text"] != "Preset 2" || rows[2][0]["text"] != "Cancel" {
-		t.Fatalf("mismatched labels did not fall back to preset numbers: %q, %v", text, rows)
+	text, _ := pickerView(t, f)
+	buttons := pickerButtons(t, f)
+	if len(buttons) != 3 || buttons[0]["text"] != "* 1" || buttons[1]["text"] != "2" || buttons[2]["text"] != "Cancel" || !strings.Contains(text, "Preset 1") || !strings.Contains(text, "Preset 2") {
+		t.Fatalf("mismatched labels did not fall back to preset numbers: %q, %v", text, buttons)
 	}
 	if strings.Contains(text, first) || strings.Contains(text, second) {
 		t.Fatalf("raw argv appeared after a label-count mismatch: %q", text)
@@ -498,8 +486,8 @@ func TestArgsMenuKeepsOwnerGenerationRulesAcrossTopics(t *testing.T) {
 	configureTestArgPresets(w.b, [][]string{{"--profile", "one"}, {"--profile", "two"}}, strings.Repeat("b", 64), 1)
 	persistTestSelection(t, w.b, 1)
 	command("/args")
-	_, rows := pickerView(t, f)
-	data := rows[0][0]["callback_data"].(string)
+	buttons := pickerButtons(t, f)
+	data := buttons[0]["callback_data"].(string)
 	messageID := int64(f.messageCount())
 	peer := newArgsTestPeer(t, w, 12)
 	peer.handleArgsCommand("2", 7)
@@ -519,12 +507,12 @@ func TestArgsMenuKeepsOwnerGenerationRulesAcrossTopics(t *testing.T) {
 		t.Fatalf("stale-generation callback changed selection to %d", index)
 	}
 	command("/args")
-	_, rows = pickerView(t, f)
-	if rows[1][0]["text"] != "* Preset 2" {
-		t.Fatalf("global current preset was not shown in the menu: %v", rows)
+	buttons = pickerButtons(t, f)
+	if buttons[1]["text"] != "* 2" {
+		t.Fatalf("global current preset was not shown in the menu: %v", buttons)
 	}
 	messageID = int64(f.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "owner-selection", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
+	w.callback(&telegram.CallbackQuery{ID: "owner-selection", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: buttons[0]["callback_data"].(string)})
 	var storedIndex int
 	if err := w.b.db.DB.QueryRow("SELECT preset_index FROM omp_args_selection").Scan(&storedIndex); err != nil || storedIndex != 1 {
 		t.Fatalf("cross-topic persisted preset = %d, error %v; want 1", storedIndex, err)
@@ -1015,13 +1003,22 @@ func TestArgsMenuPagesLargePresetSets(t *testing.T) {
 	configureTestArgPresets(w.b, presets, strings.Repeat("9", 64), 1)
 	command("/args")
 	text, rows := pickerView(t, f)
-	if !strings.Contains(text, "Page 1/2") || !strings.Contains(text, "Current OMP argument preset: 1") || len(rows) != argsMenuPageSize+2 || rows[0][0]["text"] != "* Preset 1" || rows[argsMenuPageSize][0]["text"] != "Next" || rows[len(rows)-1][0]["text"] != "Cancel" {
-		t.Fatalf("first args page has invalid bounds: %q, rows=%d", text, len(rows))
+	if !strings.Contains(text, "Page 1/2") || !strings.Contains(text, "Current OMP argument preset: 1") || len(rows) != 4 || len(rows[0]) != 5 || len(rows[1]) != 5 || len(rows[2]) != 1 || len(rows[3]) != 1 || rows[2][0]["text"] != "Next" || rows[3][0]["text"] != "Cancel" {
+		t.Fatalf("first args page has invalid five-column layout: %q, rows=%v", text, rows)
+	}
+	for index := range 10 {
+		want := fmt.Sprint(index + 1)
+		if index == 0 {
+			want = "* " + want
+		}
+		if got := rows[index/5][index%5]["text"]; got != want {
+			t.Fatalf("args button %d = %v, want %q", index, got, want)
+		}
 	}
 	messageID := int64(f.messageCount())
-	w.callback(&telegram.CallbackQuery{ID: "args-next-page", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[argsMenuPageSize][0]["callback_data"].(string)})
+	w.callback(&telegram.CallbackQuery{ID: "args-next-page", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[2][0]["callback_data"].(string)})
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/2") || len(rows) != 3 || rows[0][0]["text"] != "Preset 11" || rows[1][0]["text"] != "Previous" || rows[2][0]["text"] != "Cancel" {
+	if !strings.Contains(text, "Page 2/2") || len(rows) != 3 || len(rows[0]) != 1 || len(rows[1]) != 1 || len(rows[2]) != 1 || rows[0][0]["text"] != "11" || rows[1][0]["text"] != "Previous" || rows[2][0]["text"] != "Cancel" {
 		t.Fatalf("second args page has invalid bounds: %q, rows=%v", text, rows)
 	}
 	messageID = int64(f.messageCount())
@@ -1037,9 +1034,10 @@ func TestArgsMenuDoesNotDisplayLongRawArgs(t *testing.T) {
 	second := strings.Repeat("b", 2000)
 	configureTestArgPresets(w.b, [][]string{{"--profile", first}, {"--profile", second}}, strings.Repeat("c", 64), 1)
 	command("/args")
-	text, rows := pickerView(t, f)
-	if !strings.Contains(text, "Current OMP argument preset: 1") || len(rows) != 3 || rows[0][0]["text"] != "* Preset 1" || rows[1][0]["text"] != "Preset 2" || rows[2][0]["text"] != "Cancel" {
-		t.Fatalf("long-args menu = %q, %v", text, rows)
+	text, _ := pickerView(t, f)
+	buttons := pickerButtons(t, f)
+	if !strings.Contains(text, "Current OMP argument preset: 1") || len(buttons) != 3 || buttons[0]["text"] != "* 1" || buttons[1]["text"] != "2" || buttons[2]["text"] != "Cancel" {
+		t.Fatalf("long-args menu = %q, %v", text, buttons)
 	}
 	if strings.Contains(text, first) || strings.Contains(text, second) {
 		t.Fatal("long raw arguments appeared in the menu")
@@ -1051,10 +1049,10 @@ func TestArgsCancelKeepsOperationContextAndSelection(t *testing.T) {
 	configureTestArgPresets(w.b, [][]string{{"--model", "private-first"}, {"--model", "private-second"}}, strings.Repeat("a", 64), 2)
 	persistTestSelection(t, w.b, 2)
 	command("/args")
-	_, rows := pickerView(t, f)
+	buttons := pickerButtons(t, f)
 	messageID := f.messageCount()
-	selectFirst := rows[0][0]["callback_data"].(string)
-	clickKeyboard(w, 7, rows[len(rows)-1][0]["callback_data"].(string))
+	selectFirst := buttons[0]["callback_data"].(string)
+	clickKeyboard(w, 7, buttons[len(buttons)-1]["callback_data"].(string))
 	text := assertFinishedMenu(t, f, messageID, "Cancel")
 	if !strings.Contains(text, "OMP argument preset") || strings.Contains(text, "private-first") || strings.Contains(text, "private-second") {
 		t.Fatalf("cancel receipt lost its operation or exposed raw arguments: %q", text)
@@ -1070,15 +1068,39 @@ func TestArgsCancelKeepsOperationContextAndSelection(t *testing.T) {
 	}
 }
 
-func TestChineseArgsButtonsPreserveConfiguredLabels(t *testing.T) {
-	labels := []string{"Cancel", "Preset 2 中文"}
-	if got := argsMenuButtonLabel("zh", 1, 1, labels); got != "1: * Cancel" {
-		t.Fatalf("configured preset label was translated: %q", got)
+func TestArgsLongLabelsKeepLiteralContentAndPresetIdentity(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	configureTestArgPresets(w.b, [][]string{{"--profile", "PRIVATE_FIRST"}, {"--profile", "PRIVATE_SECOND"}}, strings.Repeat("f", 64), 1)
+	persistTestSelection(t, w.b, 1)
+	w.b.setLanguage(i18n.Chinese)
+	w.b.cfg.OMPArgsLabels = []string{"Cancel " + strings.Repeat("中文 <raw> **label** ", 160), "Preset 2 中文"}
+	command("/args")
+	body, _ := pickerView(t, f)
+	buttons := pickerButtons(t, f)
+	if !strings.Contains(html.UnescapeString(body), "1. * Cancel") || strings.Contains(body, "<raw>") || buttons[0]["text"] != "* 1" {
+		t.Fatalf("long preset label was hidden or interpreted: %q; %v", body, buttons)
 	}
-	if got := argsMenuButtonLabel("zh", 2, 1, labels); got != "2: Preset 2 中文" {
-		t.Fatalf("configured mixed-language preset label was changed: %q", got)
+	stale := buttons[0]["callback_data"].(string)
+	var selected string
+	for page := 0; page < 20; page++ {
+		for _, button := range buttons {
+			if button["text"] == "2" {
+				selected = button["callback_data"].(string)
+			}
+		}
+		if selected != "" {
+			break
+		}
+		clickKeyboard(w, 7, askTestButton(t, f, w.tr(i18n.Msg.Next)))
+		body, _ = pickerView(t, f)
+		buttons = pickerButtons(t, f)
+		requireArgsSelection(t, w.b, 1)
 	}
-	if got := argsMenuButtonLabel("zh", 2, 1, nil); !strings.Contains(got, "预设 2") {
-		t.Fatalf("generated preset label was not localized: %q", got)
+	if selected == "" || !strings.Contains(body, "Preset 2 中文") || strings.Contains(body, "PRIVATE_") {
+		t.Fatal("content paging lost the original configured label or exposed raw argv")
 	}
+	clickKeyboard(w, 7, stale)
+	requireArgsSelection(t, w.b, 1)
+	clickKeyboard(w, 7, selected)
+	requireArgsSelection(t, w.b, 2)
 }

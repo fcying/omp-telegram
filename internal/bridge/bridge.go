@@ -162,6 +162,7 @@ type confirmation struct {
 	uiTitle                         string
 	uiHistory                       string
 	uiQuestion                      askQuestion
+	uiPages                         []selectionPage
 	uiClientID                      uint64
 	workspace                       string
 	exportFormat                    string
@@ -4910,7 +4911,12 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	if c.finalAction == nil {
 		c.finalAction = w.finalAction
 	}
-	parts := split(title, 3800)
+	var parts []string
+	if (c.action == "model" || c.action == "args") && len(c.uiPages) > 0 {
+		parts = []string{title}
+	} else {
+		parts = split(title, 3800)
+	}
 	if len(parts) == 0 {
 		title = w.tr(i18n.Msg.ConfirmationRequired)
 	} else if c.action == "binding_delete" {
@@ -4936,6 +4942,14 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 	}
 	k := &telegram.Keyboard{}
 	var deleteButtons []telegram.Button
+	choiceCount := 0
+	if (c.action == "model" || c.action == "args") && len(c.uiPages) > 0 {
+		page := c.page
+		if c.action == "args" {
+			page = c.argsPage
+		}
+		choiceCount = c.uiPages[page].end - c.uiPages[page].start
+	}
 	for i, label := range options {
 		button := telegram.Button{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}
 		if c.action == "binding_delete" || c.action == "session_delete" {
@@ -4943,6 +4957,8 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 				button.Style = "danger"
 			}
 			deleteButtons = append(deleteButtons, button)
+		} else if i < choiceCount {
+			appendSelectionButton(k, i, button)
 		} else {
 			k.InlineKeyboard = append(k.InlineKeyboard, []telegram.Button{button})
 		}
@@ -5120,7 +5136,7 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		if index == "next" {
 			page = c.page + 1
 		}
-		pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize
+		pages := len(c.uiPages)
 		if page < 0 || page >= pages {
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 			return callbackDone
@@ -5142,8 +5158,8 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	if c.uiSelectMenu && n < len(c.options) {
-		start := c.page * uiSelectPageSize
-		if n < start || n >= min(start+uiSelectPageSize, len(c.options)) {
+		page := c.uiPages[c.page]
+		if n < page.start || n >= page.end {
 			_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 			return callbackDone
 		}
@@ -5178,6 +5194,10 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	delete(w.confirms, token)
 	if c.action == "args" {
 		w.selectArgsFromMenu(c, n)
+		return callbackDone
+	}
+	if c.action == "model" {
+		w.selectModel(c, n)
 		return callbackDone
 	}
 	if c.action == "ui" && w.exportingSession != "" {
@@ -5220,10 +5240,6 @@ func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 		return callbackDone
 	}
 	if c.method == "select" && n == len(c.options) {
-		return callbackDone
-	}
-	if c.action == "model" {
-		w.selectModel(c, n)
 		return callbackDone
 	}
 	if c.action == "thinking" {
@@ -5281,23 +5297,21 @@ func (w *worker) finishConfirmation(c confirmation, index int) {
 }
 
 func (w *worker) nativeSelectionText(c confirmation, footer string, completed bool) string {
+	if !completed {
+		return w.selectionPageText(c.uiQuestion, c.uiPages[c.page], c.page, len(c.uiPages), c.uiHistory, footer)
+	}
 	history := ""
 	if c.uiHistory != "" {
-		history = askLiteral(c.uiHistory, 600) + "\n\n"
+		history = strings.TrimPrefix(askLiteral(c.uiHistory, 600), "\n") + "\n"
 	}
-	start, end := 0, len(c.options)
-	if !completed {
-		start = c.page * uiSelectPageSize
-		end = min(start+uiSelectPageSize, len(c.options))
-	}
-	return history + w.askQuestionTextBudget(c.uiQuestion, start, end, footer, 3700-len(history), completed)
+	return history + w.askQuestionTextBudget(c.uiQuestion, 0, len(c.options), footer, 3700-len(history), true)
 }
 
 func (w *worker) finishNativeSelection(c confirmation, index int) {
 	cancelled := index == len(c.options)
 	footer := askLiteral(w.tr(i18n.Msg.Cancel), 1500)
 	if !cancelled {
-		footer = "**" + w.tr(i18n.Msg.AskChoice) + "**\n" + askLiteral(askOptionLabel(index, c.options[index]), 1400)
+		footer = "**" + w.tr(i18n.Msg.AskChoice) + "**" + askLine(askLiteral(askOptionLabel(index, c.options[index]), 1400))
 	}
 	finished := w.finishMenu(c.messageID, w.nativeSelectionText(c, footer, true))
 	if !finished || cancelled || c.active == 0 || c.turn == 0 || c.active != w.active || c.turn != w.turn {
@@ -5566,7 +5580,7 @@ const uiSelectPageSize = 10
 
 func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) bool {
 	defer w.beginConsumerPhase("telegram", "show_ui_select_page").end()
-	pages := (len(c.options) + uiSelectPageSize - 1) / uiSelectPageSize
+	pages := len(c.uiPages)
 	if page < 0 || page >= pages {
 		return false
 	}
@@ -5577,16 +5591,12 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 		return false
 	}
 	token := hex.EncodeToString(random[:])
-	footer := ""
-	if pages > 1 {
-		footer = askLiteral(strings.TrimSpace(w.tr(i18n.Msg.Page, page+1, pages)), 1500)
-	}
 	c.page = page
-	text := w.nativeSelectionText(c, footer, false)
+	text := w.nativeSelectionText(c, "", false)
 	keyboard := &telegram.Keyboard{}
-	start, end := page*uiSelectPageSize, min((page+1)*uiSelectPageSize, len(c.options))
-	for i := start; i < end; i++ {
-		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: menuText(askOptionLabel(i, c.options[i]), askOptionButtonLimit), CallbackData: fmt.Sprintf("%s:%d", token, i)}})
+	current := c.uiPages[page]
+	for i := current.start; i < current.end; i++ {
+		appendSelectionButton(keyboard, i-current.start, telegram.Button{Text: strconv.Itoa(i + 1), CallbackData: fmt.Sprintf("%s:%d", token, i)})
 	}
 	var navigation []telegram.Button
 	if page > 0 {
@@ -5671,8 +5681,10 @@ func (w *worker) applyUI(e rpcEvent, client *omp.Client) {
 			c.uiQuestion.Options[i].Label = option
 			if i < len(e.OptionDetails) {
 				c.uiQuestion.Options[i].Description = e.OptionDetails[i].Description
+				c.uiQuestion.Options[i].Preview = e.OptionDetails[i].Preview
 			}
 		}
+		c.uiPages = selectionPages(c.uiQuestion.Options)
 		messageID := int64(0)
 		if w.taskActive() && previous.messageID != 0 && previous.clientID == client.ID() &&
 			previous.generation == w.binding.Generation && previous.active == w.active && previous.turn == w.turn {

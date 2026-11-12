@@ -274,14 +274,17 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 从 OMP 18.18.3 起, 原生 `ask` 工具接收 `{html}`, 不再使用 `questions[]`. 表单由 OMP 解析. RPC 没有 `formDialog` 时 (包括 OMP 18.18.6), 它逐字段发出通用 `select`/`input`/`editor` 请求; checkbox 字段通过多次 `select` 收集. Bridge 复用通用 RPC UI, 不解析 HTML 或另建表单渲染器. 每个答案通过 `extension_ui_response` 回应对应请求, 不新增 prompt 或 steer; 完成归属仍为原 root/client/turn.
 
-[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为每页十个选项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理基于 questions 的扩展 `method:"ask"` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
+[`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为按内容分页, 每页最多十项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理基于 questions 的扩展 `method:"ask"` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
 
 通用 `input`/`editor` 请求保留原始文字. `placeholder` 作为提示展示; `prefill` 与有界 literal 展示分开保存, 包括显式为空的编辑器默认值. **提交空值** 与 **使用完整默认值** callback 受 owner 和 interaction 围栏保护, 发送 `value:""` 或原始 prefill, 不发送 `cancelled:true`; 取消仍是独立响应. 在 owner 的私聊 (`chat == user > 0`) 中, `askRequest.inlineInput` 选择单条问题, inline keyboard 带 `force_reply:true`; 提示说明及末尾 `[ask:...]` marker 均属于该问题, `inputID == messageID`. 接受后保留问题正文并清除键盘, 不回显提交值. 群聊保留独立定向 ForceReply 输入, 在主问题追加 **本次提交** 回执, 空字符串使用独立的零字符状态. 消息回复必须实际包含文字, 贴纸, 语音或位置等纯非文字回复不能悄悄提交空字段. 必填/类型/pattern 校验归 OMP 所有, 它可在拒绝后用新 request ID 重问. 扩展组合 Ask 自定义答案继续裁剪首尾空白并要求非空, 保持现有独立提示流程.
 
 私聊文字问题沿用既有标题预算, 在 renderer footer 为 placeholder 和默认值预览分别保留空间. 每项预览独立截断到 500 UTF-16 units, 并编码为独立 fenced literal, 长标题不能占用其预算, 预览中的反引号也不能吞掉后续字段或末尾回复 marker. 截断仅影响展示; **使用完整默认值** 仍提交完整原始 prefill.
 标题 literal 包含连续反引号时, 使用长于展示内容反引号序列的独占行围栏, 避免块解析吞掉标题或重新解释后续预览.
 
-按钮使用全局一致的选项编号. 待选问题正文通常省略重复的标签列表, 展示当前页可用的编号说明/preview, 以及问题和页码. 超过共用按钮限制 100 个 UTF-16 单位的标签保留在正文中, 编码后的标签空间优先于可选说明预留. 判断使用空白规范化后的按钮文字, 多选时计入占两个单位的 checkbox 标记; 能放入按钮的标签不重复展示. 过长标签仍受整条消息预算限制. 原生 `select` 按原始选项索引读取可选的 `optionDetails[i].description`. 编号, 展示截断和 literal 转义不改变 RPC 选项值, 答案或默认值. 原生 select 完成后在原主消息保留当前问题, 选项及本地选择. 完成时考虑全部选项, 优先为问题, 历史和答案预留空间, 再展示可选说明. 编码后的标签按实际字节扣减预算, 放不下全部选项时显示省略标记. 当前原生 RPC select envelope 不传递本地 `initialIndex` 或 checkbox 勾选状态元数据. Bridge 无法从字符串选项重建这些标记或整张表单的布局/图片; 仅返回原始选项标签, 由原生映射到值. 多次 checkbox select 只记录逐次动作, 不推断最终勾选集合, 也不将 "Done" 等标签识别为协议标记; 原生 HTML 回退发送字符串选项.
+待选择的扩展 Ask 和全部原生 `select` 菜单 (包括 Review) 在正文展示带全局编号的完整标签, description 和 preview, 保留换行与间隔. 选择按钮仅显示全局数字编号, 扩展多选额外显示 ☐/☑; 控制按钮保留简短动作文字. `selectionPages` 将选项纯文字片段缓存到 `askRequest.pages` 和原生 confirmation 的 `uiPages`. 每页携带原始选项索引的半开区间 `[start,end)`; callback 按该范围校验, 不再使用 `page*10`. 每页选项正文 payload 最多 1600 UTF-8 字节, 最多十项. 超长单项在字符边界安全分段, 优先换行; 每个续段重复同一全局编号, 与上一页的选项范围可以重叠. 翻页不提交响应, 也不重置多选状态. 原生 `select` 按原始选项索引读取可选的 `optionDetails[i].description` 和 `.preview`. Literal 展示复用 `progressToolLiteral`, 多行内容使用独占行围栏, 避免选项内容激活 Markdown. 重复问题沿用既有的 700 字节题目及 200 字节 header 预算; 先前选择历史沿用 600 字节. 待选择的组合 Ask 为自定义答案 footer 预留 500 字节; 独立自定义文字输入不重复选项页, 沿用既有 1400 字节 footer 预算. 所有多页视图均显示页码. 原始选项值与展示分开保存, 原样返回; 编号, 续页和转义不改变 RPC 答案或默认值.
+
+	原问题, 历史和已选答案能放入一条 Telegram 消息时, 完成回执会展示全部带全局编号的标签, description 和 preview. 完整回执超出源文本或渲染消息预算时, 回退到既有有界渲染并显示明确省略标记; RPC 答案始终使用原始值. 当前原生 RPC select envelope 不传递本地 `initialIndex` 或 checkbox 勾选状态元数据. Bridge 无法从字符串选项重建这些标记或整张表单的布局/图片; 仅返回原始选项标签, 由原生映射到值. 多次 checkbox select 只记录逐次动作, 不推断最终勾选集合, 也不将 "Done" 等标签识别为协议标记; 原生 HTML 回退发送字符串选项.
+待回答和完成态的选择展示片段均以单个换行连接. 分页 payload 的相邻选项也以单个换行分隔, 不额外插入空行. Renderer 仅移除生成的 literal 包装前的合成换行, 不裁剪 payload 内部空白; 问题/选项/答案的原始换行及 RPC 值保持不变.
 
 活跃的 Ask/文字对话在显示确认前后均排除卡死任务恢复, 即使原生报告 idle 且没有 active tool. 对话结束后恢复原有 watchdog 策略; 只有暂存指导不算等待用户.
 
@@ -323,6 +326,9 @@ Stop 会记录任务级 UI 接纳围栏, 即使当前没有 `askRequest`, 仅剩
 
 `/handoff` 要求 session 控制空闲且队列为空, 将可选 `customInstructions` 传给原生 RPC, 并阻止后续队列在结果返回前派发. Operation deadline 为 180 秒. Compact/handoff 明确拒绝保留可复用 runtime; 错误, 超时, 取消及未确认结果释放 runtime 供 lazy resume. 两者都不创建模型 root, 不借用其 progress/Stop 键盘. Session/model/argument 选择及原生 export/path resolution 是独立生命周期接口; [`render.go`](../internal/omp/render.go) 通过 `omp render` 解析原生历史路径, 不负责 Telegram 最终答案格式化.
 
+Bridge 自有会话, 绑定, 模型角色和参数预设列表复用 `selectionPages`, 在正文中以 literal 展示完整条目, 按内容分页, 续段保留全局编号. 会话动作保留 `resumePickerOption.session`; 绑定删除保留原绑定索引和身份; 模型及参数选择通过当前页 `[start,end)` 范围将页内按钮映射到原条目. 模型和参数菜单翻页不应用设置; 生成页正文已有展示预算, 不再经过通用确认的源文字截断. 绑定名称及队列更新重建分页并收敛请求页码, 不改变快照顺序或任务 ID. 队列正文仍使用有界的 80 UTF-16 单位预览, 不维护第二份 prompt 历史; 取消仍以原 inbox ID 为目标. 既有 owner, token, message, generation, mutation epoch 和预设校验继续生效. 简短的 thinking level, 确认及完成快捷按钮不变.
+`appendSelectionButton` 只将编号选项按每行最多五个分组, 保留 callback 索引和多选/当前预设标记. 控制按钮另起行, 不混入未满的编号行. 会话, 绑定和队列的逐条动作行不重新分组.
+
 ## Progress, status 与最终回复
 
 ### 完成快捷按钮与后续输入 (#99 契约)
@@ -333,13 +339,15 @@ Stop 会记录任务级 UI 接纳围栏, 即使当前没有 `askRequest`, 仅剩
 
 同一个已交付 outbox 行的 header 和 markup 编辑共享独占 `actions_pending=2` claim, 覆盖远端调用及确认. 按钮变化保留进行中的 claim; 与请求快照不同时, 释放后仍待更新. 其他行仍可并行编辑. 已取消但尚未发起的 markup claim 回到待处理状态; 已尝试或不确定的编辑都不能重发正文.
 
-Progress 同一行显示 `Stop | Follow-up`, `off` 时两者都不发送. Stop 保持原 task-fenced token 及索引 `0`; Follow-up 使用同一 token 的 `followup` 索引且不消费 Stop. 点击 Follow-up 仅异步打开同 topic 的 ForceReply 输入, 不暂停也不提交当前任务. 新请求替代此用户在此对话中的旧请求. 请求在发送前持久化, 带不透明随机 marker, 十分钟到期, 只接受目标用户对已明确交付的 prompt ID 的回复. Send-uncertain prompt, 错误身份, 陈旧/过期/取消/已消费请求及其他 bridge instance 的未完成请求一律拒绝, 不作为普通 prompt 或附件. 最小持久化 metadata 支持重启后识别拒绝, 不重复保存 prompt/model 正文.
+Progress 同一行显示 `Stop | Follow-up`, `off` 时两者都不发送. Stop 保持原 task-fenced token 及索引 `0`; Follow-up 使用同一 token 的 `followup` 索引且不消费 Stop. 点击 Follow-up 仅异步打开同 topic 的 ForceReply 输入, 不暂停也不提交当前任务. 新请求替代此用户在此对话中的旧请求. 请求在发送前持久化, 带不透明随机 marker, 十分钟到期, 只接受目标用户对已明确交付的 prompt ID 的回复. Send-uncertain prompt, 错误身份, 陈旧/过期/取消请求及其他 bridge instance 的未完成请求一律拒绝, 不作为普通 prompt 或附件. 已消费请求拒绝新任务; 仅允许下文所述的尚在收集图集继续接收同组成员. 最小持久化 metadata 支持重启后识别拒绝, 不重复保存 prompt/model 正文.
 
-自然完成后, binding/session 稳定时已发输入请求仍有效; 提交不绑定旧 active turn. Stop/Close 取消请求, new/resume 改变 binding 后请求失效. 空/非文本输入及现有 worker queue 已满不会消费请求或谎报入队成功. 接受时先按原 inbox ID 原子关联请求, 再追加现有队列; 接受后中断遵循现有 uncertain/cancelled inbox 恢复, 不重放为普通输入. 只有有效请求的已知 Bridge slash 回复才维持普通命令处理, 并只剥离 bridge ForceReply 上下文. 当前 Bot 的合法 marker 识别出的失效或缺记录提示, 连控制命令也拒绝. 其他有效文字独立排队, 不 steer, 不引用 ForceReply prompt. 快捷按钮同样保留原 callback inbox ID 和真实点击者身份; 严格 bridge/native dispatch 不把未知 slash 变成 prompt/steer.
+自然完成后, binding/session 稳定时已发输入请求仍有效; 提交不绑定旧 active turn. Stop/Close 取消请求, new/resume 改变 binding 后请求失效. 空/不支持的输入及现有 worker queue 已满不会消费新任务的请求或谎报入队成功. 接受时先按接纳的 inbox ID 原子关联请求, 再入队; 接受后中断遵循既有 uncertain/cancelled inbox 恢复, 不重放为普通输入. 只有有效的纯文字回复才让已知 Bridge slash 命令维持普通处理, 并只剥离 bridge ForceReply 上下文. 当前 Bot 的合法 marker 识别出的失效或缺记录提示, 连控制命令也拒绝. 其他有效文字, 图片和文件独立排队, 不 steer, 不引用 ForceReply prompt. 附件说明属于内容, 不作为控制命令执行. 快捷按钮同样保留原 callback inbox ID 和真实点击者身份; 严格 bridge/native dispatch 不把未知 slash 变成 prompt/steer.
+
+图片和文件在持久化消费 Follow-up 后复用 `queueMedia`, 沿用既有下载, owner marker, 图像准备, generation 围栏及清理路径. 图集复用 `collectAlbum`: 请求关联图集 owner 的 pending inbox ID, 包括首个收到的成员未携带回复 metadata 的情况. 对已消费提示的后续回复, 只有在 sender, media group, prompt 和请求 scope 均匹配时才能加入该请求尚在收集的图集, 不额外占队列名额. 每个识别出的 Follow-up 成员在准备前仅剥离生成的 reply/quote. 下载或准备失败将已接纳 inbox 结算为 failed, 请求保持 consumed, 不重新开放或自动重放.
 
 迁移预检期间拦截的 Stop/Close 也取消待处理 Follow-up 请求, 即使尚未建立持久化 migration 记录.
 
-Worker 按 token 维护 map, 跟踪待处理 Follow-up 输入的用户, 提示 ID, generation, 过期时间及捕获的 inline 输入模式. 私聊提示使用带 **取消** 的 inline ForceReply 键盘; 持久化接受后, 在原提示编辑已入队状态并清空键盘. 其他 chat 保留独立入队确认. 接受后在排队任务执行前移除跟踪条目. 替换, 取消及过期 tick 清除旧输入, 不删除提示或轮询数据库. 空/非文本/满队列及未授权/错误消息回复保留有效输入. Send 完成后重新检查持久化请求, 陈旧结果不能恢复请求或清除新输入. 原任务自然完成及空闲 runtime 释放保留有效请求; 完整对话 teardown 则取消请求. UI 失败不撤销接受, 不重放工作; 持久化拒绝 metadata 保留, 崩溃后不扫描 Telegram 历史.
+Worker 按 token 维护 map, 跟踪待处理 Follow-up 输入的用户, 提示 ID, generation, 过期时间及捕获的 inline 输入模式. 私聊提示使用带 **取消** 的 inline ForceReply 键盘; 持久化接受后, 在原提示编辑已入队状态并清空键盘. 其他 chat 保留独立入队确认. 接受后在排队任务执行前移除跟踪条目. 替换, 取消及过期 tick 清除旧输入, 不删除提示或轮询数据库. 空/不支持/满队列及未授权/错误消息回复保留有效输入. Send 完成后重新检查持久化请求, 陈旧结果不能恢复请求或清除新输入. 原任务自然完成及空闲 runtime 释放保留有效请求; 完整对话 teardown 则取消请求. UI 失败不撤销接受, 不重放工作; 持久化拒绝 metadata 保留, 崩溃后不扫描 Telegram 历史.
 
 私聊取消 callback 使用 `followup_cancel:` token, 核验 bot, owner, chat/thread, instance, binding 及消息身份. Send acknowledgment 返回前, bot 发出的末尾 marker 证明对应请求; 返回后必须匹配已存 prompt ID. `CancelFollowupRequest` 在当前 binding 及过期围栏下原子地只修改 pending/delivered 状态, 不修改已消费工作. 迟到发送可记录已取消提示的 ID, 不能提升其状态. 对已消费或不确定请求, 经身份核验的 callback 只能清除该消息的键盘, 不移除排队任务. Send result 和跟踪条目捕获 inline 模式; 旧 instance 记录保持旧收尾路径. 不需要修改数据库 schema.
 
@@ -674,7 +682,7 @@ Bridge 独立比较原生身份/CWD, 有界新 journal, RPC entries 和 active l
 
 [`ListSessions`](../internal/omp/list.go)启动短期 `omp acp --cwd ...` 子进程, 通过 ACP `initialize` 协商并调用 `session/list`. 列表由 OMP 提供; 桥接 `history` 不是浏览器, 桥接层也不扫描目录拼装列表. 客户端校验协议响应, 有界分页, 拒绝重复 cursor 和超大/畸形结果, 对 ID 去重, 并只保留规范化后属于请求工作目录的记录. 列表帧上限 4 MiB, 条目安全上限 10,000. 取消会排空输出并回收子进程组.
 
-[`resume_picker.go`](../internal/bridge/resume_picker.go)带截止时间异步列目录, 列表与导出共享两个并发任务名额. `/resume` 要求已有可用的已提交工作目录, 且对话空闲. 每页十项显示原生标题, 完整 ID, 可选更新时间, 当前项和其他位置占用标记. `session_favorites` 只保存每个对话/工作目录下的收藏身份; 收藏优先, 每组保持原生顺序. 原生列表中不存在的收藏仅隐藏, 不生成合成结果.
+[`resume_picker.go`](../internal/bridge/resume_picker.go) 带截止时间异步列目录, 列表与导出共享两个并发任务名额. `/resume` 要求已有可用的已提交工作目录, 且对话空闲. 正文按内容分页展示完整原生标题, workspace 路径, 完整 ID, 可选更新时间, 当前项和其他位置占用标记, 每页最多十个可选条目. 按钮仅使用全局编号或附编号的简短动作 (导出, 置顶/取消置顶, 删除). `session_favorites` 只保存每个对话/工作目录下的收藏身份; 收藏优先, 每组保持原生顺序. Pin 变化在排序后重建缓存页, 并返回第一页. 原生列表中不存在的收藏仅隐藏, 不生成合成结果.
 
 重新选择当前开启的会话不替换绑定, 也不启动已释放的 runtime. 选择器将当前已释放会话提示为本对话已绑定, 而非其他对话占用, 并说明下一条消息会按正常流程恢复 runtime. 当前已连接会话保留原有已运行提示; 其他对话持有的 claim 仍阻止选择.
 
@@ -688,9 +696,9 @@ Model, thinking 和参数预设的完成回执使用 `finishMenuOrSay`: 优先�
 
 [`binding_list.go`](../internal/bridge/binding_list.go)实现 `/bindings [old]`, 读取当前 bot/chat 的已提交绑定与未完成启动意图, 按对话合并. 意图优先决定显示的工作目录和待启动状态. 原生标题只是尽力取得的临时 ACP 元数据; 缺失时使用工作目录 basename, 不在 SQLite 保存影子标题.
 
-默认每页十项, 当前对话优先, 待定启动其次, 其余按已知 `last_used_at` 从新到旧排列. `old` 的清理排序见下文. 零值/未来时间视为未知; 同序用 thread ID 排序. 异步名称更新不重排快照. 每个条目为一颗整行按钮, 合并名称, 话题, 逻辑会话图标, 时间和 home 缩写后的 workspace. `📖` 表示逻辑 Open, `📕` 表示 Closed, 依据持久化 binding 标记而非 OMP 进程连接状态; 未完成的启动或恢复使用 `⏳`. 按钮文本有长度上限, Telegram 客户端也可能截断显示. 当前项与待定项禁用. 点击符合条件的条目打开独立的破坏性确认, 展示完整的已解析名称, Open/Closed 状态文本, 未缩写 workspace 和 session ID; 长确认先发送所有前序分段, 最后一段附带 Binding/Binding+Session/Cancel 按钮. 不再单独显示 `Del` 按钮或只读详情行.
+默认当前对话优先, 待定启动其次, 其余按已知 `last_used_at` 从新到旧排列. `old` 的清理排序见下文. 零值/未来时间视为未知; 同序用 thread ID 排序. 异步名称更新不重排快照. 完整名称, 话题, 逻辑会话图标, 时间和未缩写 workspace 路径放入 literal 正文页; 长条目以同一全局编号续页. `📖` 表示逻辑 Open, `📕` 表示 Closed, 依据持久化 binding 标记而非 OMP 进程连接状态; 未完成的启动或恢复使用 `⏳`. 当前项与待定项使用禁用的编号按钮. 可删除项使用附编号的删除按钮, 打开既有独立破坏性确认, 展示已解析名称, Open/Closed 状态文本, workspace 和 session ID; 长确认先发送所有前序分段, 最后一段附带 Binding/Binding+Session/Cancel 按钮.
 
-删除确认中的名称只归一化空白和控制字符, 不额外截断; 列表按钮仍按 UTF-16 上限裁剪.
+删除确认中的名称只归一化空白和控制字符, 不额外截断; 列表正文通过 literal 转义保留完整条目名称和路径, 不再裁剪按钮标签.
 
 时间向下取整, 仅显示一个不随语言变化的单位: `m`, `h`, `d`, `w`, `mo` (30 天) 或 `y` (365 天). 不足一分钟显示 `now`; 缺失, 非正数或未来时间戳显示 `-`. 每次渲染页面只取一次当前时间.
 
