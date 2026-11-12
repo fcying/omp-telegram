@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,23 @@ func askTestButton(t *testing.T, f *fakeHTTP, label string) string {
 				}
 			}
 		}
+		body, _ := message["text"].(string)
+		body = html.UnescapeString(strings.NewReplacer("<pre>", "", "</pre>", "", "<code>", "", "</code>", "").Replace(body))
+		for _, row := range rows {
+			for _, raw := range row.([]any) {
+				button := raw.(map[string]any)
+				text, _ := button["text"].(string)
+				number := strings.TrimPrefix(strings.TrimPrefix(text, "☐ "), "☑ ")
+				if _, err := strconv.Atoi(number); err != nil {
+					continue
+				}
+				for _, line := range strings.Split(body, "\n") {
+					if strings.HasPrefix(strings.TrimSpace(line), number+". ") && strings.Contains(strings.ToLower(line), strings.ToLower(label)) {
+						return button["callback_data"].(string)
+					}
+				}
+			}
+		}
 	}
 	t.Fatalf("Ask button containing %q missing", label)
 	return ""
@@ -221,77 +239,105 @@ func askTestResponseOperation(t *testing.T, w *worker) operationResult {
 	}
 }
 
-func TestAskPendingBodyShowsDetailsWithoutRepeatingButtons(t *testing.T) {
+func TestAskPendingBodyShowsCompleteOptionsWithNumberButtons(t *testing.T) {
 	w, f, _ := askTestWorker(t)
-	askTestOpen(t, w, "compact", map[string]any{
+	askTestOpen(t, w, "details", map[string]any{
 		"id": "approach", "question": "Choose an approach", "options": []map[string]string{
 			{"label": "Alpha"},
-			{"label": "Beta", "description": "Second option details", "preview": "Preview line"},
+			{"label": "Beta\n  second line", "description": "Second option details\n\n  indented explanation", "preview": "Preview line\n  preview continuation"},
+			{"label": "Gamma"},
 		},
 	})
 	messageID := w.ask.messageID
 	body, rows := pickerView(t, f)
-	if strings.Contains(body, "Alpha") || strings.Contains(body, "Beta") || !strings.Contains(body, "Choose an approach") ||
-		!strings.Contains(body, "2. Second option details\nPreview line") || rows[0][0]["text"] != "1. Alpha" || rows[1][0]["text"] != "2. Beta" {
-		t.Fatalf("pending question duplicated buttons or lost indexed details: %q; %v", body, rows)
+	for _, want := range []string{"Choose an approach", "1. Alpha", "2. Beta\n  second line", "3. Gamma", "Second option details\n\n  indented explanation", "Preview line\n  preview continuation"} {
+		if !strings.Contains(html.UnescapeString(body), want) {
+			t.Fatalf("pending question lost %q: %q", want, body)
+		}
 	}
-	askTestClick(t, w, f, "Alpha")
+	if len(rows) != 3 || len(rows[0]) != 3 {
+		t.Fatalf("three choices must share one numeric row above controls: %v", rows)
+	}
+	for column, button := range rows[0] {
+		if button["text"] != strconv.Itoa(column+1) {
+			t.Fatalf("selection buttons are not numeric: %v", rows)
+		}
+	}
+	if len(rows[1]) != 1 || rows[1][0]["text"] != "Custom answer" {
+		t.Fatalf("custom answer must remain on its own control row: %v", rows)
+	}
+	requirePickerFooter(t, rows, "Cancel")
+	askTestCallback(w, 7, askTestButton(t, f, "Alpha"))
+	askTestSettle(t, w)
+	responses := askTestState(t, w)
+	if len(responses) != 1 || len(responses[0].Answers) != 1 || !slices.Equal(responses[0].Answers[0].Selected, []string{"Alpha"}) {
+		t.Fatalf("numeric option changed the raw answer: %+v", responses)
+	}
 	body = askTestReceipt(t, w, f, messageID)
 	if !strings.Contains(body, "1. Alpha") || !strings.Contains(body, "2. Beta") || !strings.Contains(body, "Your choice") {
 		t.Fatalf("completed question lost its option history: %q", body)
 	}
 }
 
-func TestAskPendingOverflowLabelsRemainIdentifiable(t *testing.T) {
-	for _, scenario := range []struct {
-		name, method, prefix string
-		multi, overflow      bool
-	}{
-		{"native-ascii", "select", strings.Repeat("shared-prefix-", 9), false, true},
-		{"native-unicode", "select", strings.Repeat("公共前缀", 30), false, true},
-		{"native-exact-limit", "select", strings.Repeat("😀", 45), false, false},
-		{"extension-single", "ask", strings.Repeat("shared-prefix-", 9), false, true},
-		{"extension-multi-marker", "ask", strings.Repeat("😀", 45), true, true},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			w, f, _ := askTestWorker(t)
-			first, second := scenario.prefix+"CHOICEA", scenario.prefix+"CHOICEB"
-			event := map[string]any{"id": "overflow", "method": scenario.method, "title": "Choose destination", "options": []string{first, second, "Short"}}
-			if scenario.method == "ask" {
-				event["questions"] = []map[string]any{{"id": "destination", "question": "Choose destination", "multi": scenario.multi,
-					"options": []map[string]string{{"label": first}, {"label": second}, {"label": "Short"}}}}
+func TestAskMultiSelectionKeepsCrossPageStateAndRawLabels(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	labels := make([]string, 12)
+	for i := range labels {
+		labels[i] = "Feature " + strconv.Itoa(i+1)
+	}
+	labels[0], labels[11] = "  First\n  feature  ", "\tLast feature\nvalue  "
+	options := make([]map[string]string, len(labels))
+	for i, label := range labels {
+		options[i] = map[string]string{"label": label}
+	}
+	askTestOpen(t, w, "paged-multi", map[string]any{"id": "features", "question": "Which features?", "multi": true, "options": options})
+	messageID := w.ask.messageID
+	body, rows := pickerView(t, f)
+	if !strings.Contains(body, "Which features?") || !strings.Contains(body, "Page 1/2") || len(rows) != 6 || len(rows[0]) != 5 || len(rows[1]) != 5 {
+		t.Fatalf("first multi-choice page must have two five-column numeric rows: %q; %v", body, rows)
+	}
+	for row := range 2 {
+		for column, button := range rows[row] {
+			if button["text"] != "☐ "+strconv.Itoa(row*5+column+1) {
+				t.Fatalf("multi-choice numbering changed across rows: %v", rows)
 			}
-			askTestEvent(t, w, event)
-			body, rows := pickerView(t, f)
-			body = html.UnescapeString(body)
-			if strings.Contains(body, askOptionLabel(0, first)) != scenario.overflow || strings.Contains(body, askOptionLabel(1, second)) != scenario.overflow || strings.Contains(body, "Short") {
-				t.Fatalf("pending body hid overflow choices or duplicated fitting labels: %q", body)
-			}
-			button := rows[1][0]["text"].(string)
-			if strings.Contains(button, "CHOICEB") == scenario.overflow {
-				t.Fatalf("fixture did not exercise its intended button limit: %q", button)
-			}
-			askTestCallback(w, 7, rows[1][0]["callback_data"].(string))
-			askTestSettle(t, w)
-			if scenario.multi {
-				body, _ = pickerView(t, f)
-				if !strings.Contains(html.UnescapeString(body), second) {
-					t.Fatal("checked marker hid the overflow label")
-				}
-				askTestClick(t, w, f, "Confirm selection")
-			}
-			responses := askTestState(t, w)
-			if len(responses) != 1 {
-				t.Fatalf("overflow choice submitted multiple native answers: %+v", responses)
-			}
-			if scenario.method == "select" {
-				if responses[0].Value != second {
-					t.Fatalf("overflow display changed the raw native value: %+v", responses)
-				}
-			} else if len(responses[0].Answers) != 1 || len(responses[0].Answers[0].Selected) != 1 || responses[0].Answers[0].Selected[0] != second {
-				t.Fatalf("overflow display changed the raw extension value: %+v", responses)
-			}
-		})
+		}
+	}
+	for offset, label := range []string{"Next", "Custom answer", "Confirm selection", "Cancel"} {
+		if len(rows[offset+2]) != 1 || rows[offset+2][0]["text"] != label {
+			t.Fatalf("multi-choice controls mixed with numeric rows or changed layout: %v", rows)
+		}
+	}
+	askTestCallback(w, 7, askTestButton(t, f, "First"))
+	askTestSettle(t, w)
+	askTestClick(t, w, f, "Next")
+	body, rows = pickerView(t, f)
+	if !strings.Contains(body, "Which features?") || !strings.Contains(body, "Page 2/2") || len(rows) != 5 || len(rows[0]) != 2 || rows[0][0]["text"] != "☐ 11" || rows[0][1]["text"] != "☐ 12" {
+		t.Fatalf("last multi-choice page = %q; %v", body, rows)
+	}
+	askTestCallback(w, 7, askTestButton(t, f, "Last feature"))
+	askTestSettle(t, w)
+	askTestClick(t, w, f, "Previous")
+	_, rows = pickerView(t, f)
+	if rows[0][0]["text"] != "☑ 1" {
+		t.Fatalf("first-page selection was lost: %v", rows)
+	}
+	askTestClick(t, w, f, "Next")
+	_, rows = pickerView(t, f)
+	if len(rows[0]) != 2 || rows[0][1]["text"] != "☑ 12" {
+		t.Fatalf("last-page selection was lost: %v", rows)
+	}
+	if responses := askTestState(t, w); len(responses) != 0 {
+		t.Fatalf("paging or toggling submitted a multi-choice answer: %+v", responses)
+	}
+	askTestClick(t, w, f, "Confirm selection")
+	responses := askTestState(t, w)
+	if len(responses) != 1 || len(responses[0].Answers) != 1 || !slices.Equal(responses[0].Answers[0].Selected, []string{labels[0], labels[11]}) {
+		t.Fatalf("cross-page selection changed raw labels or order: %+v", responses)
+	}
+	body = askTestReceipt(t, w, f, messageID)
+	if !strings.Contains(body, "Which features?") || !strings.Contains(body, "Your choice") || !strings.Contains(html.UnescapeString(body), "First\n  feature") || !strings.Contains(html.UnescapeString(body), "Last feature\nvalue") {
+		t.Fatalf("confirmed question lost its question or chosen history: %q", body)
 	}
 }
 
@@ -2179,5 +2225,33 @@ func TestPrivateAskBacktickTitleKeepsLiteralBoundaries(t *testing.T) {
 				t.Fatalf("literal rendering changed the submitted default: %+v", responses)
 			}
 		})
+	}
+}
+
+func TestAskCompletedReceiptKeepsLongOptionsThatFit(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	first := "First approach\n  " + strings.Repeat("step one stays readable; ", 14)
+	second := "Second approach\n  " + strings.Repeat("alternative remains complete; ", 12)
+	firstDetail := strings.Repeat("first explanation line; ", 8)
+	secondDetail := strings.Repeat("second explanation line; ", 7)
+	askTestOpen(t, w, "long-completion", map[string]any{
+		"id": "long-options", "question": "Choose an approach", "options": []map[string]string{
+			{"label": first, "description": firstDetail},
+			{"label": second, "description": secondDetail},
+		},
+	})
+	messageID := w.ask.messageID
+	_, rows := pickerView(t, f)
+	askTestCallback(w, 7, rows[0][0]["callback_data"].(string))
+	receipt := askTestReceipt(t, w, f, messageID)
+	visible := html.UnescapeString(receipt)
+	for _, want := range []string{first, firstDetail, second, secondDetail, "Your choice", "1. " + first} {
+		if !strings.Contains(visible, want) {
+			t.Fatalf("completed receipt clipped %q although the full list fits: %q", want, receipt)
+		}
+	}
+	responses := askTestState(t, w)
+	if len(responses) != 1 || len(responses[0].Answers) != 1 || len(responses[0].Answers[0].Selected) != 1 || responses[0].Answers[0].Selected[0] != first {
+		t.Fatalf("complete display changed the native answer: %+v", responses)
 	}
 }

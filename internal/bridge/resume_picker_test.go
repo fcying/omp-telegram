@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"omp-telegram/internal/omp"
 	"omp-telegram/internal/store"
@@ -300,17 +301,18 @@ func pickerButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 
 func resumeButtons(t *testing.T, f *fakeHTTP) []map[string]any {
 	t.Helper()
-	buttons := pickerButtons(t, f)
-	text, _ := pickerView(t, f)
-	filtered := buttons[:0]
-	for _, button := range buttons {
-		label, _ := button["text"].(string)
-		if label == "Pin" || label == "Unpin" || label == "Delete" && strings.HasPrefix(text, "Saved omp sessions") {
-			continue
+	_, rows := pickerView(t, f)
+	var buttons []map[string]any
+	for _, row := range rows {
+		if len(row) == 3 && row[2]["style"] == "danger" {
+			if _, err := strconv.Atoi(row[0]["text"].(string)); err == nil {
+				buttons = append(buttons, row[0])
+				continue
+			}
 		}
-		filtered = append(filtered, button)
+		buttons = append(buttons, row...)
 	}
-	return filtered
+	return buttons
 }
 
 func clickResume(w *worker, user int64, data string) {
@@ -326,37 +328,51 @@ func TestResumePickerListsNativeDirectoryAndNavigates(t *testing.T) {
 	sessions := setResumeFixtures(t, original.Workspace, 12)
 	command("/resume")
 	w.resumeListed(finishResumeList(t, w))
-	text, rows := pickerView(t, f)
-	buttons := resumeButtons(t, f)
-	if len(buttons) != 12 || len(rows) != 11 {
-		t.Fatalf("first page: %d choices, %d rows; want ten sessions and navigation: %v", len(buttons), len(rows), rows)
-	}
-	requirePickerFooter(t, rows, "Next", "Cancel")
-	for i := range 10 {
-		listed := strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) && strings.Contains(text, "ID: "+sessions[i].ID)
-		paired := len(rows[i]) == 3 && strings.Contains(rows[i][0]["text"].(string), sessions[i].Title) && rows[i][1]["text"] == "Pin" && rows[i][2]["text"] == "Delete" && rows[i][2]["style"] == "danger"
-		if !listed || !paired {
-			t.Fatalf("session %d lost identity or adjacent pin action: %s; %v", i, text, rows[i])
+	seen, pages := 0, 0
+	var previous string
+	for {
+		text, rows := pickerView(t, f)
+		pages++
+		if len(rows) < 2 || len(rows)-1 > 10 {
+			t.Fatalf("session page has invalid row count: %v", rows)
 		}
+		for _, row := range rows[:len(rows)-1] {
+			number := seen + 1
+			if len(row) != 3 || row[0]["text"] != strconv.Itoa(number) || row[1]["text"] != fmt.Sprintf("Pin %d", number) || row[2]["text"] != fmt.Sprintf("Delete %d", number) || row[2]["style"] != "danger" {
+				t.Fatalf("session %d lost numbered actions: %v", number, row)
+			}
+			if !containsAll(text, fmt.Sprintf("%d. %s", number, sessions[seen].Title), "ID: "+sessions[seen].ID, original.Workspace) {
+				t.Fatalf("session %d lost full identity: %q", number, text)
+			}
+			seen++
+		}
+		footer := rows[len(rows)-1]
+		if pages == 1 && !strings.Contains(text, "2026-09-20 12:00 UTC") {
+			t.Fatalf("native update time missing: %q", text)
+		}
+		if seen == len(sessions) {
+			requirePickerFooter(t, rows, "Previous", "Cancel")
+			previous = footer[0]["callback_data"].(string)
+			break
+		}
+		if pages == 1 {
+			requirePickerFooter(t, rows, "Next", "Cancel")
+		} else {
+			requirePickerFooter(t, rows, "Previous", "Next", "Cancel")
+		}
+		clickResume(w, 7, footer[len(footer)-2]["callback_data"].(string))
 	}
-	if !strings.Contains(text, "2026-09-20 12:00 UTC") {
-		t.Fatalf("native update time missing: %q", text)
+	if pages < 2 {
+		t.Fatal("twelve sessions fit on a single page")
 	}
-	clickResume(w, 7, buttons[10]["callback_data"].(string))
-	text, rows = pickerView(t, f)
-	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "11. "+sessions[10].Title) || !strings.Contains(text, "12. "+sessions[11].Title) {
-		t.Fatalf("second page does not contain final native choices: %s; %v", text, rows)
+	clickResume(w, 7, previous)
+	for pages--; pages > 1; pages-- {
+		_, rows := pickerView(t, f)
+		clickResume(w, 7, rows[len(rows)-1][0]["callback_data"].(string))
 	}
-	requirePickerFooter(t, rows, "Previous", "Cancel")
-	clickResume(w, 7, buttons[2]["callback_data"].(string))
-	text, _ = pickerView(t, f)
-	buttons = resumeButtons(t, f)
-	if len(buttons) != 12 || !strings.Contains(text, "1. "+sessions[0].Title) {
-		t.Fatal("previous did not return to first page")
-	}
-	if !sameBindingIdentity(w.binding, original) {
-		t.Fatal("page navigation changed active session")
+	text, _ := pickerView(t, f)
+	if !strings.Contains(text, "1. "+sessions[0].Title) || !sameBindingIdentity(w.binding, original) {
+		t.Fatal("navigation did not restore the first page without changing the session")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -379,7 +395,7 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	text, rows := pickerView(t, f)
 	buttons := pickerButtons(t, f)
 	listed := strings.Contains(text, "1. "+sessions[1].Title+" [pinned]")
-	paired := len(rows[0]) == 3 && strings.Contains(buttons[0]["text"].(string), sessions[1].Title) && buttons[1]["text"] == "Unpin"
+	paired := len(rows[0]) == 3 && buttons[0]["text"] == "1" && buttons[1]["text"] == "Unpin 1"
 	if !listed || !paired {
 		t.Fatalf("pinned session was not first with adjacent unpin: %s; %v", text, rows[0])
 	}
@@ -395,10 +411,10 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 	}
 	text, rows = pickerView(t, f)
 	buttons = pickerButtons(t, f)
-	if !strings.Contains(text, "1. "+sessions[0].Title) || buttons[1]["text"] != "Pin" {
+	if !strings.Contains(text, "1. "+sessions[0].Title) || buttons[1]["text"] != "Pin 1" {
 		t.Fatalf("native order was not restored after unpin: %s; %v", text, buttons[:2])
 	}
-	if len(rows[2]) != 3 || rows[2][1]["text"] != "Pin" || rows[2][2]["text"] != "Delete" {
+	if len(rows[2]) != 3 || rows[2][1]["text"] != "Pin 3" || rows[2][2]["text"] != "Delete 3" {
 		t.Fatal("third session pin button missing")
 	}
 	pinData := rows[2][1]["callback_data"].(string)
@@ -412,7 +428,7 @@ func TestResumePickerPinsAndSortsSessions(t *testing.T) {
 		t.Fatalf("pinned session state = %+v", pinned)
 	}
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "1. "+sessions[2].Title+" [pinned]") || rows[0][1]["text"] != "Unpin" {
+	if !strings.Contains(text, "1. "+sessions[2].Title+" [pinned]") || rows[0][1]["text"] != "Unpin 1" {
 		t.Fatalf("newly pinned session was not promoted: %s; %v", text, rows[0])
 	}
 }
@@ -762,7 +778,7 @@ func TestExportPickerRejectsCallbackFromDifferentMessage(t *testing.T) {
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
 	text, rows := pickerView(t, f)
-	if len(rows) != 2 || len(rows[0]) != 1 || rows[0][0]["text"] != "1. Export" || !strings.Contains(text, "ID: "+sessions[0].ID) {
+	if len(rows) != 2 || len(rows[0]) != 1 || rows[0][0]["text"] != "Export 1" || !strings.Contains(text, "ID: "+sessions[0].ID) {
 		t.Fatalf("export picker lost its single export action or session identity: %s; %v", text, rows)
 	}
 	data := resumeButtons(t, f)[0]["callback_data"].(string)
@@ -812,8 +828,120 @@ func TestResumePickerLocalizesLabelsWithoutTranslatingSessionData(t *testing.T) 
 					t.Fatalf("session data was changed during localization: missing %q in %q", data, text)
 				}
 			}
-			if !strings.Contains(text, "已保存的 omp 会话") || len(rows) != 2 || rows[0][1]["text"] != "置顶" || rows[0][2]["text"] != "删除" || rows[1][0]["text"] != "取消" {
+			if !strings.Contains(text, "已保存的 omp 会话") || len(rows) != 2 || rows[0][0]["text"] != "1" || rows[0][1]["text"] != "置顶 1" || rows[0][2]["text"] != "删除 1" || rows[1][0]["text"] != "取消" {
 				t.Fatalf("session picker labels were not localized: %q; %v", text, rows)
+			}
+		})
+	}
+}
+
+func TestSessionPickerContinuesFullLiteralTitle(t *testing.T) {
+	for _, action := range []string{"resume", "export"} {
+		t.Run(action, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new test")
+			sessions := setResumeFixtures(t, w.binding.Workspace, 1)
+			sessions[0].Title = strings.Repeat("标题😀 **bold** [link](https://example.test) ```code```\n", 160)
+			listing, err := json.Marshal(sessions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(listing))
+			command("/" + action)
+			w.resumeListed(finishResumeList(t, w))
+			var complete strings.Builder
+			page := 0
+			for {
+				text, rows := pickerView(t, f)
+				data := rows[0][0]["callback_data"].(string)
+				token, _, _ := strings.Cut(data, ":")
+				c := w.confirms[token]
+				if len(c.uiPages) < 3 || c.page != page {
+					t.Fatalf("long title did not retain its content page: %+v", c.uiPages)
+				}
+				payload := c.uiPages[page]
+				if payload.start != 0 || payload.end != 1 || !utf8.ValidString(payload.text) || !strings.HasPrefix(payload.text, "1. ") || !strings.Contains(text, payload.text) {
+					t.Fatalf("literal continuation lost text, UTF-8, or global identity: %q; %+v", text, payload)
+				}
+				complete.WriteString(strings.TrimPrefix(payload.text, "1. "))
+				selectLabel := "1"
+				if action == "export" {
+					selectLabel = "Export 1"
+				} else if len(rows[0]) != 3 || rows[0][1]["text"] != "Pin 1" || rows[0][2]["text"] != "Delete 1" {
+					t.Fatalf("continued title lost short sibling actions: %v", rows[0])
+				}
+				if rows[0][0]["text"] != selectLabel {
+					t.Fatalf("continued title leaked into a button: %v", rows[0])
+				}
+				if page+1 == len(c.uiPages) {
+					break
+				}
+				footer := rows[len(rows)-1]
+				clickResume(w, 7, footer[len(footer)-2]["callback_data"].(string))
+				_, nextRows := pickerView(t, f)
+				nextData := nextRows[0][0]["callback_data"].(string)
+				clickResume(w, 7, data)
+				_, afterStale := pickerView(t, f)
+				if afterStale[0][0]["callback_data"] != nextData || w.sessionID == sessions[0].ID || w.exportCancel != nil {
+					t.Fatal("stale continuation selected a session or replaced the current page")
+				}
+				page++
+			}
+			want := sessions[0].Title + " | 2026-09-20 12:00 UTC\nID: " + sessions[0].ID + "\nWorkspace: " + w.binding.Workspace
+			if complete.String() != want {
+				t.Fatalf("continued title or session metadata was clipped: got %q, want %q", complete.String(), want)
+			}
+		})
+	}
+}
+
+func TestResumePickerContentPageActionsKeepGlobalIdentity(t *testing.T) {
+	for _, action := range []string{"select", "pin"} {
+		t.Run(action, func(t *testing.T) {
+			w, f, command := setupWorkspaceWorker(t)
+			command("/new test")
+			before := w.binding
+			sessions := setResumeFixtures(t, before.Workspace, 3)
+			for i := range sessions {
+				sessions[i].Title = fmt.Sprintf("choice-%d ", i) + strings.Repeat("标题😀", 80)
+			}
+			listing, err := json.Marshal(sessions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(listing))
+			command("/resume")
+			w.resumeListed(finishResumeList(t, w))
+			_, rows := pickerView(t, f)
+			requirePickerFooter(t, rows, "Next", "Cancel")
+			clickResume(w, 7, rows[len(rows)-1][0]["callback_data"].(string))
+			_, rows = pickerView(t, f)
+			if rows[0][0]["text"] != "2" || rows[0][1]["text"] != "Pin 2" {
+				t.Fatalf("content page used a local session number: %v", rows)
+			}
+			stale := rows[0][0]["callback_data"].(string)
+			if action == "select" {
+				clickResume(w, 7, stale)
+				if w.sessionID != sessions[1].ID || w.binding.Generation <= before.Generation {
+					t.Fatal("numbered second-page selection restored the wrong native session")
+				}
+				return
+			}
+			clickResume(w, 7, rows[0][1]["callback_data"].(string))
+			text, rows := pickerView(t, f)
+			if !containsAll(text, "1. "+sessions[1].Title+" [pinned]", sessions[1].ID) || rows[0][1]["text"] != "Unpin 1" {
+				t.Fatalf("pin did not reorder and reset content pages: %q; %v", text, rows)
+			}
+			pinned, err := w.b.db.PinnedSessions(w.b.bot.ID, w.key.chat, w.key.thread, before.Workspace)
+			requireStoreOK(t, err)
+			if _, ok := pinned[pinnedSessionKey(sessions[1].ID)]; !ok || len(pinned) != 1 {
+				t.Fatalf("second-page pin targeted the wrong session: %v", pinned)
+			}
+			currentData := rows[0][0]["callback_data"]
+			clickResume(w, 7, stale)
+			_, rows = pickerView(t, f)
+			if rows[0][0]["callback_data"] != currentData || !sameBindingIdentity(w.binding, before) {
+				t.Fatal("pre-sort callback acted on the reordered session page")
 			}
 		})
 	}

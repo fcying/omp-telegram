@@ -5,9 +5,8 @@ import (
 	"strings"
 
 	"omp-telegram/internal/i18n"
+	"omp-telegram/internal/telegram"
 )
-
-const askOptionButtonLimit = 100
 
 func askOptionLabel(index int, label string) string {
 	return fmt.Sprintf("%d. %s", index+1, label)
@@ -39,19 +38,32 @@ func askLiteral(text string, budget int) string {
 	}
 }
 
+// Join generated fragments without trimming whitespace inside literal payloads.
+func askLine(rendered string) string {
+	return "\n" + strings.TrimPrefix(rendered, "\n")
+}
+
 // Reserve the footer before spending space on optional explanations and previews.
 func (w *worker) askQuestionText(q askQuestion, start, end int, footer string) string {
 	return w.askQuestionTextBudget(q, start, end, footer, 3700, true)
 }
 
 func (w *worker) askQuestionTextBudget(q askQuestion, start, end int, footer string, limit int, completed bool) string {
-	text := "**" + w.tr(i18n.Msg.AskQuestion) + "**\n" + askLiteral(q.Question, 700)
+	text := "**" + w.tr(i18n.Msg.AskQuestion) + "**" + askLine(askLiteral(q.Question, 700))
 	if q.Header != "" {
-		text += "\n" + askLiteral(q.Header, 200)
+		text += askLine(askLiteral(q.Header, 200))
 	}
 	start, end = max(0, start), min(end, len(q.Options))
+	omitted := false
 	if completed && start < end {
-		text += "\n\n**" + w.tr(i18n.Msg.AskOptions) + "**"
+		full, fits := completeAskQuestionText(text, q, start, end, footer, w.tr(i18n.Msg.AskOptions), limit)
+		if fits {
+			return full
+		}
+		omitted = true
+	}
+	if completed && start < end {
+		text += "\n**" + w.tr(i18n.Msg.AskOptions) + "**"
 		budget := limit - len(text) - len(footer) - 16
 		labelBudget := min(200, max(16, budget/max(1, end-start)-4))
 		labels := make([]string, 0, min(end-start, max(0, budget/8)))
@@ -59,7 +71,7 @@ func (w *worker) askQuestionTextBudget(q askQuestion, start, end int, footer str
 			if budget < 18 {
 				break
 			}
-			label := "\n\n" + askLiteral(askOptionLabel(index, q.Options[index].Label), min(labelBudget, budget-2))
+			label := askLine(askLiteral(askOptionLabel(index, q.Options[index].Label), min(labelBudget, budget-2)))
 			labels = append(labels, label)
 			budget -= len(label)
 		}
@@ -67,67 +79,44 @@ func (w *worker) askQuestionTextBudget(q askQuestion, start, end int, footer str
 			text += label
 			detail := askOptionDetail(q.Options[start+offset])
 			if detail != "" && budget >= 24 {
-				literal := askLiteral(detail, min(300, budget-1))
-				text += "\n" + literal
-				budget -= len(literal) + 1
+				literal := askLine(askLiteral(detail, min(300, budget-1)))
+				text += literal
+				budget -= len(literal)
 			}
-		}
-		if len(labels) < end-start {
-			text += "\n\n..."
-		}
-	}
-	if !completed {
-		budget := limit - len(text) - len(footer) - 16
-		var labels []string
-		omitted := false
-		// Reserve overflow labels before optional details can consume their space.
-		for index := start; index < end; index++ {
-			label := askOptionLabel(index, q.Options[index].Label)
-			buttonLabel := label
-			if q.Multi {
-				// Checked and unchecked markers have the same UTF-16 width.
-				buttonLabel = "☐ " + buttonLabel
-			}
-			if len(buttonLabel) <= askOptionButtonLimit || utf16Length(menuText(buttonLabel, 0)) <= askOptionButtonLimit {
-				continue
-			}
-			if budget < 18 {
-				omitted = true
-				continue
-			}
-			if labels == nil {
-				labels = make([]string, end-start)
-			}
-			labels[index-start] = "\n\n" + askLiteral(label, budget-2)
-			budget -= len(labels[index-start])
-		}
-		for index := start; index < end; index++ {
-			if labels != nil {
-				text += labels[index-start]
-			}
-			detail := askOptionDetail(q.Options[index])
-			if detail == "" {
-				continue
-			}
-			if budget < 24 {
-				omitted = true
-				continue
-			}
-			if labels == nil || labels[index-start] == "" {
-				detail = askOptionLabel(index, detail)
-			}
-			block := "\n\n" + askLiteral(detail, min(300, budget-2))
-			text += block
-			budget -= len(block)
 		}
 		if omitted {
-			text += "\n\n..."
+			text += "\n..."
 		}
 	}
 	if footer != "" {
-		text += "\n\n" + footer
+		text += askLine(footer)
 	}
 	return text
+}
+
+func completeAskQuestionText(base string, q askQuestion, start, end int, footer, optionsHeading string, sourceLimit int) (string, bool) {
+	var text strings.Builder
+	text.Grow(len(base) + len(footer))
+	text.WriteString(base)
+	text.WriteString("\n**" + optionsHeading + "**")
+	for index := start; index < end; index++ {
+		label := askOptionLabel(index, q.Options[index].Label)
+		text.WriteString(askLine(askLiteral(label, 3*len(label)+16)))
+		if detail := askOptionDetail(q.Options[index]); detail != "" {
+			text.WriteString(askLine(askLiteral(detail, 3*len(detail)+16)))
+		}
+	}
+	if footer != "" {
+		text.WriteString(askLine(footer))
+	}
+	if text.Len() > sourceLimit {
+		return "", false
+	}
+	rendered := text.String()
+	if utf16Length(telegram.ConvertMarkdown(rendered)) > telegram.MaxMessageUTF16 {
+		return "", false
+	}
+	return rendered, true
 }
 
 func askOptionDetail(option askOption) string {
@@ -143,11 +132,11 @@ func askOptionDetail(option askOption) string {
 
 func (w *worker) askAnswerFooter(a *askRequest) string {
 	if a.method != "ask" {
-		footer := "**" + w.tr(i18n.Msg.AskSubmission) + "**\n"
+		footer := "**" + w.tr(i18n.Msg.AskSubmission) + "**"
 		if a.custom == "" {
-			return footer + w.tr(i18n.Msg.AskEmptyValue)
+			return footer + "\n" + w.tr(i18n.Msg.AskEmptyValue)
 		}
-		return footer + askLiteral(a.custom, 1400)
+		return footer + askLine(askLiteral(a.custom, 1400))
 	}
 	question := a.questions[a.question]
 	var values []string
@@ -163,5 +152,5 @@ func (w *worker) askAnswerFooter(a *askRequest) string {
 	if value == "" {
 		value = w.tr(i18n.Msg.AskNoSelection)
 	}
-	return "**" + w.tr(i18n.Msg.AskChoice) + "**\n" + askLiteral(value, 1400)
+	return "**" + w.tr(i18n.Msg.AskChoice) + "**" + askLine(askLiteral(value, 1400))
 }

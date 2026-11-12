@@ -397,7 +397,7 @@ func TestAutoSessionNameYieldsToIdleControls(t *testing.T) {
 					w.showArgsMenuPage(confirmation{action: "args", user: 7}, 0)
 					fake := http.DefaultTransport.(*fakeHTTP)
 					_, rows := pickerView(t, fake)
-					query = &telegram.CallbackQuery{ID: "auto-name-args", From: telegram.User{ID: 7}, Data: rows[1][0]["callback_data"].(string), Message: &telegram.Message{MessageID: int64(fake.messageCount()), MessageThreadID: w.key.thread, Chat: telegram.Chat{ID: w.key.chat}}}
+					query = &telegram.CallbackQuery{ID: "auto-name-args", From: telegram.User{ID: 7}, Data: rows[0][1]["callback_data"].(string), Message: &telegram.Message{MessageID: int64(fake.messageCount()), MessageThreadID: w.key.thread, Chat: telegram.Chat{ID: w.key.chat}}}
 				}
 				if phase == "ack" {
 					w.operationReturned(check)

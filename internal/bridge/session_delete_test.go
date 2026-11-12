@@ -19,7 +19,7 @@ import (
 func deletePickerButton(t *testing.T, f *fakeHTTP, row int) map[string]any {
 	t.Helper()
 	_, rows := pickerView(t, f)
-	if row >= len(rows)-1 || len(rows[row]) != 3 || rows[row][2]["text"] != "Delete" || rows[row][2]["style"] != "danger" {
+	if row >= len(rows)-1 || len(rows[row]) != 3 || rows[row][2]["text"] != "Delete "+rows[row][0]["text"].(string) || rows[row][2]["style"] != "danger" {
 		t.Fatalf("resume picker has no destructive delete for row %d: %v", row, rows)
 	}
 	return rows[row][2]
@@ -825,5 +825,61 @@ func TestSessionDeletePendingStartPreventsExecution(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), session.ID+".jsonl")); err != nil {
 		t.Fatalf("native file changed during pending resume: %v", err)
+	}
+}
+
+func TestSessionDeleteContentPageKeepsGlobalIdentity(t *testing.T) {
+	t.Setenv("OMP_TELEGRAM_FIXTURE_DELETE", "success")
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new test")
+	sessions := setResumeFixtures(t, w.binding.Workspace, 3)
+	for i := range sessions {
+		sessions[i].Title = strings.Repeat("标题😀", 80)
+	}
+	listing, err := json.Marshal(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(listing))
+	command("/resume")
+	w.resumeListed(finishResumeList(t, w))
+	click := func(data string) {
+		t.Helper()
+		token, _, _ := strings.Cut(data, ":")
+		c, ok := w.confirms[token]
+		if !ok {
+			t.Fatalf("session callback has no active confirmation: %q", data)
+		}
+		w.callback(&telegram.CallbackQuery{ID: "content-page-delete", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: c.messageID}, Data: data})
+	}
+	_, rows := pickerView(t, f)
+	requirePickerFooter(t, rows, "Next", "Cancel")
+	click(rows[len(rows)-1][0]["callback_data"].(string))
+	_, rows = pickerView(t, f)
+	if rows[0][0]["text"] != "2" || rows[0][2]["text"] != "Delete 2" {
+		t.Fatalf("content page delete lost its global session number: %v", rows)
+	}
+	click(deletePickerButton(t, f, 0)["callback_data"].(string))
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, sessions[1].ID) || strings.Contains(text, sessions[0].ID) || strings.Contains(text, sessions[2].ID) {
+		t.Fatalf("second-page delete confirmed a different native session: %q", text)
+	}
+	confirmationToken, _, _ := strings.Cut(rows[0][0]["callback_data"].(string), ":")
+	deletion := w.confirms[confirmationToken]
+	if deletion.action != "session_delete" || len(deletion.sessions) != 1 || deletion.sessions[0].ID != sessions[1].ID {
+		t.Fatalf("second-page action did not enter native deletion confirmation: %+v", deletion)
+	}
+	click(rows[0][0]["callback_data"].(string))
+	result := awaitSessionDelete(t, w)
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	w.sessionDeleteFinished(result)
+	w.resumeListed(finishResumeList(t, w))
+	for i, session := range sessions {
+		_, err := os.Stat(filepath.Join(os.Getenv("OMP_TELEGRAM_FIXTURE_SESSION_ROOT"), session.ID+".jsonl"))
+		if i == 1 && !os.IsNotExist(err) || i != 1 && err != nil {
+			t.Fatalf("numbered delete changed the wrong native file %s: %v", session.ID, err)
+		}
 	}
 }

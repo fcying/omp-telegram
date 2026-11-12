@@ -940,24 +940,25 @@ func TestExportPickerListsMultipleSessions(t *testing.T) {
 	sessions := setResumeFixtures(t, w.binding.Workspace, 12)
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
-	text, rows := pickerView(t, f)
-	buttons := resumeButtons(t, f)
-	if len(buttons) != 12 || len(rows) != 11 {
-		t.Fatalf("export first page has %d choices in %d rows; want ten sessions and navigation: %v", len(buttons), len(rows), rows)
-	}
-	requirePickerFooter(t, rows, "Next", "Cancel")
-	for i := range 10 {
-		if !strings.Contains(text, fmt.Sprintf("%d. %s", i+1, sessions[i].Title)) || !strings.Contains(text, "ID: "+sessions[i].ID) || len(rows[i]) != 1 {
-			t.Fatalf("export choice %d lost native identity or single export action: %s; %v", i, text, rows[i])
+	seen := 0
+	for {
+		text, rows := pickerView(t, f)
+		if len(rows) < 2 || len(rows)-1 > 10 {
+			t.Fatalf("export page has invalid row count: %v", rows)
 		}
+		for _, row := range rows[:len(rows)-1] {
+			if len(row) != 1 || row[0]["text"] != fmt.Sprintf("Export %d", seen+1) || !containsAll(text, fmt.Sprintf("%d. %s", seen+1, sessions[seen].Title), "ID: "+sessions[seen].ID) {
+				t.Fatalf("export choice %d lost identity or short action: %q; %v", seen+1, text, row)
+			}
+			seen++
+		}
+		if seen == len(sessions) {
+			requirePickerFooter(t, rows, "Previous", "Cancel")
+			break
+		}
+		footer := rows[len(rows)-1]
+		clickResume(w, 7, footer[len(footer)-2]["callback_data"].(string))
 	}
-	clickResume(w, 7, buttons[10]["callback_data"].(string))
-	text, rows = pickerView(t, f)
-	buttons = resumeButtons(t, f)
-	if len(buttons) != 4 || len(rows) != 3 || !strings.Contains(text, "11. "+sessions[10].Title) || !strings.Contains(text, "12. "+sessions[11].Title) {
-		t.Fatalf("export second page does not contain final native choices: %s; %v", text, rows)
-	}
-	requirePickerFooter(t, rows, "Previous", "Cancel")
 }
 
 func TestDirectHTMLExportDoesNotOpenPicker(t *testing.T) {
@@ -1367,4 +1368,43 @@ func containsAll(text string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestExportContentPageSelectionKeepsGlobalIdentity(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.DataDir = t.TempDir()
+	command("/new test")
+	before, client := w.binding, w.client
+	sessions := setResumeFixtures(t, before.Workspace, 3)
+	for i := range sessions {
+		sessions[i].Title = strings.Repeat("标题😀", 80)
+	}
+	listing, err := json.Marshal(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_TELEGRAM_FIXTURE_SESSIONS", string(listing))
+	command("/export")
+	w.resumeListed(finishResumeList(t, w))
+	_, rows := pickerView(t, f)
+	requirePickerFooter(t, rows, "Next", "Cancel")
+	clickResume(w, 7, rows[len(rows)-1][0]["callback_data"].(string))
+	_, rows = pickerView(t, f)
+	if rows[0][0]["text"] != "Export 2" {
+		t.Fatalf("export content page used a local session number: %v", rows)
+	}
+	clickResume(w, 7, rows[0][0]["callback_data"].(string))
+	result := finishExport(t, w)
+	if result.err != nil || result.sessionID != sessions[1].ID {
+		t.Fatalf("content-page export targeted the wrong native session: %+v", result)
+	}
+	w.exportFinished(result)
+	var path string
+	if err := w.b.db.DB.QueryRow("SELECT path FROM outbox WHERE kind='document' ORDER BY id DESC LIMIT 1").Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), sessions[1].ID) || strings.Contains(string(data), sessions[0].ID) || w.client != client || !sameBindingIdentity(w.binding, before) {
+		t.Fatalf("content-page export changed identity or runtime: %q; error=%v", data, err)
+	}
 }

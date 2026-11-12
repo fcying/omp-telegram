@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"html"
 	"io"
 	"net/http"
 	"strings"
@@ -238,6 +239,61 @@ func TestAskCancelledLateEditCannotEraseOptionsOrChangeReplacement(t *testing.T)
 			responses := askTestState(t, w)
 			if len(responses) != 1 || responses[0].ID != "replacement" || len(responses[0].Answers) != 1 || strings.Join(responses[0].Answers[0].Selected, ",") != "Rust" {
 				t.Fatalf("late cancelled display replayed a native response: %+v", responses)
+			}
+		})
+	}
+}
+
+func TestAskCompletedResultCompactsOnlyGeneratedSpacing(t *testing.T) {
+	for _, method := range []string{"ask", "select"} {
+		t.Run(method, func(t *testing.T) {
+			w, f, _ := askTestWorker(t)
+			question := "Choose\n\nwith original context"
+			value := "First\n\n  original second line"
+			if method == "ask" {
+				askTestOpen(t, w, "compact-result", askTestQuestion("choice", question, false, value, "Alternative"))
+			} else {
+				askTestEvent(t, w, map[string]any{"id": "compact-result", "method": "select", "title": question, "options": []string{value, "Alternative"}})
+			}
+			buttons := pickerButtons(t, f)
+			token, _, _ := strings.Cut(buttons[0]["callback_data"].(string), ":")
+			messageID := w.confirms[token].messageID
+			askTestCallback(w, 7, buttons[0]["callback_data"].(string))
+			text := askTestReceipt(t, w, f, messageID)
+			visible := html.UnescapeString(text)
+			if !strings.Contains(visible, question) || !strings.Contains(visible, value) {
+				t.Fatal("compacting the result changed original question or answer whitespace")
+			}
+			outside := text
+			for {
+				before, rest, found := strings.Cut(outside, "<pre>")
+				if !found {
+					break
+				}
+				_, after, closed := strings.Cut(rest, "</pre>")
+				if !closed {
+					t.Fatal("completed result left an unclosed literal block")
+				}
+				outside = before + "literal" + after
+			}
+			if strings.Contains(outside, "\n\n") {
+				t.Fatalf("completed result retained generated blank lines: %q", outside)
+			}
+			if method == "ask" {
+				responses := askTestState(t, w)
+				if len(responses) != 1 || len(responses[0].Answers) != 1 || len(responses[0].Answers[0].Selected) != 1 || responses[0].Answers[0].Selected[0] != value {
+					t.Fatalf("compacted Ask returned a different value: %+v", responses)
+				}
+			} else {
+				raw, err := w.call("get_state", nil)
+				requireStoreOK(t, err)
+				var state struct {
+					Value string `json:"fixtureUIValue"`
+				}
+				requireStoreOK(t, json.Unmarshal(raw, &state))
+				if state.Value != value {
+					t.Fatalf("compacted native select returned %q, want %q", state.Value, value)
+				}
 			}
 		})
 	}

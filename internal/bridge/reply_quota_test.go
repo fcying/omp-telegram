@@ -24,7 +24,13 @@ func TestQuotaSampleUsedAndResetDisplay(t *testing.T) {
 		}}, "5h 30.25%"},
 		{"zero usage and short reset", quotaSample{windows: [2]quotaWindow{
 			{present: true, resetAt: now.Add(30 * time.Minute)},
-		}}, "5h 0%(<1h)"},
+		}}, "5h 0%(30m)"},
+		{"reset under a minute", quotaSample{windows: [2]quotaWindow{
+			{present: true, resetAt: now.Add(30 * time.Second)},
+		}}, "5h 0%(1m)"},
+		{"reset just under an hour", quotaSample{windows: [2]quotaWindow{
+			{present: true, resetAt: now.Add(time.Hour - time.Second)},
+		}}, "5h 0%(59m)"},
 		{"approximate native day", quotaSample{windows: [2]quotaWindow{{},
 			{present: true, used: 100, resetAt: now.Add(6 * 24 * time.Hour), approximate: true, resetPrecision: 24 * time.Hour},
 		}}, "7d 100%(~6d)"},

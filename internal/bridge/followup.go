@@ -53,7 +53,11 @@ func (w *worker) expireFollowupInputs(now time.Time) {
 }
 
 func (w *worker) followupInputValid(r store.FollowupRequest, now time.Time) bool {
-	return r.State == "delivered" && r.PromptID > 0 &&
+	return r.State == "delivered" && w.followupInputScope(r, now)
+}
+
+func (w *worker) followupInputScope(r store.FollowupRequest, now time.Time) bool {
+	return r.PromptID > 0 &&
 		r.Instance == w.b.quickActionInstance() && now.Unix() < r.ExpiresAt &&
 		w.binding.Running && r.Generation == w.binding.Generation &&
 		r.Session == w.binding.Session && r.Workspace == w.binding.Workspace
@@ -326,6 +330,17 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 		}
 		return true
 	}
+	hasAttachment := len(message.Photo) != 0 || message.Document != nil
+	albumID := albumKey{group: message.MediaGroupID, user: message.From.ID}
+	if hasAttachment && message.MediaGroupID != "" && r.State == "consumed" &&
+		w.followupInputScope(r, time.Now()) && reply.MessageID == r.PromptID {
+		album := w.albums[albumID]
+		if album != nil && album.ownerID == r.InboxID {
+			stripFollowupQuote(in)
+			w.collectAlbum(*in)
+			return true
+		}
+	}
 	valid := w.followupInputValid(r, time.Now())
 	if !valid || reply.MessageID != r.PromptID {
 		if !valid {
@@ -340,12 +355,12 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 	command, _, foreign := parseSlashInvocation(text, w.b.bot.Username)
 	// Explicit Bridge commands retain their lifecycle and authorization paths;
 	// only the bridge-generated quote is removed, never arbitrary user context.
-	if len(message.Photo) == 0 && message.Document == nil && strings.HasPrefix(text, "/") && !foreign && knownBridgeCommand(command) {
+	if !hasAttachment && strings.HasPrefix(text, "/") && !foreign && knownBridgeCommand(command) {
 		stripFollowupQuote(in)
 		return false
 	}
-	if text == "" || len(message.Photo) != 0 || message.Document != nil {
-		w.say(w.tr(i18n.Msg.FollowupTextRequired))
+	if text == "" && !hasAttachment {
+		w.say(w.tr(i18n.Msg.FollowupContentRequired))
 		w.mark(in.id, store.InboxCancelled)
 		return true
 	}
@@ -359,7 +374,17 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 		}
 		return true
 	}
-	if w.pendingInputFull() {
+	admissionID := in.id
+	if hasAttachment && message.MediaGroupID != "" {
+		if w.albumIsSuppressed(albumID) {
+			w.mark(in.id, store.InboxCancelled)
+			return true
+		}
+		if album := w.albums[albumID]; album != nil {
+			admissionID = album.ownerID
+		}
+	}
+	if admissionID == in.id && w.pendingInputFull() {
 		w.say(w.tr(i18n.Msg.Queue.Full))
 		w.mark(in.id, store.InboxCancelled)
 		return true
@@ -372,7 +397,7 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 		w.mark(in.id, store.InboxCancelled)
 		return true
 	}
-	accepted, err := w.b.db.ConsumeFollowupRequest(r, in.id)
+	accepted, err := w.b.db.ConsumeFollowupRequest(r, admissionID)
 	if err != nil {
 		w.followupPersistenceFailed(err)
 		return true
@@ -385,6 +410,14 @@ func (w *worker) routeFollowupInput(in *incoming) bool {
 	delete(w.followupInputs, r.Token)
 	w.finishFollowupPrompt(r.PromptID, r.User, r.Token, w.inlineFollowup(r), w.tr(i18n.Msg.FollowupQueued))
 	stripFollowupQuote(in)
-	w.queue = append(w.queue, queued{id: in.id, user: message.From.ID, replyTo: message.MessageID, text: text, displayText: text})
+	if hasAttachment {
+		if message.MediaGroupID != "" {
+			w.collectAlbum(*in)
+		} else {
+			w.queueMedia(*in)
+		}
+	} else {
+		w.queue = append(w.queue, queued{id: in.id, user: message.From.ID, replyTo: message.MessageID, text: text, displayText: text})
+	}
 	return true
 }

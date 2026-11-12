@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -302,7 +303,7 @@ func (w *worker) showModelPickerReady(user int64, current omp.Model, models []om
 		w.say(w.tr(i18n.Msg.TooManyCycleRolesTelegramMenuUseModelProvider))
 		return
 	}
-	options := make([]string, 0, len(models)+1)
+	entries := make([]askOption, len(models))
 	currentRole := currentModelRoleIndex(current, models)
 	for i, model := range models {
 		label := model.Role
@@ -312,24 +313,72 @@ func (w *worker) showModelPickerReady(user int64, current omp.Model, models []om
 		if i == currentRole {
 			label = "* " + label
 		}
-		options = append(options, menuText(label, 120))
+		entries[i].Label = label
 	}
-	request := confirmation{action: "model", method: "select", user: user, models: models, options: options}
-	options = append(options, w.tr(i18n.Msg.Cancel))
+	request := confirmation{action: "model", method: "select", user: user, models: models, uiPages: selectionPages(entries), uiQuestion: askQuestion{Options: entries}}
 	identity := w.tr(i18n.Msg.NoneSelected)
 	if current.Provider != "" && current.ID != "" {
 		identity = menuText(current.Provider+"/"+current.ID, 256)
 	}
 	w.endControlOperation()
-	w.confirm(request, w.tr(i18n.Msg.ChooseOMPCycleRoleCurrentModel, identity), options)
+	request.uiQuestion.Question = w.tr(i18n.Msg.ChooseOMPCycleRoleCurrentModel, identity)
+	w.showModelPage(request, 0)
+}
+
+func (w *worker) showModelPage(c confirmation, page int) {
+	if page < 0 || page >= len(c.uiPages) {
+		return
+	}
+	c.page = page
+	current := c.uiPages[page]
+	c.options = nil
+	var buttons []string
+	for index := current.start; index < current.end; index++ {
+		c.options = append(c.options, c.uiQuestion.Options[index].Label)
+		buttons = append(buttons, strconv.Itoa(index+1))
+	}
+	if page > 0 {
+		c.options = append(c.options, "Previous")
+		buttons = append(buttons, w.tr(i18n.Msg.Previous))
+	}
+	if page+1 < len(c.uiPages) {
+		c.options = append(c.options, "Next")
+		buttons = append(buttons, w.tr(i18n.Msg.Next))
+	}
+	buttons = append(buttons, w.tr(i18n.Msg.Cancel))
+	title := c.uiQuestion.Question
+	if len(c.uiPages) > 1 {
+		title += w.tr(i18n.Msg.Page, page+1, len(c.uiPages))
+	}
+	title += "\n\n" + askLiteral(current.text, 3*len(current.text)+16)
+	w.confirm(c, title, buttons)
 }
 
 func (w *worker) selectModel(c confirmation, index int) {
-	if index < 0 || index >= len(c.models) {
-		w.finishMenu(c.messageID, w.tr(i18n.Msg.ModelSelectionUnavailableOpenModelChooseAgain))
+	if index == len(c.options) {
+		w.finishConfirmation(c, index)
 		return
 	}
-	w.beginModelState(modelOperationRequest{action: "model_select", messageID: c.messageID, role: c.models[index].Role})
+	if index < 0 || index >= len(c.options) {
+		return
+	}
+	current := c.uiPages[c.page]
+	if index >= current.end-current.start {
+		page := c.page
+		switch c.options[index] {
+		case "Previous":
+			page--
+		case "Next":
+			page++
+		default:
+			return
+		}
+		w.finishMenu(c.messageID, w.tr(i18n.Msg.PageChanged))
+		w.showModelPage(c, page)
+		return
+	}
+	w.finishConfirmation(c, index)
+	w.beginModelState(modelOperationRequest{action: "model_select", messageID: c.messageID, role: c.models[current.start+index].Role})
 }
 
 func (w *worker) switchModel(provider, id string) {

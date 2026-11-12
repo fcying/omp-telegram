@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,11 +96,16 @@ func lastCallback(t *testing.T, f *fakeHTTP) string {
 
 func queueCancelData(t *testing.T, menu queueMenuSnapshot, preview string) string {
 	t.Helper()
-	for _, row := range menu.rows {
-		if len(row) != 2 || !strings.Contains(row[0]["text"].(string), preview) || row[1]["text"] != "Cancel" {
-			continue
+	index := 0
+	for _, line := range strings.Split(menu.text, "\n") {
+		var number int
+		line = strings.TrimPrefix(strings.TrimPrefix(line, "<pre>"), "<code>")
+		if _, err := fmt.Sscanf(strings.TrimLeft(line, "`"), "%d. ", &number); err == nil {
+			index = number
 		}
-		return row[1]["callback_data"].(string)
+		if index != 0 && strings.Contains(line, preview) {
+			return queueButtonData(t, menu, fmt.Sprintf("Cancel %d", index))
+		}
 	}
 	t.Fatalf("queue cancel button for %q missing", preview)
 	return ""
@@ -224,13 +230,7 @@ func TestQueueViewerPaginatesPendingTasks(t *testing.T) {
 	if !strings.Contains(menu.text, "Running: no") || !strings.Contains(menu.text, "Pending: 11") || !strings.Contains(menu.text, "Page 1/2") {
 		t.Fatalf("first queue page summary = %q", menu.text)
 	}
-	preparing := false
-	for _, row := range menu.rows {
-		if len(row) == 2 && strings.Contains(row[0]["text"].(string), "Preparing attachment...") {
-			preparing = true
-		}
-	}
-	if !preparing || len(menu.rows) != 11 {
+	if !strings.Contains(menu.text, "Preparing attachment...") || len(menu.rows) != 11 {
 		t.Fatalf("first queue page rows = %+v", menu.rows)
 	}
 	next := queueButtonData(t, menu, "Next")
@@ -482,5 +482,52 @@ func TestQueueCancelReleasesCapacity(t *testing.T) {
 	}
 	if got := queueState(t, w, second); got != "cancelled" {
 		t.Fatalf("released capacity task state = %q", got)
+	}
+}
+
+func TestQueueBodyUsesContentPagesAndCancelsOriginalID(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 16
+	queueReady(t, w, command)
+	for i := range 11 {
+		command(fmt.Sprintf("queued %d", i+1))
+		w.queue[i].displayText = strings.Repeat("😀", 41)
+	}
+	metadata := "```\n**metadata** [link](https://example.test)\n`tail`" + strings.Repeat("界", 20)
+	w.queue[0].displayText = metadata
+	firstID, targetID := w.queue[0].id, w.queue[10].id
+	command("/queue")
+	menu := latestQueueMenu(t, f)
+	if !strings.Contains(menu.text, metadata) || len(menu.rows) >= 11 {
+		t.Fatalf("queue did not preserve literal metadata or paginate by bytes: %q rows=%+v", menu.text, menu.rows)
+	}
+	for _, row := range menu.rows[:len(menu.rows)-1] {
+		if len(row) != 2 || row[0]["disabled"] == nil || row[1]["text"] != "Cancel "+row[0]["text"].(string) || row[1]["style"] != "danger" {
+			t.Fatalf("queue exposed long labels or lost cancellation styling: %+v", row)
+		}
+	}
+	clickQueue(w, 7, menu.messageID, queueButtonData(t, menu, "Next"))
+	menu = latestQueueMenu(t, f)
+	data := queueButtonData(t, menu, "Cancel 11")
+	if !strings.HasSuffix(data, fmt.Sprintf(":cancel:%d", targetID)) {
+		t.Fatalf("global queue number mapped to wrong identity: %q", data)
+	}
+	if !w.cancelQueuedTask(firstID) {
+		t.Fatal("could not shift the pending queue before the callback")
+	}
+	clickQueue(w, 7, menu.messageID, data)
+	if queueState(t, w, targetID) != "cancelled" || len(w.queue) != 9 || w.queue[0].text != "queued 2" || w.queue[8].text != "queued 10" {
+		t.Fatalf("queue cancellation used a shifted index: %+v", w.queue)
+	}
+	menu = latestQueueMenu(t, f)
+	if !strings.Contains(menu.text, "Page 1/1") {
+		t.Fatalf("queue contraction did not rebuild and clamp content pages: %q", menu.text)
+	}
+}
+
+func TestQueuePreviewRetainsUTF16BudgetWithoutPromptHistory(t *testing.T) {
+	q := queued{displayText: strings.Repeat("😀", 41), text: "hidden full prompt history"}
+	if got, want := queueTaskText("en", q), strings.Repeat("😀", 40)+"..."; got != want {
+		t.Fatalf("queue preview changed its 80-unit budget or exposed prompt history: got %q want %q", got, want)
 	}
 }

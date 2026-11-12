@@ -1,12 +1,15 @@
 package bridge
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -123,18 +126,16 @@ func TestFollowupActiveTaskReplyIsIndependentQueue(t *testing.T) {
 	}
 }
 
-func TestFollowupEmptyAttachmentAndFullQueueDoNotConsume(t *testing.T) {
+func TestFollowupEmptyAndFullQueueDoNotConsume(t *testing.T) {
 	w, fake, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 2
 	queueReady(t, w, command)
 	r := persistTestFollowup(t, w, "retry-input")
-	for n, reason := range []string{"empty", "attachment", "full"} {
+	for n, reason := range []string{"empty", "full"} {
 		in := followupTestIncoming(t, w, r, int64(100+n), "next task")
 		switch reason {
 		case "empty":
 			in.msg.Text = "  "
-		case "attachment":
-			in.msg.Document = &telegram.Document{FileID: "file"}
 		case "full":
 			w.b.cfg.QueueCapacity = 0
 		}
@@ -879,4 +880,213 @@ func TestPrivateFollowupCancelBeforePromptAcknowledgment(t *testing.T) {
 		t.Fatalf("late acknowledgment revived or submitted cancelled input: %+v", r)
 	}
 	waitFor(t, func() bool { return f.inlineInputClosed(500) })
+}
+
+func followupTestMediaResult(t *testing.T, w *worker) mediaResult {
+	t.Helper()
+	select {
+	case result := <-w.mediaResults:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow-up attachment preparation did not finish")
+		return mediaResult{}
+	}
+}
+
+func TestFollowupAttachmentKeepsCaptionAndIndependentQueue(t *testing.T) {
+	for _, kind := range []string{"photo", "document"} {
+		for _, caption := range []string{"", "/stop\nInspect this attachment"} {
+			t.Run(kind+caption, func(t *testing.T) {
+				w, fake, command := setupWorkspaceWorker(t)
+				w.b.cfg.QueueCapacity = 2
+				queueReady(t, w, command)
+				command("missing-terminal")
+				w.dispatch()
+				root, turn, client := w.active, w.turn, w.client
+				r := persistTestFollowup(t, w, "media-reply")
+				data := []byte("original document bytes")
+				if kind == "photo" {
+					data = testPNG(t)
+				}
+				fake.mu.Lock()
+				fake.files = map[string][]byte{"followup-file": data}
+				fake.mu.Unlock()
+				in := followupTestIncoming(t, w, r, 100, "")
+				in.msg.Caption = caption
+				if kind == "photo" {
+					in.msg.Photo = []telegram.PhotoSize{{FileID: "followup-file", Width: 8, Height: 8, FileSize: int64(len(data))}}
+				} else {
+					in.msg.Document = &telegram.Document{FileID: "followup-file", FileName: "followup.txt", FileSize: int64(len(data))}
+				}
+				w.handle(in)
+				w.handle(in)
+				if len(w.queue) != 1 || !w.queue[0].preparing || len(w.steers) != 0 || w.active != root || w.turn != turn || w.client != client {
+					t.Fatal("attachment reply was rejected, duplicated or disturbed the running root")
+				}
+				prepared := followupTestMediaResult(t, w)
+				requireStoreOK(t, prepared.err)
+				w.preparedMedia(prepared)
+				q := w.queue[0]
+				if q.preparing || q.id != 100 || q.user != r.User || q.replyTo != in.msg.MessageID || q.reply != nil || !strings.Contains(q.text, caption) || strings.Contains(q.text, followupMarkerPrefix) || strings.Contains(q.text, "Bridge input prompt") {
+					t.Fatalf("prepared follow-up lost its caption or retained the input quote: %+v", q)
+				}
+				name := "followup.txt"
+				if kind == "photo" {
+					name = "photo.jpg"
+					if len(q.images) != 1 {
+						t.Fatal("photo reply lost its model image")
+					}
+					inline, err := base64.StdEncoding.DecodeString(q.images[0].Data)
+					requireStoreOK(t, err)
+					if !bytes.Equal(inline, data) {
+						t.Fatal("photo reply changed the small inline image")
+					}
+				} else if len(q.images) != 0 {
+					t.Fatal("document reply was incorrectly converted into an image")
+				}
+				saved, err := os.ReadFile(filepath.Join(q.directory, name))
+				requireStoreOK(t, err)
+				if !bytes.Equal(saved, data) {
+					t.Fatal("follow-up did not retain original attachment bytes")
+				}
+				request, err := w.b.db.FollowupRequest(r.Token)
+				requireStoreOK(t, err)
+				if request.State != "consumed" || request.InboxID != in.id {
+					t.Fatalf("attachment admission was not durably consumed once: %+v", request)
+				}
+			})
+		}
+	}
+}
+
+func TestFollowupAttachmentRejectionDoesNotDownloadOrConsume(t *testing.T) {
+	for _, reason := range []string{"owner", "expired", "message-id", "full"} {
+		t.Run(reason, func(t *testing.T) {
+			w, fake, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 1
+			queueReady(t, w, command)
+			r := persistTestFollowup(t, w, "rejected-media")
+			in := followupTestIncoming(t, w, r, 100, "")
+			in.msg.Photo = []telegram.PhotoSize{{FileID: "must-not-download"}}
+			in.msg.Caption = "caption"
+			switch reason {
+			case "owner":
+				in.msg.From.ID++
+			case "expired":
+				_, err := w.b.db.DB.Exec(`UPDATE followup_requests SET expires_at=0`)
+				requireStoreOK(t, err)
+			case "message-id":
+				in.msg.ReplyToMessage.MessageID++
+			case "full":
+				w.b.cfg.QueueCapacity = 0
+			}
+			w.handle(in)
+			request, err := w.b.db.FollowupRequest(r.Token)
+			requireStoreOK(t, err)
+			fake.mu.Lock()
+			accessed := fake.fileRequests != 0 || fake.downloadRequests != 0
+			fake.mu.Unlock()
+			if accessed || request.State != "delivered" || len(w.queue) != 0 || len(w.steers) != 0 {
+				t.Fatal("rejected attachment downloaded, consumed the request or reached model work")
+			}
+		})
+	}
+}
+
+func TestFollowupAttachmentFailureDoesNotReplay(t *testing.T) {
+	w, fake, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 1
+	queueReady(t, w, command)
+	r := persistTestFollowup(t, w, "failed-media")
+	fake.mu.Lock()
+	fake.downloadErr = errors.New("test download failure")
+	fake.mu.Unlock()
+	in := followupTestIncoming(t, w, r, 100, "")
+	in.msg.Document = &telegram.Document{FileID: "failed-download", FileName: "note.txt"}
+	w.handle(in)
+	prepared := followupTestMediaResult(t, w)
+	if prepared.err == nil {
+		t.Fatal("failed download unexpectedly prepared an attachment")
+	}
+	w.preparedMedia(prepared)
+	if len(w.queue) != 0 {
+		t.Fatal("failed attachment remained eligible for submission")
+	}
+	var state string
+	requireStoreOK(t, w.b.db.DB.QueryRow(`SELECT state FROM inbox WHERE id=100`).Scan(&state))
+	if state != "failed" {
+		t.Fatalf("failed attachment inbox = %q", state)
+	}
+	w.handle(in)
+	retry := followupTestIncoming(t, w, r, 101, "do not replay")
+	w.handle(retry)
+	request, err := w.b.db.FollowupRequest(r.Token)
+	requireStoreOK(t, err)
+	fake.mu.Lock()
+	downloads := fake.downloadRequests
+	fake.mu.Unlock()
+	if request.State != "consumed" || request.InboxID != 100 || downloads != 1 || len(w.queue) != 0 || len(w.steers) != 0 {
+		t.Fatal("failed consumed attachment was retried or converted into text work")
+	}
+}
+
+func TestFollowupAlbumConsumesOnceAndKeepsMembers(t *testing.T) {
+	for _, firstReply := range []bool{true, false} {
+		t.Run(strconv.FormatBool(firstReply), func(t *testing.T) {
+			w, fake, command := setupWorkspaceWorker(t)
+			w.b.cfg.QueueCapacity = 1
+			queueReady(t, w, command)
+			r := persistTestFollowup(t, w, "album-followup")
+			data := testPNG(t)
+			fake.mu.Lock()
+			fake.files = map[string][]byte{"album-photo": data}
+			fake.mu.Unlock()
+			for index := range 3 {
+				in := followupTestIncoming(t, w, r, int64(100+index), "")
+				in.msg.MediaGroupID = "followup-album"
+				in.msg.Photo = []telegram.PhotoSize{{FileID: "album-photo", Width: 8, Height: 8, FileSize: int64(len(data))}}
+				if index == 0 && !firstReply {
+					in.msg.ReplyToMessage, in.msg.Quote = nil, nil
+				}
+				if index == 1 {
+					in.msg.Caption = "album caption"
+				}
+				w.handle(in)
+			}
+			key := albumKey{group: "followup-album", user: r.User}
+			album := w.albums[key]
+			if len(w.queue) != 1 || album == nil || album.ownerID != 100 || len(album.messages) != 3 || len(w.steers) != 0 {
+				t.Fatal("follow-up album consumed multiple slots or rejected quoted members")
+			}
+			for _, message := range album.messages {
+				if message.ReplyToMessage != nil || message.Quote != nil {
+					t.Fatal("follow-up input quote leaked into an album member")
+				}
+			}
+			w.sealAlbum(albumEvent{key: key, version: album.version})
+			prepared := followupTestMediaResult(t, w)
+			requireStoreOK(t, prepared.err)
+			w.preparedMedia(prepared)
+			q := w.queue[0]
+			if q.preparing || len(q.images) != 3 || !strings.Contains(q.text, "album caption") || strings.Contains(q.text, followupMarkerPrefix) {
+				t.Fatalf("follow-up album lost members or caption: %+v", q)
+			}
+			request, err := w.b.db.FollowupRequest(r.Token)
+			requireStoreOK(t, err)
+			if request.State != "consumed" || request.InboxID != 100 {
+				t.Fatalf("album claim did not target its owner inbox: %+v", request)
+			}
+			for id := 100; id < 103; id++ {
+				var state string
+				requireStoreOK(t, w.b.db.DB.QueryRow(`SELECT state FROM inbox WHERE id=?`, id).Scan(&state))
+				want := "done"
+				if id == 100 {
+					want = "pending"
+				}
+				if state != want {
+					t.Fatalf("album inbox %d = %q, want %q", id, state, want)
+				}
+			}
+		})
+	}
 }
