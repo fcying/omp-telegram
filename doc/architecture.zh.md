@@ -429,11 +429,11 @@ Schema 23 增加独立于 header 内容的 `outbox.header_editable`, 回填现�
 
 观察器依赖 RPC 扩展通知: 启用 sub2api 时拒绝任一包含 `--no-ui` 的参数预设. Headless 扩展 UI 会丢弃 `notify`, bridge 不覆盖用户的显式选项. `--no-extensions` 只关闭发现, 与显式观察器路径兼容.
 
-Bridge 侧有界 HTTP 工作不占 RPC 操作通道. 每批归属/额度查询使用独立的 10 秒总预算, 覆盖所有顺序执行的 Request ID 反查和账号额度读取; 原生 RPC `/usage` 保留三秒预算. 任务 scope 或 runtime 取消可提前结束 HTTP 工作. GET 使用 `x-api-key`, 拒绝 redirect, 不暴露原始 HTTP/RPC 响应或秘密. 精确 `client:<UUID>` usage 查询必须在经过校验的分页中得到唯一匹配账号; 对配置的 provider 不回退到最新日志, provider 单独 scope 或原生凭据. 真实账号的 `/api/v1/admin/openai/accounts/:id/quota` 响应只提供 18000/604800 秒窗口中有限且在 0..100 范围内的已用百分比. ID 缺失, hook/header 不受支持, 映射歧义/缺失, HTTP/权限失败及窗口缺失均省略不可用值, 不延迟任务结算或重放模型工作.
+Bridge 侧有界 HTTP 工作不占 RPC 操作通道. 每批归属/额度查询使用独立的 10 秒总预算, 覆盖所有顺序执行的 Request ID 反查和账号额度读取; 原生 RPC `/usage` 保留三秒预算. 任务 scope 或 runtime 取消可提前结束 HTTP 工作. GET 使用 `x-api-key`, 拒绝 redirect, 不暴露原始 HTTP/RPC 响应或秘密. 精确 `client:<UUID>` usage 查询必须在经过校验的分页中得到唯一匹配账号; 对配置的 provider 不回退到最新日志, provider 单独 scope 或原生凭据. 真实账号的 `/api/v1/admin/openai/accounts/:id/quota` 响应只提供 18000/604800 秒窗口中有限且在 0..100 范围内的已用百分比. ID 缺失, hook/header 不受支持, 映射歧义/缺失, HTTP/权限失败或窗口缺失时, 若没有 last-good sample 则省略对应值; 否则保留旧显示, 不推断新的账号或额度.
 
 每次占用账号额度缓存的刷新槽位前, 批次检查 context, 已取消或超时则停止 HTTP 工作. 批次尚未访问的账号不进入刷新冷却; 已占用的槽位保留正常冷却, 不回滚共享缓存状态. 下次额度刷新取全部已确认账号的共享 claim 截止时间的最小值, 包括尚未访问的账号; 批次错误不对整个 worker 施加统一冷却.
 
-响应头通知只收集任务的全部 Request ID, 不在执行中启动 HTTP 工作. 任务最终完成后, 共享 idle gate 才允许批次解析全部保留 ID, 按实际账号去重后读取额度. 对 `ErrNotReady` 的 usage 查询在 scope 仍有效且 idle 时以至少一秒的间隔重试, 窗口为 10 秒; 实际调度由 worker 的 1.5 秒 tick 决定, scope 失效可提前取消. 批次 context 仍有效时, 一个 ID 查询失败不阻断其他 ID. 只要存在未就绪结果, 独立查询失败就不覆盖有界短重试; 没有未就绪结果时, 查询错误保留五分钟的归属查询退避, 与账号额度调度分开. 记账未就绪不占用五分钟账号额度刷新槽位. 重试不占住任务完成, 不重放 provider 请求; 迟到成功结果只能在既有围栏内更新最新对应的最终 header 目标.
+响应头通知只收集任务的全部 Request ID, 不在执行中启动 HTTP 工作. 任务最终完成后, 共享 idle gate 才允许批次解析全部保留 ID, 按实际账号去重后读取额度. Worker 会为该 provider/session 保留最近一次成功额度, 新归属或刷新 pending 期间直接显示. 当前任务的新样本成功后替换; 空结果或读取失败时保留 last-good. 该快照不用于请求归属; Sub2API 换账号时, 新结果到达前可能暂时显示上一账号的额度. AutoResearch final 优先使用产生正文的轮次额度; 该轮没有 sample 时, 才回退到同 provider/session 的 last-good, 后续空轮不会覆盖正文归属. `ErrNotReady` usage 查询在 scope 仍有效且 idle 时以至少一秒的间隔重试, 窗口为 10 秒; 实际调度由 worker 的 1.5 秒 tick 决定, scope 失效可提前取消. 批次 context 仍有效时, 一个 ID 查询失败不阻断其他 ID. 只要存在未就绪结果, 独立查询失败就不覆盖有界短重试; 没有未就绪结果时, 查询错误保留五分钟的归属查询退避, 与账号额度调度分开. 记账未就绪不占用五分钟账号额度刷新槽位. 重试不占住任务完成, 不重放 provider 请求; 迟到成功结果只能在既有围栏内更新最新对应的最终 header 目标.
 
 窗口耗尽只停止未解析 Request ID 的归属查询; 已确认账号仍按常规额度刷新门控采样. 仅刷新额度不会延长或重启已耗尽的归属窗口. 全部任务 ID 在 idle 采样前收集完毕, 不只保留最后一个响应 ID, 也不在执行中对变化中的请求集合发起探测.
 

@@ -105,6 +105,9 @@ func (w *worker) prepareReplyStatus(round bool, fields compactStatusFields, read
 		fields.quota = ""
 		if readCompleted {
 			fields.quota = w.replyStatus.roundSub2apiUsage.sub2apiQuotaSnapshot.text(time.Now())
+			if fields.quota == "" {
+				fields.quota = w.sub2apiUsageText(provider)
+			}
 		}
 	}
 	w.replyStatus.header = w.renderStatusBar(kind, fields)

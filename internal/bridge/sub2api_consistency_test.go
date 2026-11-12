@@ -337,7 +337,7 @@ func TestSub2apiHistoricalSnapshotDoesNotAdoptNextTaskAccount(t *testing.T) {
 	}
 }
 
-func TestSub2apiMissingQuotaCannotBorrowAnotherAccount(t *testing.T) {
+func TestSub2apiMissingQuotaKeepsLastGoodDisplay(t *testing.T) {
 	w, command, _, _ := sub2apiTestWorker(t, nil, nil)
 	sub2apiTestNotify(t, w, "openai-codex", w.binding.SessionID, sub2apiTestRequest1)
 	finishSub2apiTask(t, w)
@@ -357,8 +357,8 @@ func TestSub2apiMissingQuotaCannotBorrowAnotherAccount(t *testing.T) {
 	if w.sub2api.requests[sub2apiTestRequest2] != 3 {
 		t.Fatal("new account attribution was not retained for an empty quota response")
 	}
-	if got := w.providerUsageText("openai-codex", true); got != "" {
-		t.Fatalf("an account without a successful sample borrowed another account's quota: %q", got)
+	if got := w.providerUsageText("openai-codex", true); got != "Plus 1% 16%" {
+		t.Fatalf("empty quota for the new account hid the last-good display: %q", got)
 	}
 }
 
