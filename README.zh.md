@@ -428,11 +428,11 @@ final = ["status", "model", "context", "speed", "quota"]
 
 HTTP 和 SSE 响应支持通过服务端 `x-client-request-id` 响应头确定请求归属. WebSocket 不受支持: `101` 握手无法确定后续每轮实际服务的账号, bridge 不会从握手 ID 推导每轮 usage. Bridge 不修改 OMP 的 transport 配置; WebSocket 请求没有可归属的 sub2api 额度.
 
-任务最终完成且 worker 空闲后, bridge 将该任务的全部 Request ID 解析为实际上游 OpenAI OAuth 账号, 并按账号去重. 同一任务使用多个已配置 provider 时, 这些请求也汇总到同一账号集合. 字段显示其可识别的 5h/7d **已用**百分比和可用的重置倒计时, 格式见下方[状态栏](#状态栏); 多个账号可分别显示. 归属缺失或有歧义, OMP hook/header 不受支持或额度不可用时省略对应值. Bridge 不借用上一任务身份, 不根据 model 猜测账号, 不替换为网关凭据额度.
+任务最终完成且 worker 空闲后, bridge 将该任务的全部 Request ID 解析为实际上游 OpenAI OAuth 账号, 并按账号去重. 同一任务使用多个已配置 provider 时, 这些请求也汇总到同一账号集合. 字段显示其可识别的 5h/7d **已用**百分比和可用重置倒计时, 格式见下方[状态栏](#状态栏); 多个账号可分别显示. 对同一 conversation/provider/session, 新任务归属或刷新 pending 期间继续显示最近一次成功额度; 当前查询成功后替换, 只有没有 last-good sample 时才省略. 若 Sub2API 将后续任务路由到另一账号, 暂存值可能暂时属于上一账号. Bridge 不复用上一任务的 Request ID 做当前归属, 不根据 model 猜测账号, 不替换为网关凭据额度.
 
-Usage 日志可能在任务完成后才可查询. 在任务 scope 仍有效且 worker 空闲时, 有界归属重试可回填最新对应的最终 header, 不延迟任务完成, 不修改答案或重放任务. Research 保留实际正文所属轮次的归属, 而非后续空轮. 队列工作, 新 scope 或 runtime 退役优先, 不保证历史 header 必定回填.
+Usage 日志可能在任务完成后才可查询. 在任务 scope 仍有效且 worker 空闲时, 有界归属重试可回填最新对应的最终 header, 不延迟任务完成, 不修改答案或重放任务. Research 保留实际正文所属轮次的归属, 而非后续空轮; 若该轮没有 quota sample, final header 使用同 provider/session 的 last-good quota, 直到当前查询成功后替换. 队列工作, 新 scope 或 runtime 退役优先, 不保证历史 header 必定回填.
 
-原生与 sub2api 额度共用仅 idle 刷新, 缓存和渲染流程, 仅账号归属与额度获取来源不同. 同一账号的刷新尝试受五分钟门控. 刷新中, 读取失败或空结果均保留最近成功样本, 无显示 TTL; 但新任务复用缓存额度前必须确认自己的账号. Key 和原始响应不记日志, 不发送 Telegram; 详细 `/status` 不变. 实现细节见[架构文档](doc/architecture.zh.md#sub2api-额度).
+原生与 sub2api 额度共用仅 idle 刷新, 缓存和渲染流程, 仅账号归属与额度获取来源不同. 同一账号的刷新尝试受五分钟门控. 刷新中, 读取失败或空结果均保留最近成功样本, 无显示 TTL. 新任务归属待定时, 状态栏可显示同 provider/session 的 last-good; 这只影响显示, 不会用旧 Request ID 推断当前归属. Key 和原始响应不记日志, 不发送 Telegram; 详细 `/status` 不变. 实现细节见[架构文档](doc/architecture.zh.md#sub2api-额度).
 
 ### 状态栏
 

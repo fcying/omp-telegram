@@ -57,18 +57,21 @@ func (b *Bridge) sub2apiHTTP() (*sub2api.Client, [32]byte) {
 }
 
 type sub2apiUsageState struct {
-	epoch      uint64
-	client     *omp.Client
-	generation int64
-	catalog    uint64
-	sessionID  string
-	turn       uint64
-	inbox      int64
-	target     int64
-	provider   string // Actual body provider, bound when its header is committed.
-	requests   map[string]int64
-	accounts   []int64
-	invalid    bool
+	epoch             uint64
+	client            *omp.Client
+	generation        int64
+	catalog           uint64
+	sessionID         string
+	turn              uint64
+	inbox             int64
+	target            int64
+	provider          string // Actual body provider, bound when its header is committed.
+	requests          map[string]int64
+	accounts          []int64
+	invalid           bool
+	lastGoodProvider  string
+	lastGoodSessionID string
+	lastGoodSnapshot  sub2apiQuotaSnapshot
 	sub2apiQuotaSnapshot
 	next           time.Time
 	retryNext      time.Time
@@ -100,8 +103,18 @@ type sub2apiUsageResult struct {
 
 func (w *worker) resetSub2apiUsage() {
 	s := &w.sub2api
+	lastGoodProvider := s.lastGoodProvider
+	lastGoodSessionID := s.lastGoodSessionID
+	lastGoodSnapshot := sub2apiQuotaSnapshot{samples: slices.Clone(s.lastGoodSnapshot.samples)}
+	if current := s.sub2apiQuotaSnapshot; s.provider != "" && s.sessionID != "" && current.text(time.Now()) != "" {
+		lastGoodProvider, lastGoodSessionID = s.provider, s.sessionID
+		lastGoodSnapshot = sub2apiQuotaSnapshot{samples: slices.Clone(current.samples)}
+	}
 	w.cancelSub2apiUsage()
-	w.sub2api = sub2apiUsageState{epoch: s.epoch + 1, results: s.results}
+	w.sub2api = sub2apiUsageState{
+		epoch: s.epoch + 1, results: s.results,
+		lastGoodProvider: lastGoodProvider, lastGoodSessionID: lastGoodSessionID, lastGoodSnapshot: lastGoodSnapshot,
+	}
 }
 
 func (w *worker) cancelSub2apiUsage() {
@@ -174,10 +187,16 @@ func (w *worker) sub2apiUsageMatches(client *omp.Client, generation int64, epoch
 
 func (w *worker) sub2apiUsageText(provider string) string {
 	s := &w.sub2api
-	if s.invalid || s.provider != provider || !w.sub2apiUsageMatches(s.client, s.generation, s.catalog, s.sessionID, s.turn) {
+	now := time.Now()
+	if !s.invalid && s.provider == provider && w.sub2apiUsageMatches(s.client, s.generation, s.catalog, s.sessionID, s.turn) {
+		if text := s.sub2apiQuotaSnapshot.text(now); text != "" {
+			return text
+		}
+	}
+	if s.lastGoodProvider != provider || s.lastGoodSessionID == "" || s.lastGoodSessionID != w.binding.SessionID {
 		return ""
 	}
-	return s.sub2apiQuotaSnapshot.text(time.Now())
+	return s.lastGoodSnapshot.text(now)
 }
 
 func (w *worker) refreshSub2apiUsage(now time.Time) {
@@ -393,7 +412,7 @@ func (w *worker) publishSub2apiQuota(now time.Time) {
 	s := &w.sub2api
 	if w.b.cfg.StatusBar.Has("final", "quota") && s.target != 0 && w.providerUsage.target == s.target && w.providerUsage.targetProvider == s.provider {
 		fields := w.providerUsage.baseFields
-		fields.quota = s.sub2apiQuotaSnapshot.text(now)
+		fields.quota = w.sub2apiUsageText(s.provider)
 		header := w.renderStatusBar("final", fields)
 		if err := w.b.db.SetAssistantHeader(w.ctx, s.target, header); err != nil && w.ctx.Err() == nil {
 			w.b.storeLog.Error("provider usage header update failed", "event", "assistant_header_update_failed", "error_kind", "persistence")

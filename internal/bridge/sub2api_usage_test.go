@@ -181,8 +181,8 @@ func TestSub2apiMultipleActualAccountsAndNextTaskIsolation(t *testing.T) {
 	command("missing-terminal")
 	w.dispatch()
 	drainWatchdogEvents(t, w)
-	if got := w.providerUsageText("openai-codex", true); got != "" {
-		t.Fatalf("new task inherited an unconfirmed account: %q", got)
+	if got := w.providerUsageText("openai-codex", true); got != "Plus 1% 16% · Prolite 7d 100%" {
+		t.Fatalf("new task did not retain its last-good quota before attribution: %q", got)
 	}
 	sub2apiTestNotify(t, w, "openai-codex", w.binding.SessionID, sub2apiTestRequest3)
 	finishSub2apiTask(t, w)
@@ -192,6 +192,57 @@ func TestSub2apiMultipleActualAccountsAndNextTaskIsolation(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("account quota cache did not share confirmed accounts: %d reads", calls.Load())
+	}
+}
+
+func TestSub2apiLastGoodQuotaDisplaysUntilSuccessfulRefresh(t *testing.T) {
+	w, command, _, _ := sub2apiTestWorker(t, nil, nil)
+	sub2apiTestNotify(t, w, "openai-codex", w.binding.SessionID, sub2apiTestRequest1)
+	finishSub2apiTask(t, w)
+	awaitSub2apiUsage(t, w)
+
+	command("missing-terminal")
+	w.dispatch()
+	drainWatchdogEvents(t, w)
+	taskID := w.active
+	if taskID == 0 {
+		t.Fatal("second task did not start")
+	}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	interceptSub2api(t, w, func(req *http.Request) *http.Response {
+		if req.URL.Path != "/api/v1/admin/openai/accounts/3/quota" {
+			return nil
+		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-req.Context().Done():
+		}
+		return nil
+	})
+	sub2apiTestNotify(t, w, "openai-codex", w.binding.SessionID, sub2apiTestRequest2)
+	if w.sub2api.inbox != taskID || len(w.sub2api.requests) != 1 {
+		t.Fatalf("request attribution was not scoped to the second task: active=%d inbox=%d requests=%v", taskID, w.sub2api.inbox, w.sub2api.requests)
+	}
+	finishSub2apiTask(t, w)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("current account refresh did not start: active=%d busy=%t provider=%q session=%q inbox=%d requests=%v pending=%t ready=%t next=%v retryNext=%v", w.active, w.busy, w.sub2api.provider, w.sub2api.sessionID, w.sub2api.inbox, w.sub2api.requests, w.sub2api.pending != nil, w.providerUsageRefreshReady(), w.sub2api.next, w.sub2api.retryNext)
+	}
+	if got := finalReplyStatus(t, w, taskID, "answer"); !strings.Contains(got, "Plus 1% 16%") {
+		t.Fatalf("last-good quota was hidden while the current account refresh was pending: %q", got)
+	}
+	releaseOnce.Do(func() { close(release) })
+	awaitSub2apiUsage(t, w)
+	if got := finalReplyStatus(t, w, taskID, "answer"); !strings.Contains(got, "Prolite 7d 100%") || strings.Contains(got, "Plus 1%") {
+		t.Fatalf("successful current quota did not replace last-good: %q", got)
 	}
 }
 
@@ -298,6 +349,24 @@ func TestSub2apiResearchFinalHeaderKeepsBodyAccount(t *testing.T) {
 				t.Fatalf("empty round replaced body account: header=%q body=%q quota_calls=%d", header, body, calls.Load())
 			}
 		})
+	}
+}
+
+func TestSub2apiResearchFinalHeaderFallsBackToLastGood(t *testing.T) {
+	w, _, _, _ := sub2apiTestWorker(t, nil, nil)
+	w.research.root = true
+	w.replyStatus.roundMetrics.provider = "openai-codex"
+	w.sub2api.lastGoodProvider = "openai-codex"
+	w.sub2api.lastGoodSessionID = w.binding.SessionID
+	w.sub2api.lastGoodSnapshot = sub2apiQuotaSnapshot{samples: []quotaSample{{
+		label:   "Plus",
+		windows: [2]quotaWindow{{present: true, used: 1}, {present: true, used: 16}},
+	}}}
+	w.replyStatus.roundSub2apiUsage = sub2apiUsageState{}
+
+	w.prepareReplyStatus(false, compactStatusFields{}, true)
+	if !strings.Contains(w.replyStatus.header, "Plus 1% 16%") {
+		t.Fatalf("AutoResearch final omitted last-good quota when the body round had no sample: %q", w.replyStatus.header)
 	}
 }
 
