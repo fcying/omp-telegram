@@ -463,6 +463,61 @@ func TestQueueStaleMediaResultCleansCancelledTask(t *testing.T) {
 	}
 }
 
+func TestQueueStaleMediaGenerationCancelsPreparingTask(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.QueueCapacity = 1
+	queueReady(t, w, command)
+	command("attachment task")
+	id := w.queue[0].id
+	w.queue[0].preparing = true
+	cancelled := false
+	w.queue[0].cancel = func() { cancelled = true }
+	oldGeneration := w.binding.Generation
+	w.queue[0].mediaGeneration = oldGeneration
+	w.binding.Generation++
+	directory := filepath.Join(w.b.cfg.DataDir, "attachments", "inbox", "incoming-old-generation")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "image.bin"), []byte("image"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	w.preparedMedia(mediaResult{
+		id: id, generation: oldGeneration, input: media.Input{Directory: directory}, logger: w.mediaTaskLogger(id),
+	})
+	if !cancelled || len(w.queue) != 0 || queueState(t, w, id) != "cancelled" {
+		t.Fatalf("stale media result left a preparing task pending: cancelled=%v queue=%+v state=%s", cancelled, w.queue, queueState(t, w, id))
+	}
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("stale media directory remains: %v", err)
+	}
+}
+
+func TestQueueObsoleteMediaAttemptCannotCancelCurrentPlaceholder(t *testing.T) {
+	w, _, _ := setupWorkspaceWorker(t)
+	id := int64(501)
+	requireStoreOK(t, w.b.db.Accept(id, []byte(`{"update_id":501}`)))
+	currentGeneration := w.binding.Generation
+	w.queue = append(w.queue, queued{id: id, preparing: true, mediaGeneration: currentGeneration, mediaAttempt: 2})
+	directory := filepath.Join(w.b.cfg.DataDir, "attachments", "inbox", "incoming-obsolete-attempt")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "old.bin"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	w.preparedMedia(mediaResult{
+		id: id, generation: currentGeneration, attempt: 1,
+		input: media.Input{Directory: directory}, logger: w.mediaTaskLogger(id),
+	})
+	if len(w.queue) != 1 || w.queue[0].id != id || !w.queue[0].preparing || w.queue[0].mediaAttempt != 2 || queueState(t, w, id) != "pending" {
+		t.Fatal("obsolete preparation attempt changed the current placeholder")
+	}
+	if _, err := os.Stat(directory); !os.IsNotExist(err) {
+		t.Fatalf("obsolete attempt's directory remains: %v", err)
+	}
+}
+
 func TestQueueCancelReleasesCapacity(t *testing.T) {
 	w, f, command := setupWorkspaceWorker(t)
 	w.b.cfg.QueueCapacity = 2

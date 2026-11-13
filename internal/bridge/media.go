@@ -35,6 +35,7 @@ const (
 
 type mediaResult struct {
 	id, generation int64
+	attempt        uint64
 	input          media.Input
 	err            error
 	logger         *slog.Logger
@@ -126,7 +127,7 @@ func (w *worker) queueMedia(in incoming) {
 	if message.From != nil {
 		user = message.From.ID
 	}
-	w.queue = append(w.queue, queued{id: in.id, user: user, replyTo: message.MessageID, displayText: displayText, reply: &message, preparing: true})
+	w.queue = append(w.queue, queued{id: in.id, user: user, replyTo: message.MessageID, displayText: displayText, reply: &message, preparing: true, mediaGeneration: w.binding.Generation})
 	w.startMediaPreparation(in.id, []telegram.Message{message}, false)
 }
 
@@ -198,7 +199,7 @@ func (w *worker) collectAlbum(in incoming) {
 		caption:   message.Caption,
 	}
 	w.albums[key] = album
-	w.queue = append(w.queue, queued{id: in.id, user: user, replyTo: message.MessageID, displayText: displayText, albumKey: key, album: true, preparing: true})
+	w.queue = append(w.queue, queued{id: in.id, user: user, replyTo: message.MessageID, displayText: displayText, albumKey: key, album: true, preparing: true, mediaGeneration: w.binding.Generation})
 	w.log.Info("album member collected", "event", "album_collect", "inbox_id", in.id, "count", 1)
 	w.scheduleAlbum(album)
 }
@@ -375,14 +376,19 @@ func (w *worker) clearAlbums() {
 func (w *worker) startMediaPreparation(id int64, messages []telegram.Message, album bool) {
 	w.initMedia()
 	ctx, cancel := context.WithCancel(w.ctx)
+	w.mediaPreparationSeq++
+	attempt := w.mediaPreparationSeq
+	generation := w.binding.Generation
 	for i := range w.queue {
 		if w.queue[i].id == id {
 			w.queue[i].cancel = cancel
+			w.queue[i].mediaAttempt = attempt
+			generation = w.queue[i].mediaGeneration
 			break
 		}
 	}
 	members := append([]telegram.Message(nil), messages...)
-	dataDir, generation := w.b.cfg.DataDir, w.binding.Generation
+	dataDir := w.b.cfg.DataDir
 	owner := media.IncomingOwner{SessionID: w.sessionID, Workspace: w.binding.Workspace}
 	mediaLogger := w.mediaTaskLogger(id)
 	w.background.Add(1)
@@ -409,7 +415,7 @@ func (w *worker) startMediaPreparation(id int64, messages []telegram.Message, al
 				err = media.ErrCannotSaveIncomingAttachmentSessionOwner
 			}
 		}
-		result := mediaResult{id: id, generation: generation, input: prepared, err: err, logger: mediaLogger, album: album, count: len(members)}
+		result := mediaResult{id: id, generation: generation, attempt: attempt, input: prepared, err: err, logger: mediaLogger, album: album, count: len(members)}
 		select {
 		case w.mediaResults <- result:
 		case <-w.ctx.Done():
@@ -630,14 +636,12 @@ func mediaPreparationError(language i18n.Language, err error) string {
 
 func (w *worker) preparedMedia(result mediaResult) {
 	defer w.beginConsumerPhase("result", "prepared_media").end()
+	// Find the placeholder before fencing stale results so generation changes can clean the queue.
 	index := -1
-	// Preparation belongs to the logical session's queue, not its current process.
-	if result.generation == w.binding.Generation {
-		for i, q := range w.queue {
-			if q.id == result.id && q.preparing {
-				index = i
-				break
-			}
+	for i, q := range w.queue {
+		if q.id == result.id && q.mediaGeneration == result.generation && q.mediaAttempt == result.attempt {
+			index = i
+			break
 		}
 	}
 	if index < 0 {
@@ -647,6 +651,26 @@ func (w *worker) preparedMedia(result mediaResult) {
 		w.b.discardIncoming(result.input.Directory, result.logger)
 		return
 	}
+	if result.generation != w.binding.Generation {
+		if result.album {
+			result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", "stale_generation")
+		}
+		queuedDirectory := w.queue[index].directory
+		w.cancelQueuedTask(result.id)
+		if result.input.Directory != queuedDirectory {
+			w.b.discardIncoming(result.input.Directory, result.logger)
+		}
+		return
+	}
+
+	if !w.queue[index].preparing {
+		if result.album {
+			result.logger.Info("album preparation finished", "event", "album_prepare", "inbox_id", result.id, "count", result.count, "result", albumPreparationResult(result.err))
+		}
+		w.b.discardIncoming(result.input.Directory, result.logger)
+		return
+	}
+
 	if result.err != nil {
 		q := w.queue[index]
 		if q.album {

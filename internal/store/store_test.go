@@ -2437,3 +2437,95 @@ func TestFinalCompletionWithoutBodyDoesNotCreateStatusOutput(t *testing.T) {
 		t.Fatalf("completion without body created output: %v", err)
 	}
 }
+func TestMoveBindingUpdatesWorkspaceSessionHistoryAndFavorite(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	previous := Binding{Bot: 1, Chat: -2, Thread: 3, Workspace: "/workspace/old", Session: "/sessions/old.jsonl", SessionID: "abcd0000", Generation: 4, LastUsedAt: 10, Running: true}
+	requireStoreOK(t, s.Save(previous))
+	requireStoreOK(t, s.SetPinnedSession(previous.Bot, previous.Chat, previous.Thread, previous.Workspace, previous.SessionID, true))
+	next := previous
+	next.Workspace, next.Session, next.Generation, next.LastUsedAt = "/workspace/new", "/sessions/new/old.jsonl", 5, 11
+	requireStoreOK(t, s.MoveBinding(previous, next))
+	got, err := s.Binding(next.Bot, next.Chat, next.Thread)
+	requireStoreOK(t, err)
+	if got != next {
+		t.Fatalf("moved binding = %+v, want %+v", got, next)
+	}
+	var historyWorkspace, historySession string
+	var historyGeneration int64
+	requireStoreOK(t, s.DB.QueryRow("SELECT workspace,session,generation FROM history").Scan(&historyWorkspace, &historySession, &historyGeneration))
+	if historyWorkspace != previous.Workspace || historySession != previous.Session || historyGeneration != previous.Generation {
+		t.Fatalf("move history = %q %q %d, want original binding", historyWorkspace, historySession, historyGeneration)
+	}
+	oldPins, err := s.PinnedSessions(next.Bot, next.Chat, next.Thread, previous.Workspace)
+	requireStoreOK(t, err)
+	newPins, err := s.PinnedSessions(next.Bot, next.Chat, next.Thread, next.Workspace)
+	requireStoreOK(t, err)
+	if len(oldPins) != 0 || len(newPins) != 1 {
+		t.Fatalf("move pins old=%v new=%v", oldPins, newPins)
+	}
+}
+
+func TestMoveBindingPreservesAutoSessionNamePending(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	previous := Binding{Bot: 1, Chat: -2, Thread: 3, Workspace: "/workspace/old", Session: "/sessions/old.jsonl", SessionID: "abcd0000", Generation: 4, Running: true, AutoSessionNamePending: true}
+	requireStoreOK(t, s.Save(previous))
+	next := previous
+	next.Workspace, next.Session, next.Generation = "/workspace/new", "/sessions/new/old.jsonl", 5
+	if err := s.MoveBinding(previous, next); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Binding(next.Bot, next.Chat, next.Thread)
+	requireStoreOK(t, err)
+	if got != next || !got.AutoSessionNamePending {
+		t.Fatalf("move binding = %+v, want eligibility preserved in %+v", got, next)
+	}
+}
+
+func TestMoveBindingRejectsChangingAutoSessionNamePending(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	previous := Binding{Bot: 1, Chat: -2, Thread: 3, Workspace: "/workspace/old", Session: "/sessions/old.jsonl", SessionID: "abcd0000", Generation: 4, Running: true, AutoSessionNamePending: true}
+	requireStoreOK(t, s.Save(previous))
+	next := previous
+	next.Workspace, next.Session, next.Generation = "/workspace/new", "/sessions/new/old.jsonl", 5
+	next.AutoSessionNamePending = false
+	if err := s.MoveBinding(previous, next); err == nil {
+		t.Fatal("move accepted a change to one-shot auto-naming eligibility")
+	}
+	got, err := s.Binding(previous.Bot, previous.Chat, previous.Thread)
+	requireStoreOK(t, err)
+	if got != previous {
+		t.Fatalf("rejected move changed binding: %+v", got)
+	}
+}
+
+func TestMoveBindingRejectsSharedAndStaleSessionReferences(t *testing.T) {
+	for _, scenario := range []string{"shared", "stale"} {
+		t.Run(scenario, func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			previous := Binding{Bot: 1, Chat: -2, Thread: 3, Workspace: "/workspace/old", Session: "/sessions/old.jsonl", SessionID: "abcd0000", Generation: 4, Running: true}
+			requireStoreOK(t, s.Save(previous))
+			if scenario == "shared" {
+				other := Binding{Bot: 1, Chat: -2, Thread: 4, Workspace: "/workspace/other", Session: "/sessions/old.jsonl", SessionID: previous.SessionID, Generation: 1}
+				requireStoreOK(t, s.Save(other))
+			}
+			next := previous
+			next.Workspace, next.Session, next.Generation = "/workspace/new", "/sessions/new/old.jsonl", 5
+			if scenario == "stale" {
+				previous.Generation++
+				next.Generation = previous.Generation + 1
+			}
+			err := s.MoveBinding(previous, next)
+			if scenario == "shared" && !errors.Is(err, ErrSessionShared) {
+				t.Fatalf("shared session move error = %v", err)
+			}
+			if scenario == "stale" && !errors.Is(err, ErrStaleBinding) {
+				t.Fatalf("stale binding move error = %v", err)
+			}
+			current, readErr := s.Binding(1, -2, 3)
+			requireStoreOK(t, readErr)
+			if current.Workspace != "/workspace/old" || current.Session != "/sessions/old.jsonl" || current.Generation != 4 {
+				t.Fatalf("rejected move changed binding: %+v", current)
+			}
+		})
+	}
+}

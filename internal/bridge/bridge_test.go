@@ -543,6 +543,8 @@ func TestMain(m *testing.M) {
 		var uiResponses []map[string]any
 		askDialogEnabled := false
 		nativeMode := os.Getenv("OMP_TELEGRAM_FIXTURE_NATIVE_COMMANDS")
+		moveMode := os.Getenv("OMP_TELEGRAM_FIXTURE_MOVE_MODE")
+		moveInfoReject := false
 		var nativeCommands []map[string]any
 		var heldNativeDiscovery map[string]any
 		var heldNativeLocalID string
@@ -1216,6 +1218,62 @@ func TestMain(m *testing.M) {
 					emit(resp)
 					continue
 				}
+				if nativeMode != "" && strings.HasPrefix(text, "/move ") {
+					target := strings.TrimPrefix(text, "/move ")
+					if moveMode == "reject" {
+						emit(map[string]any{"type": "command_output", "text": "Move rejected by fixture."})
+						resp["data"] = map[string]any{"agentInvoked": false}
+						emit(resp)
+						continue
+					}
+					if moveMode == "agent-invoked" {
+						resp["data"] = map[string]any{"agentInvoked": true}
+						emit(resp)
+						continue
+					}
+					if info, err := os.Stat(target); err != nil || !info.IsDir() {
+						emit(map[string]any{"type": "command_output", "text": "Move target is not a directory."})
+						resp["data"] = map[string]any{"agentInvoked": false}
+						emit(resp)
+						continue
+					}
+					if err := os.Chdir(target); err != nil {
+						os.Exit(2)
+					}
+					oldSession := session
+					newSession := filepath.Join(root, "moved", filepath.Base(session))
+					if data, err := os.ReadFile(oldSession); err == nil {
+						parts := bytes.SplitN(data, []byte{'\n'}, 2)
+						var header map[string]any
+						if json.Unmarshal(parts[0], &header) != nil {
+							os.Exit(2)
+						}
+						header["cwd"] = target
+						encoded, err := json.Marshal(header)
+						if err != nil || os.MkdirAll(filepath.Dir(newSession), 0700) != nil {
+							os.Exit(2)
+						}
+						moved := append(encoded, '\n')
+						if len(parts) == 2 {
+							moved = append(moved, parts[1]...)
+						}
+						if os.WriteFile(newSession, moved, 0600) != nil || os.Remove(oldSession) != nil {
+							os.Exit(2)
+						}
+					}
+					session = newSession
+					if moveMode == "session-info-reject" {
+						moveInfoReject = true
+					}
+					emit(map[string]any{"type": "session_info_update", "sessionId": sessionID})
+					emit(map[string]any{"type": "command_output", "text": "Moved to " + target + "."})
+					resp["data"] = map[string]any{"agentInvoked": false}
+					if moveMode == "reject-after-side-effect" {
+						resp["success"], resp["error"] = false, "PRIVATE_MOVE_REJECTED_AFTER_SIDE_EFFECT"
+					}
+					emit(resp)
+					continue
+				}
 				if autoresearchFixture && (text == "/autoresearch" || strings.HasPrefix(text, "/autoresearch ")) {
 					args := strings.TrimSpace(strings.TrimPrefix(text, "/autoresearch"))
 					if nativeMode == "autoresearch-off-error" && args == "off" {
@@ -1352,6 +1410,12 @@ func TestMain(m *testing.M) {
 					continue
 				}
 				if text == "/session info" || nativeMode != "" && text == "/session:info" {
+					if moveInfoReject {
+						moveInfoReject = false
+						resp["success"], resp["error"] = false, "PRIVATE_MOVE_INFO_REJECTION"
+						emit(resp)
+						continue
+					}
 					if autoNameBarrierMode == "reject" {
 						resp["success"], resp["error"] = false, "PRIVATE_BARRIER_REJECTION"
 						emit(resp)

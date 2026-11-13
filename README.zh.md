@@ -193,6 +193,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | --- | --- |
 | `/new <名称或路径>` | 在指定目录开启新 session. 替换正在运行的 session 前需要确认. |
 | `/new` | 在上次目录开启新 session; 没有历史目录时使用 `storage.workspace_root`. |
+| `/move <绝对路径>` | 将当前 OMP session 迁移到现有目录, 并更新此 topic 的工作目录. 保留同一 session ID 和历史; 不移动项目文件. 要求任务/会话控制空闲且队列为空; 若其他 topic 也绑定此 session, 则拒绝迁移. `/stop` 可在提交前取消目录查询; 提交后无法安全中止迁移, 请等待结果确认. 结果不确定时会退役 runtime 并保留旧 binding, 不会自动重试. 如果旧路径消失后 runtime 已释放, 请先用 OMP CLI 重新根定, 再执行 `/resume <session ID>`. |
 | `/stop` | 中止当前任务并清空排队任务, 保留 session 供后续使用. |
 | `/queue` | 查看运行及排队任务. Cancel 按钮只删除 bridge 中选中的等待任务, 不中止当前任务或取消原生队列中的 prompt. |
 | `/followup <message>` | 明确排队一个独立任务, 不会作为 steer 发送给当前任务. |
@@ -248,7 +249,6 @@ Bridge 命令优先于 OMP 命令; 发给其他 bot 的命令会被忽略. Bridg
 
 | 命令或类别 | 限制与替代入口 |
 | --- | --- |
-| `/move` | 拒绝执行: 原生 workspace/session 移动不会与 bridge binding 对齐. 请用 `/new` 或 `/resume`. |
 | `/wt`, `/worktree` | 拒绝执行: bridge 不管理原生 worktree 创建和切换. 先在 OMP 或终端准备 worktree, 再用 `/new` 或 `/resume` 选择. |
 | `/session delete` | 拒绝执行: 请用 `/resume` 的 **Delete**, 保留确认和 in-use 检查. |
 | `/plan`, `/plan-review` | 依赖上游 OMP RPC 支持. Bridge 不实现其 planning workflow; RPC 不支持时请使用交互式 OMP. |

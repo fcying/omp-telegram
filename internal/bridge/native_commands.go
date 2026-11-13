@@ -144,6 +144,9 @@ func (w *worker) commandCatalogUpdated() {
 		// A reader-published update is authoritative even if discovery is still pending.
 		c.lookupCancel()
 	}
+	if c := w.workspaceMove; c != nil && c.phase == "catalog" && c.client.CommandCatalog().State != omp.CatalogUnknown {
+		c.lookupCancel()
+	}
 	w.resolveSlashInputs()
 	if client, ok := w.runtimeClient(); ok && client.CommandCatalog().State != omp.CatalogUnknown {
 		w.nativeCatalog.pausedClientID = 0
@@ -248,6 +251,10 @@ func unsupportedNativeCommand(text, botUsername string) string {
 }
 
 func (w *worker) unsupportedNativeCommandNotice(command string) {
+	if command == "/move" {
+		w.say(w.tr(i18n.Msg.WorkspaceMoveRequiresIdleTopic))
+		return
+	}
 	if command == "/session delete" {
 		w.say(w.tr(i18n.Msg.SessionDeleteNotSupportedBridgeBecauseDeletesActiveSession))
 		return

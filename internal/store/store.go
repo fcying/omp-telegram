@@ -52,6 +52,7 @@ var (
 	ErrStaleBinding          = errors.New("stale binding")
 	ErrQuickCheckFailed      = errors.New("sqlite quick check failed")
 	ErrSessionPathConflict   = errors.New("session references use different file paths")
+	ErrSessionShared         = errors.New("native session is bound to another conversation")
 )
 
 type Store struct {
@@ -1045,6 +1046,73 @@ auto_session_name_pending=CASE WHEN bindings.workspace=excluded.workspace AND bi
 		return err
 	}
 	return tx.Commit()
+}
+func (s *Store) MoveBinding(previous, next Binding) error {
+	if previous.Bot <= 0 || previous.Chat == 0 || previous.Thread < 0 || previous.Generation <= 0 ||
+		!previous.Running || !filepath.IsAbs(previous.Workspace) || !filepath.IsAbs(previous.Session) ||
+		next.Bot != previous.Bot || next.Chat != previous.Chat || next.Thread != previous.Thread ||
+		next.Generation != previous.Generation+1 || !strings.EqualFold(next.SessionID, previous.SessionID) ||
+		!next.Running || next.Interrupted || next.AutoSessionNamePending != previous.AutoSessionNamePending || !filepath.IsAbs(next.Workspace) || !filepath.IsAbs(next.Session) {
+		return errors.New("invalid session binding move")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := migrationGuard(tx, previous.Bot, previous.Chat, previous.Thread); err != nil {
+		return err
+	}
+	if err := migrationSessionGuard(tx, previous.Bot, previous.Session, previous.SessionID); err != nil {
+		return err
+	}
+	current, err := scanBinding(tx.QueryRow("SELECT bot,chat,thread,workspace,session,session_id,generation,last_used_at,running,interrupted,auto_session_name_pending FROM bindings WHERE bot=? AND chat=? AND thread=?", previous.Bot, previous.Chat, previous.Thread))
+	if err != nil {
+		return err
+	}
+	if current != previous {
+		return ErrStaleBinding
+	}
+	var shared bool
+	if err = tx.QueryRow("SELECT EXISTS(SELECT 1 FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND NOT(chat=? AND thread=?))", previous.Bot, previous.SessionID, previous.Chat, previous.Thread).Scan(&shared); err != nil {
+		return err
+	}
+	if shared {
+		return ErrSessionShared
+	}
+	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", previous.Bot, previous.Chat, previous.Thread); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`UPDATE bindings SET workspace=?,session=?,session_id=?,generation=?,last_used_at=?,running=1,interrupted=0,auto_session_name_pending=? WHERE bot=? AND chat=? AND thread=? AND generation=? AND session_id=? COLLATE NOCASE AND session=? AND workspace=?`,
+		next.Workspace, next.Session, next.SessionID, next.Generation, next.LastUsedAt, next.AutoSessionNamePending, previous.Bot, previous.Chat, previous.Thread, previous.Generation, previous.SessionID, previous.Session, previous.Workspace)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrStaleBinding
+	}
+	if _, err = tx.Exec(`INSERT INTO session_favorites(bot,chat,thread,workspace,session_id)
+SELECT bot,chat,thread,?,session_id FROM session_favorites WHERE bot=? AND chat=? AND thread=? AND workspace=? AND session_id=? COLLATE NOCASE
+ON CONFLICT(bot,chat,thread,workspace,session_id) DO NOTHING`, next.Workspace, previous.Bot, previous.Chat, previous.Thread, previous.Workspace, previous.SessionID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM session_favorites WHERE bot=? AND chat=? AND thread=? AND workspace=? AND session_id=? COLLATE NOCASE", previous.Bot, previous.Chat, previous.Thread, previous.Workspace, previous.SessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) HasOtherSessionBinding(bot, chat, thread int64, sessionID string) (bool, error) {
+	if bot <= 0 || chat == 0 || thread < 0 || sessionID == "" {
+		return false, errors.New("invalid session binding lookup")
+	}
+	var shared bool
+	err := s.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM bindings WHERE bot=? AND session_id=? COLLATE NOCASE AND NOT(chat=? AND thread=?))", bot, sessionID, chat, thread).Scan(&shared)
+	return shared, err
 }
 
 func (s *Store) BindingsForChat(bot, chat int64) ([]BindingListEntry, error) {

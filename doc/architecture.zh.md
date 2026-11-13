@@ -234,7 +234,13 @@ Discovery waiter 超时/取消/拒绝不会推翻 reader 已发布的可用目�
 
 [`native_commands.go`](../internal/bridge/native_commands.go) 在提交前立即复核队首, 包括异步接纳工作之后. 它检查当前 source/name 与原生 session 身份; 命令消失或原生 session 改变会取消队列项, 绝不降级成模型文本. 同 session revision 改变不会取消仍有效的命令; 新 client 恢复同 session 也允许. 原始 slash 开头 followup 和已准备附件不能绕过 source/lifecycle 检查.
 
-会改变生命周期的 `/move`, `/wt`, `/worktree`, `/session delete` 在路由和派发时都拒绝, 即使 discovery 不可用也如此. Session 拒绝只匹配不区分大小写且没有额外参数的 `delete`. `/session info` 和 `/session pin` 保持原生路由. 已保存绑定由桥接 session 生命周期 API 管理; 任意 extension 生命周期变更不在协调范围内. Snapshot 校验不是上游原子 check-and-execute, 桥接围栏也无法可靠识别没有 session 标记的旧 session 主动 update.
+`/move <绝对路径>` 是 bridge 拥有的生命周期操作. 它要求任务/队列/控制状态空闲, 目标目录已存在, 且该 session 没有绑定到其他 topic. 确认 builtin `move` 可用后, bridge 提交 OMP 原生 `/move`, 要求得到 local `agentInvoked:false` acknowledgment, 再通过 `SessionInfo` 校验 session ID 未变, CWD 为目标目录, 且 session 文件路径已迁移. Binding 迁移事务更新工作目录和 session 路径, 增加 generation, 将旧 binding 保留在 history, 并迁移当前 topic 的 favorite. OMP 负责迁移 JSONL 和 artifacts; bridge 不移动项目文件. Identity 或持久化结果不确定时, 保留旧 binding, 清空排队 prompt, 退役 runtime, 且不重放命令. 如果原 CWD 消失后 runtime 已释放, RPC 启动无法重新根定 session; 请先用 OMP CLI 迁移, 再执行 `/resume <session ID>`.
+`/move` 等待目录查询时, `/stop` 会取消查询. 原生 prompt 提交后, `/stop` 无法安全中止迁移, 并会明确告知用户. Move pending 期间拒绝新 prompt、附件和 callback, `/stop` 除外; callback 会立即得到回答. 已准备的 media 结果使用 inbox ID、binding generation 和唯一 preparation-attempt token 进行 fencing. 过期结果只能清理自己创建的临时目录, 不能取消替代它的新队列占位项.
+原生 `/move` prompt 一经提交, 任何 RPC 错误(包括 rejected response)都视为 uncertain, 因为它不能证明命令没有副作用. Bridge 会清空排队输入, 退役 runtime, 保留旧 binding, 且不会重放 move.
+
+移动 session 会保留 binding 当前的 `AutoSessionNamePending` 值. 尤其是, `/move` 不会消耗 `/new` 创建的一次性自动命名资格.
+
+`/wt`, `/worktree` 和 `/session delete` 仍被拒绝, 因为 bridge 不管理这些原生生命周期操作. Session 拒绝只匹配不区分大小写且没有额外参数的 `delete`. `/session info` 和 `/session pin` 保持原生路由. 任意 extension 生命周期变更仍未接入协调. Snapshot 校验不是上游原子 check-and-execute, 对没有 session 标记的旧 session 主动 update 也无法可靠识别.
 
 明确原生 local acknowledgment `agentInvoked:false`, 或请求关联的 local `prompt_result(status:"completed", agentInvoked:false)`, 无需 assistant 文本即可完成提交. 这不证明后台 operation 已结束. Local `error` 为 uncertain, `aborted` 为 cancelled, 缺失/未知状态为 uncertain; 通用通知与状态一起提交, 不泄露原始 RPC 错误, 不退役健康 runtime, 不重放命令. 仅目录识别不能实现原生 `/plan` 或 `/plan-review` 的 RPC 支持.
 

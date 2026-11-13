@@ -115,24 +115,26 @@ func updateSender(u telegram.Update) (*telegram.Message, int64) {
 }
 
 type queued struct {
-	id            int64
-	user          int64
-	replyTo       int64
-	text          string
-	displayText   string
-	kind          queuedInputKind
-	nativeName    string
-	nativeSession string
-	bridgeReview  bool // Explicit /review, not raw followup or attachment text.
-	strictCommand bool // Configured shortcuts must never fall back to model input.
-	reply         *telegram.Message
-	finalAction   *finalActionDispatch
-	images        []media.Image
-	albumKey      albumKey
-	album         bool
-	preparing     bool
-	cancel        context.CancelFunc
-	directory     string
+	id              int64
+	user            int64
+	replyTo         int64
+	text            string
+	displayText     string
+	kind            queuedInputKind
+	nativeName      string
+	nativeSession   string
+	bridgeReview    bool // Explicit /review, not raw followup or attachment text.
+	strictCommand   bool // Configured shortcuts must never fall back to model input.
+	reply           *telegram.Message
+	finalAction     *finalActionDispatch
+	images          []media.Image
+	albumKey        albumKey
+	album           bool
+	preparing       bool
+	mediaGeneration int64
+	mediaAttempt    uint64
+	cancel          context.CancelFunc
+	directory       string
 }
 
 type albumKey struct {
@@ -295,6 +297,7 @@ type worker struct {
 	nativeCatalog               nativeCommandCatalog
 	research                    autoresearchState
 	nativeControl               *nativeControlRequest
+	workspaceMove               *workspaceMoveRequest
 	autoSessionName             *autoSessionNameRequest
 	autoSessionNameFence        *autoSessionNameRequest
 	autoSessionNameReady        bool
@@ -350,6 +353,7 @@ type worker struct {
 	keyboardCleanup     chan int64
 	stopCallbackReplies chan stopCallbackReply
 	mediaResults        chan mediaResult
+	mediaPreparationSeq uint64
 	sendResults         chan sendResult
 	hostRequests        map[string]context.CancelFunc
 	resumeResults       chan resumeListResult
@@ -580,6 +584,7 @@ var botCommands = []struct {
 	{Command: "model", Description: i18n.Msg.ChooseCycleRoleModelProviderModel},
 	{Command: "thinking", Description: i18n.Msg.ChooseThinkingLevelSession},
 	{Command: "fast", Description: i18n.Msg.ToggleNativeFastMode},
+	{Command: "move", Description: i18n.Msg.MoveCurrentSessionWorkspace},
 	{Command: "compact", Description: i18n.Msg.CompactContextWhileIdle},
 	{Command: "handoff", Description: i18n.Msg.RunNativeHandoffHandoffInstructions},
 	{Command: "migrate", Description: i18n.Msg.MigrateContextMigrateRecoverOldSessionIdSessionFile},
@@ -1530,6 +1535,7 @@ func (w *worker) runtimeStopped() {
 	w.uiSelection = nativeSelectionReceipt{}
 	w.cancelArgsApply(true)
 	w.cancelNativeControl()
+	w.cancelWorkspaceMove()
 	w.resetSub2apiUsage()
 	w.cancelProviderUsage()
 	w.providerUsage = providerUsageState{}
@@ -1949,6 +1955,10 @@ func (w *worker) operationFinished(result operationResult) {
 		w.nativeControlFinished(result)
 		return
 	}
+	if result.kind == "workspace_move" {
+		w.workspaceMoveFinished(result)
+		return
+	}
 	if result.kind == "research_control" {
 		w.researchControlFinished(result)
 		if w.research.control == nil && w.client != nil {
@@ -2261,6 +2271,10 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 }
 
 func (w *worker) closeLogicalSession() bool {
+	if w.workspaceMove != nil {
+		w.say(w.tr(i18n.Msg.SessionOperationStillLoading))
+		return false
+	}
 	if !w.consumeFinalAction() {
 		return false
 	}
@@ -2391,6 +2405,16 @@ func (w *worker) stop() {
 		w.cancelMigration("cancelled", true)
 		return
 	}
+	if request := w.workspaceMove; request != nil {
+		w.clearQueue()
+		if request.phase == "catalog" {
+			w.cancelWorkspaceMove()
+			w.say(w.tr(i18n.Msg.AbortRequestedQueuedPromptsCleared))
+		} else {
+			w.say(w.tr(i18n.Msg.WorkspaceMoveAlreadySubmittedCannotStop))
+		}
+		return
+	}
 	if w.nativeControl != nil {
 		w.clearQueue()
 		w.stopNativeControl(w.tr(i18n.Msg.AbortRequestedQueuedPromptsCleared))
@@ -2496,6 +2520,9 @@ func (w *worker) startOperation(kind string, client *omp.Client, call func(conte
 		operationMeta = metadata[0]
 	}
 	if c, ok := operationMeta.(*nativeControlRequest); ok && c.phase == "catalog" {
+		readOnly = true
+	}
+	if c, ok := operationMeta.(*workspaceMoveRequest); ok && c.phase == "catalog" {
 		readOnly = true
 	}
 	if c, ok := operationMeta.(*researchControl); ok && c.phase != "prompt" {
@@ -2826,6 +2853,9 @@ func (w *worker) startInternal(resume bool, target, expectedCWD string, replace 
 }
 
 func (w *worker) startInternalWithArgs(resume bool, target, expectedCWD string, replace bool, expectedGeneration int64, fenced bool, expectedEpoch uint64, argsOverride *[]string) string {
+	if w.workspaceMove != nil {
+		return w.tr(i18n.Msg.SessionOperationStillLoading)
+	}
 	if w.migrationLocked() {
 		return w.tr(i18n.Msg.SessionMigrationUnresolvedCannotCreateSwitchBindings)
 	}
@@ -3162,6 +3192,25 @@ func (w *worker) handle(in incoming) {
 		w.mark(in.id, "ignored")
 		return
 	}
+	if w.workspaceMove != nil {
+		allowStop := false
+		if in.callback == nil && in.msg != nil && len(in.msg.Photo) == 0 && in.msg.Document == nil {
+			command, _, foreign := parseSlashInvocation(strings.TrimSpace(in.msg.Text), w.b.bot.Username)
+			allowStop = !foreign && command == "/stop"
+		}
+		if !allowStop {
+			if in.callback != nil {
+				ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+				_ = w.b.tg.AnswerCallback(ctx, in.callback.ID, w.tr(i18n.Msg.OmpSessionOperationStillLoadingWaitFinish))
+				cancel()
+			} else {
+				w.say(w.tr(i18n.Msg.OmpSessionOperationStillLoadingWaitFinish))
+			}
+			w.mark(in.id, store.InboxCancelled)
+			return
+		}
+	}
+
 	if w.deferAutoSessionNameInput(in) {
 		return
 	}
@@ -3248,6 +3297,11 @@ func (w *worker) handleSlash(in incoming, text string) {
 		w.mark(in.id, "ignored")
 		return
 	}
+	if w.workspaceMove != nil && cmd != "/stop" {
+		w.say(w.tr(i18n.Msg.OmpSessionOperationStillLoadingWaitFinish))
+		w.mark(in.id, store.InboxCancelled)
+		return
+	}
 	if !knownBridgeCommand(cmd) {
 		w.routeSlashInput(in, text, false)
 		return
@@ -3259,6 +3313,10 @@ func (w *worker) handleSlash(in incoming, text string) {
 			text += " " + arg
 		}
 		w.beginNativeControl(in, text)
+		return
+	}
+	if cmd == "/move" {
+		w.beginWorkspaceMove(in, arg)
 		return
 	}
 	if cmd == "/review" {

@@ -120,6 +120,39 @@ func TestAutoSessionNameStartsAfterDurableSuccess(t *testing.T) {
 	}
 }
 
+func TestAutoSessionNameEligibilitySurvivesWorkspaceMove(t *testing.T) {
+	w, _, trace := autoNameWorker(t, true)
+	nativeCatalogReady(t, w)
+	if !w.binding.AutoSessionNamePending {
+		t.Fatal("new session did not start with pending automatic naming")
+	}
+	target := t.TempDir()
+	nativeInput(t, w, 102, "/move "+target, false)
+	nativeUntil(t, w, func() bool { return queueState(t, w, 102) == "done" && w.workspaceMove == nil })
+	stored, err := w.b.db.Binding(w.binding.Bot, w.binding.Chat, w.binding.Thread)
+	requireStoreOK(t, err)
+	if !w.binding.AutoSessionNamePending || !stored.AutoSessionNamePending {
+		t.Fatal("workspace move consumed automatic naming eligibility")
+	}
+	nativeInput(t, w, 103, "wait", false)
+	researchBarrier(t, w)
+	if researchTraceCount(trace, "prompt", "/rename") != 0 {
+		t.Fatal("automatic naming ran before the first task completed")
+	}
+	nativeRPC(t, w, "fixture_finish_root", nil)
+	check := autoNameStateCheck(t, w)
+	if queueState(t, w, 103) != "done" || researchBody(t, w, 103) != "root completed" {
+		t.Fatal("automatic naming preceded the first task's durable completion")
+	}
+	w.operationReturned(check)
+	researchBarrier(t, w)
+	stored, err = w.b.db.Binding(w.binding.Bot, w.binding.Chat, w.binding.Thread)
+	requireStoreOK(t, err)
+	if stored.AutoSessionNamePending || researchTraceCount(trace, "prompt", "/rename") != 1 {
+		t.Fatal("first successful task did not consume the preserved naming eligibility exactly once")
+	}
+}
+
 func TestAutoSessionNameRechecksFullIdentityBeforeConsumption(t *testing.T) {
 	for _, scenario := range []string{"client", "generation", "session", "epoch", "persisted", "state-id", "state-name", "builtin"} {
 		t.Run(scenario, func(t *testing.T) {
