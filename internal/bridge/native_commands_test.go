@@ -1102,7 +1102,7 @@ func TestNativeCommandPausedDiscoveryKeepsQueuedNativeUnsubmitted(t *testing.T) 
 	}
 }
 
-func TestNativeCommandRejectsSessionRelocation(t *testing.T) {
+func TestNativeCommandRejectsWorktreeAndSessionDeletion(t *testing.T) {
 	for _, mode := range []string{"enabled", "hold", "unsupported"} {
 		t.Run(mode, func(t *testing.T) {
 			w, _, trace := nativeWorker(t, mode)
@@ -1113,7 +1113,7 @@ func TestNativeCommandRejectsSessionRelocation(t *testing.T) {
 			requireStoreOK(t, err)
 			clientID := w.client.ID()
 			inputs := []string{
-				"/move /new/path", "/wt@fixture_bot branch", "/worktree:branch",
+				"/wt@fixture_bot branch", "/worktree:branch",
 				"/session delete", "/session@fixture_bot delete", "/session:delete",
 				"/session@FIXTURE_BOT: DELETE ", "/session\u3000delete", "/session:\uFEFFdelete\uFEFF",
 			}

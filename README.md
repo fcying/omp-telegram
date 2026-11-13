@@ -193,6 +193,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | --- | --- |
 | `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running session requires confirmation. |
 | `/new` | Start a fresh session in the previous directory, or `storage.workspace_root` if none was selected. |
+| `/move <absolute path>` | Move the current OMP session to an existing directory and update this topic's workspace. Keeps the same session ID/history; does not move project files. Requires idle tasks/session controls and an empty queue; refuses sessions bound to another topic. `/stop` cancels catalog lookup before submission; after submission it cannot safely cancel the move, so wait for confirmation. If the result is uncertain, the runtime is retired and the move is not retried automatically. If the runtime was released after the old path disappeared, re-root with OMP CLI first, then use `/resume <session ID>`. |
 | `/stop` | Stop the current task and clear queued tasks while keeping the session available. |
 | `/queue` | View running and queued work. Cancel buttons remove individual bridge-pending tasks, not the active task or native queued prompts. |
 | `/followup <message>` | Queue a separate prompt instead of steering the active task. |
@@ -248,7 +249,6 @@ The exact native `/autoresearch` extension has dedicated support. The following 
 
 | Command or category | Limitation and alternative |
 | --- | --- |
-| `/move` | Rejected: native workspace/session moves are not reconciled with the bridge binding. Use `/new` or `/resume`. |
 | `/wt`, `/worktree` | Rejected: native worktree creation/switching is not managed by the bridge. Prepare the worktree in OMP or a terminal, then select it with `/new` or `/resume`. |
 | `/session delete` | Rejected: use **Delete** in `/resume`, with its confirmation and in-use checks. |
 | `/plan`, `/plan-review` | Depend on upstream OMP RPC support. The bridge does not implement their planning workflow; use interactive OMP when RPC support is unavailable. |
