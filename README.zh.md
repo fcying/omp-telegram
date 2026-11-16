@@ -570,6 +570,11 @@ Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 
 
 `rpc_queue_overflow` ERROR 和 `rpc_consumer_slow` WARN 表示 RPC 压力或 bridge 操作缓慢. 重发中断或结果不确定的工作前, 请检查 `/status` 和 workspace; 这些工作不会自动重放. 保留附近日志用于诊断, 但仅凭这些告警不能确定原因. 诊断字段解读见[架构日志契约](doc/architecture.zh.md#日志契约).
 
+## Roadmap
+
+- [ ] **Undo/rewind 和 redo.** 原生树导航已经可用, 但安全的输入身份关联, 持久化回退和活动 steer 撤销仍未解决. 跟踪 [#53](https://github.com/fcying/omp-telegram/issues/53). 对话上下文回退不会撤销文件修改或其他外部副作用.
+- [ ] **Stop 后复用 OMP 进程.** 等待上游提供可靠的取消机制. 目前 Stop 会退役进程, 保留 session.
+
 ## 开发
 
 贡献者工作流, 验证及发布命令见[开发, 验证与发布](doc/architecture.zh.md#开发-验证与发布).

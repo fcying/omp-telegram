@@ -570,6 +570,11 @@ Logs are written to stderr; use your process manager for storage and rotation. P
 
 `rpc_queue_overflow` ERROR and `rpc_consumer_slow` WARN indicate RPC pressure or slow bridge operations. Check `/status` and the workspace before resending interrupted or uncertain work; it is not replayed automatically. Preserve nearby logs for diagnosis, but these warnings alone do not establish the cause. See the [architecture logging contract](doc/architecture.md#logging-contract) for diagnostic field interpretation.
 
+## Roadmap
+
+- [ ] **Undo/rewind and redo.** Native tree navigation is available, but safe input identification, durable rewind and active steer cancellation remain unresolved. Track [#53](https://github.com/fcying/omp-telegram/issues/53). Rewinding conversation context would not undo file changes or other external side effects.
+- [ ] **Reuse the OMP process after Stop.** Requires reliable upstream cancellation. For now, Stop retires the process while preserving its session.
+
 ## Development
 
 For contributor workflows, verification and release recipes, see [Development, verification and release](doc/architecture.md#development-verification-and-release).
