@@ -305,6 +305,120 @@ func TestNativeUIDialogSurvivesBridgeMenuExpiry(t *testing.T) {
 	}
 }
 
+func TestReviewModeSelectionUsesOneNumberAndReturnsOriginalValue(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.owner = 7
+	options := []string{
+		"Review PR example/project#1 from conversation",
+		"1. Review against a base branch (PR Style)",
+		"2. Review uncommitted changes",
+		"3. Review a specific commit",
+		"4. Review a specific PR/MR",
+		"5. Custom review instructions",
+		"6. Meaningful numbered label",
+	}
+	w.ui(rpcEvent{ID: "review-mode", Method: "select", Title: "Review Mode", Options: options})
+	text, rows := pickerView(t, f)
+	for _, want := range []string{"1. Review PR example/project#1", "2. Review against a base branch", "3. Review uncommitted changes", "4. Review a specific commit", "5. Review a specific PR/MR", "6. Custom review instructions", "7. 6. Meaningful numbered label"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("review menu missing %q: %q", want, text)
+		}
+	}
+	data := rows[0][2]["callback_data"].(string)
+	messageID := int64(f.messageCount())
+	w.callback(&telegram.CallbackQuery{ID: "review-choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+	text, _ = pickerView(t, f)
+	if strings.Contains(text, "3. 2. Review uncommitted changes") || !strings.Contains(text, "3. Review uncommitted changes") {
+		t.Fatalf("completed review menu has incorrect numbering: %q", text)
+	}
+	raw, err := w.call("get_state", nil)
+	var state struct {
+		Replies int    `json:"fixtureUIReplies"`
+		Value   string `json:"fixtureUIValue"`
+	}
+	if err != nil || json.Unmarshal(raw, &state) != nil || state.Replies != 1 || state.Value != options[2] {
+		t.Fatalf("native selection = %+v, error %v", state, err)
+	}
+}
+
+func TestReviewModeCancellationRetainsSingleNumber(t *testing.T) {
+	w, f, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.owner = 7
+	w.ui(rpcEvent{ID: "review-cancel", Method: "select", Title: "Review Mode", Options: []string{
+		"Review PR example/project#1 from conversation",
+		"1. Review against a base branch (PR Style)",
+		"2. Review uncommitted changes",
+	}})
+	messageID := int64(f.messageCount())
+	data := askTestButton(t, f, "Cancel")
+	w.callback(&telegram.CallbackQuery{ID: "cancel-review", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+	text, rows := pickerView(t, f)
+	if !strings.Contains(text, "2. Review against a base branch (PR Style)") || !strings.Contains(text, "3. Review uncommitted changes") || strings.Contains(text, "2. 1. Review") || strings.Contains(text, "3. 2. Review") || !strings.Contains(text, "Cancel") || len(rows) != 0 {
+		t.Fatalf("cancelled review receipt has incorrect options or controls: %q; %v", text, rows)
+	}
+	raw, err := w.call("get_state", nil)
+	var state struct {
+		Responses []struct {
+			ID        string `json:"id"`
+			Cancelled bool   `json:"cancelled"`
+		} `json:"fixtureUIResponses"`
+	}
+	if err != nil || json.Unmarshal(raw, &state) != nil || len(state.Responses) != 1 || state.Responses[0].ID != "review-cancel" || !state.Responses[0].Cancelled {
+		t.Fatalf("native cancellation = %+v, error %v", state, err)
+	}
+}
+
+func TestNumberedNativeSelectionPreservesOriginalValue(t *testing.T) {
+	for _, title := range []string{"Select repository in /workspace", "Resume an annotation draft"} {
+		for _, cancel := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%t", title, cancel), func(t *testing.T) {
+				w, f, command := setupWorkspaceWorker(t)
+				command("/new " + t.TempDir())
+				w.owner = 7
+				options := make([]string, uiSelectPageSize+1)
+				for i := range options {
+					options[i] = fmt.Sprintf("%d. choice-%d", i+1, i+1)
+				}
+				w.ui(rpcEvent{ID: "numbered-menu", Method: "select", Title: title, Options: options})
+				messageID := int64(f.messageCount())
+				click := func(data string) {
+					w.callback(&telegram.CallbackQuery{ID: "choice", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: data})
+				}
+				click(askTestButton(t, f, "Next"))
+				text, _ := pickerView(t, f)
+				if !strings.Contains(text, "11. choice-11") || strings.Contains(text, "11. 11. choice-11") {
+					t.Fatalf("numbered page = %q", text)
+				}
+				button := "choice-11"
+				if cancel {
+					button = "Cancel"
+				}
+				click(askTestButton(t, f, button))
+				text, rows := pickerView(t, f)
+				if !strings.Contains(text, "11. choice-11") || strings.Contains(text, "11. 11. choice-11") || len(rows) != 0 {
+					t.Fatalf("numbered receipt = %q; %v", text, rows)
+				}
+				raw, err := w.call("get_state", nil)
+				var state struct {
+					Responses []struct {
+						Value     string `json:"value"`
+						Cancelled bool   `json:"cancelled"`
+					} `json:"fixtureUIResponses"`
+				}
+				if err != nil || json.Unmarshal(raw, &state) != nil || len(state.Responses) != 1 {
+					t.Fatalf("native response = %+v, error %v", state, err)
+				}
+				response := state.Responses[0]
+				if response.Cancelled != cancel || !cancel && response.Value != options[10] {
+					t.Fatalf("native response = %+v", response)
+				}
+			})
+		}
+	}
+}
+
 func TestNativeUISelectionShowsSinglePageWithoutNavigation(t *testing.T) {
 	for _, count := range []int{3, 10} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
