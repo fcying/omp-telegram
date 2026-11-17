@@ -17,7 +17,7 @@ import (
 	"omp-telegram/internal/store"
 )
 
-var Version = "v0.15.1"
+var Version = "v0.15.2"
 
 func displayVersion() string {
 	revision := ""

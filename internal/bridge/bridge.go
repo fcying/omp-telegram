@@ -5369,7 +5369,7 @@ func (w *worker) finishNativeSelection(c confirmation, index int) {
 	cancelled := index == len(c.options)
 	footer := askLiteral(w.tr(i18n.Msg.Cancel), 1500)
 	if !cancelled {
-		footer = "**" + w.tr(i18n.Msg.AskChoice) + "**" + askLine(askLiteral(askOptionLabel(index, c.options[index]), 1400))
+		footer = "**" + w.tr(i18n.Msg.AskChoice) + "**" + askLine(askLiteral(askOptionLabel(index, c.uiQuestion.Options[index].Label), 1400))
 	}
 	finished := w.finishMenu(c.messageID, w.nativeSelectionText(c, footer, true))
 	if !finished || cancelled || c.active == 0 || c.turn == 0 || c.active != w.active || c.turn != w.turn {
@@ -5380,7 +5380,7 @@ func (w *worker) finishNativeSelection(c confirmation, index int) {
 			return
 		}
 	}
-	summary := truncateUTF8(menuText(c.uiQuestion.Question, 100)+": "+askOptionLabel(index, menuText(c.options[index], 180)), 600)
+	summary := truncateUTF8(menuText(c.uiQuestion.Question, 100)+": "+askOptionLabel(index, menuText(c.uiQuestion.Options[index].Label, 180)), 600)
 	if c.uiHistory != "" {
 		summary += "\n\n" + truncateUTF8(c.uiHistory, max(0, 1200-len(summary)-2))
 	}
@@ -5693,6 +5693,20 @@ func (w *worker) showUISelectPage(c confirmation, page int, messageID int64) boo
 	return true
 }
 
+// OMP numbers some native menu labels before Bridge assigns button numbers.
+func nativeSelectionLabel(title, option string, index int) string {
+	if title == "Review Mode" {
+		switch option {
+		case "1. Review against a base branch (PR Style)", "2. Review uncommitted changes", "3. Review a specific commit", "4. Review a specific PR/MR", "5. Custom review instructions":
+			return option[3:]
+		}
+	}
+	if strings.HasPrefix(title, "Select repository in ") || title == "Resume an annotation draft" {
+		return strings.TrimPrefix(option, strconv.Itoa(index+1)+". ")
+	}
+	return option
+}
+
 func (w *worker) ui(e rpcEvent) {
 	client, connected := w.runtimeClient()
 	if !connected {
@@ -5736,7 +5750,7 @@ func (w *worker) applyUI(e rpcEvent, client *omp.Client) {
 		}
 		c.uiQuestion.Options = make([]askOption, len(e.Options))
 		for i, option := range e.Options {
-			c.uiQuestion.Options[i].Label = option
+			c.uiQuestion.Options[i].Label = nativeSelectionLabel(e.Title, option, i)
 			if i < len(e.OptionDetails) {
 				c.uiQuestion.Options[i].Description = e.OptionDetails[i].Description
 				c.uiQuestion.Options[i].Preview = e.OptionDetails[i].Preview
