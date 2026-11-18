@@ -35,12 +35,27 @@ func TestCLIProcess(t *testing.T) {
 	os.Exit(run())
 }
 
-type cliTransport struct{ stop sync.Once }
+type cliTransport struct {
+	stop          sync.Once
+	identityCalls int
+}
 
 func (f *cliTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	var result any = true
 	switch filepath.Base(r.URL.Path) {
 	case "getMe":
+		f.identityCalls++
+		switch os.Getenv("OMP_TELEGRAM_CLI_STARTUP_FAILURE") {
+		case "offline":
+			if f.identityCalls <= 3 {
+				return nil, fmt.Errorf("fixture network unreachable")
+			}
+		case "408":
+			if f.identityCalls == 1 {
+				body := `{"ok":false,"error_code":408,"description":"Request Timeout"}`
+				return &http.Response{StatusCode: http.StatusRequestTimeout, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: r}, nil
+			}
+		}
 		result = map[string]any{"id": 99, "username": "fixture_bot", "is_bot": true}
 	case "getUpdates":
 		result = []any{}
@@ -209,6 +224,26 @@ func TestKnownConfigErrorsRemainFatalWithUnknownSettings(t *testing.T) {
 				t.Fatalf("known invalid setting was ignored or exposed input: stdout=%q stderr=%q err=%v", out, errout, err)
 			}
 		}
+	}
+}
+
+func TestDaemonRecoversFromTemporaryStartupFailure(t *testing.T) {
+	for _, failure := range []string{"offline", "408"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Setenv("OMP_TELEGRAM_CLI_STARTUP_FAILURE", failure)
+			out, logs, err := cliCommand(t, true, "--config", cliConfig(t, ""))
+			if err != nil || out != "" {
+				t.Fatalf("daemon stdout=%q stderr=%q err=%v", out, logs, err)
+			}
+			retry := strings.Index(logs, "event=telegram_identity_retry")
+			ready := strings.Index(logs, "event=command_menu_registered")
+			if retry < 0 || ready <= retry || !strings.Contains(logs, "event=daemon_stop result=done") {
+				t.Fatalf("daemon did not retry, start, and shut down in the same process: %s", logs)
+			}
+			if failure == "408" && !strings.Contains(logs[retry:ready], "api_code=408") {
+				t.Fatalf("daemon did not report retrying HTTP 408: %s", logs)
+			}
+		})
 	}
 }
 

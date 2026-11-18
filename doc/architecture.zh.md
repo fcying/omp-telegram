@@ -108,6 +108,8 @@ Polling 失败采用可取消的指数退避, 从一秒增加到 30 秒. Telegra
 5. 整理 progress 清理关联, 恢复符合条件的 session claim/worker, 执行保留清理.
 6. 运行 polling, actor 路由, 四个交付 worker, 命令菜单更新, progress 清理以及可选的每日保留清理任务.
 
+启动时, `getMe` 遇到传输错误, 超时 (包括 HTTP 408), 限流, 5xx 响应或没有错误码的无效 Bot API 响应时, 复用 polling 的可取消退避重试. Daemon 保留锁, 但验证 Bot 身份和数据库归属前不启动 polling 或恢复 worker. 明确的认证错误和 Bot 归属不匹配仍会终止启动. 等待身份期间收到取消信号视为正常关闭.
+
 命令菜单注册失败不阻止 polling. 尽力而为的 UI 路径不能掩盖持久状态失败. SIGINT/SIGTERM 取消共享 context; worker 保守结算/取消未完成工作, 关闭所属进程, 等待后台工作结束后再关闭 store. Session 相关的关闭和未完成启动恢复见后文生命周期章节.
 
 Fatal 边界仅将匹配已结束 daemon context 的错误视为正常关闭. Daemon 仍运行时的取消以及其他上报错误继续传播. 停机取消进行中的 assistant append 时, 未提交文字保留给保守的 teardown 结算, 不重放.

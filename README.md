@@ -351,6 +351,7 @@ Dialogs that block OMP startup before connection are not supported: startup time
 | Symptom | Check |
 | --- | --- |
 | Bot does not respond | Both allowlists, group topics, group privacy settings, and whether another poller or webhook uses the bot. |
+| Service starts while Telegram is unreachable | The same process retries automatically until Telegram is reachable. Check `telegram_identity_retry` in the logs. An explicit token rejection still stops startup. |
 | `omp.binary executable not found` | The configured executable and the service process's `PATH`, including omp and its runtime. It may differ from your interactive shell. |
 | `/resume` shows no sessions | The selected directory and whether OMP has saved history yet. A new session may have no resumable file. |
 | `/compact` fails | Short sessions may have nothing to compact. Check OMP's model configuration if local compaction also fails. |

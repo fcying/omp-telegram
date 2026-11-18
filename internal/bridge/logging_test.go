@@ -316,12 +316,12 @@ func TestStartupCancellationDoesNotLogFailure(t *testing.T) {
 				}
 				select {
 				case err := <-done:
-					if endpoint == "getMe" {
-						if err == nil || (!reject && !errors.Is(err, context.Canceled)) {
-							t.Fatalf("startup error contract changed: %v", err)
+					if reject && endpoint == "getMe" {
+						if err == nil {
+							t.Fatal("authentication rejection did not stop startup")
 						}
 					} else if err != nil {
-						t.Fatalf("command menu failure stopped startup: %v", err)
+						t.Fatalf("startup did not stop cleanly: %v", err)
 					}
 				case <-time.After(5 * time.Second):
 					t.Fatal("startup did not return")
