@@ -604,12 +604,30 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, logs *logging.
 	mediaLog := logs.Logger(logging.Media)
 	rpcLog := logs.Logger(logging.RPC)
 	tg := telegram.New(cfg.Token, telegramLog)
-	bot, err := tg.GetMe(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			logTelegramFailure(telegramLog, slog.LevelError, "telegram_identity_failed", "telegram identity lookup failed", err)
+	var bot telegram.User
+	var err error
+	var delay time.Duration
+	for {
+		bot, err = tg.GetMe(ctx)
+		if ctx.Err() != nil {
+			return nil
 		}
-		return err
+		if err == nil {
+			break
+		}
+		info := telegram.ClassifyError(err)
+		// A gateway can return an invalid Bot API response with no Telegram error code.
+		retryable := info.Reason == "transport_failed" || info.Reason == "timeout" || info.Reason == "rate_limited" ||
+			info.Reason == "api_error" && (info.Code == 0 || info.Code == http.StatusRequestTimeout || info.Code >= 500 && info.Code <= 599)
+		if !retryable {
+			logTelegramFailure(telegramLog, slog.LevelError, "telegram_identity_failed", "telegram identity lookup failed", err)
+			return err
+		}
+		delay = nextPollDelay(delay, info.RetryAfter)
+		logTelegramFailure(telegramLog, slog.LevelWarn, "telegram_identity_retry", "telegram identity lookup failed; retrying", err, slog.Duration("retry_in", delay))
+		if !waitPollBackoff(ctx, delay) {
+			return nil
+		}
 	}
 	if err = db.CheckBot(bot.ID); err != nil {
 		storeLog.Error("bot consistency check failed", "event", "bot_check_failed", "error_kind", "persistence")

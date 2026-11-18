@@ -351,6 +351,7 @@ OMP 支持 opt-in 时自动启用扩展组合对话; 这不代表启用 HTML `fo
 | 现象 | 检查项 |
 | --- | --- |
 | bot 没有反应 | 两个白名单, 群组 topic, 群隐私设置, 以及是否有其他 polling 服务或 webhook 占用 bot. |
+| 服务启动时无法连接 Telegram | 进程会自动重试, 无需重启. 查看日志中的 `telegram_identity_retry`. Telegram 明确拒绝 token 时仍会退出. |
 | `omp.binary executable not found` | 配置的可执行文件和服务进程的 `PATH`, 包括 omp 及其运行时. 它可能不同于交互式 shell. |
 | `/resume` 列表为空 | 当前选择的目录以及 OMP 是否已经保存历史. 新 session 可能还没有可恢复文件. |
 | `/compact` 失败 | 短 session 可能没有可压缩内容. 如果本机 OMP 也失败, 检查其 model 配置. |

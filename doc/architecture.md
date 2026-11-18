@@ -108,6 +108,8 @@ Normal startup performs:
 5. Progress-cleanup reconciliation, restoration of eligible session claims/workers, and retention cleanup.
 6. Polling, actor routing, four delivery workers, command-menu updates, progress cleanup, and the optional daily retention janitor.
 
+At startup, `getMe` retries transport errors, timeouts (including HTTP 408), rate limits, 5xx responses, and invalid Bot API responses without an error code, using the same cancellable backoff as polling. The daemon keeps its lock but does not start polling or restore workers until identity and database ownership are verified. Explicit authentication errors and bot-ownership mismatches remain fatal. Cancellation while waiting for identity is a normal shutdown.
+
 Command-menu registration failure does not prevent polling. Durable-state failures are not hidden by best-effort UI paths. SIGINT/SIGTERM cancel the shared context; workers settle/cancel outstanding work conservatively, close owned processes, and complete background work before the store closes. Session-specific shutdown and unfinished-start recovery are described with the session lifecycle below.
 
 The fatal boundary treats only errors matching an already-ended daemon context as normal shutdown. Cancellation while the daemon remains live and other submitted errors still propagate. An in-flight assistant append cancelled by shutdown retains its uncommitted text for conservative teardown settlement, not replay.
