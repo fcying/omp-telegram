@@ -353,6 +353,7 @@ func TestRPCUIStartupDiagnostics(t *testing.T) {
 			{"input", "timeout", "startup_timeout_pending_ui", 1, "input"},
 			{"editor", "timeout", "startup_timeout_pending_ui", 1, "editor"},
 			{"ask", "timeout", "startup_timeout_pending_ui", 1, "ask"},
+			{"form", "timeout", "startup_timeout_pending_ui", 1, "form"},
 			{"mixed", "timeout", "startup_timeout_pending_confirm", 2, "confirm,select"},
 			{"unrelated-cancel", "timeout", "startup_timeout_pending_confirm", 1, "confirm"},
 			{"confirm", "cleanup-cancel", "startup_timeout_pending_confirm", 1, "confirm"},

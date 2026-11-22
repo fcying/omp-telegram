@@ -169,7 +169,7 @@ Linux 上通过 [`startProcess`](../internal/omp/process_linux.go) 启动的原�
 
 启动仍是同步流程: worker 仅在 `Start` 完成协商后接管 UI 事件. 不支持在接管前阻塞 `session_start` 的对话; 协商超时后启动失败, Telegram 不会出现可操作的对话. Bridge 不自动回答. 连接后的无 root UI 不会仅因没有活动任务而拒绝.
 
-在接管前, reader 旁观未应答的 `ask`/`confirm`/`select`/`input`/`editor` 请求, 不消费或回答事件. 仅启动期使用的 tracker 最多保留 128 个 SHA-256 ID 键和 allowlist 方法名; `cancel.targetId` 只移除对应请求. 失败时先冻结证据, 再读取终态错误并关闭进程; 冻结期间发布的协议/传输错误优先于 deadline, 由父 deadline 触发的 teardown 取消仍保留原超时分类. 启动成功即丢弃 tracker. 只有超时且仍有 pending 证据时, 才分类为 `startup_timeout_pending_confirm` (确认优先) 或 `startup_timeout_pending_ui`; 拒绝, 协议失败, 断连及正常取消不会借用该诊断. Pending UI 是线索, 不能证明它是超时的唯一原因.
+在启动接管前, reader 旁观未应答的 `ask`/`confirm`/`select`/`input`/`editor` 请求, 不消费或回答事件. 仅启动期使用的 tracker 最多保留 128 个 SHA-256 ID 键和 allowlist 方法名; `cancel.targetId` 只移除对应请求. 失败时先冻结证据, 再读取终态错误并关闭进程; 冻结期间发布的协议/传输错误优先于 deadline, 由父 deadline 触发的 teardown 取消仍保留原超时分类. 启动成功即丢弃 tracker. 只有超时且仍有 pending 证据时, 才分类为 `startup_timeout_pending_confirm` (确认优先) 或 `startup_timeout_pending_ui`; 拒绝, 协议失败, 断连及正常取消不会借用该诊断. Pending UI 是线索, 不能证明它是超时的唯一原因. Allowlist 包含原生 `form` 请求.
 
 `rpc_startup_failed` 记录 `client_id`, `stage` (`ready`, `set_ask_dialog`, `negotiate_protocol`), 安全 `reason`, `pending_ui_count` 和 allowlist `pending_ui_methods`. Bridge 的 `runtime_start_failed` 补充对话/generation 关联, 并根据错误分类选择本地化恢复提示. 两类诊断均不包含原始 UI ID, 标题, 问题, 选项, 默认值, 输入值或 RPC 帧; 正常 context cancellation 不产生这些失败日志. 启动 deadline, 协议回退规则和 startup intent 恢复规则不变.
 
@@ -280,7 +280,11 @@ Telegram 各 scope 分别请求更新, 不是跨 scope 原子操作. 旧语言�
 
 ### 原生对话与 session operation
 
-从 OMP 18.18.3 起, 原生 `ask` 工具接收 `{html}`, 不再使用 `questions[]`. 表单由 OMP 解析. RPC 没有 `formDialog` 时 (包括 OMP 18.18.6), 它逐字段发出通用 `select`/`input`/`editor` 请求; checkbox 字段通过多次 `select` 收集. Bridge 复用通用 RPC UI, 不解析 HTML 或另建表单渲染器. 每个答案通过 `extension_ui_response` 回应对应请求, 不新增 prompt 或 steer; 完成归属仍为原 root/client/turn.
+从 OMP 18.18.3 起, 原生 `ask` 工具接收 `{html}`. OMP 19.1+ 将完整表单作为一个 RPC `method:"form"` 请求发送; Bridge 解析受支持的具名 radio, checkbox, select 和 text 控件, 通过连续的 Telegram 交互展示, 最后一次性发送带 `data` map 的 `extension_ui_response`. 保留字段名, 选项值, 默认值, 原始文字及基本约束. Telegram 无法掩码输入, password 字段会 fail closed; 不复现富布局和图片. 较旧 OMP RPC 版本可能逐字段发出通用 `select`/`input`/`editor` 请求, 仍保持兼容. 答案继续原 root/client/turn, 不变成新的 prompt 或 steer.
+
+Radio 和 checkbox 是否提供 Other 由过滤前的选项数量和标签决定, 包括禁用选项; 展示时仍只显示启用的选项. 显示任何字段前, Bridge 使用 Go 正则引擎编译表单 pattern. 无法编译时取消请求并发送本地化提示; Go 与 JavaScript 的正则语义不完全相同.
+
+单选默认值在过滤禁用选项前按原始选项确定; 禁用且预选的占位项不会使其他选项自动选中. URL 和数字使用 Go 解析器校验, 不是 JavaScript `URL.canParse` 和 `Number`, 边界输入的解析可能不同; 数字解析前移除两端 JavaScript 空白字符.
 
 [`worker.ui`](../internal/bridge/bridge.go) 将原生 `confirm` 映射为 Confirm/Cancel 按钮, `select` 映射为按内容分页, 每页最多十项且可取消的 picker. 空 select 会取消. [`ask.go`](../internal/bridge/ask.go) 处理基于 questions 的扩展 `method:"ask"` 和非 secret 的 `input`/`editor` 文字回复; widget 和一般原生输出不是终端 UI 仿真. Token 绑定 owner/generation/client 且单次使用; selection 还绑定菜单消息. 不同于 Bridge 自有菜单, 原生对话没有 Bridge 过期时间, 翻页也不会增加期限: 原生 deadline 和 cancel 信号由 OMP 管理. 待回答对话阻止正常空闲释放.
 
@@ -324,7 +328,7 @@ Actor 在调度时持有交互取消 context. Ask 的十秒显示网络 deadline
 
 已识别的 Bridge 命令, 原生 `/autoresearch off` 控制和 foreign-bot 命令先于 Ask 的早到回复等待及过期答案拒绝分类. 研究关闭复用既有 `autoresearchArguments` 精确解析, 其他原生 slash 输入不变. 检查 bot 发出的回复目标及对话后, 去掉 Ask 引用并进入既有命令路由, 沿用正常授权/生命周期或 foreign 命令忽略逻辑, 均不作为答案. 专属提示中的问题正文截断至 1000 UTF-16 units, 使用已有的不冲突 fenced literal 编码, 与 owner mention 和 marker 独立构造. 这限制 Markdown 渲染规模, 防止表格展开或引入额外 mention, 保留 selective ForceReply 的定向目标.
 
-`ui` 入口为原生 `ask`/`select`/`confirm`/`input`/`editor` 共用接纳检查: 已有 Ask/文字请求或 pending 原生 UI confirmation 时, 不接纳新请求. 不同并发 ID 通过现有 response sender 取消一次, 当前菜单不变. 若仅剩 response 写入结果尚未消费, 则将一条后继 UI 事件暂存在已有 `askRequest` 中, 占用同一个单请求槽位, 不显示也不取消. 写入结算后, actor 重新核验其 client/generation/session/catalog-epoch/root/turn 和存活 runtime, 再由 `applyUI` 显示, 不重复接纳. Stop, 原生 cancel, 任务/runtime teardown 及当前 runtime 的写失败会撤销待显示事件, 迟到结果不能重开. 相同 ID 在 pending, 完成或拒绝后均忽略. 每个 runtime 共用的请求 receipt 上限为 4096; 耗尽时保守退役该 runtime, 不重新开放旧请求. 原生 cancel 只清理本地状态. Stop 立即撤销输入, 保留已有普通/research/steer 停止路径. Root 结算, session 替换和 runtime teardown 使交互失效. Ask/文字显示在 actor 外执行, deadline 十秒; 迟到完成仅清理旧键盘. 显示失败取消请求. 提交先消费本地状态, 再独立于 RPC operation lane 尝试一次五秒的 `extension_ui_response` 写入. 没有业务 ACK 或重试; 不确定写入仅退役仍对应原身份的 runtime/session. 空闲释放和新 root 派发等待未完成的 response 写入. 超时和默认答案仅由 OMP 决定; 启用 UI 从不改变审批策略.
+`ui` 入口为原生 `ask`/`form`/`select`/`confirm`/`input`/`editor` 共用接纳检查: 已有 Ask/文字请求或 pending 原生 UI confirmation 时, 不接纳新请求. 不同并发 ID 通过现有 response sender 取消一次, 当前菜单不变. 若仅剩 response 写入结果尚未消费, 则将一条后继 UI 事件暂存在已有 `askRequest` 中, 占用同一个单请求槽位, 不显示也不取消. 写入结算后, actor 重新核验其 client/generation/session/catalog-epoch/root/turn 和存活 runtime, 再由 `applyUI` 显示, 不重复接纳. Stop, 原生 cancel, 任务/runtime teardown 及当前 runtime 的写失败会撤销待显示事件, 迟到结果不能重开. 相同 ID 在 pending, 完成或拒绝后均忽略. 每个 runtime 共用的请求 receipt 上限为 4096; 耗尽时保守退役该 runtime, 不重新开放旧请求. 原生 cancel 只清理本地状态. Stop 立即撤销输入, 保留已有普通/research/steer 停止路径. Root 结算, session 替换和 runtime teardown 使交互失效. Ask/form 显示在 actor 外执行, deadline 十秒; 迟到完成仅清理旧键盘. 显示失败取消请求. 提交先消费本地状态, 再独立于 RPC operation lane 尝试一次五秒的 `extension_ui_response` 写入. 没有业务 ACK 或重试; 不确定写入仅退役仍对应原身份的 runtime/session. 空闲释放和新 root 派发等待未完成的 response 写入. 超时和默认答案仅由 OMP 决定; 启用 UI 从不改变审批策略.
 
 Stop 会记录任务级 UI 接纳围栏, 即使当前没有 `askRequest`, 仅剩上一条 response 写入结果尚未消费. 围栏生效时取消新 UI ID, 延后显示也检查同一围栏. 新任务或 runtime 替换/teardown 会重置围栏. Stop 成功结算也会清除围栏, 包括确认空闲或确认关闭 autoresearch 模式后保留连接中 runtime 的 Stop; 结算前围栏仍生效. Stop 已撤销 pending Ask 输入后, 即使原生 abort 明确拒绝也会退役该 runtime, 将活动 root 结算为 uncertain, 不能让无法回答的对话继续阻塞 worker. 没有 pending Ask 时的 abort 拒绝会清除围栏, 继续沿用原有 runtime 可复用策略.
 
@@ -1093,7 +1097,7 @@ Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 
 
 [`TestRealOMPBridgeCompatibility`](../internal/bridge/real_omp_integration_test.go) 使用真实 worker 和 RPC client, 对接确定性的本地 OpenAI-compatible HTTP/SSE provider. 检查启动/catalog 和 host-tool 注册, prompt 接受与任务完成的区别, root 暂停期间的 fast 控制, 排队最终回复归属及后续请求实际携带的 `service_tier=priority`. 原生 `telegram_send` 调用/结果必须为原 topic 入队不可变 workspace 快照, 不宣称已交付. Stop 必须退役旧 runtime 并取消排队任务; 惰性 resume 必须保留 session 身份和原生上下文, 不重放任务. 已有迁移兼容测试继续独立检查原生 Extension/journal. 两者都不证明生产 provider 或线上 Bot API 兼容.
 
-[`TestRealOMPAskCompatibility`](../internal/bridge/ask_real_integration_test.go) 沿用相同隔离和本地 provider 模式, 执行真实原生 `{html}` `ask` 工具调用. 表单选项和文本字段经 OMP 通用 `select`/`input`/`editor` RPC 回退传递, 必须产生原 turn 的工具结果和最终回复, 且只有一条用户输入, 不新增 prompt/steer. 覆盖原始空白/换行, 显式空值, 可见 placeholder/prefill, 原样提交默认值, 原生必填/数字/pattern 重问和过期默认值按钮. 原生 Ask 等待期间的 Stop 必须退役 runtime, 取消 root 和 queued followup, 使旧按钮失效, 且不发起后续 provider 请求. 基于 questions 的扩展 `method:"ask"` 仍是独立 UI 协议, 不是需要模拟的旧版原生工具 schema.
+[`TestRealOMPAskCompatibility`](../internal/bridge/ask_real_integration_test.go) 使用隔离的本地 provider 执行 OMP 19.1+ 原生 `{html}` `ask` 调用. 验证一个完整的 `method:"form"` 请求及一个具名 `data` 响应, 覆盖 radio 值, checkbox 数组, 文字, 原始空白/换行, 默认值, 可选空值, 数字及 pattern 重问. 工具结果必须继续原 turn, 只有一条 user 输入且没有额外 prompt/steer. 表单等待期间的 Stop 必须退役 runtime, 取消 root 和 queued followup, 使旧按钮失效, 且不发起后续 provider 请求. 基于 questions 的扩展 `method:"ask"` 仍是独立协议.
 
 [`TestRealOMPAutoSessionNameCompatibility`](../internal/bridge/auto_session_name_real_test.go) 使用独立本地标题模型, 检查原生后台 `/rename`, 手动命名优先级, session 切换/abort 隔离, ACP 持久化标题及恢复后的对话身份. 显式临时 `--session-dir` 与隔离的原生 cwd bucket 一致, 因为 ACP 列举不遍历任意自定义 session 目录.
 
@@ -1119,3 +1123,5 @@ Recipe 要求显式提供可执行文件路径, 设置 `OMP_TELEGRAM_TEST_OMP`, 
 缓存 action 固定到 commit SHA, 使用 Node.js 24. Go module 和编译缓存按 runner OS/架构, build/race job 及依赖文件 hash 隔离. 每个源码 revision 使用新缓存键, 恢复前一个兼容缓存, 无需等待 `go.sum` 变化才能更新编译产物. 相同架构和 job 类型的分片共享兼容的编译缓存; 不可变缓存只接受一个并发保存. 新缓存前缀的首次运行是冷缓存; `-count=1` 保证普通及 race 测试不依赖已缓存结果跳过执行. 分片用额外 runner 启动开销换取关键路径缩短, 不减少覆盖或放宽测试超时.
 
 `main` 上的新源码版本创建正式 release, 不移动已有版本 tag. 其他符合条件的运行发布滚动 `dev-latest` prerelease. 同仓库 PR 构建/发布真实 head commit; fork PR 只构建, 不发布. 只有 release job 有仓库内容写权限. 发布串行化, workflow 只替换滚动 prerelease tag 或创建新版本 tag. 发布要求显式更新源码版本, 不等于升级数据库 schema.
+
+替换 `dev-latest` 时, draft 和 release 删除最多尝试六次, 间隔五秒. 删除返回 HTTP 404 视为已完成, 包括响应丢失后的重试; 重试耗尽则发布失败. Release 创建不重试, 因为其执行结果可能不确定.

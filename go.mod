@@ -6,7 +6,8 @@ require (
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/pelletier/go-toml/v2 v2.4.3
 	golang.org/x/image v0.46.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/net v0.63.0
+	golang.org/x/sys v0.50.0
 	modernc.org/sqlite v1.59.0
 )
 

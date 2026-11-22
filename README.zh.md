@@ -322,7 +322,9 @@ omp --resume /path/to/session.jsonl
 
 Bridge 使用 OMP 的 `rpc-ui` 模式, 不改变已启用工具或审批策略. 如果 OMP 已启用原生 `ask`, 可以要求 Agent 使用它, 例如: "使用 Ask 让我选择 Programming, Investing 或 Languages."
 
-从 OMP 18.18.3 起, 原生 `ask` 接收 `{html}` HTML 表单, 不再使用旧 `questions[]` 工具 schema. RPC 没有 `formDialog` 时 (包括 OMP 18.18.6), OMP 通过通用 `select`/`input`/`editor` 请求逐字段提问; checkbox 字段使用多次选择. Bridge 处理这些请求, 不解析 HTML, 也不另建表单渲染器. 请按显示的选项操作, 文字输入须回复 Bridge 显示的对应问题或专属输入提示.
+从 OMP 18.18.3 起, 原生 `ask` 使用 `{html}` HTML 表单. OMP 19.1+ 通过一个 `method:"form"` RPC 请求发送完整表单; Bridge 将 radio, checkbox, select, text 和 number 字段转换为 Telegram 交互, 最后一次性返回含原字段名和选项值的 `data` 对象. 回复保留文字空白, 并遵循字段默认值及必填/输入约束. Telegram 无法掩码输入, 因此 password 字段会取消. 不复现任意表单布局和图片. 较旧 OMP RPC 版本可能逐字段发送同一表单; Bridge 仍处理这些通用 `select`/`input`/`editor` 请求.
+
+如果表单包含 Bridge 不支持的校验表达式, 对话会在显示问题前取消. 遇到这种情况时, 请让 Agent 使用更简单的表达式.
 
 扩展 Ask 和全部原生选择菜单 (包括 Review) 的正文展示完整选项标签, description 和 preview, 保留原始换行与间隔. 选择按钮只显示全局数字编号; 扩展多选额外显示 ☐/☑. 导航, 确认, 取消及自定义答案按钮仍使用简短动作文字. 每页最多十项, 内容较长时会提前分页. 超长单项在后续页继续展示, 保持同一编号; 翻页不会提交答案. 原生选择后, 完整回执能放入一条消息时, 原主消息保留问题, 全部选项及本地选择; 超出容量时, 有界回执用 `...` 标记省略内容, RPC 仍收到原始值. 后续原生 select 可以复用同一菜单, 并保留先前动作的摘要. Checkbox 回退只记录逐次选择, 不推断最终勾选集合, 也不对 "Done" 等标签作特殊解释. 展示格式与分页均不改变发送给 OMP 的原始值.
 
@@ -342,7 +344,7 @@ Extensions 仍独立支持基于 questions 的 `ui.askDialog` 和 `set_ask_dialo
 - 回复过期或仍在投递的 Ask 提示时, `/stop` 等 Bridge 命令和原生 `/autoresearch off` 控制仍按正常规则执行. 发给其他 bot 的命令会忽略, 不作为答案.
 - 只有发起任务的用户可以回答. 每个对话同时只允许一个原生交互 (Ask, 选择, 确认或文字输入); 额外并发请求会取消, 不替换原菜单. 回答后, 下一对话可能短暂等待上一答案的投递结果确认. 重复请求 ID 不重新打开对话或重放答案. 答案继续原任务, 不创建新 prompt, 失败或重启后不会重放.
 
-OMP 支持 opt-in 时自动启用扩展组合对话; 这不代表启用 HTML `formDialog`. 明确的不支持命令响应会保留 `rpc-ui`, 改用通用选择/纯文本输入; 其他协商失败会中止启动. 不支持标记为 secret 的敏感输入或任意终端编辑器.
+该 opt-in 启用基于 questions 的扩展 `ui.askDialog`; HTML `formDialog` 是单独的 RPC 请求, 如上所述由 Bridge 处理. 明确的不支持命令响应会为 questions-based 扩展对话保留 `rpc-ui`, 改用通用选择/纯文本输入; 其他协商失败会中止启动. 不支持标记为 secret 的敏感输入或任意终端编辑器.
 
 不支持在连接前阻塞 OMP 启动的对话: 启动会超时失败, Telegram 不会出现可操作的问题或按钮. 超时时若检测到未应答的确认或其他 RPC 对话, Telegram 会报告该现象, 不将它断言为已证实的原因. 请将扩展配置为非交互启动, 或把提问移至用户调用的命令; 重试前按提示要求使用 `/close`. Bridge 不自动回答启动对话. 参见[原生对话实现](doc/architecture.zh.md#原生对话与-session-operation).
 

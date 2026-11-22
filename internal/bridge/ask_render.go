@@ -131,8 +131,17 @@ func askOptionDetail(option askOption) string {
 }
 
 func (w *worker) askAnswerFooter(a *askRequest) string {
-	if a.method != "ask" {
-		footer := "**" + w.tr(i18n.Msg.AskSubmission) + "**"
+	title := i18n.Msg.AskSubmission
+	textAnswer := a.method != "ask"
+	if a.method == "ask" {
+		title = i18n.Msg.AskChoice
+	}
+	if a.form != nil {
+		field := a.form.fields[a.question]
+		textAnswer = field.inputType != "radio" && field.inputType != "checkbox" && field.inputType != "select"
+	}
+	footer := "**" + w.tr(title) + "**"
+	if textAnswer {
 		if a.custom == "" {
 			return footer + "\n" + w.tr(i18n.Msg.AskEmptyValue)
 		}
@@ -152,5 +161,5 @@ func (w *worker) askAnswerFooter(a *askRequest) string {
 	if value == "" {
 		value = w.tr(i18n.Msg.AskNoSelection)
 	}
-	return "**" + w.tr(i18n.Msg.AskChoice) + "**" + askLine(askLiteral(value, 1400))
+	return footer + askLine(askLiteral(value, 1400))
 }

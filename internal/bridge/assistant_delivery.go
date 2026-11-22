@@ -162,7 +162,7 @@ func assistantContinuationEvent(e rpcEvent) bool {
 		return true
 	case "extension_ui_request":
 		switch e.Method {
-		case "ask", "confirm", "select", "input", "editor":
+		case "ask", "form", "confirm", "select", "input", "editor":
 			return true
 		}
 	}

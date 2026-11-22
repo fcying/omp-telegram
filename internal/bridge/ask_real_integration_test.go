@@ -88,213 +88,127 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 				t.Fatal("native Ask runtime failed to start")
 			}
 			nativeInput(t, w, 100, "native ask smoke", false)
-			until(func() bool { return w.rootRequestID != "" && w.busy })
+			until(func() bool {
+				return w.rootRequestID != "" && w.busy && w.ask != nil && w.ask.form != nil && w.ask.messageID != 0 && w.ask.cancel == nil
+			})
 			client, turn, rootID := w.client, w.turn, w.rootRequestID
 			assertRoot := func() {
 				if w.client != client || w.turn != turn || w.rootRequestID != rootID || rootID == "" || w.active != 100 || !w.busy || harness.count() != 1 {
 					t.Fatal("native Ask escaped the original root or invoked extra model work while collecting fields")
 				}
 			}
-			// RPC response settlement may precede the best-effort Telegram edit.
-			receipt := func(messageID int64, footer string, contains ...string) string {
-				until(func() bool {
-					fake.mu.Lock()
-					defer fake.mu.Unlock()
-					for i := len(fake.messages) - 1; i >= 0; i-- {
-						message := fake.messages[i]
-						if message["chat_id"] == float64(w.key.chat) && message["message_id"] == float64(messageID) {
-							text, _ := message["text"].(string)
-							if !strings.Contains(text, footer) {
-								return false
-							}
-							for _, want := range contains {
-								if !strings.Contains(html.UnescapeString(text), want) {
-									return false
-								}
-							}
-							var keyboard telegram.Keyboard
-							raw, err := json.Marshal(message["reply_markup"])
-							return err == nil && json.Unmarshal(raw, &keyboard) == nil && len(keyboard.InlineKeyboard) == 0
-						}
-					}
-					return false
-				})
-				text := assertFinishedMenu(t, fake, int(messageID), footer)
-				for _, want := range contains {
-					if !strings.Contains(html.UnescapeString(text), want) {
-						t.Fatalf("original question %d lost %q in receipt: %q", messageID, want, text)
-					}
+			if w.ask.method != "form" || !strings.Contains(w.ask.questions[0].Question, "Which topic?") {
+				t.Fatalf("OMP form request was not represented as a native form: %+v", w.ask)
+			}
+			initial, _ := pickerView(t, fake)
+			if strings.Contains(initial, "<form>") || !strings.Contains(html.UnescapeString(initial), "Programming") {
+				t.Fatal("the form HTML was exposed instead of rendering supported controls")
+			}
+			click := func(label string) {
+				a := w.ask
+				if a == nil {
+					t.Fatal("native form disappeared before callback")
 				}
-				return text
-			}
-			selectField := func(title, previousID string) confirmation {
-				var current confirmation
-				until(func() bool {
-					for _, c := range w.confirms {
-						if c.action == "ui" && c.method == "select" && c.uiID != previousID && strings.Contains(c.uiQuestion.Question, title) {
-							current = c
-							return true
-						}
-					}
-					return false
-				})
-				assertRoot()
-				return current
-			}
-			inputField := func(method, title string) *telegram.Message {
-				until(func() bool {
-					return w.ask != nil && w.ask.method == method && w.ask.cancel == nil && w.ask.inputID != 0 && strings.Contains(w.ask.questions[0].Question, title)
-				})
-				assertRoot()
-				prompt := askTestPrompt(t, fake)
-				if w.ask.messageID == 0 || w.ask.messageID == prompt.MessageID {
-					t.Fatal("native field did not retain an independent main question message")
+				epoch, previousMessageID := a.epoch, a.messageID
+				if label == "Other" {
+					label = "Custom answer"
 				}
-				return prompt
+				if label == "Done" {
+					label = "Confirm selection"
+				}
+				askTestCallback(w, 7, askTestButton(t, fake, label))
+				until(func() bool {
+					return w.ask != a || a.epoch > epoch && a.cancel == nil && a.messageID != 0
+				})
+				messageID := int64(0)
+				if w.ask == a {
+					messageID = a.messageID
+				}
+				if previousMessageID != 0 && messageID != previousMessageID {
+					askTestReceipt(t, w, fake, previousMessageID)
+				}
+				assertRoot()
 			}
-			// Capture the actual delivered callback envelope before its token expires.
 			button := func(label string) *telegram.CallbackQuery {
 				data := askTestButton(t, fake, label)
 				token, _, _ := strings.Cut(data, ":")
 				c, ok := w.confirms[token]
 				if !ok {
-					t.Fatal("Telegram field button has no live interaction")
+					t.Fatal("Telegram form button has no live interaction")
 				}
-				return &telegram.CallbackQuery{ID: "real-ask-" + token, From: telegram.User{ID: 7}, Data: data,
+				return &telegram.CallbackQuery{ID: "real-form-" + token, From: telegram.User{ID: 7}, Data: data,
 					Message: &telegram.Message{MessageID: c.messageID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}}
 			}
-			reply := func(id int64, text string, prompt *telegram.Message) {
+			reply := func(id int64, text string) {
+				a := w.ask
+				if a == nil {
+					t.Fatal("native form disappeared before text response")
+				}
+				epoch, previousMessageID := a.epoch, a.messageID
+				prompt := askTestPrompt(t, fake)
 				u := update(id, 11, text)
+				u.Message.From.ID = 7
+				u.Message.Chat.ID = w.key.chat
 				u.Message.ReplyToMessage = prompt
 				raw, err := json.Marshal(u)
 				requireStoreOK(t, err)
-				requireStoreOK(t, db.Accept(id, raw))
+				requireStoreOK(t, w.b.db.Accept(id, raw))
 				w.handle(incoming{id: id, msg: u.Message})
 				w.dispatch()
-			}
-			submitted := func(action func(), value string) {
-				messageID, question := w.ask.messageID, w.ask.questions[0].Question
-				action()
-				text := receipt(messageID, "<b>Submitted</b>", question)
-				_, actual, _ := strings.Cut(html.UnescapeString(text), "<b>Submitted</b>")
-				if value == "" {
-					if strings.Contains(actual, "<code>") || strings.Contains(actual, "<pre>") {
-						t.Fatalf("empty submission was rendered as literal user text: %q", actual)
-					}
-					return
+				until(func() bool {
+					return w.ask != a || a.epoch > epoch && a.cancel == nil && a.messageID != 0
+				})
+				messageID := int64(0)
+				if w.ask == a {
+					messageID = a.messageID
 				}
-				if !strings.Contains(actual, value) {
-					t.Fatalf("original question %d submission = %q, want exact raw value %q", messageID, actual, value)
+				if previousMessageID != 0 && messageID != previousMessageID {
+					askTestReceipt(t, w, fake, previousMessageID)
 				}
-			}
-			submitReply := func(id int64, text string, prompt *telegram.Message) {
-				submitted(func() { reply(id, text, prompt) }, text)
-			}
-			submitButton := func(label, value string) {
-				submitted(func() { w.callback(button(label)) }, value)
-			}
-			topic := selectField("Which topic?", "")
-			w.callback(button("Programming"))
-			topicReceipt := receipt(topic.messageID, "<b>Your choice</b>", "Which topic?", "1. Programming", "2. Investing", "3. Languages")
-			_, localChoice, _ := strings.Cut(topicReceipt, "<b>Your choice</b>")
-			if !strings.Contains(localChoice, "Programming") {
-				t.Fatalf("native select receipt lost its local choice: %q", topicReceipt)
-			}
-			features := selectField("Which features?", topic.uiID)
-			if features.messageID != topic.messageID {
-				t.Fatal("sequential native select replaced its original menu message")
-			}
-			if scenario == "guidance" {
-				stale := button("Auth")
-				token, _, _ := strings.Cut(stale.Data, ":")
-				nativeInput(t, w, 210, "ordinary unquoted guidance: include guidance-confirmed in the final answer", false)
 				assertRoot()
-				if w.ask != nil || !reflect.DeepEqual(w.confirms[token], features) || queueState(t, w, 210) != "pending" ||
-					len(w.deferredSteers) != 1 || len(w.steers) != 0 || len(w.queue) != 0 {
-					t.Fatal("ordinary guidance changed the current field or escaped the original native Ask root")
-				}
 			}
 			if scenario == "stop" {
-				stale := button("Auth")
-				w.callback(button("Other (type your own)"))
-				prompt := inputField("input", "Which features?")
-				w.callback(button("Cancel"))
-				selectField("Which features?", features.uiID)
-				current := button("Search")
+				stale := button("Programming")
 				nativeInput(t, w, 300, "/followup must not replay", false)
 				if queueState(t, w, 300) != "pending" || len(w.queue) != 1 {
 					t.Fatal("Stop scenario did not queue its followup behind the waiting Ask")
 				}
-				reply(301, "/stop", prompt)
+				nativeInput(t, w, 301, "/stop", false)
 				until(func() bool { return w.client == nil && w.ask == nil && w.askSending == 0 && !w.controlInProgress() })
 				w.callback(stale)
-				w.callback(current)
-				reply(302, "late field answer must not replay", prompt)
-				if queueState(t, w, 100) != "cancelled" || queueState(t, w, 300) != "cancelled" ||
-					queueState(t, w, 301) != "done" || queueState(t, w, 302) != "cancelled" || harness.count() != 1 ||
-					w.client != nil || w.ask != nil || len(w.queue) != 0 || len(w.deferredSteers) != 0 {
-					t.Fatal("Stop or late field interactions replayed work or left the native Ask root/followup unconfirmed")
+				if queueState(t, w, 100) != "cancelled" || queueState(t, w, 300) != "cancelled" || queueState(t, w, 301) != "done" || harness.count() != 1 || w.client != nil || w.ask != nil || len(w.queue) != 0 {
+					t.Fatal("Stop or stale form button replayed work or left the native Ask root/followup unsettled")
 				}
-				t.Log("Stop replying to an expired field prompt retired the waiting runtime; stale/current callbacks and a late reply could not replay its root or queued followup")
+				t.Log("Stop retired the form-waiting runtime; a stale form button could not replay the root or queued followup")
 				return
 			}
-			// Checkbox rows are separate native select calls, not a bridge-owned form.
-			w.callback(button("Search"))
-			featuresReceipt := receipt(features.messageID, "<b>Your choice</b>", "Which features?", "Search")
-			_, localChoice, _ = strings.Cut(featuresReceipt, "<b>Your choice</b>")
-			if !strings.Contains(localChoice, "Search") {
-				t.Fatalf("checkbox receipt lost its individual action: %q", featuresReceipt)
+			click("Programming")
+			if scenario == "guidance" {
+				stale := button("Auth")
+				token, _, _ := strings.Cut(stale.Data, ":")
+				current := w.confirms[token]
+				nativeInput(t, w, 210, "ordinary unquoted guidance: include guidance-confirmed in the final answer", false)
+				assertRoot()
+				if w.ask == nil || !reflect.DeepEqual(w.confirms[token], current) || queueState(t, w, 210) != "pending" || len(w.deferredSteers) != 1 || len(w.steers) != 0 || len(w.queue) != 0 {
+					t.Fatal("ordinary guidance changed the form or escaped the original native Ask root")
+				}
 			}
-			features = selectField("Which features?", features.uiID)
-			w.callback(button("Auth"))
-			features = selectField("Which features?", features.uiID)
-			w.callback(button("Done selecting"))
-			selectField("Which language?", features.uiID)
-			w.callback(button("Other (type your own)"))
-			submitReply(200, "  Elixir  ", inputField("input", "Which language?"))
-			rationale := inputField("input", "Why this choice?")
-			text, _ := pickerView(t, fake)
-			if !strings.Contains(text+rationale.Text, "Explain briefly") {
-				t.Fatal("native input placeholder was not shown to the user")
+			click("Search")
+			click("Auth")
+			click("Confirm selection")
+			click("Other")
+			reply(200, "Elixir")
+			reply(201, "  Keep the original root  ")
+			reply(202, "  First line\nSecond line  ")
+			click("Submit empty")
+			click("Use default")
+			click("Submit empty")
+			reply(203, "4")
+			reply(204, "bad")
+			if w.ask == nil || !strings.Contains(w.ask.questions[w.ask.question].Question, "Reference code?") {
+				t.Fatal("native form pattern failure did not re-open its field")
 			}
-			submitReply(201, "  Keep the original root  ", rationale)
-			submitReply(202, "  First line\nSecond line  ", inputField("editor", "Implementation notes?"))
-			inputField("input", "Optional note?")
-			submitButton("Submit empty", "")
-			saved := inputField("editor", "Saved draft?")
-			text, _ = pickerView(t, fake)
-			if !strings.Contains(text+saved.Text, "Saved draft\nSecond line") {
-				t.Fatal("native editor prefill was not shown to the user")
-			}
-			submitButton("Use default", "  Saved draft\nSecond line  ")
-			inputField("editor", "Empty notes?")
-			submitButton("Submit empty", "")
-			inputField("editor", "How many?")
-			oldQuantity, oldDefault := w.ask.id, button("Use default")
-			submitButton("Submit empty", "")
-			inputField("editor", "How many?")
-			if w.ask.id == oldQuantity {
-				t.Fatal("required empty value did not reach native validation and re-open the field")
-			}
-			quantity := w.ask
-			w.callback(oldDefault)
-			if w.ask != quantity {
-				t.Fatal("a stale default button answered the replacement field")
-			}
-			submitReply(203, "10", askTestPrompt(t, fake))
-			inputField("editor", "How many?")
-			if w.ask.id == quantity.id {
-				t.Fatal("out-of-range value did not reach native validation")
-			}
-			submitReply(204, " 4 ", askTestPrompt(t, fake))
-			code := inputField("input", "Reference code?")
-			codeID := w.ask.id
-			submitReply(205, " OK ", code)
-			inputField("input", "Reference code?")
-			if w.ask.id == codeID {
-				t.Fatal("pattern validation did not see the exact untrimmed answer")
-			}
-			submitReply(206, "OK", askTestPrompt(t, fake))
+			reply(205, "OK")
 			if scenario == "guidance" {
 				until(func() bool {
 					return queueState(t, w, 100) == "done" || len(w.deferredSteers) == 0 && len(w.steers) != 0 && !w.rpcOperationActive
@@ -303,8 +217,13 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 			}
 			until(func() bool { return queueState(t, w, 100) == "done" && w.ask == nil && w.askSending == 0 })
 			calls := harness.count()
-			if w.client != client || w.turn != turn || queueState(t, w, 200) != "done" || queueState(t, w, 201) != "done" || queueState(t, w, 202) != "done" || queueState(t, w, 203) != "done" || queueState(t, w, 204) != "done" || queueState(t, w, 205) != "done" || queueState(t, w, 206) != "done" {
-				t.Fatal("native Ask field answers replaced the runtime/turn or were not consumed")
+			if w.client != client || w.turn != turn {
+				t.Fatal("native form response replaced the runtime or task turn")
+			}
+			for _, id := range []int64{200, 201, 202, 203, 204, 205} {
+				if queueState(t, w, id) != "done" {
+					t.Fatalf("native form input %d was not consumed", id)
+				}
 			}
 			want := "ask-complete"
 			if scenario == "guidance" {
@@ -316,12 +235,12 @@ func TestRealOMPAskCompatibility(t *testing.T) {
 					want = "post-tool-intermediate\n\n" + want
 				}
 			} else if calls != 2 {
-				t.Fatal("native Ask field answers invoked an extra prompt")
+				t.Fatal("native Ask form invoked an extra provider request")
 			}
 			if body := researchBody(t, w, 100); body != want {
 				t.Fatalf("original native turn final reply = %q, want %q", body, want)
 			}
-			t.Log("native HTML ask consumed named one-of/many-of/custom/input/editor fields as JSON and continued the original root with any deferred guidance")
+			t.Log("native HTML Ask form was submitted once as named JSON data and resumed the original task, with queued guidance kept separate")
 		})
 	}
 }

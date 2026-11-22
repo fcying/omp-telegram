@@ -7,6 +7,7 @@ import (
 	"html"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ type askTestResponse struct {
 	Cancelled bool            `json:"cancelled"`
 	Confirmed *bool           `json:"confirmed"`
 	Answers   []askTestAnswer `json:"answers"`
+	Data      map[string]any  `json:"data"`
 }
 
 func askTestWorker(t *testing.T) (*worker, *fakeHTTP, string) {
@@ -743,6 +745,76 @@ func TestAskNativeInputPreservesRawTextAndRepeatedQuestions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNativeHTMLFormReturnsNamedValuesOnce(t *testing.T) {
+	w, f, trace := askTestWorker(t)
+	client, root, turn := w.client, w.rootRequestID, w.turn
+	traceStart := len(fixtureRPCTrace(trace))
+	form := `<form>
+		<input type="hidden" name="csrf" value="opaque-token">
+		<fieldset><legend>Language</legend>
+			<label><input type="radio" name="language" value="lang-go">Go</label>
+			<label><input type="radio" name="language" value="lang-rust">Rust</label>
+		</fieldset>
+		<fieldset><legend>Features</legend>
+			<label><input type="checkbox" name="features" value="search-enabled">Search</label>
+			<label><input type="checkbox" name="features" value="auth-enabled">Auth</label>
+		</fieldset>
+		<label>Notes<textarea name="notes">Draft</textarea></label>
+		<label>Quantity<input type="number" name="quantity" value="3" min="1" max="9" required></label>
+		<label>Optional<input name="optional" placeholder="hint only"></label>
+	</form>`
+	askTestEvent(t, w, map[string]any{"id": "whole-form", "method": "form", "html": form})
+	if w.ask == nil || w.ask.form == nil || w.ask.method != "form" {
+		t.Fatal("OMP form request was not presented")
+	}
+	askTestClick(t, w, f, "Rust")
+	askTestClick(t, w, f, "Search")
+	askTestClick(t, w, f, "Auth")
+	askTestClick(t, w, f, "Confirm selection")
+	notesPrompt := askTestPrompt(t, f)
+	askTestReply(t, w, 210, 7, 11, "  first line\nsecond line  ", notesPrompt)
+	quantityPrompt := askTestPrompt(t, f)
+	askTestReply(t, w, 211, 7, 11, "4", quantityPrompt)
+	askTestClick(t, w, f, "Submit empty")
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].ID != "whole-form" || responses[0].Cancelled {
+		t.Fatalf("form response count/status = %+v", responses)
+	}
+	want := map[string]any{
+		"csrf": "opaque-token", "language": "lang-rust",
+		"features": []any{"search-enabled", "auth-enabled"},
+		"notes":    "  first line\nsecond line  ", "quantity": float64(4), "optional": "",
+	}
+	if !reflect.DeepEqual(responses[0].Data, want) {
+		t.Fatalf("form response data = %#v, want %#v", responses[0].Data, want)
+	}
+	if w.client != client || w.rootRequestID != root || w.turn != turn || w.active != 100 || !w.busy {
+		t.Fatal("form response changed the original root ownership")
+	}
+	for _, entry := range fixtureRPCTrace(trace)[traceStart:] {
+		if entry.kind == "prompt" || entry.kind == "steer" {
+			t.Fatalf("form answer became model input: %+v", entry)
+		}
+	}
+}
+
+func TestNativeHTMLFormCancellationDoesNotSubmitData(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	client, root, turn := w.client, w.rootRequestID, w.turn
+	askTestEvent(t, w, map[string]any{
+		"id": "cancel-form", "method": "form",
+		"html": `<form><label>Choice<select name="choice"><option value="a">A</option></select></label></form>`,
+	})
+	askTestClick(t, w, f, "Cancel")
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].ID != "cancel-form" || !responses[0].Cancelled || responses[0].Data != nil {
+		t.Fatalf("form cancellation = %+v", responses)
+	}
+	if w.client != client || w.rootRequestID != root || w.turn != turn || w.active != 100 || !w.busy {
+		t.Fatal("form cancellation changed the original root ownership")
 	}
 }
 

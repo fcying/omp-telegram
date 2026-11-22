@@ -28,6 +28,8 @@ type askRequest struct {
 	prefill            *string
 	questions          []askQuestion
 	answers            []askAnswer
+	form               *askForm
+	formData           map[string]any
 	question           int
 	epoch              uint64
 	messageID, inputID int64
@@ -55,6 +57,7 @@ type askQuestion struct {
 
 type askOption struct {
 	Label       string `json:"label"`
+	Value       string `json:"value,omitempty"`
 	Description string `json:"description"`
 	Preview     string `json:"preview"`
 }
@@ -150,31 +153,74 @@ func (w *worker) beginAsk(e rpcEvent) {
 		w.sendAskResponse(a, map[string]any{"cancelled": true})
 		return
 	}
-	if e.Method != "ask" {
-		a.questions = []askQuestion{{ID: e.ID, Question: e.Title}}
+	if e.Method == "form" {
+		form, err := parseAskForm(e.HTML)
+		if err != nil {
+			w.sendAskResponse(a, map[string]any{"cancelled": true})
+			if err == errAskFormPattern {
+				w.say(w.tr(i18n.Msg.AskFormPatternUnsupported))
+			} else {
+				w.say(w.tr(i18n.Msg.AskDisplayFailed))
+			}
+			return
+		}
+		a.form, a.formData = form, form.data
+		a.questions = make([]askQuestion, len(form.fields))
+		for index := range form.fields {
+			a.questions[index] = form.fields[index].question
+		}
+		if len(a.questions) == 0 {
+			w.sendAskResponse(a, map[string]any{"data": a.formData})
+			return
+		}
+		w.prepareAskFormField(a)
+	} else {
+		if e.Method != "ask" {
+			a.questions = []askQuestion{{ID: e.ID, Question: e.Title}}
+		}
+		if len(a.questions) == 0 {
+			w.sendAskResponse(a, map[string]any{"cancelled": true})
+			return
+		}
+		if e.Method == "ask" {
+			ids := make(map[string]bool, len(a.questions))
+			for _, question := range a.questions {
+				if question.ID == "" || ids[question.ID] {
+					w.sendAskResponse(a, map[string]any{"cancelled": true})
+					return
+				}
+				ids[question.ID] = true
+			}
+			a.selected = make(map[int]bool)
+			a.answers = make([]askAnswer, 0, len(a.questions))
+		}
+		if e.Method == "editor" || e.Method == "input" {
+			a.input = true
+		}
 	}
-	if len(a.questions) == 0 {
-		w.sendAskResponse(a, map[string]any{"cancelled": true})
+	a.inlineInput = e.Method != "ask" && e.Method != "form" && w.inlineForceReplyUser(a.user)
+	w.ask = a
+	w.renderAsk(a)
+}
+
+func (w *worker) prepareAskFormField(a *askRequest) {
+	field := a.form.fields[a.question]
+	a.selected = make(map[int]bool)
+	a.custom, a.page, a.input = "", 0, false
+	a.prefill, a.placeholder = nil, field.placeholder
+	if field.inputType != "radio" && field.inputType != "checkbox" && field.inputType != "select" {
+		a.input = true
+		if field.value != "" {
+			value := field.value
+			a.prefill = &value
+		}
 		return
 	}
-	if e.Method == "ask" {
-		ids := make(map[string]bool, len(a.questions))
-		for _, question := range a.questions {
-			if question.ID == "" || ids[question.ID] {
-				w.sendAskResponse(a, map[string]any{"cancelled": true})
-				return
-			}
-			ids[question.ID] = true
+	for index, selected := range field.selected {
+		if selected {
+			a.selected[index] = true
 		}
-		a.selected = make(map[int]bool)
-		a.answers = make([]askAnswer, 0, len(a.questions))
 	}
-	a.inlineInput = e.Method != "ask" && w.inlineForceReplyUser(a.user)
-	w.ask = a
-	if e.Method == "editor" || e.Method == "input" {
-		a.input = true
-	}
-	w.renderAsk(a)
 }
 
 // Local consumption precedes the only send attempt. No business ACK exists.
@@ -245,7 +291,7 @@ func (w *worker) pauseAsk() {
 
 func (w *worker) cancelAskInteraction(a *askRequest) {
 	receipt := ""
-	if a.method == "ask" && a.cancelledText == "" && a.question < len(a.questions) && (a.messageID != 0 || a.cancel != nil) {
+	if (a.method == "ask" || a.form != nil) && a.cancelledText == "" && a.question < len(a.questions) && (a.messageID != 0 || a.cancel != nil) {
 		question := a.questions[a.question]
 		receipt = w.askQuestionText(question, 0, len(question.Options), "**"+w.tr(i18n.Msg.Canceled)+"**")
 		a.cancelledText = receipt
@@ -301,7 +347,22 @@ func (w *worker) renderAsk(a *askRequest) {
 		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: a.token + ":" + action}})
 	}
 	if a.input {
-		if a.method == "ask" {
+		if a.form != nil {
+			field := a.form.fields[a.question]
+			if field.inputType == "radio" || field.inputType == "checkbox" || field.inputType == "select" {
+				add(w.tr(i18n.Msg.AskBack), "back")
+				if !field.required {
+					add(w.tr(i18n.Msg.AskEmpty), "empty")
+				}
+			} else {
+				if !field.required {
+					add(w.tr(i18n.Msg.AskEmpty), "empty")
+				}
+				if a.prefill != nil {
+					add(w.tr(i18n.Msg.AskDefault), "default")
+				}
+			}
+		} else if a.method == "ask" {
 			add(w.tr(i18n.Msg.AskBack), "back")
 		} else {
 			add(w.tr(i18n.Msg.AskEmpty), "empty")
@@ -327,9 +388,18 @@ func (w *worker) renderAsk(a *askRequest) {
 		if a.page+1 < len(a.pages) {
 			add(w.tr(i18n.Msg.Next), "next")
 		}
-		add(w.tr(i18n.Msg.AskCustom), "custom")
+		if a.form == nil || a.form.fields[a.question].other {
+			add(w.tr(i18n.Msg.AskCustom), "custom")
+		}
 		if question.Multi {
 			add(w.tr(i18n.Msg.AskConfirm), "confirm")
+		} else if a.form != nil {
+			field := a.form.fields[a.question]
+			if hasAskSelection(a.selected) {
+				add(w.tr(i18n.Msg.AskDefault), "default")
+			} else if !field.required {
+				add(w.tr(i18n.Msg.AskEmpty), "empty")
+			}
 		}
 	}
 	add(w.tr(i18n.Msg.Cancel), "cancel")
@@ -358,7 +428,7 @@ func (w *worker) renderAsk(a *askRequest) {
 				if a.placeholder != "" {
 					detail += "\n\n" + w.tr(i18n.Msg.AskPlaceholder) + "\n" + clipUTF16(a.placeholder, 500)
 				}
-				if a.method == "editor" && a.prefill != nil {
+				if (a.method == "editor" || a.form != nil) && a.prefill != nil {
 					detail += "\n\n" + w.tr(i18n.Msg.AskPrefill) + "\n" + clipUTF16(*a.prefill, 500)
 				}
 			}
@@ -496,7 +566,31 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 		w.endAsk(true)
 		return callbackDone
 	case "empty", "default":
-		if a.input && (a.method == "input" || a.method == "editor") {
+		if a.form != nil {
+			field := a.form.fields[a.question]
+			if action == "default" {
+				if a.input {
+					if a.prefill == nil {
+						return callbackDone
+					}
+					a.custom = *a.prefill
+				} else {
+					clear(a.selected)
+					for index, selected := range field.selected {
+						if selected {
+							a.selected[index] = true
+						}
+					}
+					a.custom = ""
+				}
+			} else {
+				a.custom = ""
+				if !a.input {
+					clear(a.selected)
+				}
+			}
+			w.advanceAsk(a)
+		} else if a.input && (a.method == "input" || a.method == "editor") {
 			if action == "default" {
 				if a.method != "editor" || a.prefill == nil {
 					return callbackDone
@@ -509,13 +603,17 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 		}
 		return callbackDone
 	case "back":
-		if a.input && a.method == "ask" {
+		if a.form != nil && a.input {
+			a.input = false
+			a.custom = ""
+			w.renderAsk(a)
+		} else if a.input && a.method == "ask" {
 			a.input = false
 			w.renderAsk(a)
 		}
 		return callbackDone
 	case "custom":
-		if !a.input {
+		if !a.input && (a.form == nil || a.form.fields[a.question].other) {
 			a.input = true
 			w.renderAsk(a)
 		}
@@ -535,7 +633,7 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 			w.renderAsk(a)
 		}
 	case "confirm":
-		if question.Multi {
+		if question.Multi || a.form != nil {
 			w.advanceAsk(a)
 		}
 	default:
@@ -548,6 +646,7 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 			a.selected[index] = !a.selected[index]
 			w.renderAsk(a)
 		} else {
+			clear(a.selected)
 			a.selected[index] = true
 			w.advanceAsk(a)
 		}
@@ -556,6 +655,11 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 }
 
 func (w *worker) advanceAsk(a *askRequest) {
+	if a.form != nil {
+		w.advanceAskForm(a)
+		return
+	}
+
 	// Freeze this question before the mutable request advances to another message.
 	question := a.questions[a.question]
 	text := ""
@@ -590,6 +694,78 @@ func (w *worker) advanceAsk(a *askRequest) {
 	}
 	w.endAsk(false)
 	w.sendAskResponse(a, map[string]any{"answers": a.answers})
+}
+
+func (w *worker) advanceAskForm(a *askRequest) {
+	field := a.form.fields[a.question]
+	question := a.questions[a.question]
+	var value any
+	include := true
+	if field.inputType == "radio" || field.inputType == "checkbox" || field.inputType == "select" {
+		selectedValues := make([]string, 0, len(a.selected)+1)
+		for index, option := range question.Options {
+			if a.selected[index] {
+				selectedValues = append(selectedValues, option.Value)
+			}
+		}
+		other := strings.TrimSpace(a.custom)
+		if other != "" {
+			if !field.other {
+				w.say(w.tr(i18n.Msg.AskFormInvalid))
+				w.renderAsk(a)
+				return
+			}
+			selectedValues = append(selectedValues, other)
+		}
+		if question.Multi && field.optionCount > 1 {
+			value = selectedValues
+			if field.required && len(selectedValues) == 0 {
+				w.say(w.tr(i18n.Msg.AskFormInvalid))
+				w.renderAsk(a)
+				return
+			}
+		} else if len(selectedValues) > 0 {
+			value = selectedValues[0]
+		} else {
+			include = false
+			if field.required {
+				w.say(w.tr(i18n.Msg.AskFormInvalid))
+				w.renderAsk(a)
+				return
+			}
+		}
+	} else {
+		if reason := askFormValidateText(field, a.custom); reason != "" {
+			w.say(w.tr(i18n.Msg.AskFormInvalid))
+			a.input = true
+			a.custom = ""
+			w.renderAsk(a)
+			return
+		}
+		value = askFormTextValue(field, a.custom)
+	}
+	if include {
+		a.formData[field.name] = value
+	}
+	text := ""
+	if !a.inlineInput {
+		text = w.askQuestionText(question, 0, len(question.Options), w.askAnswerFooter(a))
+	}
+	messageID := a.messageID
+	w.invalidateAskInteraction(a)
+	a.messageID = 0
+	if !a.inlineInput {
+		w.queueAskReceipt(messageID, text)
+	}
+	a.question++
+	a.pages = nil
+	if a.question < len(a.questions) {
+		w.prepareAskFormField(a)
+		w.renderAsk(a)
+		return
+	}
+	w.endAsk(false)
+	w.sendAskResponse(a, map[string]any{"data": a.formData})
 }
 
 // Telegram receipts are display-only and cannot settle or replay native work.
@@ -673,6 +849,10 @@ func (w *worker) routeAskInput(in *incoming) bool {
 	if a.questions[a.question].Multi {
 		w.renderAsk(a)
 	} else {
+		if a.form != nil && len(a.selected) != 0 && strings.TrimSpace(text) != "" {
+			// Only a submitted Other answer replaces the single-choice default.
+			clear(a.selected)
+		}
 		w.advanceAsk(a)
 	}
 	w.mark(in.id, store.InboxDone)
