@@ -204,12 +204,40 @@ jobs:
           TARGET: ${{ needs.prepare.outputs.target }}
         run: |
           set -euo pipefail
+          delete_with_retry() {
+            local attempt output
+            for attempt in {1..6}; do
+              if output=$("$@" 2>&1); then
+                if [[ -n "$output" ]]; then
+                  printf '%s\n' "$output"
+                fi
+                return 0
+              fi
+              # The delete may succeed remotely even if its response is lost.
+              if [[ "$output" == *"HTTP 404: Not Found"* ]]; then
+                printf 'Deletion target is already absent; treating HTTP 404 as success\n'
+                return 0
+              fi
+              if [[ -n "$output" ]]; then
+                printf '%s\n' "$output" >&2
+              fi
+              if (( attempt == 6 )); then
+                printf 'Deletion failed after %s attempts\n' "$attempt" >&2
+                return 1
+              fi
+              printf 'Deletion failed; retrying in 5 seconds (%s/5)\n' "$attempt" >&2
+              sleep 5
+            done
+          }
           if [[ "$PRERELEASE" == true ]]; then
-            while IFS= read -r release_id; do
-              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"
-            done < <(gh api --paginate --jq '.[] | select(.draft and .name == "dev-latest") | .id' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            draft_ids=$(gh api --paginate --jq '.[] | select(.draft and .name == "dev-latest") | .id' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            if [[ -n "$draft_ids" ]]; then
+              while IFS= read -r release_id; do
+                delete_with_retry gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"
+              done <<< "$draft_ids"
+            fi
             if gh release view "$VERSION" >/dev/null 2>&1; then
-              gh release delete "$VERSION" --yes
+              delete_with_retry gh release delete "$VERSION" --yes
             fi
             git tag --force "$VERSION" "$TARGET"
             git push origin "refs/tags/$VERSION" --force

@@ -38,7 +38,7 @@ func (t *startupUITracker) observe(id string, frame []byte) {
 		if ui.TargetID == "" {
 			return
 		}
-	case "ask", "confirm", "select", "input", "editor":
+	case "ask", "form", "confirm", "select", "input", "editor":
 		if id == "" {
 			return
 		}
@@ -74,7 +74,7 @@ func (t *startupUITracker) finish() startupUISnapshot {
 	}
 	t.closed = true
 	snapshot := startupUISnapshot{count: len(t.pending)}
-	for _, method := range []string{"ask", "confirm", "select", "input", "editor"} {
+	for _, method := range []string{"ask", "form", "confirm", "select", "input", "editor"} {
 		for _, pending := range t.pending {
 			if pending == method {
 				snapshot.methods = append(snapshot.methods, method)

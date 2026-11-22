@@ -513,6 +513,7 @@ type rpcEvent struct {
 	Options               []string                     `json:"options"`
 	OptionDetails         []askOption                  `json:"optionDetails"`
 	Questions             []askQuestion                `json:"questions"`
+	HTML                  string                       `json:"html"`
 	Secret                bool                         `json:"secret"`
 	Placeholder           string                       `json:"placeholder"`
 	Prefill               *string                      `json:"prefill"`
@@ -5731,7 +5732,7 @@ func (w *worker) ui(e rpcEvent) {
 		return
 	}
 	switch e.Method {
-	case "ask", "editor", "input", "confirm", "select":
+	case "ask", "form", "editor", "input", "confirm", "select":
 		admitted := w.admitUI(e, client)
 		if !admitted {
 			return
@@ -5743,7 +5744,7 @@ func (w *worker) ui(e rpcEvent) {
 // applyUI handles admitted requests and native cancellation without readmission.
 func (w *worker) applyUI(e rpcEvent, client *omp.Client) {
 	switch e.Method {
-	case "ask", "editor", "input":
+	case "ask", "form", "editor", "input":
 		w.beginAsk(e)
 	case "confirm", "select":
 		var msg string
