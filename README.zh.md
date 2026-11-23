@@ -205,7 +205,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/export` | 选择已保存的 session, 导出原始 main-session JSONL. 导出当前 session 前需等待其空闲. |
 | `/export html` | 选择已保存的 session, 导出 standalone HTML viewer. |
 | `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
-| `/status` | 查看当前 workspace, session 及完整原生 ID, model, thinking, fast mode, context, runtime 和队列状态. |
+| `/status` | 查看当前 workspace, session 及完整原生 ID, model, thinking, fast mode, context, runtime, 队列状态, 以及下次启动进程使用的全局参数预设. 已运行进程可能使用不同预设. |
 | `/args [预设编号]` | 查看预设标签, 或在空闲时选择预设并立即应用于当前对话已开启的会话. 其他对话在下次启动进程时使用新预设. |
 | `/doctor` | 运行安全的 bridge 诊断, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |

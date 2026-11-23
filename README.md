@@ -205,7 +205,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/export` | Choose a saved session to export as its original main-session JSONL. Wait until the current session is idle before exporting it. |
 | `/export html` | Choose a saved session to export as a standalone HTML viewer. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
-| `/status` | Show the current workspace, session with its full native ID, model, thinking, fast-mode, context, runtime, and queue status. |
+| `/status` | Show the current workspace, session with its full native ID, model, thinking, fast-mode, context, runtime, queue status, and globally selected args preset for the next process start. Existing processes may use a different preset. |
 | `/args [preset-number]` | View preset labels or, while idle, select a preset and immediately apply it to this conversation's open session. Other conversations use it on their next process start. |
 | `/doctor` | Run safe bridge diagnostics without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |

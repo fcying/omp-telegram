@@ -76,6 +76,7 @@ var Msg = struct {
 	ID                                                                        Message
 	NormalInputLockedUseMigrateRecoverOldRestoreSource                        Message
 	RuntimeStatus                                                             Message
+	StatusArgsPreset                                                          Message
 	Page                                                                      Message
 	Role                                                                      Message
 	AppendStatus                                                              Message
@@ -623,10 +624,11 @@ var Msg = struct {
 	AppendFormat:     message("\nFormat: %s", "\n格式: %s"),
 	ID:               message("\nID: %s\n", "\nID: %s\n"),
 	NormalInputLockedUseMigrateRecoverOldRestoreSource: message("\nNormal input is locked. Use /migrate recover old to restore the source session, or /migrate recover <session-id or absolute file path> to verify a candidate. No session will be recreated automatically.", "\n普通输入已锁定. 使用 /migrate recover old 恢复源会话, 或 /migrate recover <session-id 或绝对文件路径> 核验候选. 不会自动重新创建会话."),
-	RuntimeStatus: message("\nOMP: %s\nIdle: %s", "\nOMP: %s\n空闲: %s"),
-	Page:          message("\nPage %d/%d", "\n第 %d/%d 页"),
-	Role:          message("\nRole: %s", "\n角色: %s"),
-	AppendStatus:  message("\nStatus: %s", "\n状态: %s"),
+	RuntimeStatus:    message("\nOMP: %s\nIdle: %s", "\nOMP: %s\n空闲: %s"),
+	StatusArgsPreset: message("\nArgs preset for next start: %s", "\n下次启动的参数预设: %s"),
+	Page:             message("\nPage %d/%d", "\n第 %d/%d 页"),
+	Role:             message("\nRole: %s", "\n角色: %s"),
+	AppendStatus:     message("\nStatus: %s", "\n状态: %s"),
 	ModelSwitchedThinkingUnavailableRuntimeClosed: message("\nThinking: n/a\nThe model switch succeeded, but the follow-up thinking query failed and the runtime was closed. The session was kept open.", "\n思考: 不可用\n模型切换成功, 但后续思考设置查询失败, 运行时已关闭. 会话保持打开."),
 	ModelSwitchedThinkingUnavailable:              message("\nThinking: n/a\nThe model switch succeeded, but the follow-up thinking query failed.", "\n思考: 不可用\n模型切换成功, 但后续思考设置查询失败."),
 	ThinkingChangedQueryUnavailableRuntimeClosed:  message("\nThinking: n/a\nThe thinking level change succeeded, but the follow-up thinking query failed and the runtime was closed. The session was kept open.", "\n思考: 不可用\n思考级别修改成功, 但后续思考设置查询失败, 运行时已关闭. 会话保持打开."),

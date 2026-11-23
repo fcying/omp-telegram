@@ -184,6 +184,38 @@ func TestClosedStatusDoesNotRestartRuntime(t *testing.T) {
 	}
 }
 
+func TestStatusShowsGlobalPresetWithoutArguments(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	w.b.cfg.OMPArgsLabels = []string{"Default", "Pro"}
+	w.b.argsMu.Lock()
+	w.b.argsPresets = [][]string{{"--first"}, {"--token", "SECRET-ARGUMENT"}}
+	w.b.argsFingerprint = strings.Repeat("a", 64)
+	w.b.argsIndex = 1
+	w.b.argsMu.Unlock()
+	command("/new " + t.TempDir())
+	client := w.client
+	if err := w.b.selectArgsPreset(2); err != nil {
+		t.Fatal(err)
+	}
+	command("/status")
+	var text string
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if w.client != client || !strings.Contains(text, "Args preset for next start: 2 (Pro)") || strings.Contains(text, "SECRET-ARGUMENT") || strings.Contains(text, "--token") {
+		t.Fatalf("status did not safely show the selected global preset: %q", text)
+	}
+	command("/close")
+	w.b.cfg.OMPArgsLabels = nil
+	command("/status")
+	if err := w.b.db.DB.QueryRow("SELECT text FROM outbox ORDER BY id DESC LIMIT 1").Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Args preset for next start: 2") || strings.Contains(text, "SECRET-ARGUMENT") || w.client != nil {
+		t.Fatalf("closed status did not safely show the numbered preset: %q", text)
+	}
+}
+
 func TestChineseStatusPreservesNativeIdentityAndPaths(t *testing.T) {
 	state := statusState{}
 	state.Model.Provider = "Workspace"
