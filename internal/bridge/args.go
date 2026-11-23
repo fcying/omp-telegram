@@ -113,6 +113,15 @@ func (b *Bridge) argsMenuSnapshot() (int, int, []string) {
 	return index, len(b.argsPresets), labels
 }
 
+func (w *worker) statusArgsPreset() string {
+	index, _, labels := w.b.argsMenuSnapshot()
+	value := strconv.Itoa(index)
+	if len(labels) > 0 {
+		value += " (" + menuText(labels[index-1], 120) + ")"
+	}
+	return w.tr(i18n.Msg.StatusArgsPreset, value)
+}
+
 func (b *Bridge) argsPresetSelection() (int, int) {
 	b.argsMu.Lock()
 	defer b.argsMu.Unlock()

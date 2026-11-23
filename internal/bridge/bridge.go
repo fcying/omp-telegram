@@ -2192,7 +2192,7 @@ func (w *worker) operationFinished(result operationResult) {
 		research := w.researchStatus()
 		w.releaseStatusRuntime(result, true)
 		home, _ := os.UserHomeDir()
-		w.say(formatRuntimeStatus(w.b.language(), state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity), w.runtime == runtimeConnected) + research)
+		w.say(formatRuntimeStatus(w.b.language(), state, w.binding.Workspace, w.sessionID, home, len(w.queue), time.Since(w.lastActivity), w.runtime == runtimeConnected) + w.statusArgsPreset() + research)
 	case "name":
 		w.endControlOperation()
 		if result.err != nil {
@@ -3534,7 +3534,7 @@ func (w *worker) status() {
 	if !connected {
 		if !temporary {
 			n, _ := w.b.db.Uncertain()
-			w.say(w.tr(i18n.Msg.NoInstanceRunningGlobalUncertainRecordsUseResumeRestore, n))
+			w.say(w.tr(i18n.Msg.NoInstanceRunningGlobalUncertainRecordsUseResumeRestore, n) + w.statusArgsPreset())
 			return
 		}
 		var err error
