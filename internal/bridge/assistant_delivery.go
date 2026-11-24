@@ -112,6 +112,9 @@ func (w *worker) acceptAssistantMessage(m message, enforceInputBudget, terminalO
 	w.replyStatus.metrics.observe(m)
 	w.recordAssistantTerminal(m)
 	text := assistantText(m)
+	if text != "" {
+		w.askCancelReceipt = false
+	}
 	if text == "" && (m.StopReason == "stop" || assistantTerminalState(m) != terminalDone) {
 		// A terminal metadata-only snapshot must not erase its streamed text.
 		text = w.stream.String()
@@ -275,6 +278,9 @@ func (w *worker) reconcileAssistantMessages(e rpcEvent) bool {
 			if w.assistantDelivery.staged && position == w.assistantDelivery.messages-1 && m.Role == "assistant" {
 				text := assistantText(m)
 				if text != "" {
+					if text != w.stream.String() {
+						w.askCancelReceipt = false
+					}
 					corrected := w.stageAssistantText(text, enforceInputBudget)
 					if !corrected {
 						return false

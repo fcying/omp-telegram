@@ -59,6 +59,7 @@ var Msg = struct {
 	AskNoSelection            Message
 	AskExpired                Message
 	AskTextRequired           Message
+	AskReplyReceived          Message
 	AskFormInvalid            Message
 	AskFormPatternUnsupported Message
 	AskDisplayFailed          Message
@@ -570,6 +571,7 @@ var Msg = struct {
 	AskNoSelection:            message("(none)", "(未选择)"),
 	AskExpired:                message("This Ask input is unavailable or expired. No answer or prompt was submitted.", "此 Ask 输入已失效或不可用. 未提交答案或新任务."),
 	AskTextRequired:           message("Reply with text, or use the empty-value button when available. This question has not been answered.", "请回复文本, 或在有提交空值按钮时使用该按钮. 当前问题尚未回答."),
+	AskReplyReceived:          message("Reply received.", "已收到回复."),
 	AskDisplayFailed:          message("Could not display the native question. The dialog was cancelled.", "无法显示原生问题. 已取消该对话."),
 	AskFormInvalid:            message("This value does not meet the form requirements. Try again.", "输入内容不符合表单要求, 请重试."),
 	AskFormPatternUnsupported: message("This form uses a validation pattern the bridge cannot support. The dialog was cancelled.", "该表单包含 Bridge 不支持的校验表达式. 已取消对话."),

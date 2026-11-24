@@ -1387,10 +1387,12 @@ func TestExportContentPageSelectionKeepsGlobalIdentity(t *testing.T) {
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
 	_, rows := pickerView(t, f)
-	requirePickerFooter(t, rows, "Next", "Cancel")
-	clickResume(w, 7, rows[len(rows)-1][0]["callback_data"].(string))
+	if len(rows) != 1 || len(rows[0]) != 3 || rows[0][0]["text"] != "Export 1" || rows[0][1]["text"] != "Next" || rows[0][2]["text"] != "Cancel" {
+		t.Fatalf("first export page has invalid compact layout: %v", rows)
+	}
+	clickResume(w, 7, rows[0][1]["callback_data"].(string))
 	_, rows = pickerView(t, f)
-	if rows[0][0]["text"] != "Export 2" {
+	if len(rows) == 0 || len(rows[0]) == 0 || rows[0][0]["text"] != "Export 2" {
 		t.Fatalf("export content page used a local session number: %v", rows)
 	}
 	clickResume(w, 7, rows[0][0]["callback_data"].(string))

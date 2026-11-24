@@ -1018,8 +1018,8 @@ func TestArgsMenuPagesLargePresetSets(t *testing.T) {
 	messageID := int64(f.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "args-next-page", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[2][0]["callback_data"].(string)})
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/2") || len(rows) != 3 || len(rows[0]) != 1 || len(rows[1]) != 1 || len(rows[2]) != 1 || rows[0][0]["text"] != "11" || rows[1][0]["text"] != "Previous" || rows[2][0]["text"] != "Cancel" {
-		t.Fatalf("second args page has invalid bounds: %q, rows=%v", text, rows)
+	if !strings.Contains(text, "Page 2/2") || len(rows) != 1 || len(rows[0]) != 3 || rows[0][0]["text"] != "11" || rows[0][1]["text"] != "Previous" || rows[0][2]["text"] != "Cancel" {
+		t.Fatalf("second args page has invalid compact layout: %q, rows=%v", text, rows)
 	}
 	messageID = int64(f.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "args-last-preset", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})

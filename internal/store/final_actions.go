@@ -59,7 +59,7 @@ CREATE TRIGGER IF NOT EXISTS delete_outbox_final_actions AFTER DELETE ON outbox 
 
 // CompleteInboxWithFinalActions registers buttons in the same transaction as root success.
 func (s *Store) CompleteInboxWithFinalActions(ctx context.Context, id, chat, thread, targetID int64, header string, replies []string, actions *FinalActionSet) (int64, error) {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header, true, actions)
+	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header, true, actions, false)
 }
 
 func registerFinalActions(ctx context.Context, tx *sql.Tx, inboxID, chat, thread int64, set *FinalActionSet) error {

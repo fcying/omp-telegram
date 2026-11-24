@@ -778,13 +778,13 @@ func TestExportPickerRejectsCallbackFromDifferentMessage(t *testing.T) {
 	command("/export")
 	w.resumeListed(finishResumeList(t, w))
 	text, rows := pickerView(t, f)
-	if len(rows) != 2 || len(rows[0]) != 1 || rows[0][0]["text"] != "Export 1" || !strings.Contains(text, "ID: "+sessions[0].ID) {
+	if len(rows) != 1 || len(rows[0]) != 2 || rows[0][0]["text"] != "Export 1" || rows[0][1]["text"] != "Cancel" || !strings.Contains(text, "ID: "+sessions[0].ID) {
 		t.Fatalf("export picker lost its single export action or session identity: %s; %v", text, rows)
 	}
-	data := resumeButtons(t, f)[0]["callback_data"].(string)
+	data := rows[0][0]["callback_data"].(string)
 	before := w.binding
 	w.callback(&telegram.CallbackQuery{ID: "stale-export-picker", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: 999}, Data: data})
-	if len(w.confirms) != 0 || !sameBindingIdentity(w.binding, before) {
+	if len(w.confirms) != 0 || w.exportCancel != nil || !sameBindingIdentity(w.binding, before) {
 		t.Fatal("export callback from another message remained actionable")
 	}
 }

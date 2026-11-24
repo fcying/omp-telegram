@@ -51,6 +51,18 @@ func bindingButton(t *testing.T, f *fakeHTTP, label string) string {
 	return ""
 }
 
+func requireCompactBindingRow(t *testing.T, rows [][]map[string]any, labels ...string) {
+	t.Helper()
+	if len(rows) != 1 || len(rows[0]) != len(labels) {
+		t.Fatalf("binding keyboard = %+v, want one row with %v", rows, labels)
+	}
+	for i, label := range labels {
+		if rows[0][i]["text"] != label {
+			t.Fatalf("binding button %d = %+v, want %q", i, rows[0][i], label)
+		}
+	}
+}
+
 func bindingEntryButton(t *testing.T, f *fakeHTTP, thread int64) string {
 	t.Helper()
 	text, _ := pickerView(t, f)
@@ -190,9 +202,10 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	messageID := int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: bindingButton(t, fake, "Next")})
 	text, rows = pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, "future60 · #60 · 📕 · - · /future60") {
+	if !strings.HasPrefix(text, "Saved bindings\nPage 2/2") || !strings.Contains(text, "11. future60 · #60 · 📕 · - · /future60") {
 		t.Fatalf("second page = %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 11", "Previous", "Close")
 	w.showBindings(7, true, 0)
 	text, rows = pickerView(t, fake)
 	oldTitles := []string{
@@ -211,9 +224,10 @@ func TestBindingListSortsCurrentPendingAndRecentAcrossPages(t *testing.T) {
 	messageID = int64(fake.messageCount())
 	w.callback(&telegram.CallbackQuery{ID: "old-next", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: bindingButton(t, fake, "Next")})
 	text, rows = pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, "pending · #7 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 2/2") || !strings.Contains(text, "11. pending · #7 · ") {
 		t.Fatalf("oldest-first second page = %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "11", "Previous", "Close")
 }
 
 func TestBindingsOldPrioritizesClosedThenOldOpen(t *testing.T) {
@@ -283,18 +297,20 @@ func TestBindingsOldCommandSortsWithoutChangingDefault(t *testing.T) {
 	send(update(1, 11, "/bindings old"))
 	waitInputDone(t, db, 1)
 	text, rows := pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || len(rows) != 3 || !strings.Contains(text, "old · #22 · ") || !strings.Contains(text, "recent · #33 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, "1. old · #22 · ") || !strings.Contains(text, "2. recent · #33 · ") {
 		t.Fatalf("oldest-first command = %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
 	send(update(2, 11, "/bindings old extra"))
 	waitInputDone(t, db, 2)
 	waitFor(t, func() bool { return fake.has(11, "Usage: /bindings [old]") })
 	send(update(3, 11, "/bindings"))
 	waitInputDone(t, db, 3)
 	text, rows = pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings\nPage 1/1") || len(rows) != 3 || !strings.Contains(text, "recent · #33 · ") || !strings.Contains(text, "old · #22 · ") {
+	if !strings.HasPrefix(text, "Saved bindings\nPage 1/1") || !strings.Contains(text, "1. recent · #33 · ") || !strings.Contains(text, "2. old · #22 · ") {
 		t.Fatalf("default bindings command = %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
 }
 
 func TestBindingNavigationSharesFooterRow(t *testing.T) {
@@ -305,19 +321,19 @@ func TestBindingNavigationSharesFooterRow(t *testing.T) {
 	}
 	w.showBindingsPage(confirmation{bindings: entries, user: 7}, 0, 0)
 	messageID := int64(fake.messageCount())
-	checkFooter := func(page string, rowCount int, labels ...string) {
+	checkLastRow := func(page string, rowCount int, labels ...string) {
 		t.Helper()
 		text, rows := pickerView(t, fake)
 		if !strings.HasPrefix(text, "Saved bindings\n"+page) || len(rows) != rowCount {
 			t.Fatalf("page = %q, rows = %+v", text, rows)
 		}
-		footer := rows[len(rows)-1]
-		if len(footer) != len(labels) {
-			t.Fatalf("footer = %+v, want buttons %v", footer, labels)
+		lastRow := rows[len(rows)-1]
+		if len(lastRow) != len(labels) {
+			t.Fatalf("last row = %+v, want buttons %v", lastRow, labels)
 		}
 		for i, label := range labels {
-			if footer[i]["text"] != label || footer[i]["callback_data"] == nil {
-				t.Fatalf("footer button %d = %+v, want %q", i, footer[i], label)
+			if lastRow[i]["text"] != label || lastRow[i]["callback_data"] == nil {
+				t.Fatalf("last row button %d = %+v, want %q", i, lastRow[i], label)
 			}
 		}
 	}
@@ -328,13 +344,13 @@ func TestBindingNavigationSharesFooterRow(t *testing.T) {
 			t.Fatalf("%s callback result = %v", label, got)
 		}
 	}
-	checkFooter("Page 1/3", 11, "Next", "Close")
+	checkLastRow("Page 1/3", 11, "Next", "Close")
 	click("Next")
-	checkFooter("Page 2/3", 11, "Previous", "Next", "Close")
+	checkLastRow("Page 2/3", 11, "Previous", "Next", "Close")
 	click("Next")
-	checkFooter("Page 3/3", 2, "Previous", "Close")
+	checkLastRow("Page 3/3", 1, "Delete 21", "Previous", "Close")
 	click("Previous")
-	checkFooter("Page 2/3", 11, "Previous", "Next", "Close")
+	checkLastRow("Page 2/3", 11, "Previous", "Next", "Close")
 }
 
 func TestBindingListDisablesCurrentClosedDelete(t *testing.T) {
@@ -362,7 +378,8 @@ func TestBindingListKeepsTopicVisibleWithLongName(t *testing.T) {
 	}
 	w.showBindingsPage(confirmation{bindings: []store.BindingListEntry{entry}, user: 7}, 0, 0)
 	text, rows := pickerView(t, fake)
-	if len(rows) != 2 || !strings.Contains(text, entry.SessionName+" · #43062 · 📕 · - · /project/omp-telegram") || rows[0][0]["text"] != "Delete 1" || rows[0][0]["callback_data"] == nil {
+	requireCompactBindingRow(t, rows, "Delete 1", "Close")
+	if !strings.Contains(text, entry.SessionName+" · #43062 · 📕 · - · /project/omp-telegram") || rows[0][0]["callback_data"] == nil {
 		t.Fatalf("long title obscured topic or delete action: %+v", rows)
 	}
 }
@@ -396,9 +413,10 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.b.cfg.OMP = binary
 	w.showBindings(7, false, 0)
 	text, rows := pickerView(t, fake)
-	if len(rows) != 3 || !strings.Contains(text, filepath.Base(workspace)+" · #22 · ") || !strings.Contains(text, filepath.Base(workspace)+" · #33 · ") {
+	if !strings.Contains(text, "1. "+filepath.Base(workspace)+" · #22 · ") || !strings.Contains(text, "2. "+filepath.Base(workspace)+" · #33 · ") {
 		t.Fatalf("initial recent order = %+v", rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
 	var result bindingNamesResult
 	select {
 	case result = <-w.bindingNameResults:
@@ -408,14 +426,16 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.bindingNamesLoaded(result)
 	w.background.Wait()
 	text, rows = pickerView(t, fake)
-	if len(rows) != 3 || !strings.Contains(text, "Zzz session · #22 · ") || !strings.Contains(text, "Aaa session · #33 · ") || rows[0][0]["callback_data"] == nil || rows[1][0]["callback_data"] == nil {
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
+	if !strings.Contains(text, "1. Zzz session · #22 · ") || !strings.Contains(text, "2. Aaa session · #33 · ") || rows[0][0]["callback_data"] == nil || rows[0][1]["callback_data"] == nil {
 		t.Fatalf("native titles reordered bindings: %+v", rows)
 	}
 	w.showBindings(7, true, 0)
 	text, rows = pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, filepath.Base(workspace)+" · #33 · ") || !strings.Contains(text, filepath.Base(workspace)+" · #22 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, "1. "+filepath.Base(workspace)+" · #33 · ") || !strings.Contains(text, "2. "+filepath.Base(workspace)+" · #22 · ") {
 		t.Fatalf("initial oldest-first order = %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
 	select {
 	case result = <-w.bindingNameResults:
 	case <-time.After(5 * time.Second):
@@ -425,9 +445,10 @@ func TestBindingNameLookupKeepsRecentOrder(t *testing.T) {
 	w.cancel()
 	w.background.Wait()
 	text, rows = pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, "Aaa session · #33 · ") || !strings.Contains(text, "Zzz session · #22 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, "1. Aaa session · #33 · ") || !strings.Contains(text, "2. Zzz session · #22 · ") {
 		t.Fatalf("native titles reordered oldest-first bindings: %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
 }
 
 func TestBindingCallbacksUseSentMessageID(t *testing.T) {
@@ -448,7 +469,8 @@ func TestBindingCallbacksUseSentMessageID(t *testing.T) {
 			t.Fatalf("next confirmation = %+v, want page 1 and message %d", c, messageID)
 		}
 		text, rows := pickerView(t, fake)
-		if !strings.HasPrefix(text, "Saved bindings\nPage 2/2") || len(rows) != 2 || !strings.Contains(text, "unknown · #30 · 📖 · - · unknown") || rows[0][0]["callback_data"] == nil {
+		requireCompactBindingRow(t, rows, "Delete 11", "Previous", "Close")
+		if !strings.HasPrefix(text, "Saved bindings\nPage 2/2") || !strings.Contains(text, "11. unknown · #30 · 📖 · - · unknown") || rows[0][0]["callback_data"] == nil {
 			t.Fatalf("last page lost binding title action: text=%q rows=%+v", text, rows)
 		}
 	})
@@ -568,9 +590,10 @@ func TestBindingsOldKeepsOrderAfterDeletingClosedEntry(t *testing.T) {
 		t.Fatalf("old binding still present: %v", err)
 	}
 	text, rows := pickerView(t, fake)
-	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || len(rows) != 3 || !strings.Contains(text, "middle · #33 · ") || !strings.Contains(text, "recent · #44 · ") {
+	if !strings.HasPrefix(text, "Saved bindings (oldest first)\nPage 1/1") || !strings.Contains(text, "1. middle · #33 · ") || !strings.Contains(text, "2. recent · #44 · ") {
 		t.Fatalf("oldest-first list after deletion = %q, rows = %+v", text, rows)
 	}
+	requireCompactBindingRow(t, rows, "Delete 1", "Delete 2", "Close")
 }
 
 func TestBindingDeletionRefreshesSourcePage(t *testing.T) {

@@ -314,6 +314,20 @@ Actor 在调度时持有交互取消 context. Ask 的十秒显示网络 deadline
 
 紧凑私聊文字输入及 Follow-up 使用 [`bridge.go`](../internal/bridge/bridge.go) 的 `queueInlineInputReceipt`: 在受跟踪且独立的五秒 context 下, 按消息 ID 清除键盘, 或编辑正文并传入空 inline keyboard. 不发送收尾消息, 不删除历史. 捕获的 display/request 身份决定收尾路径, 包括迟到结果及 shutdown; 清除旧消息不能清除新消息的 inline keyboard. 群聊输入及扩展组合对话保留 `queueForceReplyCleanup`/`queueForceReplyReceipt`, 发送定向 `ReplyKeyboardRemove` 回执. `orderForceReply` 在启动前预留初始提示及旧式回执的发送顺序; 只有这些有序 job 访问每用户最新提示 ID. 旧收尾跳过失效提示, 已打开新输入时入队确认仍发送但不移除 Reply. UI 收尾尽力执行, 不持久化重放, 不结算, 改变或重放原生工作. Shutdown 在等待后台任务前处理已缓冲的 `ask_display`/`followup_prompt` result; 在途发送也会在 worker context 结束时安排收尾. Ask 提示 ID 不持久化, 不在重启后恢复.
 
+空键盘编辑省略 `force_reply`; 尚未通过真实 Bot API 验证是否保留原标志. 公开的 Bot API 服务端解析器会将空 `inline_keyboard` 加 `force_reply: true` 解析为独立 ForceReply, 而编辑 API 要求 inline markup. 不能据此推断省略标志或编辑操作会关闭客户端回复界面.
+
+私聊自定义选项提示在发送时使用 inline ForceReply 键盘, 回复后可复用按消息 ID 编辑和清除键盘的流程. Actor 保留 `[ask:...]` marker, 清除输入 ID, 并在有序发送链中仅忘记匹配的提示. 提示上的返回按钮绑定同一个 owner, epoch 和已送达消息 ID. 迟到显示的清理使用捕获的提示模式, 不借用后续问题的状态. 群聊自定义提示继续使用定向 ForceReply 和短本地回执结束输入. UI 编辑及回执不代表 OMP 响应已结算.
+
+私聊 Custom 输入将问题控件移到输入提示; Back 和 Cancel 并排位于第一行, 可选输入操作仍然可用. Actor 校验捕获的输入消息及问题消息上的回调.
+
+Telegram 发送及编辑操作会将含两个或三个按钮的 inline 键盘合并为一行, 不修改调用方的键盘; 更多按钮保持原有布局.
+
+私聊自定义提示执行 Back 或 Cancel 时, Actor 按序删除临时提示, 然后才发送后续 ForceReply 提示, 不发送收尾消息. 删除失败会记录日志; 不能保证客户端关闭回复界面.
+
+用户取消已显示的问题后, 若原生工作尚未继续, 省略重复的任务取消通知. 新模型文本, 工具工作, 另一个 Ask, 新 agent run 或明确停止任务会清除此作用域; 任务仍持久化为 cancelled, 已有 assistant 正文仍保留. 问题回执编辑仍为尽力而为.
+
+此类取消没有 assistant 正文或独立终结回复时, 任务取消与已知临时进度的仅 UI 退役在同一事务提交. Actor 用退役锁隔离在途进度确认; 迟到确认继承同一边界, 清理失败仍可重试. 若进程在取得在途发送的消息 ID 前崩溃, 无法恢复该身份. 包含 assistant 正文的预览仍等待正式投递.
+
 收尾回执失败时, 在 `telegram` component 记录 `WARN` 事件 `force_reply_cleanup_failed`, 包含 `chat_id`, `thread_id`, 原提示 `message_id`, 安全分类 `reason`/`uncertain` 及可用时的 `api_code`. 不记录原始 Telegram 错误, 凭据或消息正文. 成功发送保持静默; 没有该事件不能证明已执行收尾或客户端已清除回复界面.
 
 取消扩展组合 Ask 时, 捕获当前问题和展示长度内的全部选项快照, footer 标记为已取消, 不作为答案. 立即撤销 token 并安排键盘清理; 回执编辑独立于 RPC 取消. 当前 display 仍在途时, 用其捕获的 epoch 限定结果返回后的一次最终取消编辑, 包括首次发送迟到返回消息 ID 的情况. 因而旧渲染不能覆盖取消留痕, 也不能借用替换后对话的内容; 之前已确认题目的回执保持不变.
