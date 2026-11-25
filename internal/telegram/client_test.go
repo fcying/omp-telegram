@@ -46,6 +46,61 @@ func TestDisabledButtonOmitsCallbackData(t *testing.T) {
 	}
 }
 
+func TestSmallKeyboardsUseOneRow(t *testing.T) {
+	for _, count := range []int{2, 3, 4} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			keyboard := &Keyboard{ForceReply: true}
+			for i := 0; i < count; i++ {
+				keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []Button{{Text: fmt.Sprint(i), CallbackData: fmt.Sprint(i)}})
+			}
+			client := localClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					Keyboard Keyboard `json:"reply_markup"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				rows := request.Keyboard.InlineKeyboard
+				wantRows := 1
+				if count > 3 {
+					wantRows = count
+				}
+				if len(rows) != wantRows || !request.Keyboard.ForceReply {
+					t.Errorf("%s keyboard = %+v", r.URL.Path, request.Keyboard)
+				} else {
+					index := 0
+					for _, row := range rows {
+						for _, button := range row {
+							if button.Text != fmt.Sprint(index) || button.CallbackData != fmt.Sprint(index) {
+								t.Errorf("button %d = %+v", index, button)
+							}
+							index++
+						}
+					}
+					if index != count {
+						t.Errorf("got %d buttons, want %d", index, count)
+					}
+				}
+				fmt.Fprint(w, `{"ok":true,"result":{"message_id":42}}`)
+			})
+			ctx := context.Background()
+			if _, err := client.Send(ctx, 10, 0, "prompt", SendOptions{Keyboard: keyboard}); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Edit(ctx, 10, 42, "prompt", keyboard); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.EditKeyboard(ctx, 10, 42, keyboard); err != nil {
+				t.Fatal(err)
+			}
+			if len(keyboard.InlineKeyboard) != count {
+				t.Fatal("sending modified the original keyboard")
+			}
+		})
+	}
+}
+
 func TestConversationMessages(t *testing.T) {
 	for _, conversation := range []struct {
 		name     string

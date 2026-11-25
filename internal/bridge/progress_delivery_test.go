@@ -119,6 +119,43 @@ func TestSteerCannotDiscardPreviewAwaitingFormalDelivery(t *testing.T) {
 	awaitProgressDeletion(t, w, old.taskID, old.id)
 }
 
+func TestAskCancellationRetiresLateProgressWithoutReply(t *testing.T) {
+	w, f := realtimePreviewWorker(t)
+	root := w.active
+	transport := &acceptedPreviewHTTP{base: f, started: make(chan struct{}), gate: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(transport.gate) })
+	defer release()
+	http.DefaultTransport = transport
+	defer func() { http.DefaultTransport = f }()
+	allowInitialProgress(w)
+	w.flushPreview()
+	select {
+	case <-transport.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("progress message was not accepted")
+	}
+	w.askCancelReceipt = true
+	if !w.finishCancelled("Task was cancelled before completion.") {
+		t.Fatal("cancelled task was not settled")
+	}
+	if transport.requestCtx.Err() != nil {
+		t.Fatal("accepted progress send was cancelled before its identity arrived")
+	}
+	release()
+	var preview previewResult
+	select {
+	case preview = <-w.previewResult:
+		requireStoreOK(t, preview.err)
+		w.previewFinished(preview)
+	case <-time.After(5 * time.Second):
+		t.Fatal("late progress acknowledgment did not arrive")
+	}
+	awaitProgressDeletion(t, w, root, preview.id)
+	if replies := researchReplies(t, w, root); len(replies) != 0 {
+		t.Fatalf("cancelled task emitted a redundant reply: %q", replies)
+	}
+}
+
 func TestLocalCommandProgressRetiresWithoutAssistantReplies(t *testing.T) {
 	for _, scenario := range []string{"ack", "completion", "late-preview", "delete-retry"} {
 		t.Run(scenario, func(t *testing.T) {

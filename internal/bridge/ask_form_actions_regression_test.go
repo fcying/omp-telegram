@@ -3,6 +3,8 @@ package bridge
 import (
 	"strings"
 	"testing"
+
+	"omp-telegram/internal/telegram"
 )
 
 const askFormRegressionRadio = `<fieldset><legend>Choice</legend>
@@ -56,6 +58,225 @@ func TestAskFormSingleChoiceOtherReplacesDefaultOnlyOnSubmit(t *testing.T) {
 			}
 			askFormRegressionSubmitted(t, w, f, messageID, "other-default", "choice", tc.wantValue, tc.wantFooter)
 		})
+	}
+}
+
+func TestAskFormCustomReplyDoesNotSendClosingMessage(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "custom-receipt", "method": "form", "html": "<form>" + askFormRegressionRadio + "</form>"})
+	messageID := w.ask.messageID
+	askTestClick(t, w, f, "Custom answer")
+	prompt := askTestPrompt(t, f)
+	if !w.ask.inputInline {
+		t.Fatal("private custom prompt did not use editable inline input")
+	}
+	f.mu.Lock()
+	markup, _ := f.messages[len(f.messages)-1]["reply_markup"].(map[string]any)
+	force := markup["force_reply"] == true
+	f.mu.Unlock()
+	if !force {
+		t.Fatal("private custom prompt did not enable automatic Reply")
+	}
+	askTestReply(t, w, 200, 7, 11, "Custom choice", prompt)
+	askFormRegressionSubmitted(t, w, f, messageID, "custom-receipt", "choice", "Custom choice", "<code>Custom answer: Custom choice</code>")
+	w.background.Wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	compact := false
+	for _, message := range f.messages {
+		if sentReplyTarget(message) == float64(prompt.MessageID) {
+			t.Fatalf("successful custom input sent an extra reply: %+v", message)
+		}
+		if message["message_id"] == float64(prompt.MessageID) {
+			text, _ := message["text"].(string)
+			if strings.HasPrefix(text, "Custom answer\n[ask:") && !strings.Contains(text, "Reply to this message") {
+				compact = true
+			}
+		}
+	}
+	if !compact {
+		t.Fatal("custom input prompt did not become a compact reply target")
+	}
+}
+
+func TestPrivateAskCustomPromptBackButton(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "custom-back", "method": "form", "html": "<form>" + askFormRegressionRadio + "</form>"})
+	messageID := w.ask.messageID
+	askTestClick(t, w, f, "Custom answer")
+	promptID := w.ask.inputID
+	f.mu.Lock()
+	promptMarkup, _ := f.messages[len(f.messages)-1]["reply_markup"].(map[string]any)
+	rows, _ := promptMarkup["inline_keyboard"].([]any)
+	if len(rows) == 0 {
+		f.mu.Unlock()
+		t.Fatal("custom prompt has no buttons")
+	}
+	buttons, _ := rows[0].([]any)
+	if len(buttons) < 2 || len(buttons) > 3 || buttons[0].(map[string]any)["text"] != "Back to options" || buttons[1].(map[string]any)["text"] != "Cancel" {
+		f.mu.Unlock()
+		t.Fatalf("custom prompt buttons = %v", buttons)
+	}
+	for i := len(f.messages) - 2; i >= 0; i-- {
+		message := f.messages[i]
+		if message["message_id"] == float64(messageID) {
+			markup, _ := message["reply_markup"].(map[string]any)
+			if options, _ := markup["inline_keyboard"].([]any); len(options) != 0 {
+				f.mu.Unlock()
+				t.Fatalf("question retained buttons: %v", options)
+			}
+			break
+		}
+	}
+	f.mu.Unlock()
+	messageCount := f.messageCount()
+	data := askTestButton(t, f, "Back to options")
+	w.callback(&telegram.CallbackQuery{ID: "prompt-back", From: telegram.User{ID: 7}, Data: data,
+		Message: &telegram.Message{MessageID: promptID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}})
+	askTestSettle(t, w)
+	if w.ask == nil || w.ask.input || len(askTestState(t, w)) != 0 {
+		t.Fatal("custom prompt Back did not return to options without submitting")
+	}
+	w.background.Wait()
+	deleted := f.deletedMessageIDs()
+	if len(deleted) != 1 || deleted[0] != promptID {
+		t.Fatalf("Back deleted messages %v, want only custom prompt %d", deleted, promptID)
+	}
+	f.mu.Lock()
+	for _, message := range f.messages[messageCount:] {
+		if message["message_id"] != float64(messageID) {
+			f.mu.Unlock()
+			t.Fatal("Back sent an extra message")
+		}
+	}
+	f.mu.Unlock()
+	askTestClick(t, w, f, "Custom answer")
+	prompt := askTestPrompt(t, f)
+	if prompt.MessageID == promptID {
+		t.Fatal("re-entering custom input reused the old prompt")
+	}
+	askTestReply(t, w, 200, 7, 11, "Custom choice", prompt)
+	askFormRegressionSubmitted(t, w, f, messageID, "custom-back", "choice", "Custom choice", "<code>Custom answer: Custom choice</code>")
+}
+
+func TestPrivateAskCustomPromptCancelButton(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	w.b.cfg.ProgressMode = "summary"
+	w.previewResult = make(chan previewResult, 4)
+	preview := sendRealtimePreview(t, w)
+	askTestEvent(t, w, map[string]any{"id": "custom-cancel", "method": "form", "html": "<form>" + askFormRegressionRadio + "</form>"})
+	askTestClick(t, w, f, "Custom answer")
+	messageID := w.ask.messageID
+	promptID := w.ask.inputID
+	messageCount := f.messageCount()
+	data := askTestButton(t, f, "Cancel")
+	w.callback(&telegram.CallbackQuery{ID: "prompt-cancel", From: telegram.User{ID: 7}, Data: data,
+		Message: &telegram.Message{MessageID: promptID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}})
+	responses := askTestState(t, w)
+	if w.ask != nil || len(responses) != 1 || !responses[0].Cancelled {
+		t.Fatalf("custom prompt Cancel: ask=%v responses=%+v", w.ask, responses)
+	}
+	waitFor(t, func() bool { return len(f.deletedMessageIDs()) != 0 })
+	deleted := f.deletedMessageIDs()
+	if len(deleted) != 1 || deleted[0] != promptID {
+		t.Fatalf("Cancel deleted messages %v, want only custom prompt %d", deleted, promptID)
+	}
+	f.mu.Lock()
+	for _, message := range f.messages[messageCount:] {
+		if message["message_id"] != float64(messageID) {
+			f.mu.Unlock()
+			t.Fatal("Cancel sent an extra message")
+		}
+	}
+	f.mu.Unlock()
+	waitFor(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for i := len(f.messages) - 1; i >= 0; i-- {
+			message := f.messages[i]
+			if message["message_id"] != float64(messageID) {
+				continue
+			}
+			text, _ := message["text"].(string)
+			markup, _ := message["reply_markup"].(map[string]any)
+			rows, ok := markup["inline_keyboard"].([]any)
+			return strings.Contains(text, "Canceled") && ok && len(rows) == 0
+		}
+		return false
+	})
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","stopReason":"aborted"}]}`))
+	if state := queueState(t, w, 100); state != "cancelled" {
+		select {
+		case err := <-w.b.fatal:
+			t.Fatalf("cancelled task state = %q, fatal = %v", state, err)
+		default:
+			t.Fatalf("cancelled task state = %q, active = %d, context = %v", state, w.active, w.ctx.Err())
+		}
+	}
+	awaitProgressDeletion(t, w, 100, preview.id)
+	deleted = f.deletedMessageIDs()
+	if len(deleted) != 2 {
+		t.Fatalf("cancel did not delete both the input prompt and progress message: %v", deleted)
+	}
+	for _, reply := range researchReplies(t, w, 100) {
+		if strings.Contains(reply, "Task was cancelled before completion.") {
+			t.Fatalf("cancelled question produced redundant task notice: %q", reply)
+		}
+	}
+}
+
+func TestAskCancellationDoesNotHideLaterTaskCancellation(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "cancel-then-continue", "method": "form", "html": "<form>" + askFormRegressionRadio + "</form>"})
+	askTestClick(t, w, f, "Custom answer")
+	data := askTestButton(t, f, "Cancel")
+	w.callback(&telegram.CallbackQuery{ID: "prompt-cancel", From: telegram.User{ID: 7}, Data: data,
+		Message: &telegram.Message{MessageID: w.ask.inputID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}})
+	askTestSettle(t, w)
+	w.event([]byte(`{"type":"tool_execution_start","toolCallId":"next-tool","toolName":"test"}`))
+	w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","stopReason":"aborted"}]}`))
+	if replies := researchReplies(t, w, 100); len(replies) == 0 || !strings.Contains(strings.Join(replies, "\n"), "Task was cancelled before completion.") {
+		t.Fatalf("later task cancellation notice missing: %q", replies)
+	}
+}
+
+func TestAskCancellationNoticeAfterNonStreamingAssistantText(t *testing.T) {
+	for _, source := range []string{"message_end", "agent_end"} {
+		t.Run(source, func(t *testing.T) {
+			w, f, _ := privateAskTestWorker(t)
+			askTestEvent(t, w, map[string]any{"id": "cancel-before-text", "method": "form", "html": "<form>" + askFormRegressionRadio + "</form>"})
+			askTestClick(t, w, f, "Custom answer")
+			data := askTestButton(t, f, "Cancel")
+			w.callback(&telegram.CallbackQuery{ID: "cancel", From: telegram.User{ID: 7}, Data: data,
+				Message: &telegram.Message{MessageID: w.ask.inputID, Chat: telegram.Chat{ID: w.key.chat}, MessageThreadID: w.key.thread}})
+			askTestSettle(t, w)
+			if source == "message_end" {
+				w.event([]byte(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"new response"}]}}`))
+				w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","stopReason":"aborted"}]}`))
+			} else {
+				w.event([]byte(`{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","stopReason":"aborted","content":[{"type":"text","text":"new response"}]}]}`))
+			}
+			replies := strings.Join(researchReplies(t, w, 100), "\n")
+			if !strings.Contains(replies, "new response") || !strings.Contains(replies, "Task was cancelled before completion.") {
+				t.Fatalf("missing assistant body or cancellation notice: %q", replies)
+			}
+		})
+	}
+}
+
+func TestGroupAskCustomReplyClearsForceReply(t *testing.T) {
+	w, f, _ := askTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "group-custom", "method": "form", "html": "<form>" + askFormRegressionRadio + "</form>"})
+	askTestClick(t, w, f, "Custom answer")
+	prompt := askTestPrompt(t, f)
+	askTestReply(t, w, 200, 7, 11, "Custom choice", prompt)
+	w.background.Wait()
+	if !f.forceReplyClosed(prompt.MessageID) {
+		t.Fatal("group custom reply did not dismiss its selective ForceReply")
+	}
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].Data["choice"] != "Custom choice" {
+		t.Fatalf("group custom answer = %+v", responses)
 	}
 }
 

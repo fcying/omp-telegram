@@ -550,11 +550,10 @@ func TestNativeUISelectionPaginatesWithoutSubmittingNavigation(t *testing.T) {
 	messageID = int64(f.messageCount())
 	click(7, askTestButton(t, f, "Next"))
 	text, rows = pickerView(t, f)
-	if !strings.Contains(text, "Page 2/2") || len(rows) != 2 {
+	if !strings.Contains(text, "Page 2/2") || len(rows) != 1 || len(rows[0]) != 3 || rows[0][0]["text"] != "11" || rows[0][1]["text"] != "Previous" || rows[0][2]["text"] != "Cancel" {
 		t.Fatalf("cancel page = %q; %v", text, rows)
 	}
-	requirePickerFooter(t, rows, "Previous", "Cancel")
-	click(7, askTestButton(t, f, "Cancel"))
+	click(7, rows[0][2]["callback_data"].(string))
 	result, err = w.call("get_state", nil)
 	if err != nil || json.Unmarshal(result, &state) != nil || state.Replies != 2 || state.Value != "" {
 		t.Fatalf("cancel response = %+v, error %v", state, err)
@@ -1693,7 +1692,7 @@ func TestNativeUISelectionDetailsAndRawValue(t *testing.T) {
 			}
 			w.event(raw)
 			text, rows := pickerView(t, f)
-			if !strings.Contains(text, "Choose an action") || !strings.Contains(html.UnescapeString(text), "1. "+value) || len(rows[0]) != 2 || rows[0][0]["text"] != "1" || rows[0][1]["text"] != "2" {
+			if !strings.Contains(text, "Choose an action") || !strings.Contains(html.UnescapeString(text), "1. "+value) || len(rows) != 1 || len(rows[0]) != 3 || rows[0][0]["text"] != "1" || rows[0][1]["text"] != "2" || rows[0][2]["text"] != "Cancel" {
 				t.Fatalf("pending menu lost a complete label or numeric button: %q; %v", text, rows)
 			}
 			for _, detail := range []string{description, preview} {
@@ -1702,7 +1701,7 @@ func TestNativeUISelectionDetailsAndRawValue(t *testing.T) {
 				}
 			}
 			messageID := int64(f.messageCount())
-			w.callback(&telegram.CallbackQuery{ID: "native-details", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: pickerButtons(t, f)[0]["callback_data"].(string)})
+			w.callback(&telegram.CallbackQuery{ID: "native-details", From: telegram.User{ID: 7}, Message: &telegram.Message{MessageID: messageID}, Data: rows[0][0]["callback_data"].(string)})
 			text = assertFinishedMenu(t, f, int(messageID), "Your choice")
 			body, answer, ok := strings.Cut(text, "Your choice")
 			if !ok || !strings.Contains(answer, "1. "+value) || strings.Contains(answer, "Done") || !strings.Contains(text, "Choose an action") || !strings.Contains(text, "Done") {

@@ -5,6 +5,50 @@ import (
 	"testing"
 )
 
+func TestCancelledUIReceiptAtomicallyRetiresProgress(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		name := "committed"
+		if fail {
+			name = "rolled back"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := openTestStore(t, dir)
+			requireStoreOK(t, s.Accept(10, []byte(`{}`)))
+			requireStoreOK(t, s.Submit(10, 42))
+			requireStoreOK(t, s.SetProgressMessage(10, 7, 77))
+			if fail {
+				_, err := s.DB.Exec(`CREATE TRIGGER reject_progress_retirement BEFORE UPDATE ON progress_messages BEGIN SELECT RAISE(ABORT, 'reject retirement'); END`)
+				requireStoreOK(t, err)
+			}
+			err := s.CompleteInboxCancelledWithUIReceipt(context.Background(), 10, 7, 8)
+			if fail && err == nil {
+				t.Fatal("failed retirement unexpectedly committed")
+			}
+			if !fail {
+				requireStoreOK(t, err)
+			}
+			var state string
+			requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+			if fail && state != "submitted" {
+				t.Fatalf("failed transaction changed task state to %s", state)
+			}
+			requireStoreOK(t, s.Close())
+			s = openTestStore(t, dir)
+			requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+			candidates, err := s.CompletedProgressMessages(0)
+			requireStoreOK(t, err)
+			if fail {
+				if state != "uncertain" || len(candidates) != 0 {
+					t.Fatalf("failed transaction persisted partial cancellation: state=%s candidates=%v", state, candidates)
+				}
+			} else if state != "cancelled" || len(candidates) != 1 || candidates[0].MessageID != 77 {
+				t.Fatalf("restart lost cancelled progress cleanup: state=%s candidates=%v", state, candidates)
+			}
+		})
+	}
+}
+
 func TestProgressReplacementWaitsForEveryPartAndKeepsItsBoundary(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)

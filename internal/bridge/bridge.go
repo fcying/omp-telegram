@@ -216,6 +216,7 @@ type taskState struct {
 	owner                 int64
 	awaitingContinuation  bool
 	busy                  bool
+	askCancelReceipt      bool
 	uiStopped             bool
 	activeInputKind       queuedInputKind
 }
@@ -2519,6 +2520,7 @@ func (w *worker) completeAbort(retire bool, notice string) {
 	w.endControlOperation()
 	w.uiStopped = false
 	if retire {
+		w.askCancelReceipt = false
 		if w.taskActive() {
 			if !w.finishCancelled(w.tr(i18n.Msg.TaskCancelledBeforeCompletion)) {
 				return
@@ -3973,6 +3975,9 @@ func (w *worker) finishUncertain(notice string) bool {
 }
 
 func (w *worker) finishCancelled(notice string) bool {
+	if w.askCancelReceipt {
+		notice = ""
+	}
 	return w.finishIncomplete("cancelled", notice)
 }
 
@@ -3986,14 +3991,31 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 		return false
 	}
 	taskID := w.active
+	uiOnly := state == "cancelled" && notice == "" && !w.hasAssistantBody()
+	retirement := w.previewRetirement
+	if uiOnly && retirement != nil {
+		retirement.mu.Lock()
+	}
 	var err error
 	switch state {
 	case "uncertain":
 		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, w.remainingAssistantReplies(notice))
 	case "cancelled":
-		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, w.remainingAssistantReplies(notice))
+		if uiOnly {
+			err = w.b.db.CompleteInboxCancelledWithUIReceipt(w.ctx, taskID, w.key.chat, w.key.thread)
+		} else {
+			err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, w.remainingAssistantReplies(notice))
+		}
 	default:
 		panic("invalid terminal state")
+	}
+	if uiOnly && retirement != nil {
+		if err == nil {
+			retirement.retired = true
+			retirement.firstID = 0
+			retirement.parts = 0
+		}
+		retirement.mu.Unlock()
 	}
 	if err != nil {
 		if w.ctx.Err() == nil {
@@ -4002,6 +4024,9 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 			w.cancel()
 		}
 		return false
+	}
+	if uiOnly {
+		w.rotatePreview(0)
 	}
 	w.cancelHostRequests()
 	w.logTaskComplete(taskID, state)
@@ -4311,6 +4336,7 @@ func (w *worker) event(raw []byte) {
 			w.refreshCommandCatalog(client)
 		}
 	case "host_tool_call":
+		w.askCancelReceipt = false
 		w.renameProgressTool(e.ToolCallID, e.ToolName)
 		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 		w.hostSend(e)
@@ -4320,6 +4346,7 @@ func (w *worker) event(raw []byte) {
 			delete(w.hostRequests, e.TargetID)
 		}
 	case "tool_execution_start":
+		w.askCancelReceipt = false
 		w.startProgressTool(e.ToolCallID, e.ToolName)
 		w.recordProgressToolPayload(e.ToolCallID, e.Type, raw)
 	case "tool_execution_update":
@@ -4334,6 +4361,7 @@ func (w *worker) event(raw []byte) {
 			return
 		}
 		if e.AssistantMessageEvent.Type == "text_delta" && e.AssistantMessageEvent.Delta != "" {
+			w.askCancelReceipt = false
 			delta := e.AssistantMessageEvent.Delta
 			if len(delta) > maxAssistantOutputBytes-w.assistantDelivery.bytes-w.stream.Len() {
 				w.assistantBudgetExceeded()
@@ -4350,6 +4378,7 @@ func (w *worker) event(raw []byte) {
 	case "auto_retry_end":
 		w.progress.Retrying = false
 	case "agent_start":
+		w.askCancelReceipt = false
 		if w.research.root || !w.taskActive() {
 			w.resetSub2apiUsage()
 		}
@@ -5533,6 +5562,25 @@ func (w *worker) sendForceReply(ctx context.Context, text string, options telegr
 	return message, err
 }
 
+// A user reply consumes ForceReply without sending another Telegram message.
+func (w *worker) forgetForceReply(messageID, user int64) {
+	if messageID == 0 {
+		return
+	}
+	previous, next := w.orderForceReply()
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		defer close(next)
+		if previous != nil {
+			<-previous
+		}
+		if w.forceReplyPrompts[user] == messageID {
+			w.forceReplyPrompts[user] = 0
+		}
+	}()
+}
+
 func (w *worker) queueForceReplyCleanup(messageID, user int64) {
 	w.queueForceReplyReceipt(messageID, user, w.tr(i18n.Msg.TextInputClosed), false)
 }
@@ -5582,7 +5630,7 @@ func (w *worker) drainForceReplyResults() {
 			switch result.kind {
 			case "ask_display":
 				result := result.meta.(askDisplay)
-				w.closeAskInput(result.request, result.inputID)
+				w.closeAskInput(result.request, result.inputID, result.request.inlineInput || result.inputInline)
 			case "followup_prompt":
 				result := result.meta.(followupPromptResult)
 				w.finishFollowupPrompt(result.messageID, result.user, result.token, result.inline, "")

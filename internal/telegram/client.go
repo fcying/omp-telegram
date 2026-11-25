@@ -336,6 +336,28 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 	return updates, err
 }
 
+// compactKeyboard keeps small keyboards on one row without modifying the caller's layout.
+func compactKeyboard(keyboard *Keyboard) *Keyboard {
+	if keyboard == nil || len(keyboard.InlineKeyboard) < 2 {
+		return keyboard
+	}
+	count := 0
+	for _, row := range keyboard.InlineKeyboard {
+		count += len(row)
+		if count > 3 {
+			return keyboard
+		}
+	}
+	if count < 2 {
+		return keyboard
+	}
+	buttons := make([]Button, 0, count)
+	for _, row := range keyboard.InlineKeyboard {
+		buttons = append(buttons, row...)
+	}
+	return &Keyboard{InlineKeyboard: [][]Button{buttons}, ForceReply: keyboard.ForceReply}
+}
+
 func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, options SendOptions) (Message, error) {
 	return sendWithReplyFallback(c.logger, chatID, threadID, options, func(options SendOptions) (Message, error) {
 		fields := map[string]any{"chat_id": chatID}
@@ -347,7 +369,7 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 			fields["reply_parameters"] = map[string]int64{"message_id": options.ReplyToMessageID}
 		}
 		if options.Keyboard != nil {
-			fields["reply_markup"] = options.Keyboard
+			fields["reply_markup"] = compactKeyboard(options.Keyboard)
 		} else if options.ForceReply != nil {
 			fields["reply_markup"] = options.ForceReply
 		} else if options.RemoveKeyboard != nil {
@@ -453,7 +475,7 @@ func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string,
 	fields := map[string]any{"chat_id": chatID, "message_id": messageID}
 	applyHTML(fields, text)
 	if keyboard != nil {
-		fields["reply_markup"] = keyboard
+		fields["reply_markup"] = compactKeyboard(keyboard)
 	}
 	err := c.call(ctx, "editMessageText", fields, nil, false)
 	if parseEntitiesError(err) {
@@ -473,7 +495,7 @@ func (c *Client) EditKeyboard(ctx context.Context, chatID, messageID int64, keyb
 		keyboard = &Keyboard{InlineKeyboard: [][]Button{}}
 	}
 	err := c.call(ctx, "editMessageReplyMarkup", map[string]any{
-		"chat_id": chatID, "message_id": messageID, "reply_markup": keyboard,
+		"chat_id": chatID, "message_id": messageID, "reply_markup": compactKeyboard(keyboard),
 	}, nil, false)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(apiErr.Description), "message is not modified") {

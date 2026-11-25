@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ type askRequest struct {
 	token, inputToken  string
 	input              bool
 	inlineInput        bool
+	inputInline        bool
 	selected           map[int]bool
 	custom             string
 	page               int
@@ -73,6 +75,7 @@ type askDisplay struct {
 	epoch              uint64
 	messageID, inputID int64
 	token              string
+	inputInline        bool
 }
 
 // Per-runtime receipts prevent duplicate requests from reopening consumed UI.
@@ -146,6 +149,7 @@ func (w *worker) beginAsk(e rpcEvent) {
 	if catalog.SessionID != w.sessionID {
 		return
 	}
+	w.askCancelReceipt = false
 	a := &askRequest{client: client, generation: w.binding.Generation, session: w.sessionID,
 		active: w.active, turn: w.turn, user: w.owner, id: e.ID, method: e.Method,
 		questions: e.Questions, catalogEpoch: catalog.Epoch, placeholder: e.Placeholder, prefill: e.Prefill}
@@ -240,12 +244,36 @@ func (w *worker) sendAskResponse(a *askRequest, fields map[string]any) {
 	}()
 }
 
-func (w *worker) closeAskInput(a *askRequest, messageID int64) {
-	if a.inlineInput {
+func (w *worker) closeAskInput(a *askRequest, messageID int64, inline bool) {
+	if inline {
 		w.queueInlineInputReceipt(messageID, "")
 		return
 	}
 	w.queueForceReplyCleanup(messageID, a.user)
+}
+
+func (w *worker) deleteAskInput(messageID, user int64) {
+	if messageID == 0 {
+		return
+	}
+	previous, next := w.orderForceReply()
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		defer close(next)
+		if previous != nil {
+			<-previous
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := w.b.tg.Delete(ctx, w.key.chat, messageID); err != nil {
+			logTelegramFailure(w.b.telegramLog, slog.LevelWarn, "ask_input_delete_failed", "Ask input deletion failed", err,
+				slog.Int64("chat_id", w.key.chat), slog.Int64("thread_id", w.key.thread), slog.Int64("message_id", messageID))
+		}
+		if w.forceReplyPrompts[user] == messageID {
+			w.forceReplyPrompts[user] = 0
+		}
+	}()
 }
 
 func (w *worker) invalidateAskInteraction(a *askRequest) {
@@ -257,8 +285,8 @@ func (w *worker) invalidateAskInteraction(a *askRequest) {
 	a.epoch++
 	delete(w.confirms, a.token)
 	a.token = ""
-	w.closeAskInput(a, a.inputID)
-	a.inputID, a.inputToken = 0, ""
+	w.closeAskInput(a, a.inputID, a.inlineInput || a.inputInline)
+	a.inputID, a.inputToken, a.inputInline = 0, "", false
 	if a.cancel != nil {
 		a.cancel()
 		a.cancel = nil
@@ -403,6 +431,14 @@ func (w *worker) renderAsk(a *askRequest) {
 		}
 	}
 	add(w.tr(i18n.Msg.Cancel), "cancel")
+	inputInline := !a.inlineInput && a.input && w.inlineForceReplyUser(a.user) && (a.method == "ask" || a.form != nil && len(question.Options) > 0)
+	var inputKeyboard *telegram.Keyboard
+	if inputInline {
+		rows := keyboard.InlineKeyboard
+		inputKeyboard = &telegram.Keyboard{ForceReply: true, InlineKeyboard: [][]telegram.Button{{rows[0][0], rows[len(rows)-1][0]}}}
+		inputKeyboard.InlineKeyboard = append(inputKeyboard.InlineKeyboard, rows[1:len(rows)-1]...)
+		keyboard = &telegram.Keyboard{InlineKeyboard: [][]telegram.Button{}}
+	}
 	var prompt string
 	if a.input {
 		a.inputToken = rand.Text()
@@ -437,7 +473,7 @@ func (w *worker) renderAsk(a *askRequest) {
 				progressToolLiteral(detail+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
 		}
 	}
-	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token}
+	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token, inputInline: inputInline}
 	interactionCtx, cancel := context.WithCancel(w.ctx)
 	a.cancel = cancel
 	tg, key, results, workerCtx := w.b.tg, w.key, w.operations, w.ctx
@@ -473,8 +509,12 @@ func (w *worker) renderAsk(a *askRequest) {
 		}
 		if err == nil && prompt != "" {
 			var message telegram.Message
-			message, err = w.sendForceReply(ctx, prompt, telegram.SendOptions{
-				ForceReply: &telegram.ForceReply{ForceReply: true, Selective: true}, ReplyToMessageID: result.messageID}, a.user)
+			options := telegram.SendOptions{ForceReply: &telegram.ForceReply{ForceReply: true, Selective: true}, ReplyToMessageID: result.messageID}
+			if result.inputInline {
+				options.ForceReply = nil
+				options.Keyboard = inputKeyboard
+			}
+			message, err = w.sendForceReply(ctx, prompt, options, a.user)
 			result.inputID = message.MessageID
 		}
 		select {
@@ -485,7 +525,7 @@ func (w *worker) renderAsk(a *askRequest) {
 			_ = tg.ClearKeyboard(cleanupCtx, key.chat, result.messageID)
 		}
 		if workerCtx.Err() != nil {
-			w.closeAskInput(a, result.inputID)
+			w.closeAskInput(a, result.inputID, a.inlineInput || result.inputInline)
 		}
 	}()
 }
@@ -521,7 +561,7 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 		display := result.meta.(askDisplay)
 		a := display.request
 		if w.ask != a || !w.askScope(a) || a.epoch != display.epoch {
-			w.closeAskInput(a, display.inputID)
+			w.closeAskInput(a, display.inputID, a.inlineInput || display.inputInline)
 			if a.cancelledEpoch != 0 && a.cancelledEpoch == display.epoch {
 				a.cancelledEpoch = 0
 				w.queueAskReceipt(display.messageID, a.cancelledText)
@@ -533,7 +573,7 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 			return true
 		}
 		a.cancel = nil
-		a.messageID, a.inputID = display.messageID, display.inputID
+		a.messageID, a.inputID, a.inputInline = display.messageID, display.inputID, display.inputInline
 		if result.err != nil {
 			w.endAsk(true)
 			w.say(w.tr(i18n.Msg.AskDisplayFailed))
@@ -555,7 +595,7 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, token, action string, c confirmation) callbackResult {
 	a := w.ask
 	if !w.askScope(a) || a.token != token || a.epoch != c.epoch || q.Message == nil ||
-		q.Message.MessageID != a.messageID || q.Message.Chat.ID != w.key.chat || q.Message.MessageThreadID != w.key.thread {
+		(q.Message.MessageID != a.messageID && (!a.inputInline || q.Message.MessageID != a.inputID)) || q.Message.Chat.ID != w.key.chat || q.Message.MessageThreadID != w.key.thread {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, w.tr(i18n.Msg.ActionExpired))
 		return callbackDone
 	}
@@ -563,6 +603,11 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 	question := a.questions[a.question]
 	switch action {
 	case "cancel":
+		w.askCancelReceipt = a.messageID != 0 && (a.method == "ask" || a.form != nil)
+		if a.input && a.inputInline {
+			w.deleteAskInput(a.inputID, a.user)
+			a.inputID = 0
+		}
 		w.endAsk(true)
 		return callbackDone
 	case "empty", "default":
@@ -603,6 +648,10 @@ func (w *worker) askCallback(ctx context.Context, q *telegram.CallbackQuery, tok
 		}
 		return callbackDone
 	case "back":
+		if a.input && a.inputInline {
+			w.deleteAskInput(a.inputID, a.user)
+			a.inputID = 0
+		}
 		if a.form != nil && a.input {
 			a.input = false
 			a.custom = ""
@@ -843,6 +892,15 @@ func (w *worker) routeAskInput(in *incoming) bool {
 	}
 	if !w.mark(in.id, store.InboxSubmitted) {
 		return true
+	}
+	if !a.inlineInput && (a.method == "ask" || a.form != nil && len(a.questions[a.question].Options) > 0) {
+		if a.inputInline {
+			w.queueInlineInputReceipt(a.inputID, w.tr(i18n.Msg.AskCustom)+"\n"+askMarkerPrefix+a.inputToken+"]")
+			w.forgetForceReply(a.inputID, a.user)
+		} else {
+			w.queueForceReplyReceipt(a.inputID, a.user, w.tr(i18n.Msg.AskReplyReceived), false)
+		}
+		a.inputID = 0
 	}
 	a.custom = text
 	a.input = false

@@ -1643,7 +1643,7 @@ func (s *Store) SetAssistantHeader(ctx context.Context, id int64, header string)
 // CompleteInboxWithReplies commits the complete final result and input completion together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, 0, "", false, nil)
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, 0, "", false, nil, false)
 	return err
 }
 
@@ -1652,24 +1652,30 @@ func (s *Store) CompleteInboxWithReplies(ctx context.Context, id, chat, thread i
 // Without a target, the first new reply is editable even when its header is empty.
 // It returns the final header target after commit, or zero when no target exists or any step failed.
 func (s *Store) CompleteInboxWithAssistantHeader(ctx context.Context, id, chat, thread, targetID int64, header string, replies []string) (int64, error) {
-	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header, true, nil)
+	return s.completeInboxWithReplies(ctx, id, chat, thread, InboxDone, replies, targetID, header, true, nil, false)
 }
 
 // CompleteInboxUncertainWithReplies commits a terminal result that cannot be confirmed.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxUncertainWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies, 0, "", false, nil)
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxUncertain, replies, 0, "", false, nil, false)
 	return err
 }
 
 // CompleteInboxCancelledWithReplies commits an aborted terminal result and its replies together.
 // A failed transaction leaves the submitted input and outbox unchanged.
 func (s *Store) CompleteInboxCancelledWithReplies(ctx context.Context, id, chat, thread int64, replies []string) error {
-	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies, 0, "", false, nil)
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, replies, 0, "", false, nil, false)
 	return err
 }
 
-func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string, targetID int64, header string, headerEditable bool, actions *FinalActionSet) (int64, error) {
+// CompleteInboxCancelledWithUIReceipt atomically retires progress when no task reply is needed.
+func (s *Store) CompleteInboxCancelledWithUIReceipt(ctx context.Context, id, chat, thread int64) error {
+	_, err := s.completeInboxWithReplies(ctx, id, chat, thread, InboxCancelled, nil, 0, "", false, nil, true)
+	return err
+}
+
+func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread int64, state InboxState, replies []string, targetID int64, header string, headerEditable bool, actions *FinalActionSet, retireProgress bool) (int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -1693,6 +1699,13 @@ func (s *Store) completeInboxWithReplies(ctx context.Context, id, chat, thread i
 	}
 	if changed != 1 {
 		return 0, fmt.Errorf("input is not submitted")
+	}
+	if retireProgress {
+		_, err := tx.ExecContext(ctx, `UPDATE progress_messages SET retired=1,first_outbox_id=0,last_outbox_id=0
+WHERE inbox_id=? AND retired=0`, id)
+		if err != nil {
+			return 0, err
+		}
 	}
 	var replyHeader string
 	if targetID == 0 && headerEditable {
