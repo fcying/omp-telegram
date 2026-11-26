@@ -581,6 +581,7 @@ Logs are written to stderr; use your process manager for storage and rotation. P
 
 - [ ] **Undo/rewind and redo.** Native tree navigation is available, but safe input identification, durable rewind and active steer cancellation remain unresolved. Track [#53](https://github.com/fcying/omp-telegram/issues/53). Rewinding conversation context would not undo file changes or other external side effects.
 - [ ] **Reuse the OMP process after Stop.** Requires reliable upstream cancellation. For now, Stop retires the process while preserving its session.
+- [ ] **Scheduled monitoring.** Integrate OMP's native scheduling when it supports the required persistent scheduling and recovery; the bridge will not implement a separate scheduler. Track upstream [#2763](https://github.com/can1357/oh-my-pi/issues/2763).
 
 ## Development
 

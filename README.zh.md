@@ -581,6 +581,7 @@ Bridge 数据保存在 `<storage.data_dir>/omp-telegram.db`, 包括已接受的 
 
 - [ ] **Undo/rewind 和 redo.** 原生树导航已经可用, 但安全的输入身份关联, 持久化回退和活动 steer 撤销仍未解决. 跟踪 [#53](https://github.com/fcying/omp-telegram/issues/53). 对话上下文回退不会撤销文件修改或其他外部副作用.
 - [ ] **Stop 后复用 OMP 进程.** 等待上游提供可靠的取消机制. 目前 Stop 会退役进程, 保留 session.
+- [ ] **定时监控.** 等待 OMP 原生支持所需的持久化调度与恢复后再接入; Bridge 不单独实现调度器. 跟踪上游 [#2763](https://github.com/can1357/oh-my-pi/issues/2763).
 
 ## 开发
 
