@@ -71,7 +71,7 @@ func TestRealOMPMigrationCompatibility(t *testing.T) {
 	}
 	writeDefaults()
 	args := "--config " + strconv.Quote(nativePath) + " --session-dir " + strconv.Quote(sessions) +
-		" --no-title --no-tools --no-lsp --no-extensions --no-skills --no-rules --no-ui"
+		" --no-title --no-lsp --no-extensions --no-skills --no-rules --no-ui"
 	source = setTOMLField(source, "omp", "binary", strconv.Quote(binary))
 	source = setTOMLField(source, "omp", "args", strconv.Quote(args))
 	source = setTOMLField(source, "omp", "migration_extension", "true")

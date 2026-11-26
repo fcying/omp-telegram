@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -74,7 +75,7 @@ func TestRealOMPAutoSessionNameCompatibility(t *testing.T) {
 		}
 		cancel()
 	})
-	start := func(resume string) {
+	start := func(t *testing.T, resume string) {
 		t.Helper()
 		if current != nil {
 			current.close(t)
@@ -127,7 +128,7 @@ func TestRealOMPAutoSessionNameCompatibility(t *testing.T) {
 		return plan
 	}
 
-	start("")
+	start(t, "")
 	current.turn(t, "autoname-alpha")
 	alpha := current.state(t)
 	if alpha.Name != "" {
@@ -185,7 +186,7 @@ func TestRealOMPAutoSessionNameCompatibility(t *testing.T) {
 		}
 	}
 	for _, want := range []realOMPAutoNameState{alpha, delta} {
-		start(want.File)
+		start(t, want.File)
 		current.expectState(t, want.ID, want.Name)
 		// The provider rejects a restored title attached to another session's history.
 		marker := "autoname-alpha"
@@ -237,8 +238,10 @@ func TestRealOMPAutoSessionNameCompatibility(t *testing.T) {
 		cfg.Environment, err = omp.NewEnvironment("allowlist", []string{"HOME", "PI_CODING_AGENT_DIR", "TMPDIR", "PATH", "OMP_TELEGRAM_ADMISSION_WIRE", "OMP_TELEGRAM_ADMISSION_BINARY"}, nil)
 		requireStoreOK(t, err)
 		cfg.Binary = testBinary
+		// OMP 19.2.1 rejects --no-tools together with an explicit extension.
+		cfg.Args = slices.DeleteFunc(slices.Clone(cfg.Args), func(arg string) bool { return arg == "--no-tools" })
 		cfg.Args = append(cfg.Args, "-e", extension)
-		start("")
+		start(t, "")
 		current.turn(t, "autoname-manual")
 		state := current.state(t)
 		_, err = current.client.RefreshCommandCatalog(ctx)
