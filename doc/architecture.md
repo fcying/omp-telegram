@@ -316,6 +316,10 @@ Compact private text input and Follow-up use `queueInlineInputReceipt` in [`brid
 
 The empty-keyboard edit omits `force_reply`; preserving the original flag is not verified against the live Bot API. The public Bot API server parser maps an empty `inline_keyboard` with `force_reply: true` to a standalone ForceReply rather than an inline keyboard, while the edit API requires inline markup. Do not infer that either omission or an edit closes the client's reply interface.
 
+For private native form text fields, the question itself is the inline ForceReply target. The input mode is captured per display result because successive form fields can switch between choices and text. Invalid text retires the old input identity and opens a fresh question; group fields keep the selective ForceReply path.
+
+Cancelling a private form text question retains its opaque Ask marker in the edited cancellation receipt, so replies to the edited message remain recognizable as expired input rather than new work.
+
 Private custom-choice prompts are sent with an inline ForceReply keyboard, enabling the existing message-scoped edit and keyboard cleanup after a reply. The actor preserves the `[ask:...]` marker, clears the input ID and forgets only the matching tracked prompt in the ordered send lane. The prompt's Back callback is bound to the same owner, epoch and delivered message ID as the dialog. Stale display cleanup uses the captured prompt mode, not a later question's state. Group custom prompts retain selective ForceReply and a short local-receipt message to dismiss it. UI edits and receipts do not acknowledge OMP response settlement.
 
 Private Custom input moves the question controls to the input prompt; Back and Cancel share the first row, and optional input actions remain available. The actor validates callbacks from the captured input message as well as the question message.

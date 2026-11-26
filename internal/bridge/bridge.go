@@ -5630,7 +5630,7 @@ func (w *worker) drainForceReplyResults() {
 			switch result.kind {
 			case "ask_display":
 				result := result.meta.(askDisplay)
-				w.closeAskInput(result.request, result.inputID, result.request.inlineInput || result.inputInline)
+				w.closeAskInput(result.request, result.inputID, result.inlineInput || result.inputInline)
 			case "followup_prompt":
 				result := result.meta.(followupPromptResult)
 				w.finishFollowupPrompt(result.messageID, result.user, result.token, result.inline, "")

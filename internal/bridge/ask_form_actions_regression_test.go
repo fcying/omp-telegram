@@ -280,6 +280,106 @@ func TestGroupAskCustomReplyClearsForceReply(t *testing.T) {
 	}
 }
 
+func TestPrivateFormTextUsesQuestionAsReplyPrompt(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "choice-and-text", "method": "form", "html": "<form>" + askFormRegressionRadio + `<label>Notes <input name="notes" required></label></form>`})
+	askTestClick(t, w, f, "Second choice")
+	prompt := askTestPrompt(t, f)
+	if !w.ask.inlineInput || prompt.MessageID != w.ask.messageID || prompt.MessageID != w.ask.inputID {
+		t.Fatalf("text question is not the reply target: prompt=%d question=%d input=%d", prompt.MessageID, w.ask.messageID, w.ask.inputID)
+	}
+	f.mu.Lock()
+	markup, _ := f.messages[prompt.MessageID-1]["reply_markup"].(map[string]any)
+	forceReply := markup["force_reply"] == true
+	before := len(f.messages)
+	f.mu.Unlock()
+	if !forceReply {
+		t.Fatal("text question did not request Reply")
+	}
+	askTestReply(t, w, 200, 7, 11, "  notes  ", prompt)
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].Cancelled || responses[0].Data["choice"] != "second" || responses[0].Data["notes"] != "  notes  " {
+		t.Fatalf("form response = %+v", responses)
+	}
+	waitFor(t, func() bool { return f.inlineInputClosed(prompt.MessageID) })
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, message := range f.messages[before:] {
+		if _, isEdit := message["message_id"]; !isEdit {
+			t.Fatalf("text reply sent an extra message: %+v", message)
+		}
+	}
+}
+
+func TestPrivateFormTextInvalidReplyUsesNewQuestion(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "text-retry", "method": "form", "html": `<form><label>Code <input name="code" pattern="ok" required></label></form>`})
+	old := askTestPrompt(t, f)
+	askTestReply(t, w, 200, 7, 11, "bad", old)
+	retry := askTestPrompt(t, f)
+	if retry.MessageID == old.MessageID || retry.MessageID != w.ask.messageID || retry.MessageID != w.ask.inputID {
+		t.Fatalf("invalid text did not create a new reply target: old=%d retry=%d", old.MessageID, retry.MessageID)
+	}
+	askTestReply(t, w, 201, 7, 11, "ok", retry)
+	responses := askTestState(t, w)
+	if len(responses) != 1 || responses[0].Data["code"] != "ok" {
+		t.Fatalf("validated response = %+v", responses)
+	}
+}
+
+func TestPrivateFormTextCancelDoesNotSendClosingMessage(t *testing.T) {
+	w, f, _ := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "text-cancel", "method": "form", "html": `<form><label>Notes <input name="notes" required></label></form>`})
+	prompt := askTestPrompt(t, f)
+	before := f.messageCount()
+	askTestClick(t, w, f, "Cancel")
+	responses := askTestState(t, w)
+	if len(responses) != 1 || !responses[0].Cancelled {
+		t.Fatalf("cancelled response = %+v", responses)
+	}
+	waitFor(t, func() bool { return f.inlineInputClosed(prompt.MessageID) })
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, message := range f.messages[before:] {
+		if _, isEdit := message["message_id"]; !isEdit {
+			t.Fatalf("text cancellation sent an extra message: %+v", message)
+		}
+	}
+}
+
+func TestPrivateFormCancelledTextReplyIsExpired(t *testing.T) {
+	w, f, trace := privateAskTestWorker(t)
+	askTestEvent(t, w, map[string]any{"id": "text-cancel-stale", "method": "form", "html": `<form><label>Notes <input name="notes" required></label></form>`})
+	prompt := askTestPrompt(t, f)
+	askTestClick(t, w, f, "Cancel")
+	var receipt string
+	waitFor(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for i := len(f.messages) - 1; i >= 0; i-- {
+			message := f.messages[i]
+			if message["message_id"] == float64(prompt.MessageID) {
+				receipt, _ = message["text"].(string)
+				return strings.Contains(receipt, "Canceled")
+			}
+		}
+		return false
+	})
+	prompt.Text = receipt
+	askTestReply(t, w, 200, 7, 11, "stale answer", prompt)
+	if state := queueState(t, w, 200); state != "cancelled" {
+		t.Fatalf("stale reply state = %q", state)
+	}
+	if len(w.queue) != 0 || len(w.deferredSteers) != 0 || researchTraceCount(trace, "prompt", "stale answer") != 0 || researchTraceCount(trace, "steer", "stale answer") != 0 {
+		t.Fatal("stale reply became task or guidance")
+	}
+	var notices int
+	requireStoreOK(t, w.b.db.DB.QueryRow("SELECT COUNT(*) FROM outbox WHERE chat=? AND thread=? AND text LIKE ?", w.key.chat, w.key.thread, "%This Ask input is unavailable or expired.%").Scan(&notices))
+	if notices != 1 {
+		t.Fatalf("expired input notices = %d, want 1", notices)
+	}
+}
+
 func TestAskFormTextEmptyReceiptDoesNotShowDefault(t *testing.T) {
 	for _, tc := range []struct {
 		name, button, wantValue, wantFooter string
