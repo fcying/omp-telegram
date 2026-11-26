@@ -75,6 +75,7 @@ type askDisplay struct {
 	epoch              uint64
 	messageID, inputID int64
 	token              string
+	inlineInput        bool
 	inputInline        bool
 }
 
@@ -202,7 +203,9 @@ func (w *worker) beginAsk(e rpcEvent) {
 			a.input = true
 		}
 	}
-	a.inlineInput = e.Method != "ask" && e.Method != "form" && w.inlineForceReplyUser(a.user)
+	if e.Method != "form" {
+		a.inlineInput = e.Method != "ask" && w.inlineForceReplyUser(a.user)
+	}
 	w.ask = a
 	w.renderAsk(a)
 }
@@ -212,8 +215,10 @@ func (w *worker) prepareAskFormField(a *askRequest) {
 	a.selected = make(map[int]bool)
 	a.custom, a.page, a.input = "", 0, false
 	a.prefill, a.placeholder = nil, field.placeholder
+	a.inlineInput = false
 	if field.inputType != "radio" && field.inputType != "checkbox" && field.inputType != "select" {
 		a.input = true
+		a.inlineInput = w.inlineForceReplyUser(a.user)
 		if field.value != "" {
 			value := field.value
 			a.prefill = &value
@@ -322,6 +327,9 @@ func (w *worker) cancelAskInteraction(a *askRequest) {
 	if (a.method == "ask" || a.form != nil) && a.cancelledText == "" && a.question < len(a.questions) && (a.messageID != 0 || a.cancel != nil) {
 		question := a.questions[a.question]
 		receipt = w.askQuestionText(question, 0, len(question.Options), "**"+w.tr(i18n.Msg.Canceled)+"**")
+		if a.inlineInput && a.inputToken != "" {
+			receipt += "\n" + askMarkerPrefix + a.inputToken + "]"
+		}
 		a.cancelledText = receipt
 		if a.cancel != nil {
 			// The in-flight display must return before its final cancellation edit.
@@ -446,7 +454,7 @@ func (w *worker) renderAsk(a *askRequest) {
 			if a.placeholder != "" {
 				footer = "**" + w.tr(i18n.Msg.AskPlaceholder) + "**\n" + progressToolLiteral(clipUTF16(a.placeholder, 500)+"\n")
 			}
-			if a.method == "editor" && a.prefill != nil {
+			if (a.method == "editor" || a.form != nil) && a.prefill != nil {
 				if footer != "" {
 					footer += "\n\n"
 				}
@@ -473,7 +481,7 @@ func (w *worker) renderAsk(a *askRequest) {
 				progressToolLiteral(detail+"\n") + "\n" + askMarkerPrefix + a.inputToken + "]"
 		}
 	}
-	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token, inputInline: inputInline}
+	result := askDisplay{request: a, epoch: a.epoch, messageID: a.messageID, token: a.token, inlineInput: a.inlineInput, inputInline: inputInline}
 	interactionCtx, cancel := context.WithCancel(w.ctx)
 	a.cancel = cancel
 	tg, key, results, workerCtx := w.b.tg, w.key, w.operations, w.ctx
@@ -497,7 +505,7 @@ func (w *worker) renderAsk(a *askRequest) {
 		var err error
 		if result.messageID == 0 {
 			var message telegram.Message
-			if a.inlineInput {
+			if result.inlineInput {
 				message, err = w.sendForceReply(ctx, text, telegram.SendOptions{Keyboard: keyboard}, a.user)
 				result.inputID = message.MessageID
 			} else {
@@ -525,7 +533,7 @@ func (w *worker) renderAsk(a *askRequest) {
 			_ = tg.ClearKeyboard(cleanupCtx, key.chat, result.messageID)
 		}
 		if workerCtx.Err() != nil {
-			w.closeAskInput(a, result.inputID, a.inlineInput || result.inputInline)
+			w.closeAskInput(a, result.inputID, result.inlineInput || result.inputInline)
 		}
 	}()
 }
@@ -561,12 +569,12 @@ func (w *worker) askOperationFinished(result operationResult) bool {
 		display := result.meta.(askDisplay)
 		a := display.request
 		if w.ask != a || !w.askScope(a) || a.epoch != display.epoch {
-			w.closeAskInput(a, display.inputID, a.inlineInput || display.inputInline)
+			w.closeAskInput(a, display.inputID, display.inlineInput || display.inputInline)
 			if a.cancelledEpoch != 0 && a.cancelledEpoch == display.epoch {
 				a.cancelledEpoch = 0
 				w.queueAskReceipt(display.messageID, a.cancelledText)
 			} else {
-				if !a.inlineInput {
+				if !display.inlineInput {
 					w.queueKeyboardCleanup(display.messageID)
 				}
 			}
@@ -786,6 +794,10 @@ func (w *worker) advanceAskForm(a *askRequest) {
 	} else {
 		if reason := askFormValidateText(field, a.custom); reason != "" {
 			w.say(w.tr(i18n.Msg.AskFormInvalid))
+			if a.inlineInput {
+				w.invalidateAskInteraction(a)
+				a.messageID = 0
+			}
 			a.input = true
 			a.custom = ""
 			w.renderAsk(a)

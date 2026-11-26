@@ -316,6 +316,10 @@ Actor 在调度时持有交互取消 context. Ask 的十秒显示网络 deadline
 
 空键盘编辑省略 `force_reply`; 尚未通过真实 Bot API 验证是否保留原标志. 公开的 Bot API 服务端解析器会将空 `inline_keyboard` 加 `force_reply: true` 解析为独立 ForceReply, 而编辑 API 要求 inline markup. 不能据此推断省略标志或编辑操作会关闭客户端回复界面.
 
+私聊原生表单文字字段直接以问题消息作为 inline ForceReply 目标. 连续表单字段可在选项和文字之间切换, 因此每个显示结果捕获自己的输入模式. 无效文字撤销旧输入身份并打开新问题; 群聊字段继续使用定向 ForceReply 路径.
+
+取消私聊表单文字问题时, 编辑后的取消回执保留不透明 Ask marker, 使对该回执的回复仍可识别为过期输入, 不会变成新任务.
+
 私聊自定义选项提示在发送时使用 inline ForceReply 键盘, 回复后可复用按消息 ID 编辑和清除键盘的流程. Actor 保留 `[ask:...]` marker, 清除输入 ID, 并在有序发送链中仅忘记匹配的提示. 提示上的返回按钮绑定同一个 owner, epoch 和已送达消息 ID. 迟到显示的清理使用捕获的提示模式, 不借用后续问题的状态. 群聊自定义提示继续使用定向 ForceReply 和短本地回执结束输入. UI 编辑及回执不代表 OMP 响应已结算.
 
 私聊 Custom 输入将问题控件移到输入提示; Back 和 Cancel 并排位于第一行, 可选输入操作仍然可用. Actor 校验捕获的输入消息及问题消息上的回调.
